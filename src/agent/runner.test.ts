@@ -262,6 +262,33 @@ test("hands off when the context budget is exceeded", async () => {
   );
 });
 
+test("checks out sibling repos under the workspace and excludes them locally", async () => {
+  // The Codeberg workflow: one workspace repo with the rest cloned inside it. A task
+  // spanning the ecosystem must see siblings where its own docs say they are.
+  const sibling: RepoRef = { host: "github.com", owner: "acme", name: "gadget" };
+  const siblingSource = join(root, "gadget-source");
+  await mkdir(siblingSource, { recursive: true });
+  await sh("git init -q -b main && git config user.email t@t && git config user.name t", siblingSource);
+  await writeFile(join(siblingSource, "lib.txt"), "gadget\n");
+  await sh("git add -A && git commit -qm init", siblingSource);
+  await sh(
+    `git clone -q --mirror ${siblingSource} ${join(mirrors, sibling.host, sibling.owner, `${sibling.name}.git`)}`,
+    root,
+  );
+
+  const multiTask = asTaskId("TASK-3");
+  const checkout = await worktrees.ensureTaskCheckout([REPO, sibling], multiTask);
+
+  assert.equal(checkout.root, join(tasks, multiTask, REPO.name));
+  assert.equal(checkout.siblings.get("acme/gadget"), join(checkout.root, "repos", "gadget"));
+  assert.ok(existsSync(join(checkout.root, "repos", "gadget", "lib.txt")));
+
+  // The nested checkout must not show up as untracked in the workspace repo, or the
+  // agent will eventually commit a whole sibling repository into it.
+  const status = await worktrees.gitAt(checkout.root).run("status", "--porcelain");
+  assert.equal(status, "", `workspace should be clean, got: ${status}`);
+});
+
 test("an open_pr call is surfaced on the outcome for the completion gate", async () => {
   const { runner, faux } = buildRunner(200_000);
 

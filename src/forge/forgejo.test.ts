@@ -15,15 +15,21 @@ const spec = (repos: readonly RepoRef[]): TaskSpec => ({
   acceptance: ["true"],
 });
 
-const factory = (entries: readonly [string, string][]) =>
+const factory = (
+  owners: readonly [string, string][],
+  repos: readonly [string, string][] = [],
+) =>
   new ForgejoForgeFactory({
     apiBase: "https://codeberg.org/api/v1",
     username: "bot",
-    tokensByRepo: new Map(entries),
+    tokensByOwner: new Map(owners),
+    ...(repos.length > 0 ? { tokensByRepo: new Map(repos) } : {}),
   });
 
-test("serves the repo-scoped token for a declared repo", async () => {
-  const forge = await factory([["ElectricBoogaloo/eb-api", "tok"]]).forTask(spec([REPO]));
+test("serves the owner-wide token for a declared repo", async () => {
+  // Owner-wide is the normal unit on Codeberg: these ecosystems are worked as one
+  // workspace plus sibling clones, so essentially no task touches a single repo.
+  const forge = await factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO]));
   const credential = await forge.credential(REPO);
 
   assert.equal(credential.username, "bot");
@@ -33,17 +39,36 @@ test("serves the repo-scoped token for a declared repo", async () => {
 });
 
 test("a repo outside the task's spec is refused before any request", async () => {
-  const forge = await factory([["ElectricBoogaloo/eb-api", "tok"]]).forTask(spec([REPO]));
+  // The spec, not the token, is the scope boundary on Forgejo — the token cannot be
+  // narrowed at use time because there is no mint step.
+  const forge = await factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO]));
   await assert.rejects(
     () => forge.credential({ ...REPO, name: "other" }),
     RepoOutOfScopeError,
   );
 });
 
-test("a declared repo with no configured token fails loudly, never falling back", async () => {
-  // The absence of a fallback is the point: a broader token must never be substituted.
-  const forge = await factory([]).forTask(spec([REPO]));
+test("a declared repo under an unknown owner fails loudly", async () => {
+  const forge = await factory([["SomeoneElse", "tok"]]).forTask(spec([REPO]));
   await assert.rejects(() => forge.credential(REPO), MissingRepoTokenError);
+});
+
+test("a per-repo token overrides the owner-wide one", async () => {
+  // Lets a sensitive repo carry a tighter credential without changing how the rest of
+  // the ecosystem is reached.
+  const forge = await factory(
+    [["ElectricBoogaloo", "broad"]],
+    [["ElectricBoogaloo/eb-api", "narrow"]],
+  ).forTask(spec([REPO]));
+
+  assert.equal((await forge.credential(REPO)).password, "narrow");
+
+  const sibling = { ...REPO, name: "eb-admin" };
+  const multi = await factory(
+    [["ElectricBoogaloo", "broad"]],
+    [["ElectricBoogaloo/eb-api", "narrow"]],
+  ).forTask(spec([REPO, sibling]));
+  assert.equal((await multi.credential(sibling)).password, "broad");
 });
 
 test("no statuses at all is 'none', not success", () => {

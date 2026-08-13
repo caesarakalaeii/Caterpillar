@@ -33,18 +33,26 @@ export interface ForgejoOptions {
   /** Account the tokens belong to — used as the git username. */
   readonly username: string;
   /**
-   * Repo-scoped tokens keyed by `owner/name`. Resolved from the mounted SOPS
-   * secret. A repo without an entry is unusable by design: no fallback to a
-   * broader token, ever.
+   * Tokens covering every repo under an owner, keyed by owner.
+   *
+   * This is the normal unit for Codeberg: an ecosystem like ElectricBoogaloo is worked
+   * as one workspace plus sibling clones, so essentially no task touches a single repo
+   * and a per-repo token would have to be assembled per task anyway.
    */
-  readonly tokensByRepo: ReadonlyMap<string, string>;
+  readonly tokensByOwner: ReadonlyMap<string, string>;
+  /**
+   * Optional narrower per-repo tokens, keyed `owner/name`. Checked BEFORE the
+   * owner-wide token, so a sensitive repo can carry a tighter credential without
+   * changing how the rest are reached.
+   */
+  readonly tokensByRepo?: ReadonlyMap<string, string>;
 }
 
 export class MissingRepoTokenError extends Error {
-  constructor(slug: string) {
+  constructor(slug: string, owner: string) {
     super(
-      `no repository-scoped Forgejo token configured for ${slug} — create one with ` +
-        `write:repository + write:issue limited to that repo, then add it to the secret`,
+      `no Forgejo token configured for ${slug} — add a per-repo entry, or an ` +
+        `owner-wide token for '${owner}', to the workspace secret`,
     );
     this.name = "MissingRepoTokenError";
   }
@@ -183,11 +191,24 @@ class ForgejoForge implements Forge {
     // Nothing to revoke — these tokens are long-lived and externally rotated.
   }
 
+  /**
+   * Resolve the token for a repo: a specific override first, then the owner-wide
+   * token.
+   *
+   * `assertInScope` has already run, so this is not the security boundary — the task's
+   * declared `repos` list is. On Forgejo the token cannot be narrowed at use time
+   * anyway (there is no mint step), so scoping is enforced by the spec plus whatever
+   * the token itself was created with.
+   */
   private tokenFor(repo: RepoRef): string {
     const slug = `${repo.owner}/${repo.name}`;
-    const token = this.options.tokensByRepo.get(slug);
-    if (token === undefined) throw new MissingRepoTokenError(slug);
-    return token;
+    const specific = this.options.tokensByRepo?.get(slug);
+    if (specific !== undefined) return specific;
+
+    const byOwner = this.options.tokensByOwner.get(repo.owner);
+    if (byOwner !== undefined) return byOwner;
+
+    throw new MissingRepoTokenError(slug, repo.owner);
   }
 
   private async api<T>(repo: RepoRef, route: string, init: RequestInit = {}): Promise<T> {

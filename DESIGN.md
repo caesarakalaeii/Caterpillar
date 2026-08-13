@@ -440,15 +440,43 @@ past v15.0, so **repository-scoped access tokens are available**:
 
 **The gap: Forgejo tokens have no expiry.** There is no installation-token equivalent, and
 `POST /users/{u}/tokens` requires basic auth — so on-demand minting would mean storing the
-account password, which is strictly worse than storing a scoped token. Therefore:
+account password, which is strictly worse than storing a scoped token.
 
-- Pre-create **one repo-scoped token per Codeberg repo**, `write:repository` +
-  `write:issue`, scoped to exactly that repo.
-- Store them SOPS-encrypted; the supervisor selects by `task.repos`.
-- **Rotation is a scheduled chore, not a free property** — put it on a calendar or a
-  CronJob and alert if a token predates the rotation window.
+**And per-repo scoping does not fit the actual workflow.** `electric-boogaloo` is worked
+as *one workspace repo with the others cloned inside it* — it is a single ecosystem, and
+essentially no task touches only one repo. A per-repo token would have to be reassembled
+for every task, for no benefit. So:
 
-Blast radius therefore matches the GitHub App (one repo); lifetime does not.
+- One **owner-wide token** per Codeberg owner, `write:repository` + `write:issue`.
+- Optional per-repo overrides for anything that warrants a tighter credential; they are
+  checked before the owner-wide token.
+- Stored SOPS-encrypted as `tokens.json`:
+  ```jsonc
+  { "owners": { "ElectricBoogaloo": "<token>" },
+    "repos":  { "ElectricBoogaloo/sensitive": "<narrower token>" } }
+  ```
+- **Rotation is a scheduled chore, not a free property** — calendar or CronJob, and alert
+  if a token predates the rotation window.
+
+> **Honest consequence.** On GitHub the token's blast radius is one repo for one hour. On
+> Codeberg it is **every repo of that owner, indefinitely**. The scope boundary there is
+> `spec.repos` — enforced by `assertInScope` before any request — not the credential. That
+> is a weaker guarantee, and it is a deliberate trade for a workflow where multi-repo tasks
+> are the norm rather than the exception.
+
+### 9.4.1 Multi-repo checkout
+
+Because tasks span the ecosystem, `spec.repos[0]` is the **workspace repo** and becomes
+the agent's working directory; the rest are checked out beneath it as `repos/<name>`,
+each its own worktree on `agent/<task>`.
+
+`repos/` is added to the workspace's **local** exclude (`$GIT_COMMON_DIR/info/exclude`)
+rather than trusting the repo's `.gitignore`, so a sibling repository can never be
+committed into the workspace even in a repo that has not thought to ignore it.
+
+> Note `--git-common-dir`, not `--git-dir`: in a linked worktree the latter returns the
+> worktree-private directory, and git reads `info/exclude` only from the common one. The
+> pattern therefore applies to every worktree of that mirror, which is the intent.
 
 > Prior art: `../electric-boogaloo-workspace/scripts/cb-api.sh` solves this for a *shell*
 > agent — it sources `.env` in-process and feeds the header through a process-substituted

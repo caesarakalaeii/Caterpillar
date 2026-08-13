@@ -52,10 +52,13 @@ const main = async (): Promise<void> => {
   const token = process.env[tokenEnv] ?? "";
   console.log(`✓ token found in ${tokenEnv}`);
 
+  // Verify as an owner-wide token, which is how these are normally issued: an
+  // ecosystem is worked as one workspace plus sibling clones, so a task spanning
+  // several repos of the same owner must all resolve from this one credential.
   const factory = new ForgejoForgeFactory({
     apiBase,
     username: arg("--username") ?? repo.owner,
-    tokensByRepo: new Map([[slug, token]]),
+    tokensByOwner: new Map([[repo.owner, token]]),
   });
 
   const spec: TaskSpec = {
@@ -72,18 +75,20 @@ const main = async (): Promise<void> => {
   const status = await forge.checks(repo, "HEAD");
   console.log(`✓ commit-status route reachable — ${status.conclusion}: ${status.summary}`);
 
-  // 2: scoping must be enforced locally too; an undeclared repo has no token.
+  // 2: the spec is the scope boundary, so a repo the task did not declare is refused
+  // even though the owner-wide token would technically reach it.
   const other: RepoRef = { ...repo, name: `${repo.name}-should-not-exist` };
   try {
     await forge.credential(other);
-    console.warn("⚠ an out-of-scope repo was NOT refused — check spec scoping");
+    console.warn("⚠ a repo outside the spec was NOT refused — check spec scoping");
   } catch {
-    console.log("✓ an out-of-scope repo is refused before any request is made");
+    console.log("✓ a repo outside the task's spec is refused before any request");
   }
 
   console.log(
-    "\nToken works and is usable for pushes and PRs on " +
-      `${slug}. Remember: Forgejo tokens do not expire — schedule rotation.`,
+    `\nToken works for pushes and PRs on ${slug} and on other ${repo.owner} repos a ` +
+      `task declares.\nNote: this credential's blast radius is every ${repo.owner} ` +
+      `repo, and Forgejo tokens do not expire — schedule rotation.`,
   );
 };
 

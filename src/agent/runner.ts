@@ -105,7 +105,9 @@ export class AgentSessionRunner {
     credentials.setActive({ forge, repos: spec.repos });
 
     try {
-      const worktree = await worktrees.ensureWorktree(repo, spec.id);
+      // repos[0] is the workspace repo and becomes cwd; the rest land under repos/.
+      const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id);
+      const worktree = checkout.root;
       const recoveryNote = await this.recoverInterrupted(worktree);
 
       const control: ControlSink = {};
@@ -138,10 +140,17 @@ export class AgentSessionRunner {
         ...(await this.promptContext(spec, recoveryNote)),
       });
 
+      const layout =
+        checkout.siblings.size === 0
+          ? ""
+          : `\n\nSibling repositories are checked out inside it:\n${[...checkout.siblings]
+              .map(([slug, path]) => `- ${slug} → ${path}`)
+              .join("\n")}\nEach is its own git repository on branch agent/${spec.id}.`;
+
       const result = await runSession({
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.`,
+        systemPrompt: `${SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}`,
         initialPrompt: prompt,
         tools,
         budget,

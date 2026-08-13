@@ -5,11 +5,18 @@
  * Session starts cost a fetch rather than a clone, tasks stay isolated, and a
  * corrupted worktree is discardable without touching the mirror.
  */
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Git } from "../state/git.ts";
 import type { RepoRef, TaskId } from "../domain/task.ts";
+
+/** Where a task's repos landed. `root` is the agent's working directory. */
+export interface TaskCheckout {
+  readonly root: string;
+  /** Sibling repos, keyed `owner/name`, checked out under `root/repos/<name>`. */
+  readonly siblings: ReadonlyMap<string, string>;
+}
 
 /** Bot identity for commits the agent makes. */
 export interface CommitIdentity {
@@ -65,16 +72,22 @@ export class WorktreeManager {
    * afterwards, so a handoff resumes exactly where the previous session stopped.
    */
   async ensureWorktree(repo: RepoRef, task: TaskId): Promise<string> {
-    const mirror = await this.syncMirror(repo);
     const path = join(this.options.tasksDir, task, repo.name);
+    await this.addWorktreeAt(repo, task, path);
+    return path;
+  }
+
+  /** Create or reuse a worktree for `repo` at an explicit path. */
+  private async addWorktreeAt(repo: RepoRef, task: TaskId, path: string): Promise<void> {
+    const mirror = await this.syncMirror(repo);
     const branch = `agent/${task}`;
 
     if (existsSync(path)) {
       await this.configure(path);
-      return path;
+      return;
     }
 
-    await mkdir(join(this.options.tasksDir, task), { recursive: true });
+    await mkdir(join(path, ".."), { recursive: true });
     const git = this.options.git.at(mirror);
 
     const exists = await git.revParse(`refs/heads/${branch}`);
@@ -86,7 +99,65 @@ export class WorktreeManager {
     }
 
     await this.configure(path);
-    return path;
+  }
+
+  /**
+   * Materialise every repo a task declares, in the workspace-plus-clones layout.
+   *
+   * `repos[0]` is the WORKSPACE repo and becomes the agent's working directory. The
+   * rest are checked out beneath it as `repos/<name>`, matching how these ecosystems
+   * are actually worked — one workspace repo with siblings cloned inside it, so a task
+   * spanning several repos sees them where its own docs say they are.
+   *
+   * The nested checkouts are added to the workspace's `.git/info/exclude` rather than
+   * relying on its `.gitignore`: exclude is local-only, so the agent cannot
+   * accidentally commit a sibling repo even in a repo that has not thought to ignore
+   * the directory.
+   */
+  async ensureTaskCheckout(
+    repos: readonly RepoRef[],
+    task: TaskId,
+  ): Promise<TaskCheckout> {
+    const workspace = repos[0];
+    if (workspace === undefined) throw new Error(`task ${task} declares no repos`);
+
+    const root = await this.ensureWorktree(workspace, task);
+    const siblings = new Map<string, string>();
+
+    for (const repo of repos.slice(1)) {
+      const path = join(root, "repos", repo.name);
+      await this.addWorktreeAt(repo, task, path);
+      siblings.set(`${repo.owner}/${repo.name}`, path);
+    }
+
+    if (siblings.size > 0) await this.excludeLocally(root, "repos/");
+
+    return { root, siblings };
+  }
+
+  /**
+   * Append a pattern to the repository's local exclude file, idempotently.
+   *
+   * Must use `--git-common-dir`, NOT `--git-dir`: in a linked worktree the latter
+   * returns the worktree-private directory, but git only reads `info/exclude` from the
+   * common directory, so writing there has no effect at all.
+   *
+   * Consequence: the pattern applies to every worktree of this mirror, not just this
+   * task's. That is what we want here — `repos/` should never be committable in any
+   * checkout of a workspace repo.
+   */
+  private async excludeLocally(worktree: string, pattern: string): Promise<void> {
+    const git = this.options.git.at(worktree);
+    const commonDir = await git.run("rev-parse", "--git-common-dir");
+    const resolved = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const excludePath = join(resolved, "info", "exclude");
+
+    await mkdir(join(resolved, "info"), { recursive: true });
+    const current = existsSync(excludePath) ? await readFile(excludePath, "utf8") : "";
+    if (current.split("\n").some((line) => line.trim() === pattern)) return;
+
+    const separator = current === "" || current.endsWith("\n") ? "" : "\n";
+    await writeFile(excludePath, `${current}${separator}${pattern}\n`);
   }
 
   /** Discard a task's worktree — used after completion or on corruption. */

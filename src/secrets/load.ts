@@ -77,29 +77,55 @@ export const loadForgeFactory = async (
     // Do not echo the body — it is a map of live tokens.
     throw new Error(
       `secret '${profile.secretRef}' key 'tokens.json' is not valid JSON ` +
-        `(expected {"owner/name": "<token>"})`,
+        `(expected {"owners": {...}, "repos": {...}})`,
     );
   }
 
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(
-      `secret '${profile.secretRef}' key 'tokens.json' must be an object mapping ` +
-        `owner/name to a repository-scoped token`,
+      `secret '${profile.secretRef}' key 'tokens.json' must be an object of the form ` +
+        `{"owners": {"<owner>": "<token>"}, "repos": {"<owner>/<name>": "<token>"}}`,
     );
   }
 
-  const tokensByRepo = new Map<string, string>();
-  for (const [slug, token] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof token !== "string" || token.length === 0) {
-      throw new Error(`tokens.json entry '${slug}' must be a non-empty string`);
-    }
-    tokensByRepo.set(slug, token);
+  const shape = parsed as { readonly owners?: unknown; readonly repos?: unknown };
+  const tokensByOwner = readTokenMap(shape.owners, "owners", profile.secretRef);
+  const tokensByRepo = readTokenMap(shape.repos, "repos", profile.secretRef);
+
+  if (tokensByOwner.size === 0 && tokensByRepo.size === 0) {
+    throw new Error(
+      `secret '${profile.secretRef}' key 'tokens.json' contains no tokens — add at ` +
+        `least one owner-wide token under "owners"`,
+    );
   }
 
   const options: ForgejoOptions = {
     apiBase: profile.forge.apiBase,
     username: await bundle.read("username"),
-    tokensByRepo,
+    tokensByOwner,
+    ...(tokensByRepo.size > 0 ? { tokensByRepo } : {}),
   };
   return new ForgejoForgeFactory(options);
+};
+
+/** Parse one token sub-map, naming keys but never values in errors. */
+const readTokenMap = (
+  value: unknown,
+  field: string,
+  secretRef: string,
+): ReadonlyMap<string, string> => {
+  const map = new Map<string, string>();
+  if (value === undefined || value === null) return map;
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`secret '${secretRef}' tokens.json '${field}' must be an object`);
+  }
+
+  for (const [key, token] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof token !== "string" || token.length === 0) {
+      throw new Error(`secret '${secretRef}' tokens.json ${field}['${key}'] must be a non-empty string`);
+    }
+    map.set(key, token);
+  }
+  return map;
 };
