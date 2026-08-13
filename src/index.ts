@@ -15,8 +15,11 @@ import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
+import { parseCommand } from "./notify/commands.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
-import { errorFields, JsonLogger } from "./obs/log.ts";
+import { DiscordGateway, postMessage } from "./notify/gateway.ts";
+import { AnswerInbox, type AnswerOutcome } from "./supervisor/inbox.ts";
+import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import { loadForgeFactory, loadStateCredentials, loadTracker, SecretBundle } from "./secrets/load.ts";
 import { ensureStateCheckout } from "./state/bootstrap.ts";
 import { LeaseManager } from "./state/lease.ts";
@@ -116,6 +119,8 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
+  const inbox = new AnswerInbox();
+
   const supervisor = new Supervisor({
     config,
     store,
@@ -139,6 +144,7 @@ const main = async (): Promise<void> => {
     verifier: new AcceptanceVerifier({ worktrees, bindings }),
     progress: new GitProgressProbe({ worktrees }),
     notifier: await createNotifier(config.secretsDir),
+    inbox,
     metrics,
     logger,
     trackers,
@@ -162,11 +168,87 @@ const main = async (): Promise<void> => {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
+  // The bridge runs ALONGSIDE the loop, not inside it: a websocket that waits on a
+  // session would deliver nothing for hours. It hands work to the supervisor through
+  // the inbox, which is the only thing that touches the state repo.
+  //
+  // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
+  // mean the supervisor never starts polling and the pod idles while looking healthy.
+  const bridge = startBridge(config.secretsDir, inbox, logger, controller.signal).catch(
+    (error: unknown) => {
+      logger.error("bridge.failed", errorFields(error));
+    },
+  );
+
   try {
     await supervisor.run(controller.signal);
   } finally {
     stopMetrics();
     await credentials.stop();
+    await bridge;
+  }
+};
+
+/**
+ * The inbound bridge (DESIGN.md §7). Optional, and independent of the webhook: a bot
+ * token alone gives commands AND replies, because the bot answers as itself.
+ *
+ * Needs `bot-token` and `channel-id` in the mounted secret. Without both, a question
+ * still parks and waits — it is answered by committing the file by hand.
+ */
+const startBridge = async (
+  secretsDir: string,
+  inbox: AnswerInbox,
+  logger: Logger,
+  signal: AbortSignal,
+): Promise<void> => {
+  const bundle = new SecretBundle(secretsDir, "caterpillar-discord");
+  const token = await bundle.readOptional("bot-token").catch(() => undefined);
+  const channelId = await bundle.readOptional("channel-id").catch(() => undefined);
+
+  if (token === undefined || channelId === undefined) {
+    logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
+    return;
+  }
+
+  const reply = async (content: string): Promise<void> => {
+    await postMessage({ token, channelId, content }).catch((error: unknown) => {
+      logger.warn("bridge.reply-failed", errorFields(error));
+    });
+  };
+
+  const gateway = new DiscordGateway({
+    token,
+    channelId,
+    logger,
+    onMessage: async (content, author) => {
+      const command = parseCommand(content);
+      if (command === undefined) return;
+
+      if (command.kind === "malformed") {
+        await reply(command.reason);
+        return;
+      }
+
+      logger.info("bridge.answer", { task: command.task, author });
+      await reply(describe(command.task, await inbox.submit(command.task, command.text)));
+    },
+  });
+
+  return gateway.run(signal);
+};
+
+/** What to tell the human. Silence would leave them unable to tell a typo from an outage. */
+const describe = (task: string, outcome: AnswerOutcome): string => {
+  switch (outcome.kind) {
+    case "applied":
+      return `Answered **${task}** (question ${outcome.index}). It is \`ready\` and will be claimed on the next poll.`;
+    case "unknown-task":
+      return `No task **${task}** in the state repo. Check the id from its notification.`;
+    case "not-waiting":
+      return `**${task}** is \`${outcome.status}\`, not waiting on an answer — nothing was written.`;
+    case "failed":
+      return `Could not answer **${task}**: ${outcome.error}`;
   }
 };
 

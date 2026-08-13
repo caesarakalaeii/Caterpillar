@@ -243,6 +243,18 @@ export class StateStore {
     return JSON.parse(raw) as TaskState;
   }
 
+  /**
+   * State for a task that may not exist.
+   *
+   * For callers reacting to a name a HUMAN typed — a mistyped task id in a chat message
+   * is an ordinary event, not an exceptional one, and deserves a reply rather than a
+   * stack trace.
+   */
+  async tryReadState(task: TaskId): Promise<TaskState | undefined> {
+    if (!existsSync(join(this.taskDir(task), "state.json"))) return undefined;
+    return this.readState(task);
+  }
+
   async writeState(state: TaskState): Promise<void> {
     const dir = this.taskDir(state.id);
     await mkdir(dir, { recursive: true });
@@ -309,6 +321,14 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(index).padStart(3, "0")}-question.md`;
     await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+  }
+
+  /** Mirror of `writeQuestion`. The file's existence is what marks a question answered. */
+  async writeAnswer(task: TaskId, index: number, answer: string): Promise<void> {
+    const dir = join(this.taskDir(task), "questions");
+    await mkdir(dir, { recursive: true });
+    const name = `${String(index).padStart(3, "0")}-answer.md`;
+    await writeFile(join(dir, name), `${answer.trim()}\n`, "utf8");
   }
 
   /**

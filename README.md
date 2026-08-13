@@ -96,6 +96,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
 | `src/notify/discord.ts` | Discord webhook — questions, parks, outcomes (§11.2). |
+| `src/notify/gateway.ts` | Discord gateway websocket — the inbound bridge (§7). |
+| `src/notify/commands.ts` | `!answer` parsing. Pure, no IO (§7). |
+| `src/supervisor/inbox.ts` | Hands chat commands to the poll loop, which owns the repo. |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
 | `src/obs/log.ts` | Structured JSON-line logging to stdout (§11). |
 
@@ -183,12 +186,21 @@ failure.
 
 ## Not yet built
 
-- The **inbound** Discord bridge: `!answer` (§7) and `!task <repo> <goal>` (§14 path 3).
-  A question still lands in `tasks/<id>/questions/` and waits there until a human commits
-  the answer by hand.
-  The **outbound** half is implemented (§11.2). It is active only when a `webhook-url`
-  key exists in the mounted `caterpillar-discord` secret; without one `index.ts` uses
-  `NullNotifier` and the supervisor runs silently.
+- `!task <repo> <goal>` (§14 path 3). As written it carries no acceptance criteria, and
+  §14 already refuses specs that have none — it cannot be added without deciding where
+  they come from. Intake covers the tracker path; a hand-committed spec covers the rest.
+
+Discord itself is built, both halves, and both are inert until their secret keys exist in
+the mounted `caterpillar-discord` secret:
+
+| Key | Enables | Without it |
+|---|---|---|
+| `webhook-url` | outbound notifications (§11.2) | `NullNotifier` — the supervisor runs silently |
+| `bot-token` + `channel-id` | inbound `!answer` (§7) | a question waits until a human commits the answer file |
+
+The bot needs the **MESSAGE_CONTENT** privileged intent enabled in the Discord developer
+portal. Without it every message arrives with empty content and no command ever matches —
+a checkbox, not something code can detect or fix.
 
 Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
 live topology, the credential rules, and an unresolved security note.

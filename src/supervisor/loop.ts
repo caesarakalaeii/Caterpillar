@@ -29,6 +29,7 @@ import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
+import type { AnswerInbox } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 
 export interface SessionRunner {
@@ -73,6 +74,11 @@ export interface SupervisorDeps {
    */
   readonly intake?: Intake;
   /**
+   * Answers arriving from the inbound Discord bridge (§7). Optional: without a bridge
+   * a question is answered by committing the file by hand.
+   */
+  readonly inbox?: AnswerInbox;
+  /**
    * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
    * Optional: a workspace without a tracker is a supported configuration.
    */
@@ -102,7 +108,9 @@ export class Supervisor {
     while (!signal.aborted) {
       await store.pull("origin", config.stateRepo.branch);
 
-      // Before claiming, so an item ingested now is claimable on this same iteration.
+      // Both before claiming, so a task unparked by either is claimable on this same
+      // iteration rather than sitting idle until the next poll.
+      await this.applyAnswers();
       await this.maybeIngest();
 
       const claimed = await this.claimNext();
@@ -466,6 +474,69 @@ export class Supervisor {
         originalError: reason,
         ...errorFields(parkError),
       });
+    }
+  }
+
+  /**
+   * Apply answers submitted by the inbound bridge (DESIGN.md §7).
+   *
+   * Runs HERE, on the loop's thread of control, because the loop owns the state repo —
+   * a websocket handler writing it concurrently would interleave git invocations in one
+   * working copy. Each request is settled with what actually happened, so the human who
+   * typed it gets told rather than guessing from silence.
+   */
+  private async applyAnswers(): Promise<void> {
+    const { store, config, logger, inbox } = this.deps;
+    if (inbox === undefined) return;
+
+    for (const request of inbox.drain()) {
+      try {
+        const state = await store.tryReadState(request.task);
+        if (state === undefined) {
+          request.settle({ kind: "unknown-task" });
+          continue;
+        }
+        if (state.status !== "awaiting-human") {
+          request.settle({ kind: "not-waiting", status: state.status });
+          continue;
+        }
+
+        const pending = await store.pendingQuestion(request.task);
+        if (pending === undefined) {
+          // `awaiting-human` with nothing unanswered is a state repo someone edited by
+          // hand. Refusing beats inventing an index and burying the answer.
+          request.settle({ kind: "not-waiting", status: state.status });
+          continue;
+        }
+
+        await store.writeAnswer(request.task, pending.index, request.text);
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          `**Answer from the operator:**\n\n${request.text}`,
+        );
+        await store.writeState({
+          ...state,
+          status: "ready",
+          // The streak that made the task park is not the next session's fault, and a
+          // task resumed at the limit parks again on the very next claim without ever
+          // running. Answering IS the progress.
+          progress: { ...state.progress, noProgressStreak: 0 },
+        });
+        await store.commitAndPush(
+          `chore(${request.task}): answered question ${pending.index}`,
+          "origin",
+          config.stateRepo.branch,
+        );
+
+        logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
+        request.settle({ kind: "applied", index: pending.index });
+      } catch (error) {
+        // Never fatal: a state repo that rejects one answer must not stop the runner
+        // from working every other task.
+        logger.error("answer.failed", { task: request.task, ...errorFields(error) });
+        request.settle({ kind: "failed", error: error instanceof Error ? error.message : String(error) });
+      }
     }
   }
 

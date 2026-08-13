@@ -316,6 +316,35 @@ Nothing is running while you think. You reply:
 The bridge commits `questions/NNN-answer.md` and flips `status = ready`. The next poll
 claims it into a fresh session that reads the answer from the task directory.
 
+**How the bridge is built** (amended when it was): a Discord **gateway websocket, in the
+supervisor process** — not the separate `discord-bridge` Deployment §10 anticipated, and
+not a public interactions endpoint. §6 has runners polling outward precisely so a machine
+behind NAT needs no inbound connectivity; an HTTP endpoint would have broken that for
+every runner that is not this pod. A gateway connection is dialled OUT, so there is no
+ingress, no TLS, and no URL to leak. Node ships a global WebSocket, so it costs no
+dependency either.
+
+The bridge does **not** touch the state repo. The poll loop owns that working copy, and
+two git invocations interleaving in it is `index.lock` at best; a websocket handler
+writing it concurrently would be a race with no owner. So a command is submitted to an
+in-process inbox, the loop drains it *before claiming* — so a task unparked by an answer
+is claimable on the same pass — and the submitter is told what actually happened. Silence
+would leave a human unable to tell a typo from an offline bridge.
+
+Answering also **resets `noProgressStreak`**. `awaiting-human` is only ever reached from a
+session that produced no commit, so a task answered at the no-progress limit would park
+again on the very next claim without ever running, and the answer would be silently
+pointless.
+
+Two things are required and neither is code: the **MESSAGE_CONTENT** privileged intent
+(without it every message arrives with empty content and no command ever matches), and a
+`channel-id`, because a bot that acts on any channel it can see is a bot anyone in the
+guild can drive.
+
+`!task` (§14 path 3) is still not built. As written it carries no acceptance criteria, and
+§14 already refuses specs that have none — it cannot be added without deciding where they
+come from. Intake covers the tracker path; a hand-committed spec covers the rest.
+
 Parking rather than idling matters here: an 8-hour wait costs nothing, and context is
 rebuilt from the journal regardless.
 
@@ -720,10 +749,11 @@ answer by design (§9.2) and anything touching the network fails.
 **Amended when the notifier stopped being a stub.** §10 lists a `discord-bridge`
 Deployment. The OUTBOUND half does not need one and no longer has one: posting a message
 is one HTTPS request the supervisor can make itself, and a separate process would need
-its own copy of the webhook secret to add nothing. A bridge is required only for the
-INBOUND half (`!answer`, `!task` — §7, §14 path 3), which needs a gateway session or a
-public interactions endpoint. When that is built it is a Deployment; the outbound path
-stays where it is.
+its own copy of the webhook secret to add nothing. The INBOUND half (§7) needed a gateway session or a
+public interactions endpoint — this section predicted it would therefore become that
+Deployment. **It did not.** A gateway websocket is dialled outward, so it runs in the
+supervisor process next to the outbound half, with no ingress and no second copy of the
+secret. See §7.
 
 Four rules, each one a way a notification is silently *lost* rather than loudly broken:
 
