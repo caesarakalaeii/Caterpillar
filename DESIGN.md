@@ -543,13 +543,40 @@ determined by acceptance criteria and CI, verified independently. Granting the a
 
 ### 9.6 LLM credential
 
-All runners point at the in-cluster proxy. Its value is no longer "easy provider swap"
-(pi-ai already gives that) but:
+Two modes, selected by `llm.auth`. **Amended after implementation** — the original text
+assumed the proxy was the only path.
+
+**`subscription` (what the cluster runs).** pi-ai's Anthropic provider ships an OAuth
+mode — `"Anthropic (Claude Pro/Max)"`, `isSubscription: true` — with the PKCE flow and
+token refresh built in. The runner uses a Claude subscription rather than metered API
+billing. Consequences, all load-bearing:
+
+- **There is no proxy in this path.** An OAuth bearer credential cannot be forwarded by
+  something that authenticates with `x-api-key`, so the runner talks to
+  `api.anthropic.com` directly and the spend-cap choke point below does not exist. On a
+  subscription the cap *is* the subscription.
+- **The credential must live on writable, durable storage.** Refreshing **rotates the
+  refresh token**, and pi performs that inside `CredentialStore.modify`. A mounted
+  Kubernetes Secret is read-only, so putting it there locks the runner out about an hour
+  after start. It lives on the PVC, seeded once from `npm run llm:login` on a machine
+  with a browser — a pod has nowhere to open one.
+- **`modify` must serialize across processes.** Two sessions refreshing at once would
+  both read the same token and both write; the loser persists one the provider has
+  already invalidated. `FileCredentialStore` takes a lock directory for this.
+- **Rate limits are per-account** and shared with the operator's own interactive usage.
+
+**`proxy` (retained).** All runners point at an in-cluster proxy holding the provider
+credential. Its value is not "easy provider swap" (pi-ai already gives that) but:
 
 - The off-cluster machine runner never stores a Claude credential.
 - One choke point for the global spend cap and per-task cost metrics.
 
-Swapping to a private provider later is a proxy config change.
+The modes are not exclusive at runtime: pi resolves *a stored credential owns the
+provider; ambient env is consulted only when nothing is stored*, so a subscription runner
+can keep an API key in its environment as an automatic fallback. The cluster deliberately
+does not — there is no Anthropic key anywhere in `caesar-deployment`.
+
+Swapping to a private provider later remains a config change.
 
 ---
 

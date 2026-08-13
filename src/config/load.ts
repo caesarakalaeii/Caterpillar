@@ -7,7 +7,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { asWorkspaceName, type Capability, type WorkspaceName } from "../domain/task.ts";
-import type { RunnerConfig, WorkspaceProfile } from "./types.ts";
+import type { LlmConfig, RunnerConfig, WorkspaceProfile } from "./types.ts";
 
 export class ConfigError extends Error {
   constructor(detail: string) {
@@ -127,6 +127,44 @@ const workspace = (name: string, value: unknown): WorkspaceProfile => {
   };
 };
 
+/**
+ * Validate the LLM block.
+ *
+ * `auth` defaults to `proxy` so an existing config keeps working. Subscription mode
+ * demands `credentialsPath` up front rather than failing at the first session: the
+ * OAuth login needs a browser, so discovering it is missing inside a pod is
+ * discovering it too late.
+ */
+const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
+  const auth = llm["auth"] ?? "proxy";
+  if (auth !== "proxy" && auth !== "subscription") {
+    throw new ConfigError("llm.auth must be 'proxy' or 'subscription'");
+  }
+
+  const credentialsPath = llm["credentialsPath"];
+  if (auth === "subscription" && credentialsPath === undefined) {
+    throw new ConfigError(
+      "llm.credentialsPath is required when llm.auth is 'subscription' — it must " +
+        "point at writable, durable storage (the PVC), because refreshing the token " +
+        "rotates it",
+    );
+  }
+
+  return {
+    auth,
+    // Unused by subscription mode, but still required: a config that silently
+    // stops pointing anywhere when auth flips is worse than one that repeats itself.
+    baseUrl: str(llm["baseUrl"], "llm.baseUrl"),
+    modelId: str(llm["modelId"], "llm.modelId"),
+    providerId: str(llm["providerId"], "llm.providerId"),
+    contextWindow: num(llm["contextWindow"], "llm.contextWindow"),
+    maxTokens: num(llm["maxTokens"], "llm.maxTokens"),
+    ...(credentialsPath === undefined
+      ? {}
+      : { credentialsPath: str(credentialsPath, "llm.credentialsPath") }),
+  };
+};
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -169,13 +207,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       maxSessionsPerTask: num(raw.limits?.maxSessionsPerTask, "limits.maxSessionsPerTask", 20),
       noProgressLimit: num(raw.limits?.noProgressLimit, "limits.noProgressLimit", 3),
     },
-    llm: {
-      baseUrl: str(llm["baseUrl"], "llm.baseUrl"),
-      modelId: str(llm["modelId"], "llm.modelId"),
-      providerId: str(llm["providerId"], "llm.providerId"),
-      contextWindow: num(llm["contextWindow"], "llm.contextWindow"),
-      maxTokens: num(llm["maxTokens"], "llm.maxTokens"),
-    },
+    llm: llmConfig(llm),
     workspaces,
     pollSeconds: num(raw.pollSeconds, "pollSeconds", 30),
     secretsDir: str(raw.secretsDir, "secretsDir"),

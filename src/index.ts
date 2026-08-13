@@ -11,6 +11,7 @@ import { loadConfig } from "./config/load.ts";
 import { CredentialService } from "./credential/service.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory } from "./forge/types.ts";
+import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
@@ -121,7 +122,14 @@ const main = async (): Promise<void> => {
       store,
       worktrees,
       credentials,
-      llm: createLlmRuntime(config.llm),
+      llm: createLlmRuntime({
+        config: config.llm,
+        // Only subscription mode has a rotating credential to persist. Proxy mode
+        // authenticates from the environment and has nothing to store.
+        ...(config.llm.credentialsPath !== undefined
+          ? { credentials: new FileCredentialStore(config.llm.credentialsPath) }
+          : {}),
+      }),
       bindings,
       metrics,
     }),
