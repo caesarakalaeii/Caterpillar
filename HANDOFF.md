@@ -52,14 +52,13 @@ Built, typechecked, and tested end to end:
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
 | LLM auth: Claude subscription (OAuth) | implemented, tested — `llm.auth: subscription` |
-| Container image + CI | written, **never built** (no docker/podman on this machine) |
+| Container image + CI | **built and pushed by CI** — `ghcr.io/caesarakalaeii/caterpillar:main` |
 | `caesar-deployment` manifests | written, `kustomize build` clean, **not pushed** |
 
 Not built yet, in the order I would take them:
 
-1. **Finish the deploy**: the three prerequisites in
-   `../caesar-deployment/apps/workloads/caterpillar/README.md` — image published,
-   state repo created with the App installed on it, secrets sealed. Then land
+1. **Finish the deploy**: the four prerequisites in
+   `../caesar-deployment/apps/workloads/caterpillar/README.md`. Then land
    `argocd/apps/caterpillar.yaml` LAST (see the warning below).
 2. GitHub Issues tracker (`src/tracker/github-issues.ts` is still a stub; `loadTracker`
    returns `undefined` for it and logs, so a workspace configured for it runs unmirrored
@@ -68,12 +67,12 @@ Not built yet, in the order I would take them:
 
 ## Deployment state (nothing is live)
 
-Written but **uncommitted** in `../caesar-deployment`, plus `Dockerfile` and
-`.github/workflows/build-and-push.yml` here.
+The Caterpillar side is merged to `main` and CI publishes the image. The manifests are
+written but **uncommitted** in `../caesar-deployment`.
 
 **`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and
 `selfHeal`.** Pushing `argocd/apps/caterpillar.yaml` therefore *deploys immediately*.
-Land the workload directory first, complete the three prerequisites, and add the
+Land the workload directory first, complete the four prerequisites, and add the
 Application only when you want it live.
 
 Decisions the user made by interview (do not re-litigate):
@@ -90,8 +89,16 @@ Decisions the user made by interview (do not re-litigate):
 - **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
   from the electric-boogaloo `.env`.
 
-Still missing before it can sync: the **state repo**, the **published image**, the
-**sealed EB secret**, and the **subscription credential** copied onto the PVC.
+Still missing before it can sync: the **state repo**, the **sealed EB secret**, and the
+**subscription credential** copied onto the PVC. The image and its pull credential are
+done.
+
+The GHCR package is private (it inherits the repo's visibility), which is handled the
+way `caesar-deployment` already handles its other private images: `imagePullSecrets:
+myregistrykey`. Image-pull secrets are **namespaced**, so `caterpillar` carries its own
+re-sealed copy of the same credential at `secrets/myregistrykey.enc.yaml` — rotating the
+GHCR token means re-sealing it in every namespace that has one (`caesar`,
+`ai-editor-collector`, `plot-spot`, `sn2-randomizer`, `spotify-widget`, `caterpillar`).
 
 ### The subscription credential is the sharp edge
 
@@ -182,6 +189,16 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
 - **`argocd/root-app.yaml` auto-syncs `argocd/apps/`** with `prune` + `selfHeal`. Adding
   a file there is a deploy, not a proposal.
+- **SOPS in `caesar-deployment` encrypts by PATH.** `.sops.yaml` keys its creation rules
+  off `path_regex: .*\.enc\.yaml$`, so encrypting a `/tmp` file fails with "no matching
+  creation rules found". Write the plaintext to its final `*.enc.yaml` path (umask 077)
+  and `sops --encrypt --in-place` there.
+- **Don't hand-edit an encrypted file's plaintext fields.** The SOPS MAC covers
+  unencrypted values too, so changing `metadata.namespace` by hand breaks decryption.
+  Re-target a secret with decrypt → edit → encrypt.
+- **Check the whole repo before claiming a convention doesn't exist.** I grepped one
+  workload, concluded nothing used `imagePullSecrets`, and wrote it into two documents.
+  Six workloads use it.
 
 ## Constraints the user has set
 
