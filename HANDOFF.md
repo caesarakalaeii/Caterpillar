@@ -78,6 +78,7 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | **Discord webhook, outbound (§11.2)** | **implemented and tested (#14)** — inert until a webhook is sealed |
 | **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
 | **Toolchain** | **runs natively on node 26 (#18)** — erasable-syntax-only, CI on 22 and 26 |
+| **Journal → prompt** | **bounded (#19)** — repeats collapsed, oldest elided, file untouched |
 | **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
@@ -557,10 +558,11 @@ them away.
 4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
    task is `done`, and merging it was left to a human on purpose. Delete the repo whenever;
    it is a throwaway.
-5. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
-   pre-fix retry storm, all mislabelled "Session 0" (the park preceded the session
-   increment). It is read for handoff continuity, so it taxes any further session on that
-   task. There is no journal rotation. `SMOKE-1` is `done`, so this is latent.
+5. Minor: `SMOKE-1`'s `journal.md` is still **347KB** on disk — 620 byte-identical park
+   entries from the pre-fix retry storm, all mislabelled "Session 0". It no longer taxes
+   anything: since #19 a journal reaches the prompt as a bounded view, and that one
+   renders as a single entry saying "repeated 620 times". The file is left alone on
+   purpose; it is the audit trail, `SMOKE-1` is `done`, and nothing rewrites history.
 
 **Uncommitted work: none.** `main` was `0666b60` at the start of this session — since
 then #14 (Discord webhook), #15 (CI gate), #16 (`needs-human`), #17 (docs) and #18 (node
