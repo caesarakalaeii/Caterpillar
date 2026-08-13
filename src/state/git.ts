@@ -81,6 +81,23 @@ export class Git {
     return new Git(cwd, this.env);
   }
 
+  /**
+   * The same directory and environment, with the credential provider DROPPED.
+   *
+   * For callers that keep the directory but must not keep the credential — notably the
+   * workspace mirrors, whose clone runs in the supervisor's own cwd. `at()` already
+   * drops the provider, so anything that changes directory is safe; this covers the
+   * case that does not, which is precisely where it went wrong: the state repo's Git
+   * was handed to `WorktreeManager` verbatim, so `git clone` of a TASK repo went out
+   * carrying the state repo's `http.extraHeader`. GitHub answers a valid-but-
+   * unauthorised token with `Repository not found` and never issues the 401 that would
+   * make git consult the credential helper, so the correct token was never even asked
+   * for. Against Codeberg the same bug sends a GitHub token to another host outright.
+   */
+  withoutCredentials(): Git {
+    return new Git(this.cwd, this.env);
+  }
+
   /** Run git with extra environment (e.g. a scoped credential helper). */
   withEnv(extra: NodeJS.ProcessEnv): Git {
     return new Git(this.cwd, { ...this.env, ...extra });
@@ -99,8 +116,12 @@ export class Git {
   }
 
   private async resolveEnv(): Promise<NodeJS.ProcessEnv> {
-    if (this.envProvider === undefined) return this.env;
-    return { ...this.env, ...(await this.envProvider()) };
+    // Never prompt. Without a credential git blocks on a terminal read, and on a
+    // machine runner that has one, a supervisor waiting forever on a username is
+    // indistinguishable from a hung task. Overridable by an explicit provider.
+    const base: NodeJS.ProcessEnv = { GIT_TERMINAL_PROMPT: "0", ...this.env };
+    if (this.envProvider === undefined) return base;
+    return { ...base, ...(await this.envProvider()) };
   }
 
   async revParse(ref: string): Promise<string | undefined> {

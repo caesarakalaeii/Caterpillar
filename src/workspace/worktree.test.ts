@@ -89,6 +89,11 @@ test("the mirror clone carries the credential helper, not just the repo config",
     override at(): Git {
       return this;
     }
+    // Both derivation points must fold back to the recorder, or the manager records
+    // nothing: it strips the credential once up front (see the next test).
+    override withoutCredentials(): Git {
+      return this;
+    }
   }
 
   const subject = new WorktreeManager({
@@ -118,4 +123,47 @@ test("the mirror clone carries the credential helper, not just the repo config",
   // And the token itself must never appear on argv (DESIGN.md §9.2) — the helper
   // path is passed, the credential is resolved over the socket.
   assert.ok(!/ghs_|ghp_|x-access-token/.test(joined));
+});
+
+test("the mirror clone does not inherit the supervisor's own credential", async () => {
+  // The bug that produced `remote: Repository not found` on the first real task.
+  // `index.ts` builds ONE Git for the state repo, carrying an http.extraHeader with an
+  // App token scoped to the state repo alone, and passed that same object to
+  // WorktreeManager. `syncMirror` is the one call site that uses it directly instead of
+  // going through `at()`, so `git clone` of a TASK repo authenticated as the state repo.
+  //
+  // GitHub answers a valid-but-unauthorised token with 404 `Repository not found`, NOT
+  // 401 — so git never asks the credential helper at all, and the correct task-scoped
+  // token was never even requested. Against a Codeberg workspace the same bug ships a
+  // GitHub token to a different host.
+  const root = await scratch();
+
+  // The credential provider records every consultation. `Git` only calls it when it is
+  // about to hand the credential to a git process, so a single call is the bug.
+  let consulted = 0;
+  const stateRepoCredential = (): Promise<NodeJS.ProcessEnv> => {
+    consulted += 1;
+    return Promise.resolve({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.extraheader",
+      GIT_CONFIG_VALUE_0: "Authorization: Basic c3RhdGUtcmVwby10b2tlbg==",
+    });
+  };
+
+  const subject = new WorktreeManager({
+    git: new Git(root, process.env, stateRepoCredential),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketPath: "/run/caterpillar/cred.sock",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+  await subject.syncMirror(REPO).catch(() => undefined);
+
+  assert.equal(
+    consulted,
+    0,
+    "the workspace clone must never resolve the supervisor's own git credential",
+  );
 });

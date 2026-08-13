@@ -42,7 +42,8 @@ Built, typechecked, and tested end to end:
 |---|---|
 | Leasing (git-ref CAS, heartbeat fence) | implemented, tested |
 | Context budget + handoff trigger | implemented, tested |
-| Credential service + git helper | implemented, integration-tested over a real socket |
+| Credential service + git helper | implemented, integration-tested through **real git** (`credential fill`) |
+| Workspace mirror clone (private repos) | **fixed locally, never run in-cluster** — see "The clone fix" |
 | GitHub App forge (mint, PR, checks) | implemented, verified against live GitHub |
 | Forgejo/Codeberg forge | implemented, endpoints verified against live Codeberg |
 | Session runner | implemented, end-to-end tested with pi's `fauxProvider` |
@@ -60,8 +61,8 @@ Built, typechecked, and tested end to end:
 
 Not built yet, in the order I would take them:
 
-1. **Intake ingesters.** This is now the only thing between a live supervisor and an
-   idle one — see "The supervisor is live and has nothing to do" below.
+1. **Intake ingesters.** Once the clone fix ships, this is the only thing between a live
+   supervisor and an idle one — see "The supervisor is live and has nothing to do" below.
 2. Discord bridge (inbound `!answer`, outbound webhook).
 
 ## Deployment state: LIVE
@@ -114,7 +115,8 @@ A hand-written task (`SMOKE-1`, targeting the throwaway repo
 found **four** defects that every unit test and every live credential check had missed,
 because nothing had ever driven a private repo through the worktree path.
 
-Three are fixed and merged in **PR #8**, live as image `e42852ee`:
+Three are fixed and merged in **PR #8**, live as image `e42852ee`; the fourth is fixed
+locally but **not yet built, deployed, or run in-cluster** — see "The clone fix" below.
 
 1. **The mirror clone was anonymous.** `syncMirror` cloned *before* `configure()` wrote
    `credential.helper`, so private repos died on `could not read Username`. Public repos
@@ -130,30 +132,69 @@ Three are fixed and merged in **PR #8**, live as image `e42852ee`:
    journalled, parked, and skipped. Confirmed: the pod holds `1/1 Running` with **0
    restarts** through repeated failures where it previously CrashLoopBackOff'd.
 
-**The fourth is OPEN and is the immediate next job.** The clone now gets past auth
-setup and fails with:
+### The clone fix — diagnosed, fixed, NOT yet deployed
+
+The fourth defect was:
 
 ```
 remote: Repository not found.
 fatal: repository 'https://github.com/caesarakalaeii/caterpillar-smoke.git/' not found
 ```
 
-GitHub returns that both for "no access" and for an **anonymous** request to a private
-repo, which is the likelier reading — an empty helper response makes git fall back to
-anonymous. Already ruled out:
+An earlier version of this document guessed that an empty helper response made git fall
+back to **anonymous**. That guess was wrong, and it is worth knowing why: an anonymous
+request to a private repo gets a **401** and fails with `could not read Username`, not
+`Repository not found`. `Repository not found` means GitHub **accepted** a credential
+and then denied access — so a credential *was* being sent, just the wrong one.
 
-- the repo **is** in the installation (66 repos, up from 65 after it was created)
-- `credentials.setActive()` runs **before** `ensureTaskCheckout()`, so the binding
-  order is right (`src/agent/runner.ts`)
+It was the supervisor's own. `index.ts` builds one `Git` for the state repo, carrying an
+`http.extraHeader` App token scoped to `caterpillar-state` alone, and passed that same
+object to `WorktreeManager`. `syncMirror`'s clone is the **one** call site that uses it
+directly instead of going through `at()` (which drops the credential by design), so
+`git clone` of a task repo authenticated as the state repo. GitHub 404s, and because a
+404 is not a 401 **git never consults the credential helper at all** — the correct
+task-scoped token was never even requested.
 
-Next step: exercise the credential helper against the socket directly and see what it
-returns for `https://github.com/caesarakalaeii/caterpillar-smoke.git`. With
-`credential.useHttpPath=true` a host/path matching mismatch produces exactly this.
+Verified against real GitHub, not reasoned about: a valid token against a repo it cannot
+see reproduces the message byte-for-byte with zero helper invocations.
 
-Secondary, visible in the same log line: parking failed with `lease for SMOKE-1 is no
-longer held by this runner`, so the task retries every poll instead of parking.
-`parkFailed` cannot write once the lease is gone. Harmless — the crash-loop fix holds —
-but it means a failing task loops rather than settling.
+Fixed by `Git.withoutCredentials()`, applied inside the `WorktreeManager` constructor
+rather than at the call site — the caller that got this wrong passed the obvious thing,
+so the invariant is enforced where it cannot be forgotten. This was also a live
+cross-host leak: on the Codeberg workspace the same bug sent a GitHub token to Codeberg.
+
+**Three more defects were found while fixing it. All are on the same path and all would
+have blocked the smoke test in turn:**
+
+1. **The credential helper never answered anything, ever.** git appends the operation as
+   the **last** argv element, so the real invocation is `--socket <path> get`. The helper
+   picked the operation with `argv.find(a => !a.startsWith("--"))`, which returns the
+   **socket path**, so the `=== "get"` gate never matched and it exited silently on every
+   single request. Bug 1 hid it (GitHub 404'd before git ever needed a credential), and
+   `service.test.ts` hid it too — the harness invoked the helper as `get --socket <path>`,
+   operation first, which is not what git does. Four green tests sat on top of a helper
+   that declined everything. Now parsed by `parseInvocation`, and pinned by a test that
+   drives the real helper through real `git credential fill`.
+2. **Verification could never run on a private repo.** `probe` and `verify` both call
+   `ensureWorktree`, which unconditionally re-fetched the mirror — but they run *after*
+   `credentials.clearActive()`, so the credential service correctly refuses (§9.2) and the
+   fetch dies. The fetch was pure waste anyway: an existing worktree is already checked
+   out and a mirror fetch does not move it. `addWorktreeAt` now short-circuits.
+3. **Parking after a session failure never reached the remote.** `workTask` released the
+   lease in its `finally`, and only *then* did the caller park; `park` → `push` →
+   `assertHeld` CAS'd against a ref that had just been deleted and threw. That is the
+   `lease for SMOKE-1 is no longer held by this runner` line. The task therefore stayed
+   `ready` on the remote and was re-claimed every single poll. Parking now happens inside
+   `workTask`, before the release, with the heartbeat-current lease (the claim-time oid is
+   already stale by then). Reproduced in `src/supervisor/loop.test.ts` over a real git
+   remote: 316 retry iterations in 30s before the fix, parked on the first try after.
+
+All four fixes have regression tests, and **each test was confirmed to fail against the
+unfixed code** — the one discipline this codebase keeps having to relearn.
+
+**Still unproven:** none of this has run in-cluster. It needs a new image and another
+`SMOKE-1` run. No agent session has ever started on the runner, so everything downstream
+of the clone — session, handoff, verification, PR creation — remains untested.
 
 ### The supervisor is live and has nothing to do
 
@@ -370,9 +411,44 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 - **`credential.helper` set AFTER a clone is set too late.** The clone is the one git
   operation that runs before any repo config exists, so it needs the helper passed with
   `-c`. This is why nothing private could ever be cloned, and why public repos hid it.
-- **GitHub answers an anonymous request to a private repo with `Repository not found`**,
-  not 401. So a 404 here means "no credential reached GitHub" at least as often as it
-  means "wrong repo" — do not go hunting for a missing installation first.
+- **`Repository not found` means a credential ARRIVED and was refused.** Anonymous
+  access to a private repo gets a 401 and `could not read Username`. The two failures
+  look equally like "auth is broken" and point in opposite directions: 404 means the
+  WRONG token was sent, 401 means NO token was. An earlier version of this document
+  asserted the opposite and sent the next session hunting for a missing installation.
+- **A 404 stops git asking the credential helper.** The helper is only consulted on a
+  401 challenge. So a request that carries a valid-but-unauthorised credential never
+  reaches the helper at all — no amount of fixing the helper will change the outcome,
+  and helper-side logging stays silent while looking healthy.
+- **git appends the credential-helper operation LAST**, after the arguments baked into
+  the `credential.helper` string: `caterpillar-cred --socket /path get`. "First argument
+  that is not a flag" therefore selects the socket path. Confirmed against real git —
+  and note `git credential fill` reproduces the exact invocation offline, which makes it
+  the right way to test a helper without a network or a private repo.
+- **A test harness that calls the subject differently from the real caller proves
+  nothing.** `service.test.ts` invoked the helper as `get --socket <path>` — operation
+  first, which git never does — and four tests passed over a helper that answered no
+  request in production. Same failure mode as the credential-helper regression test
+  before it; when the thing under test is a protocol, drive it with the real other side.
+- **`at()` drops the credential, but only if you call it.** `WorktreeManager` was handed
+  the state repo's `Git` and used it verbatim for the mirror clone. When a rule is "this
+  object must not travel", enforce it at the boundary that receives the object, not by
+  documenting the method that happens to launder it.
+- **Anything the supervisor does AFTER `clearActive()` cannot use a task credential.**
+  That is the whole point of the refusal, so post-session code (probe, verifier) must
+  not need the network. Watch for helpers that fetch as a side effect of "ensure exists".
+- **Release the lease last.** Anything that wants to record WHY a task failed has to
+  write while the lease is still held; a `finally` that releases beats an outer `catch`
+  that parks, and the resulting `LeaseLostError` reads like a concurrency problem rather
+  than an ordering one. Also use the heartbeat's current lease — the claim-time oid is
+  stale as soon as the first renewal lands.
+- **A machine runner inherits `url.<...>.insteadOf` too.** The operator's global
+  `url.ssh://git@github.com/.insteadof = https://github.com/` silently rewrites every
+  HTTPS clone to SSH, which bypasses the credential helper completely and fails against
+  whatever key the host has. It cost a wrong conclusion in local testing here. Not a
+  problem in the container (no global config), but pass
+  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` when testing this path on a
+  workstation, or the experiment measures the operator's config instead of the code.
 - **`kubectl scale` loses to ArgoCD `selfHeal`.** Scaling the Deployment to 0 was
   reverted within seconds. To stop a supervisor that is failing on a task, change the
   TASK (set `state.json` to `parked`) rather than fighting the reconciler.
@@ -382,7 +458,13 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
   verified, and it is strictly safer than pulling a token onto a workstation.
 - **A test that only asserts "it threw" proves nothing.** The first credential-helper
   regression test passed identically with and without the fix, because the clone failed
-  either way. Assert on the invocation.
+  either way. Assert on the invocation. The cheap discipline that catches all of these:
+  after writing a regression test, **revert the fix and watch it fail**. Do it on a copy
+  of `src/` rather than the working tree — a test timeout that kills the shell mid-way
+  leaves the real source reverted.
+- **Assert on what was PUSHED, not on the working tree.** `park` writes `state.json`
+  locally and then pushes; a test reading the checkout passes whether or not the push
+  landed, and the next `pull` resets it anyway. The remote is the only evidence.
 - **`per_page=100` contains `page=1`** — see above; it also bit a second time when a
   digest comparison matched a substring of the previous digest. Anchor comparisons.
 
@@ -403,12 +485,14 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 
 ## Immediate next action
 
-1. **Finish the smoke test — fix the `Repository not found` clone failure.** See "What
-   the first end-to-end run proved". `SMOKE-1` is armed in the state repo and retrying
-   every poll, so the moment the credential helper returns a usable token the whole
-   pipeline runs unattended. **No agent session has ever run in-cluster**; this is still
-   the largest untested surface, and everything downstream of the clone — session,
-   handoff, verification, PR creation — is unproven.
+1. **Ship the clone fix and re-run the smoke test.** The four defects behind
+   `Repository not found` are fixed and tested locally but **exist only on this
+   workstation** — nothing is committed, no image is built, the cluster still runs
+   `e42852ee`. Merge, let CI publish, bump the image, and watch `SMOKE-1`: it is still
+   armed in the state repo and still retrying every poll, so it will claim itself as soon
+   as the new pod is up. **No agent session has ever run in-cluster**; this remains the
+   largest untested surface, and everything downstream of the clone — session, handoff,
+   verification, PR creation — is unproven.
 2. **Build intake** (DESIGN.md §14) — `Tracker.listAgentItems()` → `TaskSpec` in the
    state repo. Until this exists, a hand-written spec is the *only* way work arrives.
    Both trackers implement the read side; nothing calls it.
@@ -418,19 +502,22 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 To silence `SMOKE-1` meanwhile, flip its `state.json` to `"parked"`.
 `caesarakalaeii/caterpillar-smoke` is a throwaway; delete it whenever.
 
-**Uncommitted work:** `../caesar-deployment` has commit `fba9d90` on branch
-`docs/caterpillar-post-deploy` that was never pushed — the GitHub SSH key dropped out of
-the agent mid-session (`ssh -T` worked, then stopped; the key `8XOjnN…` vanished from
-`ssh-add -l`, and the on-disk `id_ed25519` does not authenticate either). Re-add the key
-and push.
+**Uncommitted work:**
+
+- **This repo:** the whole clone fix is uncommitted on `main` — `src/state/git.ts`,
+  `src/workspace/worktree.ts`, `src/credential/protocol.ts`,
+  `src/cli/credential-helper.ts`, `src/supervisor/loop.ts`, plus tests
+  (`src/supervisor/loop.test.ts` is new) and this file. `npm run check` and `npm test`
+  are green.
+- **`../caesar-deployment`** has commit `fba9d90` on branch
+  `docs/caterpillar-post-deploy` that was never pushed — the GitHub SSH key dropped out
+  of the agent mid-session (`ssh -T` worked, then stopped; the key `8XOjnN…` vanished
+  from `ssh-add -l`, and the on-disk `id_ed25519` does not authenticate either). Re-add
+  the key and push.
+
+**The SSH agent is still broken** as of this session: `git pull` on this repo fails with
+`sign_and_send_pubkey: signing failed for ED25519 "SSH Key" from agent`. `gh` itself
+authenticates fine (token, not key), so `gh` commands work while `git` over SSH does not.
 
 Unresolved by choice, not by omission: the exposed App private key (see the callout
 under "Live credentials").
-
-## Immediate next action
-
-Write the `caesar-deployment` manifests: `apps/workloads/caterpillar/` (Deployment with
-`Recreate`, PVC for mirrors/worktrees, ConfigMap for `config.json`, ServiceMonitor) plus
-`argocd/apps/caterpillar.yaml` at sync wave 4, following that repo's existing
-conventions. The GitHub App secret is already committed there and inert; the ConfigMap
-is the first place the workspace/tracker config from `src/config/types.ts` becomes real.

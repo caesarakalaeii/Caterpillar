@@ -94,9 +94,15 @@ export class Supervisor {
         // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
         // exits the process, and because the claim is durable the restarted
         // supervisor re-claims the same task and dies again — one malformed task
-        // wedges the whole runner permanently. Park it with the reason instead, so
-        // the failure is visible to a human and every other task keeps moving.
-        await this.parkFailed(claimed.lease, claimed.spec, error);
+        // wedges the whole runner permanently.
+        //
+        // `workTask` parks anything attributable to the task while it still holds the
+        // lease, so reaching this point means the failure escaped that path. Log it
+        // and keep polling rather than exiting.
+        process.stderr.write(
+          `${claimed.spec.id}: unhandled supervisor error — ` +
+            `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+        );
       }
     }
   }
@@ -169,10 +175,23 @@ export class Supervisor {
         const done = await this.applyOutcome(heartbeat.current(), spec, state, outcome);
         if (done) return;
       }
+    } catch (error) {
+      // Parking happens HERE rather than in the caller, because the `finally` below
+      // releases the lease on the way out and `park` -> `push` -> `assertHeld` would
+      // then fail against a ref that no longer exists — every park after a session
+      // error died with "lease is no longer held by this runner", leaving the task
+      // `ready` to be re-claimed and to fail again on the very next poll.
+      //
+      // The heartbeat is stopped FIRST so the lease oid stops moving underneath the
+      // CAS, and the CURRENT lease is used, not the one claim returned: heartbeats
+      // have renewed it since, so the original oid is already stale.
+      heartbeat.stop();
+      if (error instanceof LeaseLostError) throw error;
+      if (signal.aborted) throw error;
+      await this.parkFailed(heartbeat.current(), spec, error);
     } finally {
       heartbeat.stop();
-      const current = heartbeat.current();
-      await leases.release(current).catch(() => undefined);
+      await leases.release(heartbeat.current()).catch(() => undefined);
     }
   }
 

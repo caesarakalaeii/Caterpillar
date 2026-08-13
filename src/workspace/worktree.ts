@@ -42,11 +42,25 @@ const cloneUrl = (repo: RepoRef): string =>
   `https://${repo.host}/${repo.owner}/${repo.name}.git`;
 
 export class WorktreeManager {
-  constructor(private readonly options: WorktreeOptions) {}
+  /**
+   * Workspace git, with the supervisor's own credential stripped off.
+   *
+   * Enforced here rather than trusted to the caller, because the caller that got it
+   * wrong passed the obvious thing: `index.ts` builds one `Git` for the state repo and
+   * handed the same object over. Task repos authenticate through the credential
+   * service and nothing else (DESIGN.md §9.2/§9.3); the state repo's token must never
+   * ride along, both because it cannot see task repos and because on a Codeberg
+   * workspace it would send a GitHub token to another host.
+   */
+  private readonly git: Git;
+
+  constructor(private readonly options: WorktreeOptions) {
+    this.git = options.git.withoutCredentials();
+  }
 
   /** A Git bound to a worktree, for callers that need to inspect or commit there. */
   gitAt(path: string): Git {
-    return this.options.git.at(path);
+    return this.git.at(path);
   }
 
   /**
@@ -75,7 +89,7 @@ export class WorktreeManager {
         // `configure` is far too late — git has already failed with
         // "could not read Username". The token still never touches argv: `-c` carries
         // the helper's path, and the helper resolves the credential over the socket.
-        await this.options.git.run(
+        await this.git.run(
           ...this.credentialArgs(),
           "clone",
           "--mirror",
@@ -91,7 +105,7 @@ export class WorktreeManager {
       return path;
     }
 
-    const mirror = this.options.git.at(path);
+    const mirror = this.git.at(path);
     await mirror.run("fetch", "--prune", "origin");
     return path;
   }
@@ -126,16 +140,23 @@ export class WorktreeManager {
 
   /** Create or reuse a worktree for `repo` at an explicit path. */
   private async addWorktreeAt(repo: RepoRef, task: TaskId, path: string): Promise<void> {
-    const mirror = await this.syncMirror(repo);
     const branch = `agent/${task}`;
 
+    // An existing worktree is checked out already, and fetching the mirror would not
+    // move it — so the mirror is deliberately NOT touched here. That is not just an
+    // optimisation: `ensureWorktree` is also called by the progress probe and the
+    // verifier, which run AFTER the session and therefore after `clearActive()`. With
+    // no active task the credential service refuses to answer (by design, §9.2), so on
+    // a private repo an unnecessary fetch fails and takes the whole post-session path
+    // down with it — verification never runs and the task cannot complete.
     if (existsSync(path)) {
       await this.configure(path);
       return;
     }
 
+    const mirror = await this.syncMirror(repo);
     await mkdir(join(path, ".."), { recursive: true });
-    const git = this.options.git.at(mirror);
+    const git = this.git.at(mirror);
 
     const exists = await git.revParse(`refs/heads/${branch}`);
     if (exists === undefined) {
@@ -194,7 +215,7 @@ export class WorktreeManager {
    * checkout of a workspace repo.
    */
   private async excludeLocally(worktree: string, pattern: string): Promise<void> {
-    const git = this.options.git.at(worktree);
+    const git = this.git.at(worktree);
     const commonDir = await git.run("rev-parse", "--git-common-dir");
     const resolved = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
     const excludePath = join(resolved, "info", "exclude");
@@ -212,7 +233,7 @@ export class WorktreeManager {
     const mirror = mirrorPath(this.options.mirrorsDir, repo);
     if (!existsSync(mirror)) return;
     const path = join(this.options.tasksDir, task, repo.name);
-    await this.options.git.at(mirror).tryRun("worktree", "remove", "--force", path);
+    await this.git.at(mirror).tryRun("worktree", "remove", "--force", path);
   }
 
   /**
@@ -223,7 +244,7 @@ export class WorktreeManager {
    * per-repo token selection silently degrades to "first token wins".
    */
   private async configure(path: string): Promise<void> {
-    const git = this.options.git.at(path);
+    const git = this.git.at(path);
     const helper = `!${this.options.helperPath} --socket ${this.options.socketPath}`;
 
     // NOTE: `git config` inside a worktree writes to the repository's COMMON config,

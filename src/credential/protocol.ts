@@ -46,6 +46,46 @@ export const parseRequest = (input: string): CredentialRequest => {
 export const formatAnswer = (answer: CredentialAnswer): string =>
   `username=${answer.username}\npassword=${answer.password}\n\n`;
 
+/** What the helper was asked to do, and where to ask. */
+export interface HelperInvocation {
+  /** `get`, `store` or `erase`; undefined when git passed none. */
+  readonly operation: string | undefined;
+  readonly socketPath: string | undefined;
+}
+
+/**
+ * Parse the credential helper's argv.
+ *
+ * git appends the operation as the LAST argument, AFTER whatever the configured
+ * `credential.helper` string already carried — so a helper configured as
+ * `!caterpillar-cred --socket /run/caterpillar/cred.sock` is invoked as
+ *
+ *     caterpillar-cred --socket /run/caterpillar/cred.sock get
+ *
+ * The socket path is therefore a bare, non-`--` argument sitting BEFORE the operation.
+ * "First argument that is not a flag" picks the socket path, not `get`, and the helper
+ * then silently declines every request — verified against real git, which is what made
+ * this worth a pure function and a test rather than an inline `find`.
+ */
+export const parseInvocation = (argv: readonly string[]): HelperInvocation => {
+  let socketPath: string | undefined;
+  const operands: string[] = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === undefined) continue;
+    if (arg === "--socket") {
+      socketPath = argv[index + 1];
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    operands.push(arg);
+  }
+
+  return { operation: operands.at(-1), socketPath };
+};
+
 /**
  * Split `owner/name.git` into its parts.
  *
