@@ -34,6 +34,21 @@ const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
 const TASK = asTaskId("PROBE-1");
 const roots: string[] = [];
 
+/**
+ * Git that cannot see the operator's global or system config.
+ *
+ * Without this the test silently borrows whatever the workstation has — identity,
+ * `commit.gpgsign`, `url.<...>.insteadOf` — and passes or fails for reasons unrelated to
+ * the code. That is not hypothetical: the first version of these tests committed without
+ * setting an identity, passed here, and failed in CI with `Author identity unknown`,
+ * because a runner has no global git config at all. Hermetic is the only honest default.
+ */
+const HERMETIC: NodeJS.ProcessEnv = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+};
+
 after(async () => {
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -72,7 +87,7 @@ const fixture = async (): Promise<{ root: string; worktree: string; git: Git }> 
   const origin = join(root, "origin.git");
   const mirror = join(root, "mirrors", REPO.host, REPO.owner, `${REPO.name}.git`);
   const worktree = join(root, "tasks", TASK, REPO.name);
-  const plain = new Git(root);
+  const plain = new Git(root, HERMETIC);
 
   await plain.run("init", "--quiet", "--bare", "--initial-branch=main", origin);
 
@@ -92,13 +107,19 @@ const fixture = async (): Promise<{ root: string; worktree: string; git: Git }> 
     .at(mirror)
     .run("worktree", "add", "--quiet", "-b", `agent/${TASK}`, worktree, "main");
 
-  return { root, worktree, git: plain.at(worktree) };
+  // The real worktree gets its identity from `WorktreeManager.configure`; this fixture
+  // builds the layout with raw git, so it must supply one itself.
+  const git = plain.at(worktree);
+  await git.run("config", "user.email", "agent@example.invalid");
+  await git.run("config", "user.name", "agent");
+
+  return { root, worktree, git };
 };
 
 const probeFor = (root: string): GitProgressProbe =>
   new GitProgressProbe({
     worktrees: new WorktreeManager({
-      git: new Git(root),
+      git: new Git(root, HERMETIC),
       mirrorsDir: join(root, "mirrors"),
       tasksDir: join(root, "tasks"),
       helperPath: "/usr/local/bin/caterpillar-cred",
