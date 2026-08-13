@@ -10,9 +10,13 @@ not recoverable from the code.
 **Picking up mid-stream: [`HANDOFF.md`](HANDOFF.md)** — current status, live credential
 IDs, environment quirks, and the traps already paid for.
 
-**Status:** the supervisor runs end to end — leasing, sessions, handoff, verification,
-both forges, and both trackers. The container image is published by CI. Not yet
-deployed — see `HANDOFF.md` for what is left.
+**Status: deployed and running** in the `caterpillar` namespace since 2026-08-13 —
+leasing, sessions, handoff, verification, both forges, and both trackers.
+
+It is also **idle, and will stay idle**: nothing calls `Tracker.listAgentItems()`, so
+the tracker → task path (§14 intake) does not exist yet and the supervisor polls an
+empty `tasks/` directory. Work reaches it only by committing a spec into the state repo
+by hand. See `HANDOFF.md`.
 
 ## Development
 
@@ -120,8 +124,11 @@ the two, so the adapter does not conflate them the way Vikunja forces.
 
 ## Not yet built
 
-- Discord bridge (inbound `!answer`, outbound webhook)
-- intake ingesters
+- **intake ingesters** — the tracker → `TaskSpec` path (§14). Both trackers implement
+  `listAgentItems()`; nothing in the running binary calls it. This is what stands
+  between a live supervisor and a working one.
+- Discord bridge (inbound `!answer`, outbound webhook) — questions land in
+  `tasks/<id>/questions/` in git, and nothing notifies a human that they are there.
 
-Deployment manifests exist in `caesar-deployment` but are not committed, and nothing
-is running yet. `HANDOFF.md` has the remaining prerequisites.
+Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
+live topology, the credential rules, and an unresolved security note.

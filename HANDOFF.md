@@ -28,7 +28,7 @@ nix shell nixpkgs#nodejs_22 --command npm test  # one-off, what I used throughou
 ```
 
 - `npm run check` — typecheck (strict, `exactOptionalPropertyTypes`, no `any`)
-- `npm test` — 73 tests, all passing at last commit
+- `npm test` — 89 tests, all passing at last commit
 - Tests need `--experimental-transform-types`, **not** `--experimental-strip-types`:
   strip-only mode cannot parse TypeScript parameter properties, which this codebase
   uses throughout. Already set in `package.json`.
@@ -55,25 +55,39 @@ Built, typechecked, and tested end to end:
 | LLM auth: Claude subscription (OAuth) | implemented, tested — `llm.auth: subscription` |
 | Container image + CI | **built and pushed by CI** — `ghcr.io/caesarakalaeii/caterpillar:main` |
 | State repo | **created and verified** — `caesarakalaeii/caterpillar-state`, private |
-| `caesar-deployment` manifests | **pushed**, caesar-deployment PR #45 — Application withheld |
+| `caesar-deployment` manifests | **merged** (#45, #46, #47) |
+| Deployment | **LIVE** — see below |
 
 Not built yet, in the order I would take them:
 
-1. **Finish the deploy**: two prerequisites remain of the four in
-   `../caesar-deployment/apps/workloads/caterpillar/README.md` — the sealed EB secret
-   and the subscription credential. Both need a human. Then land
-   `argocd/apps/caterpillar.yaml` LAST (see the warning below).
-2. Discord bridge (inbound `!answer`), intake ingesters.
+1. **Intake ingesters.** This is now the only thing between a live supervisor and an
+   idle one — see "The supervisor is live and has nothing to do" below.
+2. Discord bridge (inbound `!answer`, outbound webhook).
 
-## Deployment state (nothing is live)
+## Deployment state: LIVE
 
-The Caterpillar side is merged to `main` and CI publishes the image. The manifests are
-now pushed as caesar-deployment **PR #45**, deliberately without the Application.
+Deployed 2026-08-13 and healthy. Nothing here is theoretical any more.
+
+| | |
+|---|---|
+| Namespace | `caterpillar` |
+| Context | **`default`** in `~/.kube/config` |
+| ArgoCD app | `caterpillar`, `Synced` / `Healthy`, sync wave 6 |
+| Pod | 1 replica, `Recreate`, `/healthz` + `/metrics` on 9090 |
+| PVC | `caterpillar-work`, 20Gi RWO, bound |
+
+Verified in-cluster: the App token minted, the state repo cloned onto the PVC, the
+loop polls it (`FETCH_HEAD` refreshes every few seconds), metrics serve, and the
+subscription credential loads through the app's own `FileCredentialStore`
+(`type: oauth`).
 
 **`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and
-`selfHeal`.** Pushing `argocd/apps/caterpillar.yaml` therefore *deploys immediately*.
-Land the workload directory first, complete the four prerequisites, and add the
-Application only when you want it live.
+`selfHeal`** — so anything added there deploys immediately, and anything *removed*
+there is pruned from the cluster.
+
+**The live app-of-apps is named `root`, not `root-app`.** The manifest file is
+`root-app.yaml`; the Application it creates is `root`. `kubectl -n argocd get
+application root-app` returns NotFound and looks alarming for no reason.
 
 Decisions the user made by interview (do not re-litigate):
 
@@ -90,9 +104,28 @@ Decisions the user made by interview (do not re-litigate):
 - **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
   from the electric-boogaloo `.env`.
 
-Still missing before it can sync: the **sealed EB secret** and the **subscription
-credential** copied onto the PVC. Both need a human. The image, its pull credential, and
-the state repo are done.
+All four deployment prerequisites are done: image, pull credential, state repo, sealed
+EB secret, and the subscription credential seeded onto the PVC.
+
+### The supervisor is live and has nothing to do
+
+**Read this before assuming the system works end to end.** It runs, but no task can
+reach it.
+
+`Supervisor.claimNext()` iterates `store.listTasks()`, which reads `tasks/` in the
+**state repo**. Nothing in the running binary calls `Tracker.listAgentItems()` — grep
+it: the only callers are `src/cli/verify-vikunja.ts` and
+`src/cli/verify-github-issues.ts`. The tracker → `TaskSpec` path (DESIGN.md §14) is
+**not built**.
+
+So the deployed supervisor polls an empty `tasks/` directory forever. Labelling an
+issue `agent` does nothing today. Until intake exists, the only way to give it work is
+to commit a `tasks/<id>/spec.md` into `caterpillar-state` by hand — which is also the
+cheapest way to prove the whole pipeline, since it exercises leasing, sessions,
+verification, and the forge without needing intake first.
+
+That makes **intake the single highest-value thing left**, and it is pure code with no
+credential work attached.
 
 The GHCR package is private (it inherits the repo's visibility), which is handled the
 way `caesar-deployment` already handles its other private images: `imagePullSecrets:
@@ -103,15 +136,34 @@ GHCR token means re-sealing it in every namespace that has one (`caesar`,
 
 ### The subscription credential is the sharp edge
 
-`llm.credentialsPath` points at a file on the PVC, and it **cannot become a Secret**.
-Refreshing rotates the refresh token and pi writes it back inside
-`CredentialStore.modify`; a read-only mount means the supervisor works for about an hour
-and then stops. `FileCredentialStore` takes a lock directory so two sessions can't race
-a rotation — the loser would persist a token the provider already invalidated.
+`llm.credentialsPath` is `/work/credentials/anthropic.json` on the PVC, and it **cannot
+become a Secret**. Refreshing rotates the refresh token and pi writes the new one back
+inside `CredentialStore.modify`; a read-only mount means the supervisor works until the
+access token expires and then stops. `FileCredentialStore` locks around the
+read-modify-write so two sessions can't race a rotation — the loser would persist a
+token the provider already invalidated. 30s to acquire; a lock older than 60s is treated
+as abandoned by a process that died mid-refresh.
 
 Seed it with `npm run llm:login -- --out ./auth.json` on a machine with a browser (a pod
-has nowhere to open one), then `kubectl cp` it in. The pod crash-loops until it's there;
-that's expected, copy the file in and delete the pod.
+has nowhere to open one), then `kubectl cp` it in.
+
+**Two things this document previously got wrong, both corrected by watching the real
+deploy:**
+
+- **The pod does NOT crash-loop without the credential.** It boots clean, serves
+  `/healthz`, and idles — the credential is read lazily when a session starts, not at
+  boot. Do not wait for a crash loop as a signal that anything is wrong.
+- **The real trap is that `/work/credentials` does not exist on a fresh PVC**, and
+  `kubectl cp` will not create a missing parent. `mkdir -p` it in the pod first, or the
+  copy fails.
+
+Refresh is **lazy, not scheduled**. Nothing runs on a timer; pi refreshes when it next
+uses the provider. An expired access token on an idle supervisor is normal, not a fault.
+Verified in-cluster: `modify()` acquires the lock, persists, and releases correctly on
+the real PVC.
+
+**Deleting the PVC destroys the credential**, not just the mirrors and worktrees. There
+is no copy anywhere else — recovery means re-running the browser login.
 
 ## Live credentials
 
@@ -121,10 +173,32 @@ The GitHub App exists and is verified working:
 - Private key is SOPS-encrypted at
   `../caesar-deployment/apps/workloads/caterpillar/secrets/caterpillar-github-app.enc.yaml`
   (committed as `aca5042`). Keys: `app-id`, `installation-id`, `private-key.pem` —
-  matching what `src/secrets/load.ts` reads. The plaintext PEM was shredded.
-- That secret is inert: no ArgoCD Application references the directory yet, and the
-  `caterpillar` namespace does not exist.
-- Verify any time with `npm run verify:github-app -- --pem <p> --app-id <id> --repo <r>`.
+  matching what `src/secrets/load.ts` reads.
+
+> **UNRESOLVED — the App private key is exposed.** `aca5042` committed that Secret
+> **twice**. The second path had a **trailing newline in its filename**
+> (`caterpillar-github-app.enc.yaml\n`), so that session's `shred` and
+> `sops --encrypt` both hit the correctly-named file while the newline-named copy kept
+> its cleartext `stringData` — including `private-key.pem` — and was committed
+> unencrypted. An earlier version of this document claimed "the plaintext PEM was
+> shredded". It was not.
+>
+> caesar-deployment #46 removed the file, but by the owner's explicit decision the key
+> was **not rotated** and history was **not** rewritten. The blob is still reachable in
+> `aca5042`, and any clone predating #46 still holds a working key for app `4579022`.
+> The repo is private and nothing was ever deployed from the plaintext copy.
+>
+> Rotating is cheap if this is ever revisited: generate a new key at
+> `github.com/settings/apps/caterpillar-agent`, delete the old one, re-seal the Secret.
+> App ID and installation `153385932` do not change. Note
+> `seal-caterpillar-secrets.sh` has only `eb` and `discord` modes — re-sealing the App
+> secret is a manual `sops` step.
+>
+> `ls` renders both filenames identically. Use `ls -b` or `find` to see a stray one.
+- That secret is **live** — mounted into the running pod and used for state-repo pushes
+  and task-scoped forge tokens.
+- Verify any time with `npm run verify:github-app -- --pem <p> --app-id <id> --repo <r>`,
+  or the tracker path with `npm run verify:github-issues`.
 - **The installation is account-wide** ("All repositories" — 65 repos as of this
   writing). That is why `caterpillar-state` needed no separate install. If it is ever
   narrowed to selected repos, the state-repo mint returns 422 and the pod crash-loops
@@ -137,22 +211,26 @@ key lands in the terminal, and in an agent session in the transcript.
 **The state repo exists**: `caesarakalaeii/caterpillar-state`, private, seeded with a
 README describing the layout. Verified minting `contents: write` scoped to it alone.
 
-Codeberg: the user already has a token covering the whole `ElectricBoogaloo` ecosystem
-and wants to keep it. Not yet stored in a secret.
+Codeberg and Vikunja tokens are **sealed and deployed**, in
+`caterpillar-electric-boogaloo` (`username`, `tokens.json`, `vikunja-token`).
 
-**Vikunja: nothing is provisioned yet.** Before the tracker can run:
+**Vikunja is still unverified.** The token is mounted, but:
 
-1. Create a *dedicated agent* API token (Settings → API Tokens) with exactly the scopes
-   in DESIGN.md §9.5 — and not `tasks: delete`.
-2. Store it as key `vikunja-token` in the workspace's secret (`loadTracker` reads that
-   key; the same secret already holds the forge credentials).
-3. Make sure labels `agent-wip` and `needs-human` **exist** — no adapter creates them,
-   because the token deliberately has no `labels:create` scope. Names are overridable
-   per workspace via `tracker.wipLabel` / `tracker.needsHumanLabel` in config.
-4. `VIKUNJA_TOKEN=... npm run verify:vikunja` (read-only), then
-   `-- --task <scratch id>` to exercise the write scopes. **This has not been run yet**
-   — the routes come from `../electric-boogaloo-workspace/scripts/vikunja.py`, which was
-   proven against the live instance, but this implementation has not itself touched it.
+- Labels `agent-wip` and `needs-human` **must already exist** on the instance — no
+  adapter creates them, because the token deliberately has no `labels:create` scope.
+  Names are overridable per workspace via `tracker.wipLabel` /
+  `tracker.needsHumanLabel`. If they are missing, every lifecycle transition throws
+  `UnknownVikunjaLabelError` — but only once a task actually reaches the eb workspace,
+  which cannot happen until intake exists.
+- `VIKUNJA_TOKEN=... npm run verify:vikunja` (read-only), then `-- --task <scratch id>`
+  for the write scopes. **Still never run.** The routes come from
+  `../electric-boogaloo-workspace/scripts/vikunja.py`, proven against the live instance,
+  but this implementation has not itself touched it.
+
+GitHub Issues is verified live (65 repos enumerate, token mints with `issues: write` and
+nothing else). Its ingest label `agent` had **zero** matching issues at last check, and
+the same repo-level label rule applies: `agent-wip` / `needs-human` must exist on each
+repo that carries agent work.
 
 ## Things learned the hard way
 
@@ -249,23 +327,24 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 
 ## Immediate next action
 
-Both open PRs need review and merge: Caterpillar **#5** (GitHub Issues tracker) and
-caesar-deployment **#45** (workload manifests).
+The deploy is done. Everything below is about making the live supervisor actually
+receive work.
 
-Then the two prerequisites that can only be done by a human, in this order:
+1. **Prove the pipeline with a hand-written task.** Commit a `tasks/<id>/spec.md` into
+   `caterpillar-state` (front-matter + prose goal + machine-checkable `acceptance`) and
+   watch the pod claim it. This exercises leasing, the session runner, the credential
+   helper, verification, and PR creation in one shot, and needs no new code. Nothing has
+   yet run a real agent session in-cluster — this is the biggest untested surface.
+2. **Build intake** (DESIGN.md §14) — `Tracker.listAgentItems()` → `TaskSpec` in the
+   state repo. Until this exists, step 1 is the *only* way work arrives. Both trackers
+   already implement the read side; nothing calls it.
+3. **Verify Vikunja** — one command, and it has never been run against the live
+   instance.
+4. **Discord bridge** — questions currently land in `tasks/<id>/questions/` in git and
+   nothing tells a human they are there.
 
-1. **Seal the EB secret** — `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`.
-   Reads the workspace `.env` in-process and never prints a value. Until this exists,
-   `kustomize build apps/workloads/caterpillar` fails on the missing file, which is
-   expected and harmless while no Application references the directory.
-2. **Seed the subscription credential** — `npm run llm:login -- --out ./auth.json` on a
-   machine with a browser, then `kubectl cp` it onto the PVC and `shred -u` the local
-   copy. This one needs the pod to already exist, so it comes after the first sync.
-
-Vikunja is still unprovisioned (token + the two labels) and blocks only the
-electric-boogaloo workspace's mirroring, not the deploy.
-
-Land `argocd/apps/caterpillar.yaml` LAST — that file is the deploy.
+Unresolved by choice, not by omission: the exposed App private key (see the callout
+under "Live credentials").
 
 ## Immediate next action
 
