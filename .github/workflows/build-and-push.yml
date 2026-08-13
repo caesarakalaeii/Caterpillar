@@ -1,0 +1,66 @@
+name: Build and Push
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: caesarakalaeii/caterpillar
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # --ignore-scripts matches .npmrc and the Dockerfile: no dependency lifecycle
+      # scripts run, in CI or anywhere else.
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    # Images are only published from real branches. A PR from a fork must not be able
+    # to push to the registry.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # keel in the cluster polls the `main` tag by digest and rolls the
+          # Deployment when it moves.
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
