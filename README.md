@@ -7,6 +7,9 @@ restarts, and machine boundaries.
 there are chosen deliberately, several against the obvious default, and the reasons are
 not recoverable from the code.
 
+**Picking up mid-stream: [`HANDOFF.md`](HANDOFF.md)** — current status, live credential
+IDs, environment quirks, and the traps already paid for.
+
 **Status:** skeleton. Boundaries are defined and typechecked; forge, tracker, notifier,
 and the session/verifier wiring are stubs that throw.
 
