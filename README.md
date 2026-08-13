@@ -11,7 +11,8 @@ not recoverable from the code.
 IDs, environment quirks, and the traps already paid for.
 
 **Status:** the supervisor runs end to end — leasing, sessions, handoff, verification,
-both forges, and the Vikunja tracker. Not yet deployed; see *Not yet built* below.
+both forges, and the Vikunja tracker. The container image is published by CI. Not yet
+deployed — see `HANDOFF.md` for what is left.
 
 ## Development
 
@@ -109,4 +110,6 @@ Vikunja answers both with 401, and only one of them is worth debugging.
 - GitHub Issues tracker (HTTP)
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
-- `caesar-deployment` manifests and ArgoCD Application
+
+Deployment manifests exist in `caesar-deployment` but are not committed, and nothing
+is running yet. `HANDOFF.md` has the remaining prerequisites.
