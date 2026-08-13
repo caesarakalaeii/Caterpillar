@@ -36,10 +36,13 @@ export class MissingSecretError extends Error {
 
 /** Reads one key from a mounted secret directory. */
 export class SecretBundle {
-  constructor(
-    private readonly dir: string,
-    private readonly secretRef: string,
-  ) {}
+  private readonly dir: string;
+  private readonly secretRef: string;
+
+  constructor(dir: string, secretRef: string) {
+    this.dir = dir;
+    this.secretRef = secretRef;
+  }
 
   async read(key: string): Promise<string> {
     const path = join(this.dir, this.secretRef, key);

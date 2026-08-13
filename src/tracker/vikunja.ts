@@ -80,12 +80,13 @@ interface VikunjaTask {
 }
 
 export class VikunjaApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly route: string,
-    body: string,
-  ) {
+  readonly status: number;
+  readonly route: string;
+
+  constructor(status: number, route: string, body: string) {
     super(`Vikunja ${route} failed with ${status}: ${body.slice(0, 400)}`);
+    this.status = status;
+    this.route = route;
     this.name = "VikunjaApiError";
   }
 }
@@ -175,7 +176,10 @@ export class VikunjaTracker implements Tracker {
   /** Lazily-loaded title → id index, shared by every label operation. */
   private labels?: Promise<ReadonlyMap<string, number>>;
 
-  constructor(private readonly options: VikunjaOptions) {
+  private readonly options: VikunjaOptions;
+
+  constructor(options: VikunjaOptions) {
+    this.options = options;
     this.http = options.fetch ?? ((input, init) => fetch(input, init));
   }
 

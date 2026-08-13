@@ -25,7 +25,11 @@ class FakeForge implements Forge {
   readonly kind = "fake";
   minted = 0;
 
-  constructor(private readonly allowed: readonly RepoRef[]) {}
+  private readonly allowed: readonly RepoRef[];
+
+  constructor(allowed: readonly RepoRef[]) {
+    this.allowed = allowed;
+  }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
     assertInScope(repo, this.allowed);
@@ -54,7 +58,7 @@ const runHelper = (socketPath: string, request: string): Promise<string> =>
   new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ["--experimental-transform-types", HELPER, "--socket", socketPath, "get"],
+      [HELPER, "--socket", socketPath, "get"],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     let stdout = "";
@@ -131,7 +135,7 @@ test("real git gets a usable credential out of the helper", async () => {
       "git",
       [
         "-c",
-        `credential.helper=!${process.execPath} --experimental-transform-types ${HELPER} --socket ${socketPath}`,
+        `credential.helper=!${process.execPath} ${HELPER} --socket ${socketPath}`,
         "-c",
         "credential.useHttpPath=true",
         "credential",

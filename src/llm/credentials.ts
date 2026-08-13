@@ -48,10 +48,12 @@ export class CredentialLockError extends Error {
 type CredentialFile = Record<string, Credential>;
 
 export class FileCredentialStore implements CredentialStore {
-  /**
-   * @param path JSON file on durable, WRITABLE storage — the PVC, not a Secret mount.
-   */
-  constructor(private readonly path: string) {}
+  /** JSON file on durable, WRITABLE storage — the PVC, not a Secret mount. */
+  private readonly path: string;
+
+  constructor(path: string) {
+    this.path = path;
+  }
 
   async read(providerId: string): Promise<Credential | undefined> {
     return (await this.load())[providerId];

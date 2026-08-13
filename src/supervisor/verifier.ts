@@ -48,7 +48,11 @@ export interface AcceptanceVerifierOptions {
 }
 
 export class AcceptanceVerifier {
-  constructor(private readonly options: AcceptanceVerifierOptions) {}
+  private readonly options: AcceptanceVerifierOptions;
+
+  constructor(options: AcceptanceVerifierOptions) {
+    this.options = options;
+  }
 
   async verify(spec: TaskSpec, state: TaskState): Promise<VerificationResult> {
     const repo = spec.repos[0];

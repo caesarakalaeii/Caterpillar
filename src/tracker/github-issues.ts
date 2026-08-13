@@ -88,12 +88,13 @@ interface GitHubIssue {
 }
 
 export class GitHubIssuesApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly route: string,
-    body: string,
-  ) {
+  readonly status: number;
+  readonly route: string;
+
+  constructor(status: number, route: string, body: string) {
     super(`GitHub ${route} failed with ${status}: ${body.slice(0, 400)}`);
+    this.status = status;
+    this.route = route;
     this.name = "GitHubIssuesApiError";
   }
 }
@@ -122,7 +123,10 @@ export class GitHubIssuesTracker implements Tracker {
   /** Per-repo lower-cased label name sets, loaded once each. */
   private readonly labels = new Map<string, Promise<ReadonlySet<string>>>();
 
-  constructor(private readonly options: GitHubIssuesOptions) {
+  private readonly options: GitHubIssuesOptions;
+
+  constructor(options: GitHubIssuesOptions) {
+    this.options = options;
     this.http = options.fetch ?? ((input, init) => fetch(input, init));
   }
 

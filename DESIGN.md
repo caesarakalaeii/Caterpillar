@@ -891,3 +891,38 @@ initially; it fails closed, which is the safe direction.
 
 **Unresolved:** whether a task may spawn subtasks, and if so whether they get their own
 lease and directory. Deferred until a real task needs it.
+
+---
+
+## 16. Toolchain constraints
+
+**The source is erasable-syntax-only.** Added after the fact, when the workstation moved
+to node 26.
+
+Node runs this TypeScript by *erasing* types, never transforming them. Anything that
+type-checks but emits runtime code — a parameter property, an `enum`, a namespace — loads
+fine nowhere: it fails with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`, per FILE, before a single
+test in that file registers. So `constructor(private readonly x: T) {}` is out; declare
+the field and assign it.
+
+The alternative was `--experimental-transform-types`, which is what this repo used until
+node 26 **removed** it. That flag was a dead end in both directions: the codebase could
+not run on a current node, and pinning to node 22 to keep the flag meant a workstation
+with a newer node could not run the tests at all — which is exactly what happened, and it
+cost a session's worth of workarounds before anyone fixed the cause.
+
+Three things hold the line, and all three are needed:
+
+- `erasableSyntaxOnly` in `tsconfig.json` — turns the runtime failure into a compile
+  error.
+- `tsconfig.test.json` — the build excludes `*.test.ts`, so without this nothing type
+  checks the tests, and a parameter property in a test file passes `npm run check` and
+  then takes that file's whole suite down at runtime. That is not hypothetical; it is how
+  the last two occurrences were found.
+- A CI matrix over node 22 and 26 — the floor and what workstations actually have. The
+  failure mode is asymmetric: a flag that exists on one version and not the other fails
+  loudly on exactly one of them.
+
+`engines.node` is `>=22.18` because 22.18 is the first release that strips types without
+a flag. The container image is unaffected either way: it runs compiled JavaScript from
+`dist/`, and never strips anything.

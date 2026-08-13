@@ -102,10 +102,13 @@ const parseRepo = (raw: string): RepoRef => {
 };
 
 export class StateStore {
-  constructor(
-    private readonly root: string,
-    private readonly git: Git,
-  ) {}
+  private readonly root: string;
+  private readonly git: Git;
+
+  constructor(root: string, git: Git) {
+    this.root = root;
+    this.git = git;
+  }
 
   taskDir(task: TaskId): string {
     return join(this.root, "tasks", task);

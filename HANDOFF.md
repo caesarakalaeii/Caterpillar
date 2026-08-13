@@ -25,37 +25,34 @@ Manifests: `~/git/caesar-deployment` at `apps/workloads/caterpillar`.
 > ran on a NixOS box; this one is Arch with a zen kernel and no nix at all. Assume nothing
 > about the host from this document; check.
 
-## Environment — READ THIS, IT CHANGED
+## Environment
 
-The previous handoff said "NixOS, there is no `node` or `npm` on PATH, everything runs
-through nix". On the current machine the opposite is true and worse:
+**The node problem is fixed at the source; there is nothing to work around any more.**
 
-- `node` and `npm` **are** on PATH (`/usr/sbin`), at **node 26.5.0**. There is **no `nix`**.
-- **`npm test` cannot run on the system node.** Node 26 *removed*
-  `--experimental-transform-types`, and strip-only TypeScript mode cannot parse the
-  parameter properties this codebase uses throughout, so not a single test file loads. The
-  same applies to `npm start` and all six `verify:*` scripts, which use the same flag.
-- `src/credential/service.test.ts` **spawns the credential helper with that flag**, so it
-  fails for the same reason even if you work around the runner.
-- `npm run check` and `npm run build` are fine — they are `tsc`.
-- CI pins **node 22** and is green. It is the authority on whether tests pass.
+- `node` and `npm` are on PATH (`/usr/sbin`) at **node 26.5.0**. There is **no `nix`**.
+- `npm test`, `npm start` and every `verify:*` script **run on it directly** — no flag, no
+  tarball, no compile step. **159 tests, 159 passing** on node 26.
 
-`flake.nix` is still in the repo and still correct; it just has nothing to run it here.
+Two earlier handoffs described elaborate workarounds here (compile the tests first; then,
+download a node 22 tarball and put it on PATH). Both are gone, and so is their cause. The
+repo used `--experimental-transform-types`, which node 26 removed, and its source used
+parameter properties, which node cannot strip. Every one of the 44 was converted to a
+field plus an assignment, and three things now stop it coming back (DESIGN.md §16):
 
-**Get a node 22 and everything works normally.** No sudo needed, and it takes a minute —
-this session did exactly this and ran the real suite (`npm test`, **155 tests, 155
-passing**), matching CI:
+- `erasableSyntaxOnly` in `tsconfig.json` turns the runtime load failure into a compile
+  error.
+- `tsconfig.test.json` applies the same check to **test** files, which the build excludes
+  — that gap is exactly how the last two slipped through `npm run check` and then failed
+  to load at runtime.
+- CI runs the suite on **node 22 and 26**. The failure is asymmetric, so one version alone
+  proves nothing.
 
-```bash
-curl -fsSLO https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
-tar -xf node-v22.14.0-linux-x64.tar.xz -C <somewhere>
-export PATH=<somewhere>/node-v22.14.0-linux-x64/bin:$PATH
-npm test    # and npm run check, npm run build, npm run verify:*
-```
+`engines.node` is `>=22.18`, the first release that strips types without a flag. The
+container image is unaffected: it runs compiled JS from `dist/`.
 
-The previous handoff's compile-the-tests-first workaround is no longer needed; it is gone
-from this file rather than kept as a second way to do the same thing. A permanent fix is
-still `pacman -S nodejs-lts-jod` (or equivalent) — nobody has done it.
+If you write `constructor(private readonly x: T) {}` out of habit, `npm run check` will
+tell you immediately. `flake.nix` is still in the repo and still correct; it just has
+nothing to run it here.
 
 `node_modules` was absent entirely at the start of the previous session; `npm install`
 fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin entry.
@@ -80,6 +77,7 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | **Tracker intake (§14)** | **implemented, deployed, and PROVEN end to end (#11, #12)** |
 | **Discord webhook, outbound (§11.2)** | **implemented and tested (#14)** — inert until a webhook is sealed |
 | **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
+| **Toolchain** | **runs natively on node 26 (#18)** — erasable-syntax-only, CI on 22 and 26 |
 | **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
@@ -351,8 +349,22 @@ them away.
 
 **Environment and tooling**
 
-- **Node 26 removed `--experimental-transform-types`.** See Environment above. A test that
-  spawns a subprocess with the flag fails too.
+- **Node ERASES types, it does not transform them.** Anything emitting runtime code — a
+  parameter property, an enum, a namespace — type-checks and then fails to LOAD, per FILE,
+  before one test registers. Node 26 removed `--experimental-transform-types` outright, so
+  the flag was a dead end in both directions. Fixed at the source (§16); the guard is
+  `erasableSyntaxOnly` plus a CI matrix, because the failure exists on one node version and
+  not the other.
+- **A tsconfig that excludes tests type-checks NOTHING in them.** The build must exclude
+  `*.test.ts`, so `npm run check` silently skipped every test file until
+  `tsconfig.test.json` was added — which is how two unloadable test files passed a green
+  check.
+- **A codemod must be diffed, not trusted.** The script that rewrote all 44 parameter
+  properties silently DELETED the `super()` call in every error subclass on its first run,
+  because the rewrite skipped the span between the body brace and the insertion point. It
+  also stranded a constructor's `@param` doc above a field, and choked on an apostrophe in
+  a comment (`repo's`) by reading it as an unterminated string. Every one of those was
+  caught by reading the diff, not by the tests.
 - **`git add -A <path>` fails the WHOLE command on a pathspec that matches nothing.** A
   freshly bootstrapped state repo has no `tasks/` directory, so `commitAndPush` threw before
   recording anything. Each path is now staged only when it exists.
@@ -542,20 +554,18 @@ them away.
    Until then, answering a question is the manual two-write procedure above.
 3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
    The open question is what it should do, not whether it works.
-4. **Install node 22 permanently** so `npm test` and the `verify:*` scripts work without a
-   scratch tarball on PATH.
-5. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
+4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
    task is `done`, and merging it was left to a human on purpose. Delete the repo whenever;
    it is a throwaway.
-6. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
+5. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
    pre-fix retry storm, all mislabelled "Session 0" (the park preceded the session
    increment). It is read for handoff continuity, so it taxes any further session on that
    task. There is no journal rotation. `SMOKE-1` is `done`, so this is latent.
 
-**Uncommitted work: none.** `main` was `0666b60` at the start of this session and is
-`fb7ede2` now — #14 (Discord webhook), #15 (CI gate), #16 (`needs-human`), all squash-
-merged, built, and rolled by Keel. **159 tests, 159 passing.** The pod is healthy with 0
-restarts.
+**Uncommitted work: none.** `main` was `0666b60` at the start of this session — since
+then #14 (Discord webhook), #15 (CI gate), #16 (`needs-human`), #17 (docs) and #18 (node
+26) were squash-merged, built, and rolled by Keel. **159 tests, 159 passing, on node 26
+with no flags.** The pod is healthy with 0 restarts.
 
 Of the three, only #15 changes observable behaviour today: #14 is inert until a webhook is
 sealed, and #16 only shows up on the next task that asks a question. `caesar-deployment` has no unpushed commits either (its #48

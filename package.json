@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Long-running autonomous coding agent supervisor. See DESIGN.md.",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   },
   "bin": {
     "caterpillar": "./dist/index.js",
@@ -13,15 +13,15 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test --experimental-transform-types 'src/**/*.test.ts'",
-    "start": "node --experimental-transform-types src/index.ts",
-    "verify:github-app": "node --experimental-transform-types src/cli/verify-github-app.ts",
-    "verify:forgejo": "node --experimental-transform-types src/cli/verify-forgejo.ts",
-    "verify:vikunja": "node --experimental-transform-types src/cli/verify-vikunja.ts",
-    "verify:github-issues": "node --experimental-transform-types src/cli/verify-github-issues.ts",
-    "verify:discord": "node --experimental-transform-types src/cli/verify-discord.ts",
-    "llm:login": "node --experimental-transform-types src/cli/llm-login.ts"
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "node --test 'src/**/*.test.ts'",
+    "start": "node src/index.ts",
+    "verify:github-app": "node src/cli/verify-github-app.ts",
+    "verify:forgejo": "node src/cli/verify-forgejo.ts",
+    "verify:vikunja": "node src/cli/verify-vikunja.ts",
+    "verify:github-issues": "node src/cli/verify-github-issues.ts",
+    "verify:discord": "node src/cli/verify-discord.ts",
+    "llm:login": "node src/cli/llm-login.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",

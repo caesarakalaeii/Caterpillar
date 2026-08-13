@@ -92,7 +92,11 @@ const digestOf = (item: TrackerItem): string =>
   createHash("sha256").update(`${item.title}\n\n${item.body}`).digest("hex");
 
 export class Ingester {
-  constructor(private readonly deps: IngesterDeps) {}
+  private readonly deps: IngesterDeps;
+
+  constructor(deps: IngesterDeps) {
+    this.deps = deps;
+  }
 
   /**
    * One intake pass over every configured tracker. Returns tasks created.

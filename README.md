@@ -43,22 +43,29 @@ In Vikunja the editor cannot put `agent` on the fence line, so put it as the fir
 
 ## Development
 
-NixOS-friendly — everything comes from the flake:
+Any node from **22.18** up, including 26. There is no build step for development and no
+flag to remember — node runs the TypeScript directly:
 
 ```bash
-nix develop            # node 22, git, jq, sops, age, kubectl, kustomize
 npm install --ignore-scripts
-npm run check          # typecheck
+npm run check          # typecheck, sources AND tests
 npm test               # unit tests
 npm run build          # emit to dist/
 ```
 
-**Node 22 specifically, not "22 or newer".** The tests and the `verify:*` scripts run
-TypeScript through `--experimental-transform-types`, which node 26 **removed** — and
-strip-only mode cannot parse the parameter properties this codebase uses throughout, so
-on node 26 `npm test` fails to load a single file. `src/credential/service.test.ts`
-spawns the credential helper with the same flag, so it fails there for the same reason.
-CI pins node 22; a workstation with a newer node needs one too.
+A flake is still provided (`nix develop` — node, git, jq, sops, age, kubectl, kustomize),
+but nothing here needs it.
+
+**The source is deliberately erasable-syntax-only**, enforced by `erasableSyntaxOnly` in
+`tsconfig.json`. Node *erases* types rather than transforming them, so any construct that
+emits runtime code — a parameter property, an enum, a namespace — type-checks perfectly
+and then fails to LOAD with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`, per file, before a single
+test in it registers. Write `private readonly x: T` as a field and assign it in the
+constructor. `tsconfig.test.json` applies the same rule to test files, which the build
+excludes; CI runs the whole suite on node 22 and 26, because the failure is a load error
+on one version and invisible on the other.
+
+22.18 is the floor because that is the first release to strip types without a flag.
 
 `--ignore-scripts` is deliberate: no dependency lifecycle scripts run on install.
 `.npmrc` pins exact versions and refuses same-day releases, because pi's API is young

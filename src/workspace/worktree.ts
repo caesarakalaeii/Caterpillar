@@ -54,7 +54,10 @@ export class WorktreeManager {
    */
   private readonly git: Git;
 
-  constructor(private readonly options: WorktreeOptions) {
+  private readonly options: WorktreeOptions;
+
+  constructor(options: WorktreeOptions) {
+    this.options = options;
     this.git = options.git.withoutCredentials();
   }
 

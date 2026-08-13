@@ -64,11 +64,11 @@ const DEFAULT_MAX_RETRIES = 3;
 
 /** Status and body only — never the URL, which carries the webhook token. */
 export class DiscordWebhookError extends Error {
-  constructor(
-    readonly status: number,
-    body: string,
-  ) {
+  readonly status: number;
+
+  constructor(status: number, body: string) {
     super(`Discord webhook rejected the message with ${status}: ${body.slice(0, 400)}`);
+    this.status = status;
     this.name = "DiscordWebhookError";
   }
 }
@@ -77,7 +77,10 @@ export class DiscordNotifier implements Notifier {
   private readonly http: FetchLike;
   private readonly pause: (ms: number) => Promise<void>;
 
-  constructor(private readonly options: DiscordOptions) {
+  private readonly options: DiscordOptions;
+
+  constructor(options: DiscordOptions) {
+    this.options = options;
     this.http = options.fetch ?? ((input, init) => fetch(input, init));
     this.pause = options.sleep ?? ((ms) => sleep(ms));
   }

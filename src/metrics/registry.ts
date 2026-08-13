@@ -17,11 +17,15 @@ type MetricKind = "counter" | "gauge";
 class Metric {
   private readonly samples = new Map<string, Sample>();
 
-  constructor(
-    readonly name: string,
-    readonly kind: MetricKind,
-    readonly help: string,
-  ) {}
+  readonly name: string;
+  readonly kind: MetricKind;
+  readonly help: string;
+
+  constructor(name: string, kind: MetricKind, help: string) {
+    this.name = name;
+    this.kind = kind;
+    this.help = help;
+  }
 
   private key(labels: LabelValues): string {
     return Object.keys(labels)
