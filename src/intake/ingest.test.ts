@@ -58,10 +58,13 @@ class FakeTracker implements Tracker {
   readonly comments: { readonly ref: TrackerRef; readonly text: string }[] = [];
   listCalls = 0;
 
-  constructor(
-    private items: readonly TrackerItem[],
-    private readonly failList = false,
-  ) {}
+  private items: readonly TrackerItem[];
+  private readonly failList: boolean;
+
+  constructor(items: readonly TrackerItem[], failList = false) {
+    this.items = items;
+    this.failList = failList;
+  }
 
   setItems(items: readonly TrackerItem[]): void {
     this.items = items;

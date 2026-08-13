@@ -82,10 +82,13 @@ export const tokenGitEnv = (token: string): NodeJS.ProcessEnv => ({
 export class StateRepoCredentials {
   private cached: { readonly token: string; readonly expiresAt: number } | undefined;
 
-  constructor(
-    private readonly app: GitHubAppOptions,
-    readonly repo: RepoRef,
-  ) {}
+  private readonly app: GitHubAppOptions;
+  readonly repo: RepoRef;
+
+  constructor(app: GitHubAppOptions, repo: RepoRef) {
+    this.app = app;
+    this.repo = repo;
+  }
 
   /** Use as `new Git(path, process.env, credentials.gitEnv)`. */
   readonly gitEnv: GitEnvProvider = async () => tokenGitEnv(await this.token());

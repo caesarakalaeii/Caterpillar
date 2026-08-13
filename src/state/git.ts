@@ -17,11 +17,13 @@ export interface GitResult {
 }
 
 export class GitError extends Error {
-  constructor(
-    readonly args: readonly string[],
-    readonly result: GitResult,
-  ) {
+  readonly args: readonly string[];
+  readonly result: GitResult;
+
+  constructor(args: readonly string[], result: GitResult) {
     super(`git ${args.join(" ")} failed (${result.code}): ${result.stderr.trim()}`);
+    this.args = args;
+    this.result = result;
     this.name = "GitError";
   }
 }
@@ -62,12 +64,16 @@ const run = (
 export type GitEnvProvider = () => Promise<NodeJS.ProcessEnv>;
 
 export class Git {
-  constructor(
-    private readonly cwd: string,
-    private readonly env: NodeJS.ProcessEnv = process.env,
-    /** Bound to ONE repo's credential. Deliberately not inherited — see `at`. */
-    private readonly envProvider?: GitEnvProvider,
-  ) {}
+  private readonly cwd: string;
+  private readonly env: NodeJS.ProcessEnv;
+  /** Bound to ONE repo's credential. Deliberately not inherited — see `at`. */
+  private readonly envProvider: GitEnvProvider | undefined;
+
+  constructor(cwd: string, env: NodeJS.ProcessEnv = process.env, envProvider?: GitEnvProvider) {
+    this.cwd = cwd;
+    this.env = env;
+    this.envProvider = envProvider;
+  }
 
   /**
    * Run git in a different directory, sharing environment.

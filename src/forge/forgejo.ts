@@ -59,17 +59,18 @@ export class MissingRepoTokenError extends Error {
 }
 
 export class ForgejoApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly route: string,
-    body: string,
-  ) {
+  readonly status: number;
+  readonly route: string;
+
+  constructor(status: number, route: string, body: string) {
     const hint =
       status === 403 || status === 401
         ? " — a repository-scoped token only reaches read/write:repository and " +
           "read/write:issue; check the token's scopes and its repository list"
         : "";
     super(`Forgejo ${route} failed with ${status}: ${body.slice(0, 400)}${hint}`);
+    this.status = status;
+    this.route = route;
     this.name = "ForgejoApiError";
   }
 }
@@ -142,10 +143,13 @@ export const summariseCombinedStatus = (body: CombinedStatusResponse): CheckStat
 class ForgejoForge implements Forge {
   readonly kind = "forgejo";
 
-  constructor(
-    private readonly options: ForgejoOptions,
-    private readonly allowed: readonly RepoRef[],
-  ) {}
+  private readonly options: ForgejoOptions;
+  private readonly allowed: readonly RepoRef[];
+
+  constructor(options: ForgejoOptions, allowed: readonly RepoRef[]) {
+    this.options = options;
+    this.allowed = allowed;
+  }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
     assertInScope(repo, this.allowed);
@@ -230,7 +234,11 @@ class ForgejoForge implements Forge {
 }
 
 export class ForgejoForgeFactory implements ForgeFactory {
-  constructor(private readonly options: ForgejoOptions) {}
+  private readonly options: ForgejoOptions;
+
+  constructor(options: ForgejoOptions) {
+    this.options = options;
+  }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
     return new ForgejoForge(this.options, spec.repos);

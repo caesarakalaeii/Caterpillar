@@ -1,0 +1,12 @@
+{
+  // Tests are excluded from the build (they must not reach `dist/`), which also meant
+  // nothing ever type-checked them: a parameter property in a test file passed `npm run
+  // check` and then failed to LOAD at runtime, taking the whole file's tests with it
+  // before one could register. This config exists to close that gap — same strictness,
+  // no emit, tests included.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -48,15 +48,17 @@ export interface Tracker {
  * debugging a token that is fine (DESIGN.md §9.5).
  */
 export class TrackerScopeError extends Error {
-  constructor(
-    readonly route: string,
-    readonly requiredScope: string,
-  ) {
+  readonly route: string;
+  readonly requiredScope: string;
+
+  constructor(route: string, requiredScope: string) {
     super(
       `tracker rejected ${route} — the API token almost certainly lacks the ` +
         `'${requiredScope}' scope. Re-grant it in the UI; do not retry, and do not ` +
         `debug the token itself.`,
     );
+    this.route = route;
+    this.requiredScope = requiredScope;
     this.name = "TrackerScopeError";
   }
 }

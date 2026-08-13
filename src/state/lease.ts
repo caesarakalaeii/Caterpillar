@@ -16,8 +16,11 @@ import type { RunnerId, TaskId } from "../domain/task.ts";
 export const leaseRef = (task: TaskId): string => `refs/leases/${task}`;
 
 export class LeaseLostError extends Error {
-  constructor(readonly task: TaskId) {
+  readonly task: TaskId;
+
+  constructor(task: TaskId) {
     super(`lease for ${task} is no longer held by this runner — aborting`);
+    this.task = task;
     this.name = "LeaseLostError";
   }
 }

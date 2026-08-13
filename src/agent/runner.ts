@@ -90,7 +90,11 @@ export class WorkspaceNotConfiguredError extends Error {
 }
 
 export class AgentSessionRunner {
-  constructor(private readonly options: AgentSessionRunnerOptions) {}
+  private readonly options: AgentSessionRunnerOptions;
+
+  constructor(options: AgentSessionRunnerOptions) {
+    this.options = options;
+  }
 
   async run(spec: TaskSpec, state: TaskState): Promise<SessionOutcome> {
     const { credentials, worktrees, store, llm, metrics } = this.options;

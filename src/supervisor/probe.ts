@@ -16,7 +16,11 @@ export interface GitProgressProbeOptions {
 }
 
 export class GitProgressProbe {
-  constructor(private readonly options: GitProgressProbeOptions) {}
+  private readonly options: GitProgressProbeOptions;
+
+  constructor(options: GitProgressProbeOptions) {
+    this.options = options;
+  }
 
   async probe(spec: TaskSpec, state: TaskState): Promise<ProgressEvidence> {
     const repo = spec.repos[0];

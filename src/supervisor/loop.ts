@@ -83,7 +83,11 @@ export class Supervisor {
   /** 0 means "never ran", so the first pass happens at boot. */
   private lastIntakeAt = 0;
 
-  constructor(private readonly deps: SupervisorDeps) {}
+  private readonly deps: SupervisorDeps;
+
+  constructor(deps: SupervisorDeps) {
+    this.deps = deps;
+  }
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
   async run(signal: AbortSignal): Promise<void> {

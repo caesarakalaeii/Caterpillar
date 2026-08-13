@@ -16,11 +16,20 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported range, because the failure is asymmetric and
+        # silent: node strips types rather than transforming them, so a construct that
+        # emits runtime code (a parameter property, an enum) type-checks fine and then
+        # refuses to LOAD — per file, before a single test registers. 22.18 is the first
+        # release that strips by default; 26 is what workstations have.
+        node: ['22', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node }}
       # --ignore-scripts matches .npmrc and the Dockerfile: no dependency lifecycle
       # scripts run, in CI or anywhere else.
       - run: npm ci --ignore-scripts

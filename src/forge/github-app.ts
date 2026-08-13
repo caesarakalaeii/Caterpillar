@@ -114,12 +114,13 @@ export const signAppJwt = (appId: string, privateKeyPem: string, now = Date.now(
 };
 
 export class GitHubApiError extends Error {
-  constructor(
-    readonly status: number,
-    readonly route: string,
-    body: string,
-  ) {
+  readonly status: number;
+  readonly route: string;
+
+  constructor(status: number, route: string, body: string) {
     super(`GitHub ${route} failed with ${status}: ${body.slice(0, 400)}`);
+    this.status = status;
+    this.route = route;
     this.name = "GitHubApiError";
   }
 }
@@ -128,10 +129,13 @@ class GitHubAppForge implements Forge {
   readonly kind = "github";
   private cached: GitCredential | undefined;
 
-  constructor(
-    private readonly options: GitHubAppOptions,
-    private readonly allowed: readonly RepoRef[],
-  ) {}
+  private readonly options: GitHubAppOptions;
+  private readonly allowed: readonly RepoRef[];
+
+  constructor(options: GitHubAppOptions, allowed: readonly RepoRef[]) {
+    this.options = options;
+    this.allowed = allowed;
+  }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
     assertInScope(repo, this.allowed);
@@ -290,10 +294,13 @@ export const mintInstallationToken = async (
 export class InstallationTokenSource {
   private cached: GitCredential | undefined;
 
-  constructor(
-    private readonly options: GitHubAppOptions,
-    private readonly permissions: Readonly<Record<string, string>>,
-  ) {}
+  private readonly options: GitHubAppOptions;
+  private readonly permissions: Readonly<Record<string, string>>;
+
+  constructor(options: GitHubAppOptions, permissions: Readonly<Record<string, string>>) {
+    this.options = options;
+    this.permissions = permissions;
+  }
 
   async token(): Promise<string> {
     const cached = this.cached;
@@ -372,7 +379,11 @@ export const summarise = (
 };
 
 export class GitHubAppForgeFactory implements ForgeFactory {
-  constructor(private readonly options: GitHubAppOptions) {}
+  private readonly options: GitHubAppOptions;
+
+  constructor(options: GitHubAppOptions) {
+    this.options = options;
+  }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
     return new GitHubAppForge(this.options, spec.repos);
