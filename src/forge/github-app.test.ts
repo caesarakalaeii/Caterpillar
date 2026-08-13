@@ -35,6 +35,42 @@ test("no CI signal at all is reported as 'none', not success", () => {
   assert.equal(status.conclusion, "none");
 });
 
+test("check runs alone are green — an EMPTY combined status is not pending", () => {
+  // GitHub answers /status with `state: "pending"` on a ref that has NO statuses at all,
+  // and a repo whose CI is Actions-only never gets any: the signal lives entirely in
+  // check-runs. ORing that state into the pending branch made §12 unsatisfiable for
+  // every such repo — the first intake-sourced task claimed done, was rejected with
+  // "CI has not finished: 0 check(s) still running" over a green PR, re-ran, and
+  // eventually gave up and asked a human. `total_count`, not `state`, says whether the
+  // combined status is worth reading.
+  const status = summarise(
+    { check_runs: [{ status: "completed", conclusion: "success", name: "GitGuardian" }] },
+    { state: "pending", total_count: 0 },
+  );
+  assert.equal(status.conclusion, "success", status.summary);
+});
+
+test("a genuinely pending commit status still blocks a green check run", () => {
+  // The other half of the fix: an empty combined status is ignorable, a populated one
+  // is not. Without this the correction would wave through a ref whose legacy status
+  // has not reported yet.
+  const status = summarise(
+    { check_runs: [{ status: "completed", conclusion: "success", name: "lint" }] },
+    { state: "pending", total_count: 1 },
+  );
+  assert.equal(status.conclusion, "pending");
+});
+
+test("a pending verdict never claims zero checks are running", () => {
+  // "0 check(s) still running" is what the operator saw for two sessions. A summary
+  // that contradicts its own verdict sends whoever reads it looking in the wrong place.
+  const status = summarise(
+    { check_runs: [{ status: "completed", conclusion: "success", name: "lint" }] },
+    { state: "pending", total_count: 1 },
+  );
+  assert.equal(status.summary.includes("0 check"), false, status.summary);
+});
+
 test("a failing check run wins over passing ones", () => {
   const status = summarise(
     {

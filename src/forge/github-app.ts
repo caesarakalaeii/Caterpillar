@@ -332,12 +332,22 @@ export const summarise = (
   );
   const pendingRuns = runs.check_runs.filter((run) => run.status !== "completed");
 
-  const hasSignal = runs.check_runs.length > 0 || combined.total_count > 0;
+  /**
+   * `combined.state` is only meaningful when something actually posted a status.
+   *
+   * GitHub answers /status with `state: "pending"` for a ref carrying NO statuses at
+   * all, and an Actions-only repo never gets one — its entire CI signal is check-runs.
+   * Reading that default as a real verdict made the §12 gate unsatisfiable there: a
+   * green PR was rejected as "CI has not finished" on every claim, forever. Legacy
+   * commit statuses are the minority case now, so this is the common path, not an edge.
+   */
+  const hasStatuses = combined.total_count > 0;
+  const hasSignal = runs.check_runs.length > 0 || hasStatuses;
   if (!hasSignal) {
     return { conclusion: "none", summary: "no checks or statuses reported for this ref" };
   }
 
-  if (failedRuns.length > 0 || combined.state === "failure") {
+  if (failedRuns.length > 0 || (hasStatuses && combined.state === "failure")) {
     const names = failedRuns.map((r) => r.name).join(", ");
     return {
       conclusion: "failure",
@@ -345,12 +355,20 @@ export const summarise = (
     };
   }
 
-  if (pendingRuns.length > 0 || combined.state === "pending") {
-    return { conclusion: "pending", summary: `${pendingRuns.length} check(s) still running` };
+  const statusPending = hasStatuses && combined.state === "pending";
+  if (pendingRuns.length > 0 || statusPending) {
+    // Named separately, because "0 check(s) still running" as the reason a task was
+    // rejected reads as a contradiction and points at the wrong endpoint entirely.
+    const waiting = [
+      ...(pendingRuns.length > 0 ? [`${pendingRuns.length} check(s) still running`] : []),
+      ...(statusPending ? ["commit status is pending"] : []),
+    ];
+    return { conclusion: "pending", summary: waiting.join("; ") };
   }
 
   const conclusion: CheckConclusion = "success";
-  return { conclusion, summary: `${runs.check_runs.length} check(s) passed` };
+  const passed = runs.check_runs.length + combined.total_count;
+  return { conclusion, summary: `${passed} check(s)/status(es) passed` };
 };
 
 export class GitHubAppForgeFactory implements ForgeFactory {
