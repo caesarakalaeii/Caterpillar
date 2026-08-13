@@ -35,7 +35,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
-| `src/forge/` | `Forge` interface + GitHub App / Forgejo stubs (§9.1, §9.4). |
+| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). |
 | `src/tracker/` | `Tracker` interface + GitHub Issues / Vikunja stubs (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories. |
@@ -75,9 +75,19 @@ npm run verify:github-app -- --pem <key.pem> --app-id <id> --repo <owner/name>
 Signs a JWT, prints the installation id, mints a repo-scoped token, and echoes the
 granted permissions. Never prints the token.
 
+## Verifying a Codeberg token
+
+```bash
+CODEBERG_TOKEN=... npm run verify:forgejo -- --repo ElectricBoogaloo/eb-api
+```
+
+Confirms the token reaches the repo, that out-of-scope repos are refused, and that the
+commit-status route works with its scopes. Avoids `GET /user`, which a
+repository-scoped token cannot reach — a 403 there looks like a bad token when the
+scoping is in fact correct.
+
 ## Not yet built
 
-- Forgejo/Codeberg forge (repo-scoped tokens, PRs, commit status)
 - tracker implementations (Vikunja and GitHub Issues HTTP)
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
