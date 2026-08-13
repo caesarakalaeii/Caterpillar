@@ -5,7 +5,7 @@
  * Session starts cost a fetch rather than a clone, tasks stay isolated, and a
  * corrupted worktree is discardable without touching the mirror.
  */
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Git } from "../state/git.ts";
@@ -49,13 +49,44 @@ export class WorktreeManager {
     return this.options.git.at(path);
   }
 
-  /** Ensure a bare mirror exists and is current. */
+  /**
+   * Ensure a bare mirror exists and is current.
+   *
+   * The existence test is for `HEAD` inside the mirror, NOT for the directory. A
+   * failed clone can leave the directory behind, and treating that as "mirror exists"
+   * sends every later call down the fetch path, where it fails forever with
+   * "not a git repository" — a message that describes the symptom and hides the cause.
+   * A partial mirror is discarded and re-cloned instead.
+   */
   async syncMirror(repo: RepoRef): Promise<string> {
     const path = mirrorPath(this.options.mirrorsDir, repo);
 
-    if (!existsSync(path)) {
-      await mkdir(path, { recursive: true });
-      await this.options.git.run("clone", "--mirror", cloneUrl(repo), path);
+    if (!existsSync(join(path, "HEAD"))) {
+      // Leave no half-built mirror behind on failure, so a retry is a clean clone
+      // rather than a permanently poisoned path.
+      await rm(path, { recursive: true, force: true });
+      // Only the PARENT is created: `git clone` makes the target itself, and
+      // pre-creating it is what allowed the poisoned-directory state above.
+      await mkdir(join(path, ".."), { recursive: true });
+
+      try {
+        // The credential helper is passed to the CLONE itself, not merely configured
+        // afterwards. A private repo cannot be cloned anonymously, and the post-clone
+        // `configure` is far too late — git has already failed with
+        // "could not read Username". The token still never touches argv: `-c` carries
+        // the helper's path, and the helper resolves the credential over the socket.
+        await this.options.git.run(
+          ...this.credentialArgs(),
+          "clone",
+          "--mirror",
+          cloneUrl(repo),
+          path,
+        );
+      } catch (error) {
+        await rm(path, { recursive: true, force: true });
+        throw error;
+      }
+
       await this.configure(path);
       return path;
     }
@@ -63,6 +94,22 @@ export class WorktreeManager {
     const mirror = this.options.git.at(path);
     await mirror.run("fetch", "--prune", "origin");
     return path;
+  }
+
+  /**
+   * `-c` overrides that route authentication through the credential service.
+   *
+   * Needed for any git invocation that runs BEFORE a repo exists to hold config —
+   * currently the mirror clone. Everything afterwards reads the same settings from the
+   * repo config that `configure` writes.
+   */
+  private credentialArgs(): readonly string[] {
+    return [
+      "-c",
+      `credential.helper=!${this.options.helperPath} --socket ${this.options.socketPath}`,
+      "-c",
+      "credential.useHttpPath=true",
+    ];
   }
 
   /**
