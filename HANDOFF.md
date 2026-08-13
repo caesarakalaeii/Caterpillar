@@ -48,7 +48,7 @@ Built, typechecked, and tested end to end:
 | Session runner | implemented, end-to-end tested with pi's `fauxProvider` |
 | Verifier + progress probe | implemented |
 | Multi-repo checkout | implemented, tested |
-| Vikunja tracker | implemented, unit-tested — **not yet run against the live instance** |
+| Vikunja tracker | implemented, unit-tested, **verified against the live instance** |
 | GitHub Issues tracker | implemented, unit-tested, **verified against live GitHub** (PR #5) |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
@@ -106,6 +106,54 @@ Decisions the user made by interview (do not re-litigate):
 
 All four deployment prerequisites are done: image, pull credential, state repo, sealed
 EB secret, and the subscription credential seeded onto the PVC.
+
+### What the first end-to-end run proved
+
+A hand-written task (`SMOKE-1`, targeting the throwaway repo
+`caesarakalaeii/caterpillar-smoke`) was committed to the state repo and claimed. It
+found **four** defects that every unit test and every live credential check had missed,
+because nothing had ever driven a private repo through the worktree path.
+
+Three are fixed and merged in **PR #8**, live as image `e42852ee`:
+
+1. **The mirror clone was anonymous.** `syncMirror` cloned *before* `configure()` wrote
+   `credential.helper`, so private repos died on `could not read Username`. Public repos
+   hid it completely. The helper is now passed to the clone itself via `-c`.
+2. **A failed clone poisoned the path permanently.** `mkdir` ran before `clone`, so a
+   failure left an empty directory; every retry then took the `fetch` branch and died
+   with `not a git repository` — a message describing the symptom and hiding the cause.
+   Unrecoverable without deleting the path by hand, which had to be done on the live PVC.
+   The check now tests for `HEAD` *inside* the mirror and self-heals a partial one.
+3. **One bad task killed the supervisor.** `run()` rethrew anything but
+   `LeaseLostError`, exiting the process; the durable claim meant the restart re-claimed
+   the same task and died again, wedging the runner permanently. Such a task is now
+   journalled, parked, and skipped. Confirmed: the pod holds `1/1 Running` with **0
+   restarts** through repeated failures where it previously CrashLoopBackOff'd.
+
+**The fourth is OPEN and is the immediate next job.** The clone now gets past auth
+setup and fails with:
+
+```
+remote: Repository not found.
+fatal: repository 'https://github.com/caesarakalaeii/caterpillar-smoke.git/' not found
+```
+
+GitHub returns that both for "no access" and for an **anonymous** request to a private
+repo, which is the likelier reading — an empty helper response makes git fall back to
+anonymous. Already ruled out:
+
+- the repo **is** in the installation (66 repos, up from 65 after it was created)
+- `credentials.setActive()` runs **before** `ensureTaskCheckout()`, so the binding
+  order is right (`src/agent/runner.ts`)
+
+Next step: exercise the credential helper against the socket directly and see what it
+returns for `https://github.com/caesarakalaeii/caterpillar-smoke.git`. With
+`credential.useHttpPath=true` a host/path matching mismatch produces exactly this.
+
+Secondary, visible in the same log line: parking failed with `lease for SMOKE-1 is no
+longer held by this runner`, so the task retries every poll instead of parking.
+`parkFailed` cannot write once the lease is gone. Harmless — the crash-loop fix holds —
+but it means a failing task loops rather than settling.
 
 ### The supervisor is live and has nothing to do
 
@@ -214,18 +262,28 @@ README describing the layout. Verified minting `contents: write` scoped to it al
 Codeberg and Vikunja tokens are **sealed and deployed**, in
 `caterpillar-electric-boogaloo` (`username`, `tokens.json`, `vikunja-token`).
 
-**Vikunja is still unverified.** The token is mounted, but:
+**Vikunja is VERIFIED** as of 2026-08-13 — the first time this implementation touched
+the live instance. Token authenticates, 4 projects visible, and both `agent-wip` and
+`needs-human` exist (the user created them).
 
-- Labels `agent-wip` and `needs-human` **must already exist** on the instance — no
-  adapter creates them, because the token deliberately has no `labels:create` scope.
-  Names are overridable per workspace via `tracker.wipLabel` /
-  `tracker.needsHumanLabel`. If they are missing, every lifecycle transition throws
-  `UnknownVikunjaLabelError` — but only once a task actually reaches the eb workspace,
-  which cannot happen until intake exists.
-- `VIKUNJA_TOKEN=... npm run verify:vikunja` (read-only), then `-- --task <scratch id>`
-  for the write scopes. **Still never run.** The routes come from
-  `../electric-boogaloo-workspace/scripts/vikunja.py`, proven against the live instance,
-  but this implementation has not itself touched it.
+Run it without ever exposing the token by executing it **inside the pod**, where the
+secret is already mounted:
+
+```bash
+POD=$(kubectl --context default -n caterpillar get pods -o jsonpath='{.items[0].metadata.name}')
+kubectl --context default -n caterpillar exec "$POD" -- sh -c \
+  'VIKUNJA_TOKEN=$(cat /etc/caterpillar/secrets/caterpillar-electric-boogaloo/vikunja-token) \
+   node dist/cli/verify-vikunja.js --api-base https://tasks.eb.bims.sh/api/v1'
+```
+
+The same trick works for `verify-github-issues.js` with
+`/etc/caterpillar/secrets/caterpillar-github-app/`. `dist/cli/` ships in the image, so
+every verifier can be run against live credentials without decrypting anything locally.
+
+Not yet exercised: the Vikunja **write** scopes (`-- --task <scratch id>`), which only a
+real transition or a deliberate scratch item covers. The lifecycle labels must keep
+existing — no adapter creates them, since the token deliberately has no `labels:create`
+scope. Names are overridable via `tracker.wipLabel` / `tracker.needsHumanLabel`.
 
 GitHub Issues is verified live (65 repos enumerate, token mints with `issues: write` and
 nothing else). Its ingest label `agent` had **zero** matching issues at last check, and
@@ -309,6 +367,24 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 - **The caesar cluster is the `default` context in `~/.kube/config`**, not anything in
   `~/.kube/caesar-clusters` — the `k3d-caesar-cluster` context there points at a host
   that refuses connections. Check `kubectl --context default get ns` for `argocd`.
+- **`credential.helper` set AFTER a clone is set too late.** The clone is the one git
+  operation that runs before any repo config exists, so it needs the helper passed with
+  `-c`. This is why nothing private could ever be cloned, and why public repos hid it.
+- **GitHub answers an anonymous request to a private repo with `Repository not found`**,
+  not 401. So a 404 here means "no credential reached GitHub" at least as often as it
+  means "wrong repo" — do not go hunting for a missing installation first.
+- **`kubectl scale` loses to ArgoCD `selfHeal`.** Scaling the Deployment to 0 was
+  reverted within seconds. To stop a supervisor that is failing on a task, change the
+  TASK (set `state.json` to `parked`) rather than fighting the reconciler.
+- **Run the verifiers inside the pod.** `dist/cli/` ships in the image and the secrets
+  are already mounted, so `kubectl exec` + `node dist/cli/verify-*.js` checks live
+  credentials without decrypting anything locally. This is how Vikunja finally got
+  verified, and it is strictly safer than pulling a token onto a workstation.
+- **A test that only asserts "it threw" proves nothing.** The first credential-helper
+  regression test passed identically with and without the fix, because the clone failed
+  either way. Assert on the invocation.
+- **`per_page=100` contains `page=1`** — see above; it also bit a second time when a
+  digest comparison matched a substring of the previous digest. Anchor comparisons.
 
 ## Constraints the user has set
 
@@ -327,21 +403,26 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 
 ## Immediate next action
 
-The deploy is done. Everything below is about making the live supervisor actually
-receive work.
-
-1. **Prove the pipeline with a hand-written task.** Commit a `tasks/<id>/spec.md` into
-   `caterpillar-state` (front-matter + prose goal + machine-checkable `acceptance`) and
-   watch the pod claim it. This exercises leasing, the session runner, the credential
-   helper, verification, and PR creation in one shot, and needs no new code. Nothing has
-   yet run a real agent session in-cluster — this is the biggest untested surface.
+1. **Finish the smoke test — fix the `Repository not found` clone failure.** See "What
+   the first end-to-end run proved". `SMOKE-1` is armed in the state repo and retrying
+   every poll, so the moment the credential helper returns a usable token the whole
+   pipeline runs unattended. **No agent session has ever run in-cluster**; this is still
+   the largest untested surface, and everything downstream of the clone — session,
+   handoff, verification, PR creation — is unproven.
 2. **Build intake** (DESIGN.md §14) — `Tracker.listAgentItems()` → `TaskSpec` in the
-   state repo. Until this exists, step 1 is the *only* way work arrives. Both trackers
-   already implement the read side; nothing calls it.
-3. **Verify Vikunja** — one command, and it has never been run against the live
-   instance.
-4. **Discord bridge** — questions currently land in `tasks/<id>/questions/` in git and
-   nothing tells a human they are there.
+   state repo. Until this exists, a hand-written spec is the *only* way work arrives.
+   Both trackers implement the read side; nothing calls it.
+3. **Discord bridge** — questions land in `tasks/<id>/questions/` in git and nothing
+   tells a human they are there. An agent that parks on a question parks silently.
+
+To silence `SMOKE-1` meanwhile, flip its `state.json` to `"parked"`.
+`caesarakalaeii/caterpillar-smoke` is a throwaway; delete it whenever.
+
+**Uncommitted work:** `../caesar-deployment` has commit `fba9d90` on branch
+`docs/caterpillar-post-deploy` that was never pushed — the GitHub SSH key dropped out of
+the agent mid-session (`ssh -T` worked, then stopped; the key `8XOjnN…` vanished from
+`ssh-add -l`, and the on-disk `id_ed25519` does not authenticate either). Re-add the key
+and push.
 
 Unresolved by choice, not by omission: the exposed App private key (see the callout
 under "Live credentials").
