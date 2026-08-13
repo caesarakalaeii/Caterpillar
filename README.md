@@ -14,7 +14,10 @@ IDs, environment quirks, and the traps already paid for.
 2026-08-13 — leasing, sessions, handoff, verification, both forges, and both trackers.
 The first in-cluster task took a spec from the state repo through two sessions and a
 context handoff to a merged pull request, with the supervisor's own §12 gates — not the
-agent's word — deciding it was done.
+agent's word — deciding it was done. The **tracker path is proven too**: a GitHub issue
+labelled `agent` became a task 23 seconds later and ran through to `done` and a closed
+issue, including one round trip through `ask_human` when the agent hit a supervisor bug it
+could not work around.
 
 Work reaches it two ways: label a tracker item `agent` and intake renders a spec (§14),
 or commit a `tasks/<id>/spec.md` into the state repo by hand for full control over the

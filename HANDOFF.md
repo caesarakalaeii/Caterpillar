@@ -1,6 +1,7 @@
 # Handoff
 
-State as of 2026-08-13, after intake shipped and the Discord webhook was implemented.
+State as of 2026-08-13, after the intake → session loop was closed end to end. Every
+link in the chain is now proven in-cluster; what is left is unbuilt, not unverified.
 Overwrite this file rather than appending to
 it — an append-forever handoff eventually consumes the context it exists to preserve (the
 same reason `handoff.md` is overwritten and `journal.md` appends, DESIGN.md §4.1).
@@ -76,8 +77,10 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | GitHub Issues tracker | implemented, verified against live GitHub |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | **Structured logging (§11)** | **implemented and deployed (#10)** — JSON lines on stdout |
-| **Tracker intake (§14)** | **implemented and deployed (#11, #12)** — running on a 300s timer |
+| **Tracker intake (§14)** | **implemented, deployed, and PROVEN end to end (#11, #12)** |
 | **Discord webhook, outbound (§11.2)** | **implemented and tested (#14)** — inert until a webhook is sealed |
+| **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
+| **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
 | Container image + CI | built and pushed by CI on every push to `main` |
@@ -110,10 +113,36 @@ Two consecutive passes were **329s** apart, confirming the interval gate (300s +
 30s poll of granularity). `failed: 0` with both trackers configured is what proves it
 actually talked to GitHub and Vikunja rather than iterating an empty map.
 
-**NOT proven: intake → session.** No tracker item has ever become a task. Both trackers had
-**0 `agent`-labelled items** at last check, which is why deploying intake was safe and also
-why the path is unexercised. Closing that loop costs money and opens a PR, so it is a
-deliberate decision, not an oversight.
+**PROVEN: intake → session → done.** This was the last unproven link and it is now closed.
+A GitHub issue labelled `agent` (`caterpillar-smoke#2`) became a task within 23 seconds of
+being created, was claimed, worked, verified by the supervisor's own §12 gates, and closed
+— with the tracker mirroring every step:
+
+```
+intake.created → intake.pass{seen:1,created:1} → task.claimed → session.start
+  → done-claimed → verification.result{passed:true} → task.done
+```
+
+Cost: **5 sessions, $0.96**, of which sessions 2–4 were wasted on a supervisor bug (below).
+The work itself took one 72-second session and $0.16 — a better number to quote for a
+trivial task than SMOKE-1's $3.94.
+
+**It found two real defects**, which is the point of running it:
+
+1. **The §12 CI gate was unsatisfiable for every Actions/App-only repo** (#15). GitHub
+   answers `/commits/<sha>/status` with `state: "pending"` for a ref with NO statuses, and
+   a repo whose checks come from Apps or Actions never gets one. A green PR was rejected as
+   `CI has not finished: 0 check(s) still running` on every claim, forever. SMOKE-1 missed
+   it by having no CI signal at all, which takes the "none" path.
+2. **`needs-human` was never removed** (#16), so the task ended `done`, closed, and still
+   advertising that it wanted a human.
+
+**Also proven, unexpectedly: `ask_human`.** After three rejections the agent stopped
+retrying, diagnosed the gate bug correctly on its own — including that GitHub Apps report
+only through `/check-runs` — established it could not work around it (its token is
+`metadata: read`, so posting a status is a 403), and asked. It explicitly declined to add a
+CI workflow because the issue had not asked for one. The park cost nothing while the fix
+was written.
 
 ## Giving it work
 
@@ -143,6 +172,31 @@ a code block** — TipTap cannot put text on the fence line.
 
 To silence intake entirely, remove the `agent` label. To stop a task, set its `state.json`
 to `parked` — do **not** `kubectl scale`, ArgoCD `selfHeal` reverts it within seconds.
+
+**The target repo needs the three lifecycle labels** — `agent`, `agent-wip`,
+`needs-human`. No adapter creates them, deliberately (see below), and `caterpillar-smoke`
+had none of them. A missing one does not fail the task: `mirror()` logs
+`tracker.mirror-failed` and continues. It fails the tracker VIEW silently, which is worse
+to debug than a crash.
+
+### Answering a question by hand
+
+There is no inbound bridge, so this is the operator's job (§7). Two writes to
+`caterpillar-state`, and the ORDER matters:
+
+1. `tasks/<id>/questions/NNN-answer.md`, matching the question's number. The supervisor
+   treats an unanswered question as the absence of that file.
+2. `tasks/<id>/state.json` with `status: "ready"`.
+
+Answer FIRST. The poll is 30s, and a task flipped to `ready` before its answer exists
+starts a session that cannot see it.
+
+**Reset `progress.noProgressStreak` in the same write** if it has reached
+`noProgressLimit` (3). Otherwise `checkLimits` parks the task on the very next claim,
+before a session runs — which is what happens after any run of sessions that produced no
+commit, including one caused by a supervisor bug rather than by the agent.
+
+Both writes go through the GitHub contents API fine; no clone is needed.
 
 ## Deployment state: LIVE
 
@@ -416,6 +470,19 @@ them away.
 - **Discord parses `@everyone` in webhook content by default.** The prose is
   agent-authored and quotes files the agent read. `allowed_mentions: {parse: []}` is not
   optional.
+- **GitHub's combined status endpoint answers `pending` for a ref with NO statuses.**
+  `total_count`, not `state`, says whether it is worth reading. A repo whose CI comes from
+  Apps or Actions never has a commit status at all, so ORing that `state` into a pending
+  check made the §12 gate unsatisfiable there — a green PR rejected on every claim,
+  forever (#15). Forgejo is immune only because statuses are its ONLY signal, so it returns
+  early on an empty list.
+- **A rejection summary that contradicts its verdict costs a debugging round.** The gate
+  said `CI has not finished: 0 check(s) still running`. Zero running checks is a finished
+  CI. Name the source that is actually blocking.
+- **`needs-human` must be REMOVED when the question is answered** (#16). A claim is the
+  only exit from `awaiting-human`, so a claim means it was answered. The label is a filter
+  a human reads; one that outlives its question fills the list with work already back in
+  progress. Not cleared on `parked` — a parked task genuinely does want a human.
 - **The GitHub search API is deliberately unused for intake** — eventually consistent (a
   freshly labelled issue can be invisible for ~a minute, exactly intake's window),
   separately rate limited, and on a deprecation path. Enumerate the installation instead.
@@ -465,27 +532,33 @@ them away.
 
 ## Immediate next action
 
-1. **Close the intake → session loop.** Label a scratch issue on
-   `caesarakalaeii/caterpillar-smoke` (a throwaway; delete it whenever) with `agent` and an
-   `agent` block, then watch `intake.pass` report `created: 1` and the session start. This is
-   the last unproven link in the chain and it costs a few dollars. **Ask first** — it spends
-   the user's subscription and opens a PR.
-2. **Seal a Discord webhook**, if the user wants notifications. See above — it is now three
-   operator steps and a verify command, with nothing left to implement.
-3. **The inbound bridge** (`!answer`, `!task`). This one IS the `discord-bridge` Deployment
+1. **Seal a Discord webhook**, if the user wants notifications. Three operator steps and a
+   verify command, with nothing left to implement — and the value is now demonstrated
+   rather than hypothetical: `caterpillar-smoke#2` sat parked on a question that nobody was
+   told about. A human found it by reading logs.
+2. **The inbound bridge** (`!answer`, `!task`). This one IS the `discord-bridge` Deployment
    §10 anticipates: it needs a gateway session or a public interactions endpoint, neither of
    which the supervisor's outward-polling design provides. Design it before building it.
+   Until then, answering a question is the manual two-write procedure above.
+3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
+   The open question is what it should do, not whether it works.
 4. **Install node 22 permanently** so `npm test` and the `verify:*` scripts work without a
    scratch tarball on PATH.
-5. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
+5. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
+   task is `done`, and merging it was left to a human on purpose. Delete the repo whenever;
+   it is a throwaway.
+6. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
    pre-fix retry storm, all mislabelled "Session 0" (the park preceded the session
    increment). It is read for handoff continuity, so it taxes any further session on that
    task. There is no journal rotation. `SMOKE-1` is `done`, so this is latent.
 
-**Uncommitted work: none.** `main` was `0666b60` at the start of this session; the Discord
-webhook went out as #14 on `feat/discord-webhook`. Everything before it is merged and
-deployed, and the pod is healthy with 0 restarts. **Nothing about #14 changes the running
-deployment** — with no webhook secret sealed, `index.ts` still selects `NullNotifier`. `caesar-deployment` has no unpushed commits either (its #48
+**Uncommitted work: none.** `main` was `0666b60` at the start of this session and is
+`fb7ede2` now — #14 (Discord webhook), #15 (CI gate), #16 (`needs-human`), all squash-
+merged, built, and rolled by Keel. **159 tests, 159 passing.** The pod is healthy with 0
+restarts.
+
+Of the three, only #15 changes observable behaviour today: #14 is inert until a webhook is
+sealed, and #16 only shows up on the next task that asks a question. `caesar-deployment` has no unpushed commits either (its #48
 merged as `5f2a95ad`); it does carry untracked `.planning/` and `tea_debug.log`, which are
 not mine and were left alone.
 
