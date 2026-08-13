@@ -211,6 +211,10 @@ export class GitHubIssuesTracker implements Tracker {
       case "claimed":
         await this.comment(ref, `Picked up by ${transition.runner} as ${task}.`);
         await this.addLabel(slug, number, this.wipLabel);
+        // A claim is the only way out of `awaiting-human`, so reaching here means the
+        // question was answered. Left behind, the label keeps advertising for help
+        // nobody needs and whoever filters on it finds work already back in progress.
+        await this.removeLabel(slug, number, this.needsHumanLabel);
         return;
 
       case "question":
@@ -231,6 +235,8 @@ export class GitHubIssuesTracker implements Tracker {
             transition.prUrl,
         );
         await this.removeLabel(slug, number, this.wipLabel);
+        // A done task is waiting on nobody, whatever it asked along the way.
+        await this.removeLabel(slug, number, this.needsHumanLabel);
         // Last, so a failure here leaves an issue that is visibly finished in prose and
         // can be closed by hand. Closed is only ever reached from here — §12.
         await this.call<unknown>("PATCH", `repos/${slug}/issues/${number}`, "issues", {

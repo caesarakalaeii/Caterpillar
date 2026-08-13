@@ -267,6 +267,10 @@ export class VikunjaTracker implements Tracker {
       case "claimed":
         await this.comment(ref, `Picked up by ${transition.runner} as ${task}.`);
         await this.addLabel(id, this.wipLabel);
+        // A claim is the only way out of `awaiting-human`, so reaching here means the
+        // question was answered. needs-human is how a human FILTERS for items wanting
+        // them; leaving it set fills that list with work already back in progress.
+        await this.removeLabel(id, this.needsHumanLabel);
         return;
 
       case "question":
@@ -290,6 +294,8 @@ export class VikunjaTracker implements Tracker {
             transition.prUrl,
         );
         await this.removeLabel(id, this.wipLabel);
+        // A done task is waiting on nobody, whatever it asked along the way.
+        await this.removeLabel(id, this.needsHumanLabel);
         // Last, so a failure here leaves an item that is visibly finished in prose
         // and can be closed by hand. `done` is only ever reached from here — §12.
         await this.call<unknown>("POST", `tasks/${id}`, "tasks:update", { done: true });

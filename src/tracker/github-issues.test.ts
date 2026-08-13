@@ -198,7 +198,11 @@ test("comments are markdown, posted verbatim", async () => {
   assert.deepEqual(calls[0]?.body, { body: "**bold** and a https://example.com link" });
 });
 
-test("claiming comments first, then applies the wip label", async () => {
+test("claiming comments, applies wip, and stops advertising needs-human", async () => {
+  // A claim after a question means the question was ANSWERED — that is the only way a
+  // task leaves `awaiting-human`. Leaving the label behind sends whoever filters on it
+  // to an item nobody is waiting on, and the first intake-sourced task ended `done`,
+  // closed, and still labelled `needs-human`.
   const { fetch, calls } = stub(lifecycle());
   await tracker(fetch).transition(REF, { kind: "claimed", runner: "runner-1" }, TASK);
 
@@ -207,9 +211,10 @@ test("claiming comments first, then applies the wip label", async () => {
     [
       "POST repos/caesarakalaeii/widget/issues/42/comments",
       "POST repos/caesarakalaeii/widget/issues/42/labels",
+      "DELETE repos/caesarakalaeii/widget/issues/42/labels/needs-human",
     ],
   );
-  assert.deepEqual(calls.at(-1)?.body, { labels: ["agent-wip"] });
+  assert.deepEqual(calls.at(-2)?.body, { labels: ["agent-wip"] });
 });
 
 test("a label GitHub would have silently created is refused instead", async () => {
@@ -267,6 +272,8 @@ test("completion closes the issue last, after the prose and the label", async ()
     [
       "POST repos/caesarakalaeii/widget/issues/42/comments",
       "DELETE repos/caesarakalaeii/widget/issues/42/labels/agent-wip",
+      // A done task is waiting on nobody, whatever it asked along the way.
+      "DELETE repos/caesarakalaeii/widget/issues/42/labels/needs-human",
       "PATCH repos/caesarakalaeii/widget/issues/42",
     ],
   );

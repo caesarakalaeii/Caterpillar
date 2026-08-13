@@ -527,12 +527,21 @@ agent token* rather than reusing a human one:
 **The agent does not get to close tasks.** The supervisor owns tracker state transitions:
 
 ```
-claim         → comment "picked up by <runner>", label agent-wip
+claim         → comment "picked up by <runner>", label agent-wip, UNLABEL needs-human
 handoff       → (silent — no comment, or the task becomes a wall of noise)
-ask_human     → comment with the question, label needs-human
-done          → only after §12 gates pass: comment with PR link, mark done
+ask_human     → comment with the question, label needs-human (agent-wip stays — the
+                task is still owned, just blocked)
+done          → only after §12 gates pass: comment with PR link, unlabel agent-wip
+                and needs-human, mark done
 parked        → comment with the reason, remove agent-wip
 ```
+
+`needs-human` is cleared on claim and on done (**amended** after the first
+intake-sourced task finished `done`, closed, and still wearing it). A claim is the only
+exit from `awaiting-human`, so reaching one means the question was answered; the label
+is how a human *filters* for items wanting them, and one that outlives its question
+fills that list with work already back in progress. It is deliberately NOT cleared on
+`parked`: a parked task genuinely does want a human.
 
 The agent gets one narrow tool, `task_note(text)`, which appends a comment. It **cannot**
 mark a task done — for the same reason it cannot self-declare success in §12: done is
