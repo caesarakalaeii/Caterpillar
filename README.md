@@ -10,8 +10,8 @@ not recoverable from the code.
 **Picking up mid-stream: [`HANDOFF.md`](HANDOFF.md)** — current status, live credential
 IDs, environment quirks, and the traps already paid for.
 
-**Status:** skeleton. Boundaries are defined and typechecked; forge, tracker, notifier,
-and the session/verifier wiring are stubs that throw.
+**Status:** the supervisor runs end to end — leasing, sessions, handoff, verification,
+both forges, and the Vikunja tracker. Not yet deployed; see *Not yet built* below.
 
 ## Development
 
@@ -39,9 +39,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
 | `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). |
-| `src/tracker/` | `Tracker` interface + GitHub Issues / Vikunja stubs (§9.5). |
+| `src/tracker/` | `Tracker` interface + Vikunja; GitHub Issues still a stub (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
-| `src/secrets/load.ts` | Mounted SOPS secrets → forge factories. |
+| `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
@@ -68,6 +68,9 @@ awkward, the change is probably wrong.
    partitioned runner must not resurrect stale work.
 5. **`journal.md` appends; `handoff.md` is overwritten.** An append-forever handoff
    eventually consumes the context window it exists to preserve.
+6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
+   the state repo is written and pushed, and a mirroring failure only logs — an
+   unreachable tracker must never fail a task.
 
 ## Verifying a GitHub App setup
 
@@ -89,9 +92,21 @@ commit-status route works with its scopes. Avoids `GET /user`, which a
 repository-scoped token cannot reach — a 403 there looks like a bad token when the
 scoping is in fact correct.
 
+## Verifying a Vikunja token
+
+```bash
+VIKUNJA_TOKEN=... npm run verify:vikunja                  # read-only
+VIKUNJA_TOKEN=... npm run verify:vikunja -- --task 42     # also writes, use a scratch item
+```
+
+Confirms the token authenticates, that agent-labelled items are discoverable, and that
+the lifecycle labels exist. Avoids `GET /user` and `GET /tasks/all`, which no API token
+can reach. A scope failure is reported as "re-grant this scope", never as a bad token —
+Vikunja answers both with 401, and only one of them is worth debugging.
+
 ## Not yet built
 
-- tracker implementations (Vikunja and GitHub Issues HTTP)
+- GitHub Issues tracker (HTTP)
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
 - `caesar-deployment` manifests and ArgoCD Application
