@@ -212,6 +212,28 @@ test("claiming comments first, then labels", async () => {
   assert.deepEqual(calls[2]?.body, { label_id: 8 });
 });
 
+test("claiming clears needs-human, because a claim means the answer arrived", async () => {
+  // Vikunja is where this matters most: needs-human is how a human FILTERS for items
+  // that want them. A task that was answered and resumed must drop out of that filter,
+  // or the list fills with work nobody is blocked on.
+  const { fetch, calls } = stub((_method, path) => {
+    if (path.startsWith("labels?")) {
+      return [
+        { id: 8, title: "agent-wip" },
+        { id: 9, title: "needs-human" },
+      ];
+    }
+    if (path === "tasks/42") return { id: 42, labels: [{ id: 9 }] };
+    return null;
+  });
+
+  await tracker(fetch).transition(REF, { kind: "claimed", runner: "pod-7f3a" }, TASK);
+
+  // Bulk replace, not a per-label DELETE: tasksLabels:delete is deliberately withheld.
+  assert.deepEqual(paths(calls).at(-1), "POST tasks/42/labels/bulk");
+  assert.deepEqual(calls.at(-1)?.body, { labels: [] });
+});
+
 test("a label the instance does not have fails loudly rather than being invented", async () => {
   // The token has no labels:create scope, and silently skipping would leave the
   // tracker claiming nothing is in progress while a runner holds the task.
