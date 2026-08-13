@@ -17,7 +17,8 @@
     "test": "node --test --experimental-transform-types 'src/**/*.test.ts'",
     "start": "node --experimental-transform-types src/index.ts",
     "verify:github-app": "node --experimental-transform-types src/cli/verify-github-app.ts",
-    "verify:forgejo": "node --experimental-transform-types src/cli/verify-forgejo.ts"
+    "verify:forgejo": "node --experimental-transform-types src/cli/verify-forgejo.ts",
+    "verify:vikunja": "node --experimental-transform-types src/cli/verify-vikunja.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",

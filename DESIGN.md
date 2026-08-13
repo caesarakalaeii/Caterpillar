@@ -514,6 +514,13 @@ agent token* rather than reusing a human one:
   that route's scope**, not that the token is bad. Re-grant in the UI; do not debug the
   token. The supervisor should surface this distinctly so the agent never "fixes" a scope
   problem by retrying.
+- Descriptions and comments are **HTML fragments**, not markdown — the editor is TipTap.
+  A `**bold**` progress note renders as literal asterisks, so supervisor prose is escaped
+  and wrapped in `<p>` on the way out, and stripped back to text on the way in (an
+  intake spec built from tag soup is noise for the agent).
+- Label *removal* has to go through the bulk endpoint: the per-label `DELETE` needs
+  `tasksLabels: delete`, which is deliberately not granted — the agent's credential must
+  not be able to strip a label a human applied.
 
 **The agent does not get to close tasks.** The supervisor owns tracker state transitions:
 

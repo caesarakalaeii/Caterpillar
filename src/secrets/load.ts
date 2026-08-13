@@ -15,6 +15,8 @@ import type { WorkspaceProfile } from "../config/types.ts";
 import { GitHubAppForgeFactory, type GitHubAppOptions } from "../forge/github-app.ts";
 import { ForgejoForgeFactory, type ForgejoOptions } from "../forge/forgejo.ts";
 import type { ForgeFactory } from "../forge/types.ts";
+import type { Tracker } from "../tracker/types.ts";
+import { VikunjaTracker, type VikunjaOptions } from "../tracker/vikunja.ts";
 
 export class MissingSecretError extends Error {
   constructor(secretRef: string, key: string) {
@@ -106,6 +108,42 @@ export const loadForgeFactory = async (
     ...(tokensByRepo.size > 0 ? { tokensByRepo } : {}),
   };
   return new ForgejoForgeFactory(options);
+};
+
+/**
+ * Build the Tracker for a workspace, or `undefined` when it has none.
+ *
+ * Expected keys:
+ *   vikunja — vikunja-token  (a dedicated agent token, scoped per DESIGN.md §9.5)
+ *
+ * A workspace with no tracker block is a supported configuration: the tracker is a
+ * view, never authoritative, so the supervisor runs perfectly well without one.
+ */
+export const loadTracker = async (
+  profile: WorkspaceProfile,
+  secretsDir: string,
+): Promise<Tracker | undefined> => {
+  const config = profile.tracker;
+  if (config === undefined) return undefined;
+
+  if (config.kind === "github-issues") {
+    // Not implemented yet. Returning undefined rather than a tracker whose every
+    // method throws: a half-wired tracker would fail mid-transition, after the
+    // supervisor had already moved the authoritative state in git.
+    return undefined;
+  }
+
+  const bundle = new SecretBundle(secretsDir, profile.secretRef);
+  const options: VikunjaOptions = {
+    apiBase: config.apiBase,
+    token: await bundle.read("vikunja-token"),
+    ingestLabel: config.ingestLabel,
+    ...(config.wipLabel !== undefined ? { wipLabel: config.wipLabel } : {}),
+    ...(config.needsHumanLabel !== undefined
+      ? { needsHumanLabel: config.needsHumanLabel }
+      : {}),
+  };
+  return new VikunjaTracker(options);
 };
 
 /** Parse one token sub-map, naming keys but never values in errors. */

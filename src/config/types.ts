@@ -21,6 +21,14 @@ export interface TrackerConfig {
   readonly apiBase: string;
   /** Label that marks an item as agent-eligible at intake. */
   readonly ingestLabel: string;
+  /**
+   * Labels the supervisor applies as a task moves (DESIGN.md §9.5). Optional because
+   * the adapters default them (`agent-wip`, `needs-human`) — they exist here so a
+   * tracker that already uses different vocabulary needs a config change, not a
+   * code change. The label must already exist: no adapter creates one.
+   */
+  readonly wipLabel?: string;
+  readonly needsHumanLabel?: string;
 }
 
 /**
