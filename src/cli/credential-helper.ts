@@ -13,18 +13,17 @@
  * helper-crashed message that obscures the real cause.
  */
 import { connect } from "node:net";
-import { parseRequest, formatAnswer, type CredentialAnswer } from "../credential/protocol.ts";
+import {
+  parseInvocation,
+  parseRequest,
+  formatAnswer,
+  type CredentialAnswer,
+} from "../credential/protocol.ts";
 
 const readStdin = async (): Promise<string> => {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8");
-};
-
-const socketPathFromArgv = (argv: readonly string[]): string | undefined => {
-  const index = argv.indexOf("--socket");
-  if (index < 0) return undefined;
-  return argv[index + 1];
 };
 
 const ask = (socketPath: string, payload: string): Promise<CredentialAnswer> =>
@@ -50,13 +49,11 @@ const ask = (socketPath: string, payload: string): Promise<CredentialAnswer> =>
   });
 
 const main = async (): Promise<void> => {
-  const argv = process.argv.slice(2);
-  const operation = argv.find((arg) => !arg.startsWith("--"));
+  const { operation, socketPath } = parseInvocation(process.argv.slice(2));
 
   // `store` and `erase` are no-ops: we mint on demand and never cache on disk.
   if (operation !== "get") return;
 
-  const socketPath = socketPathFromArgv(argv);
   if (socketPath === undefined) {
     process.stderr.write("caterpillar-cred: --socket <path> is required\n");
     return;

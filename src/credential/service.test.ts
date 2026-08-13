@@ -41,12 +41,20 @@ class FakeForge implements Forge {
   async revoke(): Promise<void> {}
 }
 
-/** Invoke the helper exactly as git would. */
+/**
+ * Invoke the helper exactly as git would.
+ *
+ * The argument ORDER is load-bearing. git appends the operation AFTER the arguments
+ * configured in `credential.helper`, so the real invocation is
+ * `--socket <path> get`, not `get --socket <path>`. This harness used to pass them
+ * the other way round, which is precisely why a helper that declined every real
+ * request had four green tests sitting on top of it.
+ */
 const runHelper = (socketPath: string, request: string): Promise<string> =>
   new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      ["--experimental-transform-types", HELPER, "get", "--socket", socketPath],
+      ["--experimental-transform-types", HELPER, "--socket", socketPath, "get"],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
     let stdout = "";
@@ -105,6 +113,53 @@ test("refuses when no task is active", async () => {
   );
 
   assert.equal(output, "");
+});
+
+test("real git gets a usable credential out of the helper", async () => {
+  // The end of the chain the unit tests keep missing: REAL git, invoking the helper
+  // its own way, through a real socket. `credential fill` is the same code path a
+  // clone or push takes to resolve a credential, minus the network — so this pins
+  // git's actual argv convention rather than our belief about it.
+  //
+  // The operator's own config is neutralised: a global `url.<ssh>.insteadOf` or a
+  // configured `gh` helper would otherwise answer first and hide a broken helper.
+  const forge = new FakeForge([REPO]);
+  service.setActive({ forge, repos: [REPO] });
+
+  const output = await new Promise<string>((resolve, reject) => {
+    const child = spawn(
+      "git",
+      [
+        "-c",
+        `credential.helper=!${process.execPath} --experimental-transform-types ${HELPER} --socket ${socketPath}`,
+        "-c",
+        "credential.useHttpPath=true",
+        "credential",
+        "fill",
+      ],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_TERMINAL_PROMPT: "0",
+        },
+      },
+    );
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", () => resolve(stdout));
+    child.stdin.end("protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n");
+  });
+
+  assert.match(output, /^username=x-access-token$/m);
+  assert.match(output, /^password=ghs_fake_token$/m);
+  assert.equal(forge.minted, 1);
 });
 
 test("refuses when git sent no path (useHttpPath not enabled)", async () => {
