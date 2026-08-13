@@ -19,6 +19,7 @@
     "verify:github-app": "node --experimental-transform-types src/cli/verify-github-app.ts",
     "verify:forgejo": "node --experimental-transform-types src/cli/verify-forgejo.ts",
     "verify:vikunja": "node --experimental-transform-types src/cli/verify-vikunja.ts",
+    "verify:github-issues": "node --experimental-transform-types src/cli/verify-github-issues.ts",
     "llm:login": "node --experimental-transform-types src/cli/llm-login.ts"
   },
   "dependencies": {

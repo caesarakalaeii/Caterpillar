@@ -11,7 +11,7 @@ not recoverable from the code.
 IDs, environment quirks, and the traps already paid for.
 
 **Status:** the supervisor runs end to end — leasing, sessions, handoff, verification,
-both forges, and the Vikunja tracker. The container image is published by CI. Not yet
+both forges, and both trackers. The container image is published by CI. Not yet
 deployed — see `HANDOFF.md` for what is left.
 
 ## Development
@@ -40,7 +40,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
 | `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). |
-| `src/tracker/` | `Tracker` interface + Vikunja; GitHub Issues still a stub (§9.5). |
+| `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
@@ -105,9 +105,21 @@ the lifecycle labels exist. Avoids `GET /user` and `GET /tasks/all`, which no AP
 can reach. A scope failure is reported as "re-grant this scope", never as a bad token —
 Vikunja answers both with 401, and only one of them is worth debugging.
 
+## Verifying a GitHub Issues installation
+
+```bash
+npm run verify:github-issues -- --pem <key.pem> --app-id <id> --installation <id>
+npm run verify:github-issues -- ... --issue owner/name#7    # also writes, use a scratch issue
+```
+
+Mints an installation token with `issues: write` and `metadata: read` and nothing else,
+enumerates the installation's repos, lists agent-labelled issues, and checks the
+lifecycle labels exist on each repo carrying agent work. A 403 is reported as "the
+installation lacks this permission", which is distinct from a 401 — GitHub separates
+the two, so the adapter does not conflate them the way Vikunja forces.
+
 ## Not yet built
 
-- GitHub Issues tracker (HTTP)
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
 
