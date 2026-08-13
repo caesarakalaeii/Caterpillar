@@ -170,6 +170,41 @@ export class WorktreeManager {
   }
 
   /**
+   * The commit the task branch forked from, or undefined when it cannot be resolved.
+   *
+   * This is the baseline for "did this session commit?" on a FIRST session, where no
+   * head from a previous session has been recorded yet. Resolved entirely LOCALLY and
+   * deliberately so: the progress probe runs after the session, hence after
+   * `clearActive()`, where the credential service refuses to answer by design (§9.2)
+   * and anything touching the network fails.
+   *
+   * A mirror's `HEAD` is a symbolic ref to its default branch, and a linked worktree
+   * shares the mirror's refs, so the fork point is a plain local `merge-base`.
+   */
+  async branchPoint(worktree: string): Promise<string | undefined> {
+    const mirror = this.git.at(await this.commonDir(worktree));
+    const base = await mirror.tryRun("symbolic-ref", "--short", "HEAD");
+    if (base.code !== 0) return undefined;
+
+    const forkPoint = await this.git
+      .at(worktree)
+      .tryRun("merge-base", "HEAD", base.stdout.trim());
+    return forkPoint.code === 0 ? forkPoint.stdout.trim() : undefined;
+  }
+
+  /**
+   * The repository's common directory, absolute.
+   *
+   * Must be `--git-common-dir`, NOT `--git-dir`: in a linked worktree the latter
+   * returns the worktree-private directory, which holds neither the shared refs nor
+   * `info/exclude`.
+   */
+  private async commonDir(worktree: string): Promise<string> {
+    const dir = await this.git.at(worktree).run("rev-parse", "--git-common-dir");
+    return dir.startsWith("/") ? dir : join(worktree, dir);
+  }
+
+  /**
    * Materialise every repo a task declares, in the workspace-plus-clones layout.
    *
    * `repos[0]` is the WORKSPACE repo and becomes the agent's working directory. The
@@ -206,18 +241,15 @@ export class WorktreeManager {
   /**
    * Append a pattern to the repository's local exclude file, idempotently.
    *
-   * Must use `--git-common-dir`, NOT `--git-dir`: in a linked worktree the latter
-   * returns the worktree-private directory, but git only reads `info/exclude` from the
-   * common directory, so writing there has no effect at all.
+   * git only reads `info/exclude` from the common directory (see `commonDir`), so
+   * writing anywhere else has no effect at all — the first attempt silently did nothing.
    *
    * Consequence: the pattern applies to every worktree of this mirror, not just this
    * task's. That is what we want here — `repos/` should never be committable in any
    * checkout of a workspace repo.
    */
   private async excludeLocally(worktree: string, pattern: string): Promise<void> {
-    const git = this.git.at(worktree);
-    const commonDir = await git.run("rev-parse", "--git-common-dir");
-    const resolved = commonDir.startsWith("/") ? commonDir : join(worktree, commonDir);
+    const resolved = await this.commonDir(worktree);
     const excludePath = join(resolved, "info", "exclude");
 
     await mkdir(join(resolved, "info"), { recursive: true });

@@ -15,6 +15,7 @@ import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
+import { errorFields, JsonLogger } from "./obs/log.ts";
 import { loadForgeFactory, loadStateCredentials, loadTracker, SecretBundle } from "./secrets/load.ts";
 import { ensureStateCheckout } from "./state/bootstrap.ts";
 import { LeaseManager } from "./state/lease.ts";
@@ -57,6 +58,7 @@ const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) =
 
 const main = async (): Promise<void> => {
   const config = await loadConfig(CONFIG_PATH);
+  const logger = new JsonLogger({ level: config.log.level });
 
   // The state repo's own credential: minted from the App, never served over the
   // credential socket, and never inherited by task worktrees (DESIGN.md §9.3).
@@ -86,10 +88,10 @@ const main = async (): Promise<void> => {
     } else if (profile.tracker !== undefined) {
       // Configured but unavailable — say so, or a silently unmirrored workspace
       // looks like a broken tracker rather than an unimplemented adapter.
-      process.stderr.write(
-        `workspace '${name}': tracker '${profile.tracker.kind}' is not implemented; ` +
-          `running without tracker mirroring\n`,
-      );
+      logger.warn("tracker.unavailable", {
+        workspace: name,
+        tracker: profile.tracker.kind,
+      });
     }
   }
   const bindings: WorkspaceBindings = { forges, trackers };
@@ -137,6 +139,7 @@ const main = async (): Promise<void> => {
     progress: new GitProgressProbe({ worktrees }),
     notifier: await createNotifier(config.secretsDir),
     metrics,
+    logger,
     trackers,
   });
 
@@ -144,7 +147,7 @@ const main = async (): Promise<void> => {
 
   const controller = new AbortController();
   const shutdown = (signal: string): void => {
-    process.stderr.write(`received ${signal}, finishing current session\n`);
+    logger.info("supervisor.shutdown", { signal });
     controller.abort();
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -168,6 +171,9 @@ const createNotifier = async (secretsDir: string): Promise<Notifier> => {
 };
 
 main().catch((error: unknown) => {
-  process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+  // A failure here can predate `loadConfig`, so this logger takes the default level
+  // rather than the configured one — a boot failure must never be the thing that gets
+  // filtered out.
+  new JsonLogger().error("supervisor.boot-failed", errorFields(error));
   process.exitCode = 1;
 });

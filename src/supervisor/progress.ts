@@ -21,6 +21,13 @@ export interface ProgressEvidence {
   readonly stepCompleted: boolean;
   /** Branch head observed now — carried into the record as the next baseline. */
   readonly headOid?: string;
+  /**
+   * What `committed` was actually decided against: the previous session's head, or the
+   * branch's fork point on a first session. Reported so a "no progress" park can be
+   * told apart from a probe that compared against the wrong thing — the failure mode
+   * that made a productive first session look like a stall.
+   */
+  readonly baselineOid?: string;
 }
 
 export const madeProgress = (evidence: ProgressEvidence): boolean =>

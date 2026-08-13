@@ -15,6 +15,7 @@ import type { RunnerConfig } from "../config/types.ts";
 import { asRunnerId, asTaskId, type TaskState } from "../domain/task.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { NullNotifier } from "../notify/discord.ts";
+import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
@@ -88,6 +89,7 @@ const config: RunnerConfig = {
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
   limits: { maxSessionsPerTask: 20, noProgressLimit: 3 },
+  log: { level: "info" },
   llm: {
     auth: "proxy",
     baseUrl: "http://localhost",
@@ -145,6 +147,7 @@ test("a task whose session throws is parked on the REMOTE, not just locally", as
     progress,
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
   });
 
   const controller = new AbortController();
