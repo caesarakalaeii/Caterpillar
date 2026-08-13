@@ -1,0 +1,105 @@
+/**
+ * Minimal Prometheus text-exposition registry. See DESIGN.md §11.
+ *
+ * Hand-rolled rather than pulling prom-client: the metric set is small and fixed,
+ * and this keeps the dependency surface (and therefore the supply-chain review
+ * burden) down. Scraped by a ServiceMonitor.
+ */
+export type LabelValues = Readonly<Record<string, string>>;
+
+interface Sample {
+  readonly labels: LabelValues;
+  value: number;
+}
+
+type MetricKind = "counter" | "gauge";
+
+class Metric {
+  private readonly samples = new Map<string, Sample>();
+
+  constructor(
+    readonly name: string,
+    readonly kind: MetricKind,
+    readonly help: string,
+  ) {}
+
+  private key(labels: LabelValues): string {
+    return Object.keys(labels)
+      .sort()
+      .map((k) => `${k}=${labels[k] ?? ""}`)
+      .join(",");
+  }
+
+  set(labels: LabelValues, value: number): void {
+    this.samples.set(this.key(labels), { labels, value });
+  }
+
+  inc(labels: LabelValues, delta = 1): void {
+    const key = this.key(labels);
+    const existing = this.samples.get(key);
+    if (existing === undefined) this.samples.set(key, { labels, value: delta });
+    else existing.value += delta;
+  }
+
+  render(): string {
+    const lines = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} ${this.kind}`];
+    for (const sample of this.samples.values()) {
+      const labels = Object.entries(sample.labels)
+        .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
+        .join(",");
+      lines.push(labels.length > 0 ? `${this.name}{${labels}} ${sample.value}` : `${this.name} ${sample.value}`);
+    }
+    return lines.join("\n");
+  }
+}
+
+export class Registry {
+  private readonly metrics = new Map<string, Metric>();
+
+  private metric(name: string, kind: MetricKind, help: string): Metric {
+    const existing = this.metrics.get(name);
+    if (existing !== undefined) return existing;
+    const created = new Metric(name, kind, help);
+    this.metrics.set(name, created);
+    return created;
+  }
+
+  counter(name: string, help: string): Metric {
+    return this.metric(name, "counter", help);
+  }
+
+  gauge(name: string, help: string): Metric {
+    return this.metric(name, "gauge", help);
+  }
+
+  render(): string {
+    return `${[...this.metrics.values()].map((m) => m.render()).join("\n")}\n`;
+  }
+}
+
+/** The metric set from DESIGN.md §11. */
+export class AgentMetrics {
+  readonly registry = new Registry();
+
+  readonly taskStatus = this.registry.gauge("caterpillar_task_status", "Tasks by status");
+  readonly sessions = this.registry.counter("caterpillar_sessions_total", "Sessions started");
+  readonly tokens = this.registry.counter("caterpillar_tokens_total", "Tokens consumed");
+  readonly cost = this.registry.counter("caterpillar_cost_usd_total", "Cost in USD");
+  readonly handoffs = this.registry.counter("caterpillar_handoffs_total", "Session exits by reason");
+  readonly leaseAge = this.registry.gauge("caterpillar_lease_age_seconds", "Age of the held lease");
+  readonly noProgress = this.registry.gauge("caterpillar_no_progress_streak", "Consecutive sessions without progress");
+
+  /**
+   * Sessions that ended past the safe context point. Must stay 0: it means the
+   * handoff threshold fired too late, and the next request risks a context-length
+   * error from the provider. Alert on this (DESIGN.md §6.1).
+   */
+  readonly contextOverruns = this.registry.counter(
+    "caterpillar_context_overrun_total",
+    "sessions ending past the safe context point — must stay 0",
+  );
+
+  render(): string {
+    return this.registry.render();
+  }
+}
