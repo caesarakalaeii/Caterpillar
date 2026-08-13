@@ -28,16 +28,27 @@ export class GitProgressProbe {
     const git = this.options.worktrees.gitAt(worktree);
     const head = await git.revParse("HEAD");
 
-    const previous = state.progress.lastHeadOid;
+    // On a first session nothing has recorded a head yet, so the baseline is the point
+    // the task branch forked from. Without that fallback the commit that STARTS the work
+    // can never be proven and a productive first session is recorded as a stall: SMOKE-1
+    // finished with a two-session no-progress streak while its PR sat open, and one more
+    // session would have parked it citing "no commit" with a commit on the branch.
+    //
+    // The fork point is used ONLY as that fallback. Comparing against it forever would
+    // make every session after the first commit look productive, and an agent that
+    // commits once and then spins would never trip the thrash detector (§11.1).
+    const previous =
+      state.progress.lastHeadOid ??
+      (await this.options.worktrees.branchPoint(worktree));
     const committed = head !== undefined && previous !== undefined && head !== previous;
 
     return {
-      // On the first session there is no baseline, so a commit cannot be proven.
-      // Recording the head now makes the next session's comparison meaningful.
+      // The head observed now becomes the next session's baseline.
       committed,
       acceptanceImproved: false,
       stepCompleted: false,
       ...(head !== undefined ? { headOid: head } : {}),
+      ...(previous !== undefined ? { baselineOid: previous } : {}),
     };
   }
 }

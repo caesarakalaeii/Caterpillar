@@ -10,8 +10,11 @@ not recoverable from the code.
 **Picking up mid-stream: [`HANDOFF.md`](HANDOFF.md)** — current status, live credential
 IDs, environment quirks, and the traps already paid for.
 
-**Status: deployed and running** in the `caterpillar` namespace since 2026-08-13 —
-leasing, sessions, handoff, verification, both forges, and both trackers.
+**Status: deployed, running, and proven end to end** in the `caterpillar` namespace since
+2026-08-13 — leasing, sessions, handoff, verification, both forges, and both trackers.
+The first in-cluster task took a spec from the state repo through two sessions and a
+context handoff to a merged pull request, with the supervisor's own §12 gates — not the
+agent's word — deciding it was done.
 
 It is also **idle, and will stay idle**: nothing calls `Tracker.listAgentItems()`, so
 the tracker → task path (§14 intake) does not exist yet and the supervisor polls an
@@ -29,6 +32,13 @@ npm run check          # typecheck
 npm test               # unit tests
 npm run build          # emit to dist/
 ```
+
+**Node 22 specifically, not "22 or newer".** The tests and the `verify:*` scripts run
+TypeScript through `--experimental-transform-types`, which node 26 **removed** — and
+strip-only mode cannot parse the parameter properties this codebase uses throughout, so
+on node 26 `npm test` fails to load a single file. `src/credential/service.test.ts`
+spawns the credential helper with the same flag, so it fails there for the same reason.
+CI pins node 22; a workstation with a newer node needs one too.
 
 `--ignore-scripts` is deliberate: no dependency lifecycle scripts run on install.
 `.npmrc` pins exact versions and refuses same-day releases, because pi's API is young
@@ -56,6 +66,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
+| `src/obs/log.ts` | Structured JSON-line logging to stdout (§11). |
 
 ## Invariants worth not breaking
 
@@ -129,6 +140,9 @@ the two, so the adapter does not conflate them the way Vikunja forces.
   between a live supervisor and a working one.
 - Discord bridge (inbound `!answer`, outbound webhook) — questions land in
   `tasks/<id>/questions/` in git, and nothing notifies a human that they are there.
+  Note the outbound half is **wired but not implemented**: `DiscordNotifier.notify`
+  throws. It is harmless only because no webhook secret exists, so `index.ts` falls back
+  to `NullNotifier` — sealing that secret arms the throw on the first question or park.
 
 Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
 live topology, the credential rules, and an unresolved security note.

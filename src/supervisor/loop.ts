@@ -25,6 +25,7 @@ import {
 import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
+import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notifier } from "../notify/discord.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
@@ -59,6 +60,7 @@ export interface SupervisorDeps {
   readonly progress: ProgressProbe;
   readonly notifier: Notifier;
   readonly metrics: AgentMetrics;
+  readonly logger: Logger;
   /**
    * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
    * Optional: a workspace without a tracker is a supported configuration.
@@ -71,13 +73,22 @@ export class Supervisor {
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
   async run(signal: AbortSignal): Promise<void> {
-    const { config, store } = this.deps;
+    const { config, store, logger } = this.deps;
+
+    logger.info("supervisor.start", {
+      runner: config.runnerId,
+      capabilities: config.capabilities.join(","),
+      pollSeconds: config.pollSeconds,
+    });
 
     while (!signal.aborted) {
       await store.pull("origin", config.stateRepo.branch);
 
       const claimed = await this.claimNext();
       if (claimed === undefined) {
+        // Debug, not info: at the default poll interval this is the single noisiest
+        // line the supervisor could emit, and an idle runner is not news.
+        logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
         await sleep(config.pollSeconds * 1000);
         continue;
       }
@@ -87,6 +98,7 @@ export class Supervisor {
       } catch (error) {
         if (error instanceof LeaseLostError) {
           // Another runner owns this task now. Drop everything without writing.
+          logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
           continue;
         }
         if (signal.aborted) throw error;
@@ -99,10 +111,10 @@ export class Supervisor {
         // `workTask` parks anything attributable to the task while it still holds the
         // lease, so reaching this point means the failure escaped that path. Log it
         // and keep polling rather than exiting.
-        process.stderr.write(
-          `${claimed.spec.id}: unhandled supervisor error — ` +
-            `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
-        );
+        logger.error("supervisor.unhandled", {
+          task: claimed.spec.id,
+          ...errorFields(error),
+        });
       }
     }
   }
@@ -122,6 +134,12 @@ export class Supervisor {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
+      this.deps.logger.info("task.claimed", {
+        task: id,
+        runner: lease.runner,
+        workspace: spec.workspace,
+        sessions: state.sessions,
+      });
       await this.mirror(spec, { kind: "claimed", runner: lease.runner });
       return { lease, spec };
     }
@@ -135,7 +153,7 @@ export class Supervisor {
    * and the next lease check throws, unwinding without writing anything.
    */
   private async workTask(lease: Lease, spec: TaskSpec, signal: AbortSignal): Promise<void> {
-    const { store, leases, config, metrics } = this.deps;
+    const { store, leases, config, metrics, logger } = this.deps;
 
     let lost: LeaseLostError | undefined;
     const heartbeat = startHeartbeat(
@@ -164,7 +182,25 @@ export class Supervisor {
         state = await this.transition(heartbeat.current(), state, "running");
         metrics.sessions.inc({ task: spec.id });
 
+        logger.info("session.start", {
+          task: spec.id,
+          session: state.sessions + 1,
+          phase: state.phase,
+        });
+
         const outcome = await this.deps.runner.run(spec, state);
+
+        logger.info("session.end", {
+          task: spec.id,
+          session: state.sessions + 1,
+          reason: outcome.reason,
+          contextTokens: outcome.contextTokens,
+          inputTokens: outcome.usage.inputTokens,
+          outputTokens: outcome.usage.outputTokens,
+          costUsd: outcome.usage.costUsd,
+          error: outcome.error,
+        });
+
         metrics.handoffs.inc({ task: spec.id, reason: outcome.reason });
         metrics.tokens.inc({ task: spec.id, kind: "input" }, outcome.usage.inputTokens);
         metrics.tokens.inc({ task: spec.id, kind: "output" }, outcome.usage.outputTokens);
@@ -202,11 +238,28 @@ export class Supervisor {
     state: TaskState,
     outcome: SessionOutcome,
   ): Promise<TaskState> {
-    const { store, config, metrics } = this.deps;
+    const { store, config, metrics, logger } = this.deps;
 
     const session = state.sessions + 1;
     const evidence = await this.deps.progress.probe(spec, state);
     const progress = recordProgress(state.progress, session, evidence);
+
+    // The evidence, not just the resulting streak: a task parked for "no progress" is
+    // otherwise indistinguishable from a probe that failed to SEE the progress, which
+    // is exactly the bug SMOKE-1 hit and nothing in the logs could have shown.
+    logger.info("progress.probe", {
+      task: spec.id,
+      session,
+      committed: evidence.committed,
+      acceptanceImproved: evidence.acceptanceImproved,
+      stepCompleted: evidence.stepCompleted,
+      headOid: evidence.headOid,
+      baselineOid: evidence.baselineOid,
+      // Distinguishes the fork-point fallback from a recorded head, which is what makes
+      // a first-session verdict readable at all.
+      firstSession: state.progress.lastHeadOid === undefined,
+      noProgressStreak: progress.noProgressStreak,
+    });
 
     await store.appendJournal(
       spec.id,
@@ -251,7 +304,7 @@ export class Supervisor {
     state: TaskState,
     outcome: SessionOutcome,
   ): Promise<boolean> {
-    const { store, notifier } = this.deps;
+    const { store, notifier, logger } = this.deps;
 
     switch (outcome.reason) {
       case "handoff":
@@ -269,6 +322,10 @@ export class Supervisor {
       case "ask-human": {
         const question = outcome.question ?? outcome.summary;
         const index = state.sessions;
+        // The question TEXT is deliberately not logged: it is agent-authored prose that
+        // can quote anything it read, including a file it should not have. The index
+        // locates it in `tasks/<id>/questions/` for anyone who needs it.
+        logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
         await store.writeQuestion(spec.id, index, question);
         await this.transition(lease, state, "awaiting-human");
         await this.push(lease, `chore(${spec.id}): awaiting human input`);
@@ -284,6 +341,12 @@ export class Supervisor {
 
       case "done-claimed": {
         const result = await this.deps.verifier.verify(spec, state);
+        logger.info("verification.result", {
+          task: spec.id,
+          session: state.sessions,
+          passed: result.passed,
+          detail: result.detail,
+        });
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.
@@ -301,6 +364,7 @@ export class Supervisor {
         await this.push(lease, `chore(${spec.id}): done`);
         // Mirrored only here, after both §12 gates passed and git already says done.
         const prUrl = result.prUrl ?? state.pr?.url ?? "(no PR recorded)";
+        logger.info("task.done", { task: spec.id, sessions: state.sessions, prUrl });
         await this.mirror(spec, { kind: "completed", prUrl });
         await notifier.notify({ kind: "done", task: spec.id, prUrl });
         return true;
@@ -311,6 +375,11 @@ export class Supervisor {
         return true;
 
       case "error":
+        logger.error("task.failed", {
+          task: spec.id,
+          session: state.sessions,
+          error: outcome.error ?? outcome.summary,
+        });
         await this.transition(lease, state, "failed");
         await this.push(lease, `chore(${spec.id}): failed`);
         await notifier.notify({
@@ -328,7 +397,8 @@ export class Supervisor {
     state: TaskState,
     reason: string,
   ): Promise<void> {
-    const { store, notifier } = this.deps;
+    const { store, notifier, logger } = this.deps;
+    logger.warn("task.parked", { task: spec.id, sessions: state.sessions, reason });
     await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
     await this.transition(lease, state, "parked");
     await this.push(lease, `chore(${spec.id}): parked`);
@@ -350,11 +420,11 @@ export class Supervisor {
       const state = await this.deps.store.readState(spec.id);
       await this.park(lease, spec, state, `session failed: ${reason}`);
     } catch (parkError) {
-      const detail = parkError instanceof Error ? parkError.message : String(parkError);
-      process.stderr.write(
-        `${spec.id}: session failed and the task could not be parked (${detail}) — ` +
-          `original error: ${reason}\n`,
-      );
+      this.deps.logger.error("task.park-failed", {
+        task: spec.id,
+        originalError: reason,
+        ...errorFields(parkError),
+      });
     }
   }
 
@@ -380,20 +450,24 @@ export class Supervisor {
       // Config error: the workspace's tracker is not the one this task came from, so
       // its ids mean something else entirely. Writing anyway would comment on an
       // unrelated item.
-      process.stderr.write(
-        `${spec.id}: tracker ref is '${ref.kind}' but workspace '${spec.workspace}' ` +
-          `has '${tracker.kind}' — not mirroring\n`,
-      );
+      this.deps.logger.error("tracker.kind-mismatch", {
+        task: spec.id,
+        workspace: spec.workspace,
+        specKind: ref.kind,
+        workspaceKind: tracker.kind,
+      });
       return;
     }
 
     try {
       await tracker.transition(ref, transition, spec.id);
     } catch (error) {
-      process.stderr.write(
-        `${spec.id}: mirroring '${transition.kind}' to ${tracker.kind} failed: ` +
-          `${error instanceof Error ? error.message : String(error)}\n`,
-      );
+      this.deps.logger.warn("tracker.mirror-failed", {
+        task: spec.id,
+        tracker: tracker.kind,
+        transition: transition.kind,
+        ...errorFields(error),
+      });
     }
   }
 

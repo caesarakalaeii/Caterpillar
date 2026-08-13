@@ -609,6 +609,39 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 Discord stays a signal channel — questions, parks, terminal outcomes. Everything else
 goes to Grafana.
 
+Three channels, and they answer different questions. Keeping them apart is deliberate:
+
+| Channel | Answers | Retention |
+|---|---|---|
+| Metrics | "is the fleet healthy" — rates, totals, queue depth | Prometheus |
+| **Logs** | "what is this runner doing, and why did that task park" | Loki |
+| Journal (`journal.md`) | "what did the AGENT do and decide" — handoff continuity | git, forever |
+
+**Logs** (amended after the first in-cluster run)
+
+Originally there were only metrics and the journal. Both are aggregates, and the first
+task to run in-cluster completed with `kubectl logs` empty end to end — the only writes
+to the process streams were on error paths a healthy run never reaches. A successful run
+and a wedged one were indistinguishable from outside.
+
+One JSON object per line on **stdout**, which is what the cluster already ingests from
+container output. No agent, no sidecar, no format to teach it.
+
+- `ts`, `level`, `event` on every record; `event` is a dotted name (`task.claimed`,
+  `session.end`, `progress.probe`) so a query can select a lifecycle stage without
+  matching prose.
+- Level from `log.level` in config, default `info`. `poll.idle` is `debug` precisely
+  because at the default poll interval it is the noisiest line the supervisor could emit.
+- **Never a credential.** Nothing redacts, so the rule lives at the call sites: log
+  identifiers and outcomes, never a token or a header. `GitError` is safe by
+  construction — §9.2 keeps tokens out of argv, so its message cannot carry one.
+- **Never agent prose.** A question's text is agent-authored and can quote anything it
+  read, so `task.awaiting-human` logs the question's index and leaves the text in git.
+
+Logs are for the operator and are disposable; the journal is for the next session and is
+not. That is why a park writes both — a `warn` record so a human sees it now, and a
+journal entry so the next session sees it at all.
+
 **Metrics**
 
 | Metric | Type | Notes |
@@ -638,6 +671,22 @@ sessions with none → park and notify.
 
 This is the limit that catches the failure the others miss: an agent burning tokens for
 hours while going in circles.
+
+**A commit is proven per-session, against a baseline.** The baseline is the branch head
+recorded at the end of the previous session, and on a FIRST session — where no such head
+exists — the point the task branch forked from. Both halves are load-bearing:
+
+- Without the fork-point fallback the commit that *starts* the work can never be proven.
+  The first in-cluster task finished with a two-session no-progress streak while its PR
+  sat open, and one more session would have parked it citing "no commit" with a commit on
+  the branch.
+- Comparing against the fork point *forever* would be worse: every session after the
+  first commit would look productive, and an agent that commits once and then spins would
+  never trip the detector at all.
+
+The fork point is resolved locally (`merge-base` against the mirror's default branch),
+because the probe runs after `clearActive()` where the credential service refuses to
+answer by design (§9.2) and anything touching the network fails.
 
 ---
 

@@ -7,6 +7,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { asWorkspaceName, type Capability, type WorkspaceName } from "../domain/task.ts";
+import type { LogLevel } from "../obs/log.ts";
 import type { LlmConfig, RunnerConfig, WorkspaceProfile } from "./types.ts";
 
 export class ConfigError extends Error {
@@ -33,6 +34,7 @@ interface RawConfig {
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
   readonly secretsDir?: unknown;
+  readonly log?: { readonly level?: unknown };
 }
 
 const str = (value: unknown, field: string): string => {
@@ -48,6 +50,18 @@ const num = (value: unknown, field: string, fallback?: number): number => {
     throw new ConfigError(`${field} must be a finite number`);
   }
   return value;
+};
+
+const KNOWN_LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
+
+const logLevel = (value: unknown): LogLevel => {
+  if (value === undefined) return "info";
+  if (typeof value !== "string" || !KNOWN_LOG_LEVELS.includes(value as LogLevel)) {
+    throw new ConfigError(
+      `log.level must be one of ${KNOWN_LOG_LEVELS.join(", ")} (got '${String(value)}')`,
+    );
+  }
+  return value as LogLevel;
 };
 
 const KNOWN_CAPABILITIES: readonly Capability[] = [
@@ -211,5 +225,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     workspaces,
     pollSeconds: num(raw.pollSeconds, "pollSeconds", 30),
     secretsDir: str(raw.secretsDir, "secretsDir"),
+    log: { level: logLevel(raw.log?.level) },
   };
 };

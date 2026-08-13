@@ -6,6 +6,7 @@
  * dump is never a credential leak.
  */
 import type { Capability, ForgeKind, TrackerKind, WorkspaceName } from "../domain/task.ts";
+import type { LogLevel } from "../obs/log.ts";
 
 export interface ForgeConfig {
   readonly kind: ForgeKind;
@@ -137,4 +138,10 @@ export interface RunnerConfig {
   readonly pollSeconds: number;
   /** Directory of mounted secret files, keyed by `secretRef`. */
   readonly secretsDir: string;
+  readonly log: LogConfig;
+}
+
+export interface LogConfig {
+  /** Records below this severity are dropped. Defaults to `info`. */
+  readonly level: LogLevel;
 }
