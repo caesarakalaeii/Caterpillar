@@ -20,11 +20,13 @@ import {
   type TaskSpec,
   type TaskState,
   type TaskStatus,
+  type WorkspaceName,
 } from "../domain/task.ts";
 import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import type { Notifier } from "../notify/discord.ts";
+import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 
 export interface SessionRunner {
@@ -57,6 +59,11 @@ export interface SupervisorDeps {
   readonly progress: ProgressProbe;
   readonly notifier: Notifier;
   readonly metrics: AgentMetrics;
+  /**
+   * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
+   * Optional: a workspace without a tracker is a supported configuration.
+   */
+  readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
 }
 
 export class Supervisor {
@@ -102,6 +109,7 @@ export class Supervisor {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
+      await this.mirror(spec, { kind: "claimed", runner: lease.runner });
       return { lease, spec };
     }
     return undefined;
@@ -238,6 +246,7 @@ export class Supervisor {
         await store.writeQuestion(spec.id, index, question);
         await this.transition(lease, state, "awaiting-human");
         await this.push(lease, `chore(${spec.id}): awaiting human input`);
+        await this.mirror(spec, { kind: "question", question });
         await notifier.notify({
           kind: "question",
           task: spec.id,
@@ -264,11 +273,10 @@ export class Supervisor {
 
         await this.transition(lease, state, "done");
         await this.push(lease, `chore(${spec.id}): done`);
-        await notifier.notify({
-          kind: "done",
-          task: spec.id,
-          prUrl: result.prUrl ?? "(no PR recorded)",
-        });
+        // Mirrored only here, after both §12 gates passed and git already says done.
+        const prUrl = result.prUrl ?? state.pr?.url ?? "(no PR recorded)";
+        await this.mirror(spec, { kind: "completed", prUrl });
+        await notifier.notify({ kind: "done", task: spec.id, prUrl });
         return true;
       }
 
@@ -298,7 +306,47 @@ export class Supervisor {
     await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
     await this.transition(lease, state, "parked");
     await this.push(lease, `chore(${spec.id}): parked`);
+    await this.mirror(spec, { kind: "parked", reason });
     await notifier.notify({ kind: "parked", task: spec.id, reason });
+  }
+
+  /**
+   * Mirror a lifecycle change into the task's tracker (DESIGN.md §9.5).
+   *
+   * Always after the authoritative git write — the lease CAS for a claim, the state
+   * push for everything else. The tracker is a VIEW, git wins when they disagree, and
+   * that ordering is why a failure here only logs: an unreachable Vikunja must never
+   * fail a task, and the next transition overwrites the view anyway.
+   *
+   * Handoffs are deliberately not mirrored: a multi-hour task would otherwise become
+   * twenty comments of noise.
+   */
+  private async mirror(spec: TaskSpec, transition: TrackerTransition): Promise<void> {
+    const ref = spec.tracker;
+    if (ref === undefined) return;
+
+    const tracker = this.deps.trackers?.get(spec.workspace);
+    if (tracker === undefined) return;
+
+    if (tracker.kind !== ref.kind) {
+      // Config error: the workspace's tracker is not the one this task came from, so
+      // its ids mean something else entirely. Writing anyway would comment on an
+      // unrelated item.
+      process.stderr.write(
+        `${spec.id}: tracker ref is '${ref.kind}' but workspace '${spec.workspace}' ` +
+          `has '${tracker.kind}' — not mirroring\n`,
+      );
+      return;
+    }
+
+    try {
+      await tracker.transition(ref, transition, spec.id);
+    } catch (error) {
+      process.stderr.write(
+        `${spec.id}: mirroring '${transition.kind}' to ${tracker.kind} failed: ` +
+          `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
   }
 
   private async transition(

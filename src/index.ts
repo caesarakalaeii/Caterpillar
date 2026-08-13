@@ -14,7 +14,7 @@ import type { ForgeFactory } from "./forge/types.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
-import { loadForgeFactory, SecretBundle } from "./secrets/load.ts";
+import { loadForgeFactory, loadTracker, SecretBundle } from "./secrets/load.ts";
 import { Git } from "./state/git.ts";
 import { LeaseManager } from "./state/lease.ts";
 import { StateStore } from "./state/store.ts";
@@ -58,8 +58,18 @@ const main = async (): Promise<void> => {
   const trackers = new Map<WorkspaceName, Tracker>();
   for (const [name, profile] of config.workspaces) {
     forges.set(name, await loadForgeFactory(profile, config.secretsDir));
-    // Tracker implementations land next; a workspace without one simply has no
-    // tracker mirroring, which is a supported configuration.
+
+    const tracker = await loadTracker(profile, config.secretsDir);
+    if (tracker !== undefined) {
+      trackers.set(name, tracker);
+    } else if (profile.tracker !== undefined) {
+      // Configured but unavailable — say so, or a silently unmirrored workspace
+      // looks like a broken tracker rather than an unimplemented adapter.
+      process.stderr.write(
+        `workspace '${name}': tracker '${profile.tracker.kind}' is not implemented; ` +
+          `running without tracker mirroring\n`,
+      );
+    }
   }
   const bindings: WorkspaceBindings = { forges, trackers };
 
@@ -102,6 +112,7 @@ const main = async (): Promise<void> => {
     progress: new GitProgressProbe({ worktrees }),
     notifier: await createNotifier(config.secretsDir),
     metrics,
+    trackers,
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);

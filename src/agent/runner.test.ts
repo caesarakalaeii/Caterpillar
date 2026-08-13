@@ -86,7 +86,7 @@ const stateRepo = join(root, "state");
 // A real upstream repo, mirrored to the path WorktreeManager expects. Pre-creating the
 // mirror means syncMirror takes the fetch path and never reaches the network.
 await mkdir(source, { recursive: true });
-await sh("git init -q -b main && git config user.email t@t && git config user.name t", source);
+await sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false", source);
 await writeFile(join(source, "README.md"), "# widget\n");
 await sh("git add -A && git commit -qm init", source);
 
@@ -268,7 +268,7 @@ test("checks out sibling repos under the workspace and excludes them locally", a
   const sibling: RepoRef = { host: "github.com", owner: "acme", name: "gadget" };
   const siblingSource = join(root, "gadget-source");
   await mkdir(siblingSource, { recursive: true });
-  await sh("git init -q -b main && git config user.email t@t && git config user.name t", siblingSource);
+  await sh("git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false", siblingSource);
   await writeFile(join(siblingSource, "lib.txt"), "gadget\n");
   await sh("git add -A && git commit -qm init", siblingSource);
   await sh(

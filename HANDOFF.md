@@ -12,7 +12,7 @@ it were settled by interview, and several were made *against* the obvious defaul
 stated reasons. Do not re-litigate them; if one looks wrong, the rationale is written
 down next to it.
 
-`README.md` has the file-by-file layout and the five load-bearing invariants.
+`README.md` has the file-by-file layout and the six load-bearing invariants.
 
 **The local directory is `~/Hobby/remote-agent` but the project is `Caterpillar`** —
 the directory was never renamed. Remote: `github.com/caesarakalaeii/Caterpillar`
@@ -28,7 +28,7 @@ nix shell nixpkgs#nodejs_22 --command npm test  # one-off, what I used throughou
 ```
 
 - `npm run check` — typecheck (strict, `exactOptionalPropertyTypes`, no `any`)
-- `npm test` — 41 tests, all passing at last commit
+- `npm test` — 59 tests, all passing at last commit
 - Tests need `--experimental-transform-types`, **not** `--experimental-strip-types`:
   strip-only mode cannot parse TypeScript parameter properties, which this codebase
   uses throughout. Already set in `package.json`.
@@ -48,15 +48,17 @@ Built, typechecked, and tested end to end:
 | Session runner | implemented, end-to-end tested with pi's `fauxProvider` |
 | Verifier + progress probe | implemented |
 | Multi-repo checkout | implemented, tested |
+| Vikunja tracker | implemented, unit-tested — **not yet run against the live instance** |
+| Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 
 Not built yet, in the order I would take them:
 
-1. **Vikunja tracker** — `src/tracker/vikunja.ts` is a stub with the traps documented.
-   Natural next step: it is the tracker for the `electric-boogaloo` ecosystem that was
-   just properly modelled.
-2. **`caesar-deployment` manifests** + ArgoCD Application — would let this actually run.
+1. **`caesar-deployment` manifests** + ArgoCD Application — would let this actually run.
    Everything else is easier to shake out once something is deployed.
-3. GitHub Issues tracker, Discord bridge (inbound `!answer`), intake ingesters.
+2. GitHub Issues tracker (`src/tracker/github-issues.ts` is still a stub; `loadTracker`
+   returns `undefined` for it and logs, so a workspace configured for it runs unmirrored
+   rather than half-mirrored).
+3. Discord bridge (inbound `!answer`), intake ingesters.
 
 ## Live credentials
 
@@ -73,6 +75,20 @@ The GitHub App exists and is verified working:
 
 Codeberg: the user already has a token covering the whole `ElectricBoogaloo` ecosystem
 and wants to keep it. Not yet stored in a secret.
+
+**Vikunja: nothing is provisioned yet.** Before the tracker can run:
+
+1. Create a *dedicated agent* API token (Settings → API Tokens) with exactly the scopes
+   in DESIGN.md §9.5 — and not `tasks: delete`.
+2. Store it as key `vikunja-token` in the workspace's secret (`loadTracker` reads that
+   key; the same secret already holds the forge credentials).
+3. Make sure labels `agent-wip` and `needs-human` **exist** — no adapter creates them,
+   because the token deliberately has no `labels:create` scope. Names are overridable
+   per workspace via `tracker.wipLabel` / `tracker.needsHumanLabel` in config.
+4. `VIKUNJA_TOKEN=... npm run verify:vikunja` (read-only), then
+   `-- --task <scratch id>` to exercise the write scopes. **This has not been run yet**
+   — the routes come from `../electric-boogaloo-workspace/scripts/vikunja.py`, which was
+   proven against the live instance, but this implementation has not itself touched it.
 
 ## Things learned the hard way
 
@@ -92,13 +108,26 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
   token scope. DESIGN.md §9.2.
 - **Forgejo has no Checks API** (`/check-runs` → 404, verified). Commit statuses are
   the only CI signal, and its `error`/`warning` states have no GitHub equivalent.
-- **Forgejo returns `statuses: null`, not `[]`.** Typed and tested.
+- **Forgejo returns `statuses: null`, not `[]`.** Typed and tested. Vikunja does the
+  same with a task's `labels`.
 - **`--git-common-dir`, not `--git-dir`**, for `info/exclude` in a linked worktree.
   The first attempt silently did nothing.
 - **Never set `remote.origin.url` from a worktree** — worktrees share the mirror's
   config, so it rewrites the mirror's fetch URL for every task.
 - **Vikunja: `GET /user` and `GET /tasks/all` are unreachable by any API token**, and a
   401 means a missing route scope, not a bad token. Probe `/projects` instead.
+- **Vikunja descriptions and comments are HTML, not markdown** (TipTap). A `**bold**`
+  note renders as literal asterisks, so prose is escaped and wrapped in `<p>` going out
+  and stripped back to text coming in.
+- **Vikunja label removal goes through `POST /tasks/{id}/labels/bulk`**, re-sending the
+  surviving set. The per-label `DELETE` needs `tasksLabels: delete`, which the agent
+  token must not have — it would let the agent strip a label a human applied.
+- **Commit signing must be forced off.** A machine runner inherits the operator's global
+  git config, and `commit.gpgsign = true` (the default once SSH signing is set up) fails
+  every commit with an error naming 1Password rather than anything here. Handled in two
+  places, and both are needed: `-c commit.gpgsign=false` on every `Git` invocation, and
+  `commit.gpgsign false` written into each worktree's config, because the agent commits
+  with its own `git` calls through the bash tool.
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
 
 ## Constraints the user has set
@@ -115,8 +144,8 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 
 ## Immediate next action
 
-Implement `VikunjaTracker` against `https://tasks.eb.bims.sh/api/v1`. The stub in
-`src/tracker/vikunja.ts` already documents the required scopes and both API traps. Key
-design constraint from DESIGN.md §9.5: **the supervisor owns tracker state transitions
-and the agent gets only `task_note()`** — an agent able to close its own tracker item
-would route around the §12 completion gate.
+Write the `caesar-deployment` manifests: `apps/workloads/caterpillar/` (Deployment with
+`Recreate`, PVC for mirrors/worktrees, ConfigMap for `config.json`, ServiceMonitor) plus
+`argocd/apps/caterpillar.yaml` at sync wave 4, following that repo's existing
+conventions. The GitHub App secret is already committed there and inert; the ConfigMap
+is the first place the workspace/tracker config from `src/config/types.ts` becomes real.

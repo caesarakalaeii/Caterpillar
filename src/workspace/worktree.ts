@@ -190,5 +190,10 @@ export class WorktreeManager {
     await git.run("config", "credential.useHttpPath", "true");
     await git.run("config", "user.name", this.options.identity.name);
     await git.run("config", "user.email", this.options.identity.email);
+    // Written into the repo config, not just passed to our own invocations: the agent
+    // commits with its own `git` calls through the bash tool, and on a machine runner
+    // those inherit the operator's global `commit.gpgsign`. The bot identity has no
+    // signing key, and signing agent work with the operator's key would be a lie.
+    await git.run("config", "commit.gpgsign", "false");
   }
 }

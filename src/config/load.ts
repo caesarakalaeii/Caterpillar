@@ -103,12 +103,21 @@ const workspace = (name: string, value: unknown): WorkspaceProfile => {
     );
   }
 
+  const optionalLabel = (field: string): string | undefined => {
+    const value = t[field];
+    return value === undefined ? undefined : str(value, `workspaces.${name}.tracker.${field}`);
+  };
+  const wipLabel = optionalLabel("wipLabel");
+  const needsHumanLabel = optionalLabel("needsHumanLabel");
+
   return {
     ...profile,
     tracker: {
       kind: trackerKind,
       apiBase: str(t["apiBase"], `workspaces.${name}.tracker.apiBase`),
       ingestLabel: str(t["ingestLabel"], `workspaces.${name}.tracker.ingestLabel`),
+      ...(wipLabel !== undefined ? { wipLabel } : {}),
+      ...(needsHumanLabel !== undefined ? { needsHumanLabel } : {}),
     },
   };
 };

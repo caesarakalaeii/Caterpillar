@@ -26,6 +26,17 @@ export class GitError extends Error {
   }
 }
 
+/**
+ * Applied to every invocation.
+ *
+ * Commit signing is forced OFF because the supervisor commits as a bot identity that
+ * has no signing key. A machine runner (DESIGN.md §3) inherits the operator's global
+ * git config, and `commit.gpgsign = true` there — the default once anyone sets up SSH
+ * signing — makes every state and lease commit fail with an error that names the
+ * signing agent rather than anything in this system.
+ */
+const GLOBAL_ARGS: readonly string[] = ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"];
+
 const run = (
   cwd: string,
   args: readonly string[],
@@ -34,7 +45,7 @@ const run = (
   new Promise((resolve) => {
     execFile(
       "git",
-      [...args],
+      [...GLOBAL_ARGS, ...args],
       { cwd, env, maxBuffer: 64 * 1024 * 1024 },
       (error, stdout, stderr) => {
         const code =
