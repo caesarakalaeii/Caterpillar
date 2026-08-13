@@ -50,15 +50,43 @@ Built, typechecked, and tested end to end:
 | Multi-repo checkout | implemented, tested |
 | Vikunja tracker | implemented, unit-tested — **not yet run against the live instance** |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
+| State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
+| Container image + CI | written, **never built** (no docker/podman on this machine) |
+| `caesar-deployment` manifests | written, `kustomize build` clean, **not pushed** |
 
 Not built yet, in the order I would take them:
 
-1. **`caesar-deployment` manifests** + ArgoCD Application — would let this actually run.
-   Everything else is easier to shake out once something is deployed.
+1. **Finish the deploy**: the three prerequisites in
+   `../caesar-deployment/apps/workloads/caterpillar/README.md` — image published,
+   state repo created with the App installed on it, secrets sealed. Then land
+   `argocd/apps/caterpillar.yaml` LAST (see the warning below).
 2. GitHub Issues tracker (`src/tracker/github-issues.ts` is still a stub; `loadTracker`
    returns `undefined` for it and logs, so a workspace configured for it runs unmirrored
    rather than half-mirrored).
 3. Discord bridge (inbound `!answer`), intake ingesters.
+
+## Deployment state (nothing is live)
+
+Written but **uncommitted** in `../caesar-deployment`, plus `Dockerfile` and
+`.github/workflows/build-and-push.yml` here.
+
+**`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and
+`selfHeal`.** Pushing `argocd/apps/caterpillar.yaml` therefore *deploys immediately*.
+Land the workload directory first, complete the three prerequisites, and add the
+Application only when you want it live.
+
+Decisions the user made by interview (do not re-litigate):
+
+- **LiteLLM deployed alongside**, rather than pointing at Anthropic directly — keeps
+  §9.6 intact: one spend-cap choke point, and no provider credential outside the proxy.
+- **State repo on GitHub, authenticated with the existing App**, rather than a deploy
+  key — no new secret, at the cost of the App needing an installation on that repo.
+- **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
+  from the electric-boogaloo `.env`.
+
+Still missing before it can sync: an **Anthropic API key** (nothing in the repo or the
+`.env` provides one; `scripts/seal-caterpillar-secrets.sh litellm` prompts for it), the
+**state repo**, and the **published image**.
 
 ## Live credentials
 
@@ -134,7 +162,10 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 
 - **Do not read `~/Hobby/electric-boogaloo-workspace/.env`.** It holds the Codeberg and
   Vikunja tokens. The scripts beside it (`cb-api.sh`, `vikunja.py`) are fine to read and
-  are good prior art for the secret-handling pattern.
+  are good prior art for the secret-handling pattern. Enforced by a tool classifier, not
+  just convention — even listing variable *names* is blocked. The user seals those
+  tokens themselves with `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`,
+  which reads `.env` in-process and never prints a value.
 - Conventional Commits, **no** `Co-Authored-By` trailer, no gitmoji.
 - Never use the type `any`.
 - Prefer open-source, provider-agnostic tooling — this is why the project is built on

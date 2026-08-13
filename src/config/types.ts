@@ -66,11 +66,24 @@ export interface LimitsConfig {
 }
 
 export interface StateRepoConfig {
-  /** Clone URL of the state repo. Written by the supervisor only (DESIGN.md §9.3). */
+  /**
+   * Clone URL of the state repo. Written by the supervisor only (DESIGN.md §9.3).
+   * HTTPS, so the GitHub App token can authenticate it as a header.
+   */
   readonly url: string;
   readonly branch: string;
   /** Checkout path on the PVC. */
   readonly path: string;
+  /**
+   * Secret holding the GitHub App credentials used for the state repo — same key
+   * layout as a github workspace (`app-id`, `installation-id`, `private-key.pem`).
+   * The App must be installed on the state repo, which is a different repo from the
+   * ones tasks touch.
+   *
+   * Optional: without it the supervisor assumes the checkout is already authenticated,
+   * which is only true for local development.
+   */
+  readonly secretRef?: string;
 }
 
 export interface WorkspacePathsConfig {

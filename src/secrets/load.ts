@@ -11,7 +11,8 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { WorkspaceProfile } from "../config/types.ts";
+import type { StateRepoConfig, WorkspaceProfile } from "../config/types.ts";
+import { parseStateRepoUrl, StateRepoCredentials } from "../state/credential.ts";
 import { GitHubAppForgeFactory, type GitHubAppOptions } from "../forge/github-app.ts";
 import { ForgejoForgeFactory, type ForgejoOptions } from "../forge/forgejo.ts";
 import type { ForgeFactory } from "../forge/types.ts";
@@ -108,6 +109,31 @@ export const loadForgeFactory = async (
     ...(tokensByRepo.size > 0 ? { tokensByRepo } : {}),
   };
   return new ForgejoForgeFactory(options);
+};
+
+/**
+ * Build the credential for the supervisor's own state-repo pushes (DESIGN.md §9.3).
+ *
+ * Returns undefined when no `secretRef` is configured, which means "the checkout is
+ * already authenticated" — true for local development, never in the cluster.
+ */
+export const loadStateCredentials = async (
+  stateRepo: StateRepoConfig,
+  secretsDir: string,
+  apiBase: string,
+): Promise<StateRepoCredentials | undefined> => {
+  if (stateRepo.secretRef === undefined) return undefined;
+
+  const bundle = new SecretBundle(secretsDir, stateRepo.secretRef);
+  return new StateRepoCredentials(
+    {
+      appId: await bundle.read("app-id"),
+      installationId: await bundle.read("installation-id"),
+      privateKeyPem: await bundle.read("private-key.pem"),
+      apiBase,
+    },
+    parseStateRepoUrl(stateRepo.url),
+  );
 };
 
 /**

@@ -19,7 +19,12 @@ export class ConfigError extends Error {
 /** Shape of the on-disk config file. Validated into RunnerConfig. */
 interface RawConfig {
   readonly capabilities?: unknown;
-  readonly stateRepo?: { readonly url?: unknown; readonly branch?: unknown; readonly path?: unknown };
+  readonly stateRepo?: {
+    readonly url?: unknown;
+    readonly branch?: unknown;
+    readonly path?: unknown;
+    readonly secretRef?: unknown;
+  };
   readonly paths?: { readonly mirrors?: unknown; readonly tasks?: unknown };
   readonly lease?: { readonly heartbeatSeconds?: unknown; readonly staleAfterSeconds?: unknown };
   readonly handoff?: { readonly thresholdFraction?: unknown };
@@ -145,6 +150,9 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       url: str(raw.stateRepo?.url, "stateRepo.url"),
       branch: str(raw.stateRepo?.branch, "stateRepo.branch"),
       path: str(raw.stateRepo?.path, "stateRepo.path"),
+      ...(raw.stateRepo?.secretRef === undefined
+        ? {}
+        : { secretRef: str(raw.stateRepo.secretRef, "stateRepo.secretRef") }),
     },
     paths: {
       mirrors: str(raw.paths?.mirrors, "paths.mirrors"),
