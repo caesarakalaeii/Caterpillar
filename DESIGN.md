@@ -156,6 +156,22 @@ state-repo/
 it is the audit trail. `handoff.md` is deliberately *overwritten*: it holds only what the
 next session needs, so it cannot grow without bound.
 
+**The journal is bounded on the way INTO a prompt, never on disk** (amended after
+SMOKE-1). Append-only and unbounded-in-context are different properties, and only the
+first one is wanted: the file is the audit trail and git keeps it whole, but every
+session was opening by paying for all of it. SMOKE-1 finished with a 347KB journal —
+620 byte-identical park entries from a retry storm around two that said anything — so
+any further session on that task would have started ~90k tokens down.
+
+`journalForPrompt` renders a view: consecutive entries with identical bodies collapse
+into one that states the repeat count, then the oldest entries are dropped until it fits
+~5% of the context window, and what was dropped is declared in the text. Nothing is
+deleted, and the cap scales with the window rather than being a fixed number that is a
+rounding error on one model and a quarter of the budget on another.
+
+The collapse is deliberately CONSECUTIVE-only: parking, working, then parking again for
+the same reason is real history, and the second park means something the first does not.
+
 ### 4.2 `state.json`
 
 ```jsonc

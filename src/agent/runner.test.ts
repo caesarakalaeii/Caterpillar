@@ -7,6 +7,7 @@
  * session, and the context budget cutting a session off at the threshold.
  */
 import assert from "node:assert/strict";
+import { gunzipSync } from "node:zlib";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -112,10 +113,14 @@ await writeFile(
   ].join("\n"),
 );
 
-// A second task whose journal is large enough to fill a small context window. The
-// faux provider derives usage from the real prompt text, so this is the honest way to
-// exercise the handoff trigger — and it mirrors what actually fills context in
-// production: an accumulated journal.
+// A second task whose SPEC is large enough to fill a small context window. The faux
+// provider derives usage from the real prompt text, so this is the honest way to
+// exercise the handoff trigger.
+//
+// It used to be the journal that was oversized here. That stopped working the moment
+// the journal became bounded on its way into the prompt (`journalForPrompt`) — which is
+// the point of the bound, and why the thing that fills the window in this test has to be
+// a part that has no cap. The spec is the immutable goal; nothing truncates it.
 const BIG_TASK = asTaskId("TASK-2");
 await mkdir(join(stateRepo, "tasks", BIG_TASK), { recursive: true });
 await writeFile(
@@ -129,13 +134,41 @@ await writeFile(
     '  - "true"',
     "---",
     "",
-    "Keep working.",
+    "Keep working. ".repeat(200),
+    "Investigated the widget subsystem in detail. ".repeat(4_000),
+    "",
+  ].join("\n"),
+);
+
+// A third task carrying the shape SMOKE-1 ended up with: a retry storm's worth of
+// byte-identical park entries around the one entry that says something.
+const JOURNAL_TASK = asTaskId("TASK-4"); // TASK-3 is taken by the sibling-repo test
+const JOURNAL_REPEATS = 400;
+await mkdir(join(stateRepo, "tasks", JOURNAL_TASK), { recursive: true });
+await writeFile(
+  join(stateRepo, "tasks", JOURNAL_TASK, "spec.md"),
+  [
+    "---",
+    "workspace: test",
+    "repos:",
+    "  - github.com/acme/widget",
+    "acceptance:",
+    '  - "true"',
+    "---",
+    "",
+    "Create a file called generated.txt.",
     "",
   ].join("\n"),
 );
 await writeFile(
-  join(stateRepo, "tasks", BIG_TASK, "journal.md"),
-  "## Session 1\n\nInvestigated the widget subsystem in detail. ".repeat(4_000),
+  join(stateRepo, "tasks", JOURNAL_TASK, "journal.md"),
+  [
+    "\n## Session 1 — 2026-08-12T09:00:00.000Z\n\nthe decision that matters: use the fork point\n",
+    ...Array.from(
+      { length: JOURNAL_REPEATS },
+      (_, i) => `\n## Session 0 — 2026-08-12T10:${String(i % 60).padStart(2, "0")}:00.000Z\n\n**Parked:** lease lost\n`,
+    ),
+  ].join(""),
 );
 
 after(async () => {
@@ -235,6 +268,36 @@ test("runs a session, executes tools in the worktree, and records a done claim",
 
   // The transcript is persisted even though the session ended via a control tool.
   assert.ok(existsSync(join(stateRepo, "tasks", TASK, "sessions", "001.jsonl.gz")));
+});
+
+test("a retry storm's journal reaches the model collapsed, not in full", async () => {
+  // End to end through the real runner, asserted on the TRANSCRIPT — the actual bytes
+  // sent to the model, not a unit test of the renderer. SMOKE-1's journal was 347KB of
+  // one repeated sentence, and every later session on that task would have opened by
+  // paying for all of it.
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "nothing left to do" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const journalSpec = await store.readSpec(JOURNAL_TASK);
+  await runner.run(journalSpec, state({ id: JOURNAL_TASK }));
+
+  const transcript = gunzipSync(
+    await readFile(join(stateRepo, "tasks", JOURNAL_TASK, "sessions", "001.jsonl.gz")),
+  ).toString("utf8");
+
+  const copies = transcript.split("**Parked:** lease lost").length - 1;
+  assert.equal(copies, 1, `the prompt carried ${copies} copies of one park entry`);
+  assert.match(transcript, new RegExp(`repeated ${JOURNAL_REPEATS} times`), "say how many");
+  assert.match(
+    transcript,
+    /the decision that matters/,
+    "collapsing repeats must not cost the entry that mattered",
+  );
 });
 
 test("hands off when the context budget is exceeded", async () => {

@@ -36,6 +36,7 @@ import type { AgentMetrics } from "../metrics/registry.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { buildPrompt, SYSTEM_PROMPT } from "./prompt.ts";
 import { runSession } from "./session.ts";
@@ -215,8 +216,15 @@ export class AgentSessionRunner {
     readonly answer?: string;
     readonly recoveryNote?: string;
   }> {
-    const { store } = this.options;
-    const journal = await store.readIfPresent(spec.id, "journal.md");
+    const { store, llm } = this.options;
+    const raw = await store.readIfPresent(spec.id, "journal.md");
+    // The FILE keeps every entry (invariant 5); the PROMPT gets a bounded view of it.
+    // Unbounded, a long task pays for its whole history at the start of every session —
+    // SMOKE-1's journal reached 347KB, nearly all of it one repeated park entry.
+    const journal =
+      raw === undefined
+        ? undefined
+        : journalForPrompt(raw, journalBudgetChars(llm.model.contextWindow));
     const handoff = await store.readIfPresent(spec.id, "handoff.md");
     const answer = await store.latestAnswer(spec.id);
 

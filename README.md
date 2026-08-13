@@ -86,6 +86,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
+| `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/runner.ts` | Assembles a session: worktree, tools, prompt, budget. |
@@ -113,7 +114,10 @@ awkward, the change is probably wrong.
 4. **Every push verifies the lease first.** Claim-time exclusion is not enough — a
    partitioned runner must not resurrect stale work.
 5. **`journal.md` appends; `handoff.md` is overwritten.** An append-forever handoff
-   eventually consumes the context window it exists to preserve.
+   eventually consumes the context window it exists to preserve. The journal keeps every
+   entry on disk, but reaches a prompt as a bounded VIEW — repeats collapsed, oldest
+   entries elided and declared — because append-only and unbounded-in-context are
+   different properties and only the first is wanted (§4.1).
 6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
    the state repo is written and pushed, and a mirroring failure only logs — an
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
