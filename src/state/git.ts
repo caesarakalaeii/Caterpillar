@@ -55,13 +55,28 @@ const run = (
     );
   });
 
+/**
+ * Supplies credential environment for a single git invocation, resolved per call so a
+ * short-lived token can be re-minted rather than captured at construction.
+ */
+export type GitEnvProvider = () => Promise<NodeJS.ProcessEnv>;
+
 export class Git {
   constructor(
     private readonly cwd: string,
     private readonly env: NodeJS.ProcessEnv = process.env,
+    /** Bound to ONE repo's credential. Deliberately not inherited — see `at`. */
+    private readonly envProvider?: GitEnvProvider,
   ) {}
 
-  /** Run git in a different directory, sharing environment. */
+  /**
+   * Run git in a different directory, sharing environment.
+   *
+   * The credential provider is deliberately DROPPED. It carries an `http.extraHeader`
+   * for one specific remote, and git sends that header on every HTTP request it makes:
+   * inherited into a task worktree, a state-repo GitHub token would be sent to
+   * Codeberg on the next push.
+   */
   at(cwd: string): Git {
     return new Git(cwd, this.env);
   }
@@ -73,14 +88,19 @@ export class Git {
 
   /** Throws GitError on non-zero exit. */
   async run(...args: readonly string[]): Promise<string> {
-    const result = await run(this.cwd, args, this.env);
+    const result = await run(this.cwd, args, await this.resolveEnv());
     if (result.code !== 0) throw new GitError(args, result);
     return result.stdout.trim();
   }
 
   /** Never throws — for probes where failure is a legitimate answer. */
   async tryRun(...args: readonly string[]): Promise<GitResult> {
-    return run(this.cwd, args, this.env);
+    return run(this.cwd, args, await this.resolveEnv());
+  }
+
+  private async resolveEnv(): Promise<NodeJS.ProcessEnv> {
+    if (this.envProvider === undefined) return this.env;
+    return { ...this.env, ...(await this.envProvider()) };
   }
 
   async revParse(ref: string): Promise<string | undefined> {
