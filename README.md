@@ -37,6 +37,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
 | `src/forge/` | `Forge` interface + GitHub App / Forgejo stubs (§9.1, §9.4). |
 | `src/tracker/` | `Tracker` interface + GitHub Issues / Vikunja stubs (§9.5). |
+| `src/credential/` | Credential service + git helper protocol (§9.2). |
+| `src/secrets/load.ts` | Mounted SOPS secrets → forge factories. |
+| `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
@@ -60,13 +63,20 @@ awkward, the change is probably wrong.
 5. **`journal.md` appends; `handoff.md` is overwritten.** An append-forever handoff
    eventually consumes the context window it exists to preserve.
 
+## Verifying a GitHub App setup
+
+```bash
+npm run verify:github-app -- --pem <key.pem> --app-id <id> --repo <owner/name>
+```
+
+Signs a JWT, prints the installation id, mints a repo-scoped token, and echoes the
+granted permissions. Never prints the token.
+
 ## Not yet built
 
-- forge implementations (JWT signing, token minting, PR + checks calls)
+- Forgejo/Codeberg forge (repo-scoped tokens, PRs, commit status)
 - tracker implementations (Vikunja and GitHub Issues HTTP)
 - `SessionRunner` / `Verifier` / `ProgressProbe` wiring in `src/index.ts`
-- workspace mirrors and per-task worktrees
-- git credential helper binary
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
 - `caesar-deployment` manifests and ArgoCD Application

@@ -389,6 +389,20 @@ or in an environment dump becomes a token **committed to git history**. So:
 The 1-hour expiry is invisible because the helper mints on demand. Exporting `GH_TOKEN`
 once at session start is what would break mid-session.
 
+> **How strong is this boundary, honestly?** The trust diagram above says the agent
+> "never sees" the token. That holds against *accidental* exposure, which is the
+> realistic failure mode here: nothing routine puts the token where a committed
+> transcript can capture it.
+>
+> It does **not** hold against a deliberately adversarial agent. The agent has `bash`
+> in the same container as the supervisor, so it could invoke the credential helper
+> itself. Process-level separation inside one container cannot prevent that.
+>
+> What holds unconditionally is the blast radius: 1-hour TTL, one repo, no merge, no
+> admin. Treat the helper as leak *hygiene* and the token scope as the actual security
+> boundary. Hardening the first property requires splitting the agent out of the
+> supervisor's trust domain — see §15.
+
 ### 9.3 The state repo is not agent-writable
 
 Task tokens are scoped only to repos named in the spec, and the state repo is never one
