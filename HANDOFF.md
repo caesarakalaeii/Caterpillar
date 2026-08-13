@@ -1,6 +1,7 @@
 # Handoff
 
-State as of 2026-08-13, after intake shipped. Overwrite this file rather than appending to
+State as of 2026-08-13, after intake shipped and the Discord webhook was implemented.
+Overwrite this file rather than appending to
 it — an append-forever handoff eventually consumes the context it exists to preserve (the
 same reason `handoff.md` is overwritten and `journal.md` appends, DESIGN.md §4.1).
 
@@ -29,32 +30,34 @@ The previous handoff said "NixOS, there is no `node` or `npm` on PATH, everythin
 through nix". On the current machine the opposite is true and worse:
 
 - `node` and `npm` **are** on PATH (`/usr/sbin`), at **node 26.5.0**. There is **no `nix`**.
-- **`npm test` cannot run at all.** Node 26 *removed* `--experimental-transform-types`, and
-  strip-only TypeScript mode cannot parse the parameter properties this codebase uses
-  throughout, so not a single test file loads. The same applies to `npm start` and all five
-  `verify:*` scripts, which use the same flag.
+- **`npm test` cannot run on the system node.** Node 26 *removed*
+  `--experimental-transform-types`, and strip-only TypeScript mode cannot parse the
+  parameter properties this codebase uses throughout, so not a single test file loads. The
+  same applies to `npm start` and all six `verify:*` scripts, which use the same flag.
 - `src/credential/service.test.ts` **spawns the credential helper with that flag**, so it
   fails for the same reason even if you work around the runner.
 - `npm run check` and `npm run build` are fine — they are `tsc`.
-- CI pins **node 22** and is green — **143 tests, 143 passing** at `a540f6b`. It is the
-  authority on whether tests pass; a local run that cannot load half the suite is not.
+- CI pins **node 22** and is green. It is the authority on whether tests pass.
 
 `flake.nix` is still in the repo and still correct; it just has nothing to run it here.
 
-**The fix is to install node 22.** Until someone does, run tests by compiling first — this
-is what produced every test result in this session, and it reproduces CI's count exactly:
+**Get a node 22 and everything works normally.** No sudo needed, and it takes a minute —
+this session did exactly this and ran the real suite (`npm test`, **155 tests, 155
+passing**), matching CI:
 
 ```bash
-# tsconfig excludes *.test.ts, so use a copy that includes them and outputs elsewhere.
-# The compiled tree lives outside the repo, so symlink node_modules or bare specifiers
-# ('yaml', pi) fail to resolve and whole FILES fail before any test registers.
-tsc -p <tsconfig-including-tests>   # outDir e.g. /tmp/.../dist-test
-ln -sfn "$PWD/node_modules" /tmp/.../dist-test/node_modules
-node --test $(find /tmp/.../dist-test -name '*.test.js')
+curl -fsSLO https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
+tar -xf node-v22.14.0-linux-x64.tar.xz -C <somewhere>
+export PATH=<somewhere>/node-v22.14.0-linux-x64/bin:$PATH
+npm test    # and npm run check, npm run build, npm run verify:*
 ```
 
-`node_modules` was absent entirely at the start of this session; `npm install` fixed it and
-also synced a lockfile that was missing the `caterpillar-cred` bin entry.
+The previous handoff's compile-the-tests-first workaround is no longer needed; it is gone
+from this file rather than kept as a second way to do the same thing. A permanent fix is
+still `pacman -S nodejs-lts-jod` (or equivalent) — nobody has done it.
+
+`node_modules` was absent entirely at the start of the previous session; `npm install`
+fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin entry.
 
 ## Status
 
@@ -74,6 +77,7 @@ also synced a lockfile that was missing the `caterpillar-cred` bin entry.
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | **Structured logging (§11)** | **implemented and deployed (#10)** — JSON lines on stdout |
 | **Tracker intake (§14)** | **implemented and deployed (#11, #12)** — running on a 300s timer |
+| **Discord webhook, outbound (§11.2)** | **implemented and tested (#14)** — inert until a webhook is sealed |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
 | Container image + CI | built and pushed by CI on every push to `main` |
@@ -81,8 +85,10 @@ also synced a lockfile that was missing the `caterpillar-cred` bin entry.
 
 Not built:
 
-1. **Discord.** Outbound `DiscordNotifier.notify` is **wired but throws** — see the trap
-   below. Inbound `!answer` and `!task` intake (§14 path 3) do not exist.
+1. **The inbound Discord bridge.** `!answer` (§7) and `!task <repo> <goal>` (§14 path 3)
+   do not exist. A question waits in `tasks/<id>/questions/` until a human commits the
+   answer by hand — the supervisor now *tells* you it is there, but you still answer in
+   git. Outbound is done (§11.2).
 2. Nothing else from DESIGN.md is missing.
 
 ## What is actually proven, and what is not
@@ -200,13 +206,31 @@ will not create a missing parent — `mkdir -p` it in the pod first.
 - **Deleting the PVC destroys the credential**, not just mirrors and worktrees. Recovery
   means re-running the browser login.
 
-### The Discord trap
+### Discord: safe to seal now, and still silent until you do
 
-`src/notify/discord.ts` is fully wired into `index.ts` and `loop.ts`, but
-`DiscordNotifier.notify` ends in `throw new Error("not implemented")`. It is harmless *only*
-because the mounted `caterpillar-discord` secret directory is **empty**, so `index.ts` falls
-back to `NullNotifier`. **Sealing a `webhook-url` into it arms the throw on the first
-question, park, or completion.** Implement it or leave the secret empty.
+The trap the previous handoff described is gone. `DiscordNotifier.notify` makes a real
+webhook POST (§11.2), and a failure only logs `notify.failed` — it cannot park a task that
+finished. Nothing is sealed, so `index.ts` still falls back to `NullNotifier` and the
+supervisor is silent.
+
+To turn it on, three steps in `caesar-deployment`, all the operator's:
+
+1. `scripts/seal-caterpillar-secrets.sh discord` — prompts for the URL, never echoes it,
+   writes `secrets/caterpillar-discord.enc.yaml` with a `webhook-url` key.
+2. Add that file to `secrets/secret-generator.yaml`.
+3. Drop `optional: true` from the secret mount in `deployment.yaml`.
+
+Then prove it from inside the pod, which is where the secret already is:
+
+```bash
+kubectl --context default -n caterpillar exec "$POD" -- sh -c \
+  'DISCORD_WEBHOOK_URL=$(cat /etc/caterpillar/secrets/caterpillar-discord/webhook-url) \
+   node dist/cli/verify-discord.js'
+```
+
+It posts one real message and prints the webhook id but never the token. **Not run yet —
+there is no webhook.** It was exercised end to end against a local stand-in server that
+answers 204 like Discord does, which proves the wiring but not the credential.
 
 ## Live credentials
 
@@ -351,6 +375,11 @@ them away.
 - **`listAgentItems()` filters on the ingest label alone**, so a refused item comes back
   every pass. Suppress repeat comments with a **durable** record: Keel rolls the pod on every
   push to `main`, so an in-memory set re-comments on every deploy.
+- **A notification must never be able to fail a task.** `notify` was called bare inside
+  `applyOutcome`, so the moment it made a real request, a webhook outage unwound into
+  `workTask`'s catch and parked a task that had just been verified and pushed as `done`.
+  Same rule as tracker mirroring: write git first, then tell the view, and only log if
+  telling it fails. Anything added to that path later inherits the same rule.
 - **Write `state.json` before `spec.md`.** The spec is the existence marker, so a crash
   between them leaves a task the claim loop skips and the next pass recreates. The reverse
   order wedges the item as permanently existing and never claimable.
@@ -375,6 +404,18 @@ them away.
   Vikunja is protected by a withheld `labels:create` scope; GitHub has no equivalent, so
   `github-issues.ts` checks the repo's labels first and refuses. Do not simplify that away.
 - **GitHub distinguishes 401 from 403; Vikunja cannot.** Only 403 becomes `TrackerScopeError`.
+- **A Discord webhook is rate limited per WEBHOOK, and `retry_after` is in SECONDS** —
+  in both the header and the JSON body. Treating it as milliseconds retries instantly and
+  earns a second 429. Honouring it unbounded is worse: `notify` is awaited inside the task
+  loop, so a large `retry_after` stops the runner doing anything. It is capped at 10s.
+- **Discord's 2000-character limit is counted in CODE POINTS, and exceeding it is a 400** —
+  the message never appears. An agent-authored question is exactly the payload that blows
+  it. Slicing UTF-16 instead of code points splits a surrogate pair into a lone surrogate,
+  which `JSON.stringify` encodes happily and Discord then rejects — a 400 that only ever
+  shows up for emoji.
+- **Discord parses `@everyone` in webhook content by default.** The prose is
+  agent-authored and quotes files the agent read. `allowed_mentions: {parse: []}` is not
+  optional.
 - **The GitHub search API is deliberately unused for intake** — eventually consistent (a
   freshly labelled issue can be invisible for ~a minute, exactly intake's window),
   separately rate limited, and on a deprecation path. Enumerate the installation instead.
@@ -395,6 +436,13 @@ them away.
 - **`per_page=100` contains the substring `page=1`.** A stub matching `path.includes("page=1")`
   answers every page with a full one and paginates forever. Anchor on `&page=N`. Same class
   of bug bit a digest comparison matching a substring — anchor comparisons.
+- **Mutation-test the guard, not just the code.** Every behaviour in the Discord notifier
+  was checked by reverting it on a COPY of `src/` and confirming the matching test failed.
+  One did not: the surrogate-pair test passed over a UTF-16 slice, because the truncation
+  budget happened to land on an even offset where the naive slice is accidentally correct.
+  A test that only passes when the fix is present *by coincidence* is not a regression
+  test. It now starts the prose with an ASCII character to force an odd cut.
+  `scripts`-free and cheap: copy `src/`, patch one line, run that file's tests.
 - **Run intake tests TWICE.** Both of its failure modes (duplicate tasks, comment spam) are
   invisible in a single pass.
 
@@ -422,16 +470,22 @@ them away.
    `agent` block, then watch `intake.pass` report `created: 1` and the session start. This is
    the last unproven link in the chain and it costs a few dollars. **Ask first** — it spends
    the user's subscription and opens a PR.
-2. **Implement `DiscordNotifier.notify`**, or leave the secret empty. Today an agent that
-   parks on a question parks silently, and sealing a webhook makes it throw instead.
-3. **Install node 22** so `npm test` and the `verify:*` scripts work locally again.
-4. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
+2. **Seal a Discord webhook**, if the user wants notifications. See above — it is now three
+   operator steps and a verify command, with nothing left to implement.
+3. **The inbound bridge** (`!answer`, `!task`). This one IS the `discord-bridge` Deployment
+   §10 anticipates: it needs a gateway session or a public interactions endpoint, neither of
+   which the supervisor's outward-polling design provides. Design it before building it.
+4. **Install node 22 permanently** so `npm test` and the `verify:*` scripts work without a
+   scratch tarball on PATH.
+5. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
    pre-fix retry storm, all mislabelled "Session 0" (the park preceded the session
    increment). It is read for handoff continuity, so it taxes any further session on that
    task. There is no journal rotation. `SMOKE-1` is `done`, so this is latent.
 
-**Uncommitted work: none.** `main` is `a540f6b`, everything is merged and deployed, and the
-pod is healthy with 0 restarts. `caesar-deployment` has no unpushed commits either (its #48
+**Uncommitted work: none.** `main` was `0666b60` at the start of this session; the Discord
+webhook went out as #14 on `feat/discord-webhook`. Everything before it is merged and
+deployed, and the pod is healthy with 0 restarts. **Nothing about #14 changes the running
+deployment** — with no webhook secret sealed, `index.ts` still selects `NullNotifier`. `caesar-deployment` has no unpushed commits either (its #48
 merged as `5f2a95ad`); it does carry untracked `.planning/` and `tea_debug.log`, which are
 not mine and were left alone.
 
