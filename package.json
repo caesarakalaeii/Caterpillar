@@ -18,7 +18,8 @@
     "start": "node --experimental-transform-types src/index.ts",
     "verify:github-app": "node --experimental-transform-types src/cli/verify-github-app.ts",
     "verify:forgejo": "node --experimental-transform-types src/cli/verify-forgejo.ts",
-    "verify:vikunja": "node --experimental-transform-types src/cli/verify-vikunja.ts"
+    "verify:vikunja": "node --experimental-transform-types src/cli/verify-vikunja.ts",
+    "llm:login": "node --experimental-transform-types src/cli/llm-login.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",
