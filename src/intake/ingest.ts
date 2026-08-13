@@ -49,6 +49,16 @@ export const intakeDue = (
   intervalSeconds: number,
 ): boolean => lastAtMs === 0 || nowMs - lastAtMs >= intervalSeconds * 1000;
 
+/** What one pass did. Reported so an idle intake is distinguishable from a broken one. */
+export interface IntakePass {
+  /** Items the trackers returned, before any were skipped or refused. */
+  readonly seen: number;
+  readonly created: number;
+  readonly rejected: number;
+  /** Trackers that could not be listed at all. */
+  readonly failed: number;
+}
+
 export interface IngesterDeps {
   readonly store: StateStore;
   /** Trackers to ingest from, by workspace. A workspace without one is supported. */
@@ -91,9 +101,12 @@ export class Ingester {
    * be one push, and the state repo's history should read as intake events rather than
    * as individual file writes.
    */
-  async ingest(remote: string, branch: string): Promise<number> {
+  async ingest(remote: string, branch: string): Promise<IntakePass> {
     const { store, trackers, logger } = this.deps;
     let created = 0;
+    let seen = 0;
+    let rejected = 0;
+    let failed = 0;
     let changed = false;
 
     for (const [workspace, tracker] of trackers) {
@@ -109,12 +122,15 @@ export class Ingester {
           tracker: tracker.kind,
           error: error instanceof Error ? error.message : String(error),
         });
+        failed += 1;
         continue;
       }
 
+      seen += items.length;
       for (const item of items) {
         const outcome = await this.ingestItem(workspace, tracker, item);
         if (outcome === "created") created += 1;
+        if (outcome === "rejected") rejected += 1;
         if (outcome !== "skipped") changed = true;
       }
     }
@@ -126,7 +142,7 @@ export class Ingester {
         branch,
       );
     }
-    return created;
+    return { seen, created, rejected, failed };
   }
 
   private async ingestItem(

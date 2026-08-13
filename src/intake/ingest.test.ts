@@ -116,7 +116,7 @@ test("a labelled item becomes a ready task, and a second pass does not duplicate
   const tracker = new FakeTracker([item(VALID)]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
-  assert.equal(await subject.ingest("origin", "main"), 1);
+  assert.equal((await subject.ingest("origin", "main")).created, 1);
 
   const tasks = await store.listTasks();
   assert.deepEqual(tasks, ["GH-acme-widget-12"]);
@@ -141,7 +141,7 @@ test("a labelled item becomes a ready task, and a second pass does not duplicate
   assert.match(listed, /^tasks\/GH-acme-widget-12\/spec\.md$/m);
 
   // Second pass: the item is still labelled and still returned by the tracker.
-  assert.equal(await subject.ingest("origin", "main"), 0, "must not re-ingest");
+  assert.equal((await subject.ingest("origin", "main")).created, 0, "must not re-ingest");
   assert.deepEqual(await store.listTasks(), ["GH-acme-widget-12"]);
 });
 
@@ -152,13 +152,13 @@ test("an item that cannot become a task is commented on exactly once", async () 
   const tracker = new FakeTracker([item("Please just fix it.")]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
-  assert.equal(await subject.ingest("origin", "main"), 0);
+  assert.equal((await subject.ingest("origin", "main")).created, 0);
   assert.equal(tracker.comments.length, 1);
   assert.match(tracker.comments[0]?.text ?? "", /acceptance/);
   assert.deepEqual(await store.listTasks(), [], "a refused item must not become a task");
 
   for (let pass = 0; pass < 3; pass += 1) {
-    assert.equal(await subject.ingest("origin", "main"), 0);
+    assert.equal((await subject.ingest("origin", "main")).created, 0);
   }
   assert.equal(tracker.comments.length, 1, "one comment, however many passes run");
 });
@@ -171,11 +171,11 @@ test("editing a refused item makes intake look again", async () => {
   const tracker = new FakeTracker([item("Please just fix it.")]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
-  assert.equal(await subject.ingest("origin", "main"), 0);
+  assert.equal((await subject.ingest("origin", "main")).created, 0);
   assert.equal(tracker.comments.length, 1);
 
   tracker.setItems([item(`Please just fix it.\n\n${VALID}`)]);
-  assert.equal(await subject.ingest("origin", "main"), 1, "the fixed item is ingested");
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "the fixed item is ingested");
   assert.deepEqual(await store.listTasks(), ["GH-acme-widget-12"]);
 
   // And the stale refusal is gone, so a future re-refusal is reported rather than
@@ -212,8 +212,47 @@ test("an unreachable tracker does not stop another workspace's intake", async ()
     ]),
   );
 
-  assert.equal(await subject.ingest("origin", "main"), 1);
+  assert.equal((await subject.ingest("origin", "main")).created, 1);
   assert.deepEqual(await store.listTasks(), ["GH-acme-widget-12"]);
+});
+
+test("a pass reports what it saw, not only what it created", async () => {
+  // `created: 0` is the normal case, so it cannot be the only thing reported: a working
+  // intake and a broken one would look identical. `seen` separates "nobody labelled
+  // anything" from "items came back and none became tasks".
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID, "1"), item("no block here", "2")]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
+
+  assert.deepEqual(await subject.ingest("origin", "main"), {
+    seen: 2,
+    created: 1,
+    rejected: 1,
+    failed: 0,
+  });
+
+  // Second pass: both items still come back from the tracker, and neither does anything.
+  assert.deepEqual(await subject.ingest("origin", "main"), {
+    seen: 2,
+    created: 0,
+    rejected: 0,
+    failed: 0,
+  });
+});
+
+test("a tracker that cannot be listed is counted, not silently dropped", async () => {
+  const { store } = await stateRepo();
+  const subject = ingesterFor(
+    store,
+    new Map([[asWorkspaceName("electric-boogaloo"), new FakeTracker([], true)]]),
+  );
+
+  assert.deepEqual(await subject.ingest("origin", "main"), {
+    seen: 0,
+    created: 0,
+    rejected: 0,
+    failed: 1,
+  });
 });
 
 test("nothing is committed when there is nothing to do", async () => {
@@ -222,7 +261,7 @@ test("nothing is committed when there is nothing to do", async () => {
   const before = await origin.run("rev-parse", "main");
 
   const subject = ingesterFor(store, new Map([[WORKSPACE, new FakeTracker([])]]));
-  assert.equal(await subject.ingest("origin", "main"), 0);
+  assert.equal((await subject.ingest("origin", "main")).created, 0);
 
   assert.equal(await origin.run("rev-parse", "main"), before, "no empty commits");
 });
@@ -233,7 +272,7 @@ test("several items in one pass produce one commit", async () => {
   const tracker = new FakeTracker([item(VALID, "1"), item(VALID, "2"), item(VALID, "3")]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
-  assert.equal(await subject.ingest("origin", "main"), 3);
+  assert.equal((await subject.ingest("origin", "main")).created, 3);
   assert.equal((await store.listTasks()).length, 3);
 
   const after = await origin.run("rev-list", "--count", "main");
