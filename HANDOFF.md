@@ -1,73 +1,144 @@
 # Handoff
 
-State as of 2026-08-13. Overwrite this file rather than appending to it — an
-append-forever handoff eventually consumes the context it exists to preserve (the same
-reason `handoff.md` is overwritten and `journal.md` appends, DESIGN.md §4.1).
+State as of 2026-08-13, after intake shipped. Overwrite this file rather than appending to
+it — an append-forever handoff eventually consumes the context it exists to preserve (the
+same reason `handoff.md` is overwritten and `journal.md` appends, DESIGN.md §4.1).
 
 ## Orientation
 
 **Caterpillar** is a long-running autonomous coding agent supervisor. Read
-[`DESIGN.md`](DESIGN.md) first — it is the source of truth for intent, the decisions in
-it were settled by interview, and several were made *against* the obvious default for
-stated reasons. Do not re-litigate them; if one looks wrong, the rationale is written
-down next to it.
+[`DESIGN.md`](DESIGN.md) first — it is the source of truth for intent, the decisions in it
+were settled by interview, and several were made *against* the obvious default for stated
+reasons. Do not re-litigate them; if one looks wrong, the rationale is written down next to
+it. **DESIGN.md is also this project's ADR record** — there is no `docs/adr/`, and every
+architectural change so far has been recorded by amending the relevant section.
 
 `README.md` has the file-by-file layout and the six load-bearing invariants.
 
-**The local directory is `~/Hobby/remote-agent` but the project is `Caterpillar`** —
-the directory was never renamed. Remote: `github.com/caesarakalaeii/Caterpillar`
-(private).
+Repo: `~/git/Caterpillar` → `github.com/caesarakalaeii/Caterpillar` (private).
+Manifests: `~/git/caesar-deployment` at `apps/workloads/caterpillar`.
 
-## Environment
+> An earlier version of this file said the working copy was `~/Hobby/remote-agent`. **That
+> directory does not exist on this machine** — and neither does `~/Hobby`. Earlier sessions
+> ran on a NixOS box; this one is Arch with a zen kernel and no nix at all. Assume nothing
+> about the host from this document; check.
 
-NixOS. **There is no `node` or `npm` on PATH.** Everything runs through nix:
+## Environment — READ THIS, IT CHANGED
+
+The previous handoff said "NixOS, there is no `node` or `npm` on PATH, everything runs
+through nix". On the current machine the opposite is true and worse:
+
+- `node` and `npm` **are** on PATH (`/usr/sbin`), at **node 26.5.0**. There is **no `nix`**.
+- **`npm test` cannot run at all.** Node 26 *removed* `--experimental-transform-types`, and
+  strip-only TypeScript mode cannot parse the parameter properties this codebase uses
+  throughout, so not a single test file loads. The same applies to `npm start` and all five
+  `verify:*` scripts, which use the same flag.
+- `src/credential/service.test.ts` **spawns the credential helper with that flag**, so it
+  fails for the same reason even if you work around the runner.
+- `npm run check` and `npm run build` are fine — they are `tsc`.
+- CI pins **node 22** and is green — **143 tests, 143 passing** at `a540f6b`. It is the
+  authority on whether tests pass; a local run that cannot load half the suite is not.
+
+`flake.nix` is still in the repo and still correct; it just has nothing to run it here.
+
+**The fix is to install node 22.** Until someone does, run tests by compiling first — this
+is what produced every test result in this session, and it reproduces CI's count exactly:
 
 ```bash
-nix develop                                    # node 22, git, jq, sops, age, kubectl
-nix shell nixpkgs#nodejs_22 --command npm test  # one-off, what I used throughout
+# tsconfig excludes *.test.ts, so use a copy that includes them and outputs elsewhere.
+# The compiled tree lives outside the repo, so symlink node_modules or bare specifiers
+# ('yaml', pi) fail to resolve and whole FILES fail before any test registers.
+tsc -p <tsconfig-including-tests>   # outDir e.g. /tmp/.../dist-test
+ln -sfn "$PWD/node_modules" /tmp/.../dist-test/node_modules
+node --test $(find /tmp/.../dist-test -name '*.test.js')
 ```
 
-- `npm run check` — typecheck (strict, `exactOptionalPropertyTypes`, no `any`)
-- `npm test` — 89 tests, all passing at last commit
-- Tests need `--experimental-transform-types`, **not** `--experimental-strip-types`:
-  strip-only mode cannot parse TypeScript parameter properties, which this codebase
-  uses throughout. Already set in `package.json`.
-- `sops` is not installed globally either — `nix shell nixpkgs#sops --command sops ...`
+`node_modules` was absent entirely at the start of this session; `npm install` fixed it and
+also synced a lockfile that was missing the `caterpillar-cred` bin entry.
 
 ## Status
-
-Built, typechecked, and tested end to end:
 
 | Area | State |
 |---|---|
 | Leasing (git-ref CAS, heartbeat fence) | implemented, tested |
 | Context budget + handoff trigger | implemented, tested |
-| Credential service + git helper | implemented, integration-tested through **real git** (`credential fill`) |
-| Workspace mirror clone (private repos) | **fixed locally, never run in-cluster** — see "The clone fix" |
+| Credential service + git helper | implemented, integration-tested through **real git** |
+| Workspace mirror clone (private repos) | **fixed, deployed, and exercised in-cluster** |
 | GitHub App forge (mint, PR, checks) | implemented, verified against live GitHub |
 | Forgejo/Codeberg forge | implemented, endpoints verified against live Codeberg |
-| Session runner | implemented, end-to-end tested with pi's `fauxProvider` |
-| Verifier + progress probe | implemented |
+| Session runner | implemented, **ran a real task to a merged PR in-cluster** |
+| Verifier + progress probe | implemented; probe's first-session bug fixed (#10) |
 | Multi-repo checkout | implemented, tested |
-| Vikunja tracker | implemented, unit-tested, **verified against the live instance** |
-| GitHub Issues tracker | implemented, unit-tested, **verified against live GitHub** (PR #5) |
+| Vikunja tracker | implemented, verified against the live instance |
+| GitHub Issues tracker | implemented, verified against live GitHub |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
-| State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
-| LLM auth: Claude subscription (OAuth) | implemented, tested — `llm.auth: subscription` |
-| Container image + CI | **built and pushed by CI** — `ghcr.io/caesarakalaeii/caterpillar:main` |
-| State repo | **created and verified** — `caesarakalaeii/caterpillar-state`, private |
-| `caesar-deployment` manifests | **merged** (#45, #46, #47) |
-| Deployment | **LIVE** — see below |
+| **Structured logging (§11)** | **implemented and deployed (#10)** — JSON lines on stdout |
+| **Tracker intake (§14)** | **implemented and deployed (#11, #12)** — running on a 300s timer |
+| State-repo credential + bootstrap | implemented, tested |
+| LLM auth: Claude subscription (OAuth) | implemented, tested |
+| Container image + CI | built and pushed by CI on every push to `main` |
+| Deployment | **LIVE**, and no longer idle-by-design |
 
-Not built yet, in the order I would take them:
+Not built:
 
-1. **Intake ingesters.** Once the clone fix ships, this is the only thing between a live
-   supervisor and an idle one — see "The supervisor is live and has nothing to do" below.
-2. Discord bridge (inbound `!answer`, outbound webhook).
+1. **Discord.** Outbound `DiscordNotifier.notify` is **wired but throws** — see the trap
+   below. Inbound `!answer` and `!task` intake (§14 path 3) do not exist.
+2. Nothing else from DESIGN.md is missing.
+
+## What is actually proven, and what is not
+
+**Proven end to end in-cluster.** A hand-written spec (`SMOKE-1`) went from the state repo
+through a private-repo mirror clone, an agent session, a context handoff, a second session,
+a completion claim, the supervisor's **own** §12 verification, and `done` — producing
+[`caterpillar-smoke#1`](https://github.com/caesarakalaeii/caterpillar-smoke/pull/1), since
+merged. Cost: 2 sessions, 3.75M input tokens, **$3.94**. That is the number to quote when
+someone asks what a trivial task costs.
+
+**Proven in-cluster for intake.** It runs, reaches both trackers, and finds nothing:
+
+```json
+{"seen":0,"created":0,"rejected":0,"failed":0,"level":"info","event":"intake.pass"}
+```
+
+Two consecutive passes were **329s** apart, confirming the interval gate (300s + up to one
+30s poll of granularity). `failed: 0` with both trackers configured is what proves it
+actually talked to GitHub and Vikunja rather than iterating an empty map.
+
+**NOT proven: intake → session.** No tracker item has ever become a task. Both trackers had
+**0 `agent`-labelled items** at last check, which is why deploying intake was safe and also
+why the path is unexercised. Closing that loop costs money and opens a PR, so it is a
+deliberate decision, not an oversight.
+
+## Giving it work
+
+Two paths (§14):
+
+1. **Label a tracker item `agent`** and put an `agent` block in the body. Within ~5 minutes
+   intake renders a spec and the supervisor claims it.
+2. **Commit `tasks/<id>/spec.md`** into `caterpillar-state` by hand — most control over
+   acceptance criteria, and the fastest way to test the pipeline without a tracker.
+
+````
+```agent
+repos:
+  - owner/name          # optional on GitHub — defaults to the issue's own repo
+requires:               # optional; defaults to none, so any runner may claim
+  - linux
+acceptance:             # REQUIRED — at least one command that must exit 0
+  - "npm test"
+```
+````
+
+An item without acceptance criteria is **refused** and commented on **once**, because a task
+with no machine-checkable criteria can never satisfy §12. Refusals are recorded at
+`intake/<task-id>.json` in the state repo, keyed by a digest of the item's title and body;
+editing the item re-opens it. **In Vikunja the `agent` marker must be the first line INSIDE
+a code block** — TipTap cannot put text on the fence line.
+
+To silence intake entirely, remove the `agent` label. To stop a task, set its `state.json`
+to `parked` — do **not** `kubectl scale`, ArgoCD `selfHeal` reverts it within seconds.
 
 ## Deployment state: LIVE
-
-Deployed 2026-08-13 and healthy. Nothing here is theoretical any more.
 
 | | |
 |---|---|
@@ -76,448 +147,293 @@ Deployed 2026-08-13 and healthy. Nothing here is theoretical any more.
 | ArgoCD app | `caterpillar`, `Synced` / `Healthy`, sync wave 6 |
 | Pod | 1 replica, `Recreate`, `/healthz` + `/metrics` on 9090 |
 | PVC | `caterpillar-work`, 20Gi RWO, bound |
+| Image | `ghcr.io/caesarakalaeii/caterpillar:main`, rolled by Keel (`policy: force`, `trigger: poll`) |
 
-Verified in-cluster: the App token minted, the state repo cloned onto the PVC, the
-loop polls it (`FETCH_HEAD` refreshes every few seconds), metrics serve, and the
-subscription credential loads through the app's own `FileCredentialStore`
-(`type: oauth`).
+Deploy = merge to `main`. CI builds and pushes, Keel notices within ~45–90s and rolls the
+Deployment. Watch it with `gh run watch` then poll the pod's `imageID`.
 
-**`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and
-`selfHeal`** — so anything added there deploys immediately, and anything *removed*
-there is pruned from the cluster.
+**`CONFIG_PATH` is `/etc/caterpillar/config/config.json`**, not `/etc/caterpillar/config.json`
+— the ConfigMap mounts a directory. Read it with
+`kubectl exec <pod> -- cat /etc/caterpillar/config/config.json`.
 
-**The live app-of-apps is named `root`, not `root-app`.** The manifest file is
-`root-app.yaml`; the Application it creates is `root`. `kubectl -n argocd get
-application root-app` returns NotFound and looks alarming for no reason.
+`log.level` and `intake.intervalSeconds` are **absent** from the deployed ConfigMap, so both
+run on their code defaults (`info`, `300`). Neither needed a `caesar-deployment` change.
+Raising the level to `debug` requires editing that ConfigMap, which is a deploy.
 
-Decisions the user made by interview (do not re-litigate):
+**`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and `selfHeal`**
+— adding a file there is a deploy, not a proposal; removing one prunes it from the cluster.
+**The live app-of-apps is named `root`, not `root-app`** — `kubectl -n argocd get application
+root-app` returns NotFound and looks alarming for no reason.
 
-- **Claude Pro/Max subscription, not a metered API key.** pi-ai's Anthropic provider
-  ships an OAuth mode (`isSubscription: true`) with PKCE and refresh built in — I
-  initially and wrongly claimed this needed hand-built client impersonation. It does
-  not. There is **no Anthropic API key anywhere** in either repo.
-- **LiteLLM was removed** as a consequence: an OAuth bearer credential cannot be
-  forwarded by a proxy that authenticates with `x-api-key`. DESIGN.md §9.6 is amended
-  to describe both modes; `proxy` is retained in code and config.
-- **State repo on GitHub, authenticated with the existing App**, rather than a deploy
-  key — no new secret. The feared cost (an extra installation step) turned out not to
-  exist: installation `153385932` is account-wide, so the repo was covered on creation.
-- **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
-  from the electric-boogaloo `.env`.
-
-All four deployment prerequisites are done: image, pull credential, state repo, sealed
-EB secret, and the subscription credential seeded onto the PVC.
-
-### What the first end-to-end run proved
-
-A hand-written task (`SMOKE-1`, targeting the throwaway repo
-`caesarakalaeii/caterpillar-smoke`) was committed to the state repo and claimed. It
-found **four** defects that every unit test and every live credential check had missed,
-because nothing had ever driven a private repo through the worktree path.
-
-Three are fixed and merged in **PR #8**, live as image `e42852ee`; the fourth is fixed
-locally but **not yet built, deployed, or run in-cluster** — see "The clone fix" below.
-
-1. **The mirror clone was anonymous.** `syncMirror` cloned *before* `configure()` wrote
-   `credential.helper`, so private repos died on `could not read Username`. Public repos
-   hid it completely. The helper is now passed to the clone itself via `-c`.
-2. **A failed clone poisoned the path permanently.** `mkdir` ran before `clone`, so a
-   failure left an empty directory; every retry then took the `fetch` branch and died
-   with `not a git repository` — a message describing the symptom and hiding the cause.
-   Unrecoverable without deleting the path by hand, which had to be done on the live PVC.
-   The check now tests for `HEAD` *inside* the mirror and self-heals a partial one.
-3. **One bad task killed the supervisor.** `run()` rethrew anything but
-   `LeaseLostError`, exiting the process; the durable claim meant the restart re-claimed
-   the same task and died again, wedging the runner permanently. Such a task is now
-   journalled, parked, and skipped. Confirmed: the pod holds `1/1 Running` with **0
-   restarts** through repeated failures where it previously CrashLoopBackOff'd.
-
-### The clone fix — diagnosed, fixed, NOT yet deployed
-
-The fourth defect was:
-
-```
-remote: Repository not found.
-fatal: repository 'https://github.com/caesarakalaeii/caterpillar-smoke.git/' not found
-```
-
-An earlier version of this document guessed that an empty helper response made git fall
-back to **anonymous**. That guess was wrong, and it is worth knowing why: an anonymous
-request to a private repo gets a **401** and fails with `could not read Username`, not
-`Repository not found`. `Repository not found` means GitHub **accepted** a credential
-and then denied access — so a credential *was* being sent, just the wrong one.
-
-It was the supervisor's own. `index.ts` builds one `Git` for the state repo, carrying an
-`http.extraHeader` App token scoped to `caterpillar-state` alone, and passed that same
-object to `WorktreeManager`. `syncMirror`'s clone is the **one** call site that uses it
-directly instead of going through `at()` (which drops the credential by design), so
-`git clone` of a task repo authenticated as the state repo. GitHub 404s, and because a
-404 is not a 401 **git never consults the credential helper at all** — the correct
-task-scoped token was never even requested.
-
-Verified against real GitHub, not reasoned about: a valid token against a repo it cannot
-see reproduces the message byte-for-byte with zero helper invocations.
-
-Fixed by `Git.withoutCredentials()`, applied inside the `WorktreeManager` constructor
-rather than at the call site — the caller that got this wrong passed the obvious thing,
-so the invariant is enforced where it cannot be forgotten. This was also a live
-cross-host leak: on the Codeberg workspace the same bug sent a GitHub token to Codeberg.
-
-**Three more defects were found while fixing it. All are on the same path and all would
-have blocked the smoke test in turn:**
-
-1. **The credential helper never answered anything, ever.** git appends the operation as
-   the **last** argv element, so the real invocation is `--socket <path> get`. The helper
-   picked the operation with `argv.find(a => !a.startsWith("--"))`, which returns the
-   **socket path**, so the `=== "get"` gate never matched and it exited silently on every
-   single request. Bug 1 hid it (GitHub 404'd before git ever needed a credential), and
-   `service.test.ts` hid it too — the harness invoked the helper as `get --socket <path>`,
-   operation first, which is not what git does. Four green tests sat on top of a helper
-   that declined everything. Now parsed by `parseInvocation`, and pinned by a test that
-   drives the real helper through real `git credential fill`.
-2. **Verification could never run on a private repo.** `probe` and `verify` both call
-   `ensureWorktree`, which unconditionally re-fetched the mirror — but they run *after*
-   `credentials.clearActive()`, so the credential service correctly refuses (§9.2) and the
-   fetch dies. The fetch was pure waste anyway: an existing worktree is already checked
-   out and a mirror fetch does not move it. `addWorktreeAt` now short-circuits.
-3. **Parking after a session failure never reached the remote.** `workTask` released the
-   lease in its `finally`, and only *then* did the caller park; `park` → `push` →
-   `assertHeld` CAS'd against a ref that had just been deleted and threw. That is the
-   `lease for SMOKE-1 is no longer held by this runner` line. The task therefore stayed
-   `ready` on the remote and was re-claimed every single poll. Parking now happens inside
-   `workTask`, before the release, with the heartbeat-current lease (the claim-time oid is
-   already stale by then). Reproduced in `src/supervisor/loop.test.ts` over a real git
-   remote: 316 retry iterations in 30s before the fix, parked on the first try after.
-
-All four fixes have regression tests, and **each test was confirmed to fail against the
-unfixed code** — the one discipline this codebase keeps having to relearn.
-
-**Still unproven:** none of this has run in-cluster. It needs a new image and another
-`SMOKE-1` run. No agent session has ever started on the runner, so everything downstream
-of the clone — session, handoff, verification, PR creation — remains untested.
-
-### The supervisor is live and has nothing to do
-
-**Read this before assuming the system works end to end.** It runs, but no task can
-reach it.
-
-`Supervisor.claimNext()` iterates `store.listTasks()`, which reads `tasks/` in the
-**state repo**. Nothing in the running binary calls `Tracker.listAgentItems()` — grep
-it: the only callers are `src/cli/verify-vikunja.ts` and
-`src/cli/verify-github-issues.ts`. The tracker → `TaskSpec` path (DESIGN.md §14) is
-**not built**.
-
-So the deployed supervisor polls an empty `tasks/` directory forever. Labelling an
-issue `agent` does nothing today. Until intake exists, the only way to give it work is
-to commit a `tasks/<id>/spec.md` into `caterpillar-state` by hand — which is also the
-cheapest way to prove the whole pipeline, since it exercises leasing, sessions,
-verification, and the forge without needing intake first.
-
-That makes **intake the single highest-value thing left**, and it is pure code with no
-credential work attached.
-
-The GHCR package is private (it inherits the repo's visibility), which is handled the
-way `caesar-deployment` already handles its other private images: `imagePullSecrets:
-myregistrykey`. Image-pull secrets are **namespaced**, so `caterpillar` carries its own
-re-sealed copy of the same credential at `secrets/myregistrykey.enc.yaml` — rotating the
+The GHCR package is private (it inherits the repo's visibility), handled with
+`imagePullSecrets: myregistrykey`. Image-pull secrets are **namespaced**, so rotating the
 GHCR token means re-sealing it in every namespace that has one (`caesar`,
 `ai-editor-collector`, `plot-spot`, `sn2-randomizer`, `spotify-widget`, `caterpillar`).
 
+Decisions the user made by interview (do not re-litigate):
+
+- **Claude Pro/Max subscription, not a metered API key.** pi-ai's Anthropic provider ships
+  an OAuth mode with PKCE and refresh built in. There is **no Anthropic API key anywhere**.
+- **LiteLLM was removed** as a consequence: an OAuth bearer credential cannot be forwarded
+  by a proxy that authenticates with `x-api-key`. DESIGN.md §9.6 covers both modes.
+- **State repo on GitHub, authenticated with the existing App**, not a deploy key.
+- **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens.
+
 ### The subscription credential is the sharp edge
 
-`llm.credentialsPath` is `/work/credentials/anthropic.json` on the PVC, and it **cannot
-become a Secret**. Refreshing rotates the refresh token and pi writes the new one back
-inside `CredentialStore.modify`; a read-only mount means the supervisor works until the
-access token expires and then stops. `FileCredentialStore` locks around the
-read-modify-write so two sessions can't race a rotation — the loser would persist a
-token the provider already invalidated. 30s to acquire; a lock older than 60s is treated
-as abandoned by a process that died mid-refresh.
+`llm.credentialsPath` is `/work/credentials/anthropic.json` on the PVC and **cannot become a
+Secret**. Refreshing rotates the refresh token and pi writes the new one back inside
+`CredentialStore.modify`; a read-only mount means the supervisor works until the access
+token expires and then stops. `FileCredentialStore` locks around the read-modify-write so
+two sessions cannot race a rotation. 30s to acquire; a lock older than 60s is treated as
+abandoned.
 
-Seed it with `npm run llm:login -- --out ./auth.json` on a machine with a browser (a pod
-has nowhere to open one), then `kubectl cp` it in.
+Seed it with `npm run llm:login -- --out ./auth.json` on a machine with a browser, then
+`kubectl cp` it in. **`/work/credentials` does not exist on a fresh PVC** and `kubectl cp`
+will not create a missing parent — `mkdir -p` it in the pod first.
 
-**Two things this document previously got wrong, both corrected by watching the real
-deploy:**
+- **The pod does NOT crash-loop without the credential.** It boots, serves `/healthz`, and
+  idles; the credential is read lazily when a session starts. Do not wait for a crash loop
+  as a signal that something is wrong.
+- Refresh is **lazy, not scheduled**. An expired access token on an idle supervisor is
+  normal.
+- **Deleting the PVC destroys the credential**, not just mirrors and worktrees. Recovery
+  means re-running the browser login.
 
-- **The pod does NOT crash-loop without the credential.** It boots clean, serves
-  `/healthz`, and idles — the credential is read lazily when a session starts, not at
-  boot. Do not wait for a crash loop as a signal that anything is wrong.
-- **The real trap is that `/work/credentials` does not exist on a fresh PVC**, and
-  `kubectl cp` will not create a missing parent. `mkdir -p` it in the pod first, or the
-  copy fails.
+### The Discord trap
 
-Refresh is **lazy, not scheduled**. Nothing runs on a timer; pi refreshes when it next
-uses the provider. An expired access token on an idle supervisor is normal, not a fault.
-Verified in-cluster: `modify()` acquires the lock, persists, and releases correctly on
-the real PVC.
-
-**Deleting the PVC destroys the credential**, not just the mirrors and worktrees. There
-is no copy anywhere else — recovery means re-running the browser login.
+`src/notify/discord.ts` is fully wired into `index.ts` and `loop.ts`, but
+`DiscordNotifier.notify` ends in `throw new Error("not implemented")`. It is harmless *only*
+because the mounted `caterpillar-discord` secret directory is **empty**, so `index.ts` falls
+back to `NullNotifier`. **Sealing a `webhook-url` into it arms the throw on the first
+question, park, or completion.** Implement it or leave the secret empty.
 
 ## Live credentials
 
-The GitHub App exists and is verified working:
-
 - App slug `caterpillar-agent`, **App ID `4579022`**, **installation ID `153385932`**
-- Private key is SOPS-encrypted at
-  `../caesar-deployment/apps/workloads/caterpillar/secrets/caterpillar-github-app.enc.yaml`
-  (committed as `aca5042`). Keys: `app-id`, `installation-id`, `private-key.pem` —
-  matching what `src/secrets/load.ts` reads.
+- Private key SOPS-encrypted at
+  `../caesar-deployment/apps/workloads/caterpillar/secrets/caterpillar-github-app.enc.yaml`.
+  Keys: `app-id`, `installation-id`, `private-key.pem`.
+- **The installation is account-wide** ("All repositories" — 66 repos as of this writing).
+  That is why `caterpillar-state` needed no separate install. Narrowing it to selected repos
+  makes the state-repo mint return 422 and the pod crash-loop at bootstrap.
 
-> **UNRESOLVED — the App private key is exposed.** `aca5042` committed that Secret
-> **twice**. The second path had a **trailing newline in its filename**
-> (`caterpillar-github-app.enc.yaml\n`), so that session's `shred` and
-> `sops --encrypt` both hit the correctly-named file while the newline-named copy kept
-> its cleartext `stringData` — including `private-key.pem` — and was committed
-> unencrypted. An earlier version of this document claimed "the plaintext PEM was
-> shredded". It was not.
+> **UNRESOLVED — the App private key is exposed.** `aca5042` in `caesar-deployment`
+> committed that Secret **twice**. The second path had a **trailing newline in its filename**,
+> so that session's `shred` and `sops --encrypt` both hit the correctly-named file while the
+> newline-named copy kept its cleartext `stringData` — including `private-key.pem` — and was
+> committed unencrypted.
 >
-> caesar-deployment #46 removed the file, but by the owner's explicit decision the key
-> was **not rotated** and history was **not** rewritten. The blob is still reachable in
-> `aca5042`, and any clone predating #46 still holds a working key for app `4579022`.
-> The repo is private and nothing was ever deployed from the plaintext copy.
+> caesar-deployment #46 removed the file, but **by the owner's explicit decision the key was
+> not rotated and history was not rewritten**. The blob is still reachable in `aca5042`, and
+> any clone predating #46 still holds a working key for app `4579022`. The repo is private
+> and nothing was ever deployed from the plaintext copy.
 >
-> Rotating is cheap if this is ever revisited: generate a new key at
-> `github.com/settings/apps/caterpillar-agent`, delete the old one, re-seal the Secret.
-> App ID and installation `153385932` do not change. Note
-> `seal-caterpillar-secrets.sh` has only `eb` and `discord` modes — re-sealing the App
-> secret is a manual `sops` step.
+> Rotating is cheap if revisited: generate a new key at
+> `github.com/settings/apps/caterpillar-agent`, delete the old one, re-seal the Secret. App
+> ID and installation do not change. `seal-caterpillar-secrets.sh` has only `eb` and
+> `discord` modes — re-sealing the App secret is a manual `sops` step.
 >
 > `ls` renders both filenames identically. Use `ls -b` or `find` to see a stray one.
-- That secret is **live** — mounted into the running pod and used for state-repo pushes
-  and task-scoped forge tokens.
-- Verify any time with `npm run verify:github-app -- --pem <p> --app-id <id> --repo <r>`,
-  or the tracker path with `npm run verify:github-issues`.
-- **The installation is account-wide** ("All repositories" — 65 repos as of this
-  writing). That is why `caterpillar-state` needed no separate install. If it is ever
-  narrowed to selected repos, the state-repo mint returns 422 and the pod crash-loops
-  at bootstrap.
 
-To use the key locally: `sops --decrypt` the secret to a mode-0600 file, extract
-`private-key.pem` with `yq`, and `shred -u` it after. Do not decrypt to stdout — the
-key lands in the terminal, and in an agent session in the transcript.
+Codeberg and Vikunja tokens are sealed and deployed in `caterpillar-electric-boogaloo`
+(`username`, `tokens.json`, `vikunja-token`).
 
-**The state repo exists**: `caesarakalaeii/caterpillar-state`, private, seeded with a
-README describing the layout. Verified minting `contents: write` scoped to it alone.
+### Run the verifiers inside the pod
 
-Codeberg and Vikunja tokens are **sealed and deployed**, in
-`caterpillar-electric-boogaloo` (`username`, `tokens.json`, `vikunja-token`).
-
-**Vikunja is VERIFIED** as of 2026-08-13 — the first time this implementation touched
-the live instance. Token authenticates, 4 projects visible, and both `agent-wip` and
-`needs-human` exist (the user created them).
-
-Run it without ever exposing the token by executing it **inside the pod**, where the
-secret is already mounted:
+`dist/cli/` ships in the image and the secrets are already mounted, so live credentials can
+be checked without decrypting anything locally. This is strictly safer than pulling a token
+onto a workstation, and it is how both trackers were verified. **The flags are required and
+the error message only names the first missing one:**
 
 ```bash
 POD=$(kubectl --context default -n caterpillar get pods -o jsonpath='{.items[0].metadata.name}')
+
+kubectl --context default -n caterpillar exec "$POD" -- sh -c '
+S=/etc/caterpillar/secrets/caterpillar-github-app
+node dist/cli/verify-github-issues.js --pem $S/private-key.pem \
+  --app-id "$(cat $S/app-id)" --installation "$(cat $S/installation-id)" \
+  --owner caesarakalaeii'
+
 kubectl --context default -n caterpillar exec "$POD" -- sh -c \
   'VIKUNJA_TOKEN=$(cat /etc/caterpillar/secrets/caterpillar-electric-boogaloo/vikunja-token) \
    node dist/cli/verify-vikunja.js --api-base https://tasks.eb.bims.sh/api/v1'
 ```
 
-The same trick works for `verify-github-issues.js` with
-`/etc/caterpillar/secrets/caterpillar-github-app/`. `dist/cli/` ships in the image, so
-every verifier can be run against live credentials without decrypting anything locally.
-
-Not yet exercised: the Vikunja **write** scopes (`-- --task <scratch id>`), which only a
-real transition or a deliberate scratch item covers. The lifecycle labels must keep
-existing — no adapter creates them, since the token deliberately has no `labels:create`
-scope. Names are overridable via `tracker.wipLabel` / `tracker.needsHumanLabel`.
-
-GitHub Issues is verified live (65 repos enumerate, token mints with `issues: write` and
-nothing else). Its ingest label `agent` had **zero** matching issues at last check, and
-the same repo-level label rule applies: `agent-wip` / `needs-human` must exist on each
-repo that carries agent work.
+Last run: GitHub **66 repos visible, 0 items labelled `agent`**; Vikunja **4 projects, 0
+items labelled `agent`**, with `agent-wip` and `needs-human` both present. Write scopes on
+both are still unexercised — that needs `--issue`/`--task` against a scratch item. The
+lifecycle labels must keep existing on every repo carrying agent work; no adapter creates
+them, deliberately (see below).
 
 ## Things learned the hard way
 
-Each of these cost real debugging. They are all encoded in code or tests now; do not
-"simplify" them away.
+Each of these cost real debugging. They are encoded in code or tests now; do not "simplify"
+them away.
 
-- **pi does not auto-compact.** Compaction lives in the coding-agent harness, not
-  `pi-agent-core`. The hazard is a provider context-length error, not silent
-  summarisation. DESIGN.md §6.1 was corrected after implementation.
-- **Context size must include `cacheRead` + `cacheWrite`.** `input + output` alone
-  badly undercounts a cached context, so a 70% threshold would fire far too late.
-- **"No merging" is not expressible as a GitHub permission.** `pull_requests: write`
-  authorises merge. Branch protection requiring an approving review is what enforces
-  it. DESIGN.md §9.1.
-- **The agent/supervisor credential boundary is leak hygiene, not a wall.** They share
-  a container, so an adversarial agent could reach the socket. The real boundary is
-  token scope. DESIGN.md §9.2.
-- **Forgejo has no Checks API** (`/check-runs` → 404, verified). Commit statuses are
-  the only CI signal, and its `error`/`warning` states have no GitHub equivalent.
-- **Forgejo returns `statuses: null`, not `[]`.** Typed and tested. Vikunja does the
-  same with a task's `labels`.
-- **`--git-common-dir`, not `--git-dir`**, for `info/exclude` in a linked worktree.
-  The first attempt silently did nothing.
-- **Never set `remote.origin.url` from a worktree** — worktrees share the mirror's
-  config, so it rewrites the mirror's fetch URL for every task.
-- **Vikunja: `GET /user` and `GET /tasks/all` are unreachable by any API token**, and a
-  401 means a missing route scope, not a bad token. Probe `/projects` instead.
-- **Vikunja descriptions and comments are HTML, not markdown** (TipTap). A `**bold**`
-  note renders as literal asterisks, so prose is escaped and wrapped in `<p>` going out
-  and stripped back to text coming in.
-- **Vikunja label removal goes through `POST /tasks/{id}/labels/bulk`**, re-sending the
-  surviving set. The per-label `DELETE` needs `tasksLabels: delete`, which the agent
-  token must not have — it would let the agent strip a label a human applied.
-- **Commit signing must be forced off.** A machine runner inherits the operator's global
-  git config, and `commit.gpgsign = true` (the default once SSH signing is set up) fails
-  every commit with an error naming 1Password rather than anything here. Handled in two
-  places, and both are needed: `-c commit.gpgsign=false` on every `Git` invocation, and
-  `commit.gpgsign false` written into each worktree's config, because the agent commits
-  with its own `git` calls through the bash tool.
-- **pi-ai supports Claude subscriptions natively.** `anthropicProvider()` carries an
-  `oauth` auth mode next to `apiKey` — PKCE flow, device code, and token refresh, all
-  in the library. Do not reach for the API key path by reflex; check the provider first.
-- **An OAuth refresh ROTATES the refresh token**, and pi does it inside
-  `CredentialStore.modify`. That single fact decides where the credential can live: not
-  a Secret, not an env var — writable durable storage only.
+**Environment and tooling**
+
+- **Node 26 removed `--experimental-transform-types`.** See Environment above. A test that
+  spawns a subprocess with the flag fails too.
+- **`git add -A <path>` fails the WHOLE command on a pathspec that matches nothing.** A
+  freshly bootstrapped state repo has no `tasks/` directory, so `commitAndPush` threw before
+  recording anything. Each path is now staged only when it exists.
+- **The `yaml` package is YAML 1.2**: `no`, `yes`, `on`, `off` stay **strings**; only
+  `true`/`false` are booleans. An earlier comment in `store.ts` claiming otherwise was
+  wrong. The realistic coercion hazard is an unquoted command containing `: `, which becomes
+  a **mapping** — `- npm test: unit` parses to `{"npm test": "unit"}`.
+- **A machine runner inherits the operator's global git config** — identity,
+  `commit.gpgsign`, `url.<...>.insteadOf`. Commit signing is forced off in two places and
+  both are needed. **Tests must be hermetic**: pass
+  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`, or the experiment measures the
+  workstation. This bit again this session — probe tests passed locally and failed CI with
+  `Author identity unknown`, because a runner has no global identity at all.
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
-- **`argocd/root-app.yaml` auto-syncs `argocd/apps/`** with `prune` + `selfHeal`. Adding
-  a file there is a deploy, not a proposal.
-- **SOPS in `caesar-deployment` encrypts by PATH.** `.sops.yaml` keys its creation rules
-  off `path_regex: .*\.enc\.yaml$`, so encrypting a `/tmp` file fails with "no matching
-  creation rules found". Write the plaintext to its final `*.enc.yaml` path (umask 077)
-  and `sops --encrypt --in-place` there.
-- **Don't hand-edit an encrypted file's plaintext fields.** The SOPS MAC covers
-  unencrypted values too, so changing `metadata.namespace` by hand breaks decryption.
-  Re-target a secret with decrypt → edit → encrypt.
-- **Check the whole repo before claiming a convention doesn't exist.** I grepped one
-  workload, concluded nothing used `imagePullSecrets`, and wrote it into two documents.
-  Six workloads use it.
-- **GitHub's issues route returns pull requests too.** Every PR is an issue in the data
-  model, so unfiltered intake would hand the agent its own open PRs as fresh work. The
-  `pull_request` key is the only reliable discriminator.
-- **`POST /issues/{n}/labels` silently CREATES an unknown label**, with a random colour.
-  Vikunja is protected from this by a withheld `labels:create` scope; GitHub has no
-  equivalent to withhold, so `github-issues.ts` checks the repo's labels first and
-  refuses. Do not "simplify" that lookup away.
-- **GitHub distinguishes 401 from 403; Vikunja cannot.** 403 is a valid credential
-  without the permission, 401 is a bad credential. Only 403 becomes `TrackerScopeError`.
-- **The GitHub search API is deliberately unused for intake.** It is eventually
-  consistent — a freshly labelled issue can be invisible for about a minute, which is
-  exactly the window intake runs in — separately rate limited, and its legacy
-  issue-search behaviour is on a deprecation path. Enumerate the installation instead.
-- **`per_page=100` contains the substring `page=1`.** A test stub matching pages with
-  `path.includes("page=1")` answers every page with a full one and paginates forever.
-  This cost a hung suite; the Vikunja tests only escape it because `per_page=50` does
-  not contain `page=1`. Anchor on `&page=N`.
-- **The caesar cluster is the `default` context in `~/.kube/config`**, not anything in
-  `~/.kube/caesar-clusters` — the `k3d-caesar-cluster` context there points at a host
-  that refuses connections. Check `kubectl --context default get ns` for `argocd`.
-- **`credential.helper` set AFTER a clone is set too late.** The clone is the one git
-  operation that runs before any repo config exists, so it needs the helper passed with
-  `-c`. This is why nothing private could ever be cloned, and why public repos hid it.
-- **`Repository not found` means a credential ARRIVED and was refused.** Anonymous
-  access to a private repo gets a 401 and `could not read Username`. The two failures
-  look equally like "auth is broken" and point in opposite directions: 404 means the
-  WRONG token was sent, 401 means NO token was. An earlier version of this document
-  asserted the opposite and sent the next session hunting for a missing installation.
-- **A 404 stops git asking the credential helper.** The helper is only consulted on a
-  401 challenge. So a request that carries a valid-but-unauthorised credential never
-  reaches the helper at all — no amount of fixing the helper will change the outcome,
-  and helper-side logging stays silent while looking healthy.
-- **git appends the credential-helper operation LAST**, after the arguments baked into
-  the `credential.helper` string: `caterpillar-cred --socket /path get`. "First argument
-  that is not a flag" therefore selects the socket path. Confirmed against real git —
-  and note `git credential fill` reproduces the exact invocation offline, which makes it
-  the right way to test a helper without a network or a private repo.
-- **A test harness that calls the subject differently from the real caller proves
-  nothing.** `service.test.ts` invoked the helper as `get --socket <path>` — operation
-  first, which git never does — and four tests passed over a helper that answered no
-  request in production. Same failure mode as the credential-helper regression test
-  before it; when the thing under test is a protocol, drive it with the real other side.
-- **`at()` drops the credential, but only if you call it.** `WorktreeManager` was handed
-  the state repo's `Git` and used it verbatim for the mirror clone. When a rule is "this
-  object must not travel", enforce it at the boundary that receives the object, not by
-  documenting the method that happens to launder it.
-- **Anything the supervisor does AFTER `clearActive()` cannot use a task credential.**
-  That is the whole point of the refusal, so post-session code (probe, verifier) must
-  not need the network. Watch for helpers that fetch as a side effect of "ensure exists".
-- **Release the lease last.** Anything that wants to record WHY a task failed has to
-  write while the lease is still held; a `finally` that releases beats an outer `catch`
-  that parks, and the resulting `LeaseLostError` reads like a concurrency problem rather
-  than an ordering one. Also use the heartbeat's current lease — the claim-time oid is
-  stale as soon as the first renewal lands.
-- **A machine runner inherits `url.<...>.insteadOf` too.** The operator's global
-  `url.ssh://git@github.com/.insteadof = https://github.com/` silently rewrites every
-  HTTPS clone to SSH, which bypasses the credential helper completely and fails against
-  whatever key the host has. It cost a wrong conclusion in local testing here. Not a
-  problem in the container (no global config), but pass
-  `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` when testing this path on a
-  workstation, or the experiment measures the operator's config instead of the code.
-- **`kubectl scale` loses to ArgoCD `selfHeal`.** Scaling the Deployment to 0 was
-  reverted within seconds. To stop a supervisor that is failing on a task, change the
-  TASK (set `state.json` to `parked`) rather than fighting the reconciler.
-- **Run the verifiers inside the pod.** `dist/cli/` ships in the image and the secrets
-  are already mounted, so `kubectl exec` + `node dist/cli/verify-*.js` checks live
-  credentials without decrypting anything locally. This is how Vikunja finally got
-  verified, and it is strictly safer than pulling a token onto a workstation.
-- **A test that only asserts "it threw" proves nothing.** The first credential-helper
-  regression test passed identically with and without the fix, because the clone failed
-  either way. Assert on the invocation. The cheap discipline that catches all of these:
-  after writing a regression test, **revert the fix and watch it fail**. Do it on a copy
-  of `src/` rather than the working tree — a test timeout that kills the shell mid-way
-  leaves the real source reverted.
-- **Assert on what was PUSHED, not on the working tree.** `park` writes `state.json`
-  locally and then pushes; a test reading the checkout passes whether or not the push
-  landed, and the next `pull` resets it anyway. The remote is the only evidence.
-- **`per_page=100` contains `page=1`** — see above; it also bit a second time when a
-  digest comparison matched a substring of the previous digest. Anchor comparisons.
+- **SOPS in `caesar-deployment` encrypts by PATH** (`path_regex: .*\.enc\.yaml$`), so
+  encrypting a `/tmp` file fails with "no matching creation rules found". Write plaintext to
+  its final `*.enc.yaml` path (umask 077) and `sops --encrypt --in-place` there.
+- **Don't hand-edit an encrypted file's plaintext fields.** The SOPS MAC covers unencrypted
+  values too. Re-target with decrypt → edit → encrypt.
+- **The caesar cluster is the `default` context**, not anything in `~/.kube/caesar-clusters`.
+- **`kubectl scale` loses to ArgoCD `selfHeal`.** Change the TASK, not the replica count.
+
+**Credentials and git**
+
+- **`credential.helper` set AFTER a clone is set too late.** The clone runs before any repo
+  config exists, so the helper must be passed with `-c`.
+- **`Repository not found` means a credential ARRIVED and was refused.** Anonymous access to
+  a private repo gets a **401** and `could not read Username`. 404 means the WRONG token was
+  sent; 401 means NO token was. The two look equally like "auth is broken" and point in
+  opposite directions.
+- **A 404 stops git asking the credential helper.** The helper is only consulted on a 401,
+  so a valid-but-unauthorised credential never reaches it — helper-side logging stays silent
+  while looking healthy.
+- **git appends the credential-helper operation LAST**: `caterpillar-cred --socket <path> get`.
+  "First argument that is not a flag" therefore selects the *socket path*. `git credential
+  fill` reproduces the real invocation offline and is the right way to test a helper.
+- **`at()` drops the credential, but only if you call it.** `WorktreeManager` was handed the
+  state repo's `Git` and used it verbatim. Enforce "this object must not travel" at the
+  boundary that RECEIVES it, not by documenting the method that launders it.
+- **Anything the supervisor does AFTER `clearActive()` cannot use a task credential.** So
+  post-session code (probe, verifier) must not need the network. Watch for helpers that
+  fetch as a side effect of "ensure exists".
+- **Never set `remote.origin.url` from a worktree** — worktrees share the mirror's config.
+- **`--git-common-dir`, not `--git-dir`**, for `info/exclude` and shared refs in a linked
+  worktree. The first attempt silently did nothing.
+- **"No merging" is not expressible as a GitHub permission.** `pull_requests: write`
+  authorises merge; branch protection requiring an approving review is what enforces it.
+- **The agent/supervisor credential boundary is leak hygiene, not a wall.** They share a
+  container. The real boundary is token scope.
+
+**Supervisor behaviour**
+
+- **Release the lease LAST.** Anything recording *why* a task failed must write while the
+  lease is held. Use the heartbeat's current lease — the claim-time oid is stale as soon as
+  the first renewal lands.
+- **A first-session commit needs a baseline that exists.** The probe compared against the
+  previous session's head, so the commit that STARTS the work could never count: SMOKE-1
+  finished with `noProgressStreak: 2` and a merged PR. The fallback is the branch's fork
+  point, resolved locally. Do **not** use the fork point as the baseline always — then every
+  session after the first commit looks productive and thrashing never parks.
+- **pi does not auto-compact.** The hazard is a provider context-length error, not silent
+  summarisation.
+- **Context size must include `cacheRead` + `cacheWrite`.** `input + output` badly
+  undercounts a cached context, so a 70% threshold would fire far too late.
+- **An OAuth refresh ROTATES the refresh token**, inside `CredentialStore.modify`. That one
+  fact decides where the credential can live: writable durable storage only.
+- **Intake must not ride the poll interval.** A GitHub pass costs 1 request + 1 per repo
+  (~66 here). At a 30s poll that is ~132/min against an installation budget of ~83/min,
+  exhausting it within minutes and taking the forge calls down too. Stamp the clock BEFORE
+  the pass, or a failing tracker is retried every poll.
+- **Intake's id must derive from the tracker ref alone**, never the title — humans edit
+  titles, and a changed id means a duplicate task every pass. It also becomes a directory
+  name, so reduce it to one safe path segment or an item can write outside `tasks/`.
+- **`listAgentItems()` filters on the ingest label alone**, so a refused item comes back
+  every pass. Suppress repeat comments with a **durable** record: Keel rolls the pod on every
+  push to `main`, so an in-memory set re-comments on every deploy.
+- **Write `state.json` before `spec.md`.** The spec is the existence marker, so a crash
+  between them leaves a task the claim loop skips and the next pass recreates. The reverse
+  order wedges the item as permanently existing and never claimable.
+
+**Trackers and forges**
+
+- **Forgejo has no Checks API** (`/check-runs` → 404). Commit statuses are the only CI
+  signal, and its `error`/`warning` states have no GitHub equivalent.
+- **Forgejo returns `statuses: null`, not `[]`.** Vikunja does the same with `labels`.
+- **Vikunja: `GET /user` and `GET /tasks/all` are unreachable by any API token**, and a 401
+  means a missing route scope, not a bad token. Probe `/projects`.
+- **Vikunja descriptions and comments are HTML** (TipTap), not markdown. Prose is escaped
+  going out and stripped back to text coming in — and **`<pre><code>` has no literal fences**,
+  so `stripHtml` re-inserts them or intake's fenced `agent` block is unparseable while
+  looking correct in the UI.
+- **Vikunja label removal goes through `POST /tasks/{id}/labels/bulk`**, re-sending the
+  surviving set. The per-label `DELETE` needs `tasksLabels: delete`, which the agent token
+  must not have.
+- **GitHub's issues route returns pull requests too.** The `pull_request` key is the only
+  reliable discriminator, or intake hands the agent its own open PRs as fresh work.
+- **`POST /issues/{n}/labels` silently CREATES an unknown label** with a random colour.
+  Vikunja is protected by a withheld `labels:create` scope; GitHub has no equivalent, so
+  `github-issues.ts` checks the repo's labels first and refuses. Do not simplify that away.
+- **GitHub distinguishes 401 from 403; Vikunja cannot.** Only 403 becomes `TrackerScopeError`.
+- **The GitHub search API is deliberately unused for intake** — eventually consistent (a
+  freshly labelled issue can be invisible for ~a minute, exactly intake's window),
+  separately rate limited, and on a deprecation path. Enumerate the installation instead.
+
+**Testing discipline**
+
+- **A test that only asserts "it threw" proves nothing.** Assert on the invocation. After
+  writing a regression test, **revert the fix and watch it fail** — on a copy of `src/`, not
+  the working tree, or a timeout that kills the shell leaves the real source reverted. A
+  cleaner way: run the suite against a `git worktree` of `HEAD` to get a baseline, which is
+  how this session proved 5 apparent failures were pre-existing.
+- **A test harness that calls the subject differently from the real caller proves nothing.**
+  `service.test.ts` invoked the helper as `get --socket <path>` — operation first, which git
+  never does — and four tests passed over a helper that answered no request in production.
+  When the thing under test is a protocol, drive it with the real other side.
+- **Assert on what was PUSHED, not on the working tree.** A test reading the checkout passes
+  whether or not the push landed. This found the `git add -A tasks` defect above.
+- **`per_page=100` contains the substring `page=1`.** A stub matching `path.includes("page=1")`
+  answers every page with a full one and paginates forever. Anchor on `&page=N`. Same class
+  of bug bit a digest comparison matching a substring — anchor comparisons.
+- **Run intake tests TWICE.** Both of its failure modes (duplicate tasks, comment spam) are
+  invisible in a single pass.
 
 ## Constraints the user has set
 
-- **Do not read `~/Hobby/electric-boogaloo-workspace/.env`.** It holds the Codeberg and
-  Vikunja tokens. The scripts beside it (`cb-api.sh`, `vikunja.py`) are fine to read and
-  are good prior art for the secret-handling pattern. Enforced by a tool classifier, not
-  just convention — even listing variable *names* is blocked. The user seals those
-  tokens themselves with `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`,
-  which reads `.env` in-process and never prints a value.
-- Conventional Commits, **no** `Co-Authored-By` trailer, no gitmoji.
+- **Do not read the user's `.env` holding the Codeberg and Vikunja tokens.** The old path
+  (`~/Hobby/electric-boogaloo-workspace/.env`) does not exist on this machine, but the
+  constraint stands wherever it now lives. Enforced by a tool classifier, not just
+  convention — even listing variable *names* is blocked. The user seals those tokens
+  themselves with `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`, which reads
+  the file in-process and never prints a value.
+- Conventional Commits, **no** `Co-Authored-By` trailer, no gitmoji. The repo's history has
+  **no trailers at all** — match it.
 - Never use the type `any`.
-- Prefer open-source, provider-agnostic tooling — this is why the project is built on
-  `pi` rather than a vendor SDK. The user asked to be argued with rather than deferred
-  to; pi also turned out to be technically better here.
-- Pull before working in a repo.
+- Prefer open-source, provider-agnostic tooling — this is why the project is built on `pi`
+  rather than a vendor SDK. The user asked to be argued with rather than deferred to.
+- Pull before working in a repo, and branch before committing — every change so far went
+  through a PR (#1–#12), squash-merged.
+- Architectural changes are recorded in **DESIGN.md**, which serves as the ADR record.
 
 ## Immediate next action
 
-1. **Ship the clone fix and re-run the smoke test.** The four defects behind
-   `Repository not found` are fixed and tested locally but **exist only on this
-   workstation** — nothing is committed, no image is built, the cluster still runs
-   `e42852ee`. Merge, let CI publish, bump the image, and watch `SMOKE-1`: it is still
-   armed in the state repo and still retrying every poll, so it will claim itself as soon
-   as the new pod is up. **No agent session has ever run in-cluster**; this remains the
-   largest untested surface, and everything downstream of the clone — session, handoff,
-   verification, PR creation — is unproven.
-2. **Build intake** (DESIGN.md §14) — `Tracker.listAgentItems()` → `TaskSpec` in the
-   state repo. Until this exists, a hand-written spec is the *only* way work arrives.
-   Both trackers implement the read side; nothing calls it.
-3. **Discord bridge** — questions land in `tasks/<id>/questions/` in git and nothing
-   tells a human they are there. An agent that parks on a question parks silently.
+1. **Close the intake → session loop.** Label a scratch issue on
+   `caesarakalaeii/caterpillar-smoke` (a throwaway; delete it whenever) with `agent` and an
+   `agent` block, then watch `intake.pass` report `created: 1` and the session start. This is
+   the last unproven link in the chain and it costs a few dollars. **Ask first** — it spends
+   the user's subscription and opens a PR.
+2. **Implement `DiscordNotifier.notify`**, or leave the secret empty. Today an agent that
+   parks on a question parks silently, and sealing a webhook makes it throw instead.
+3. **Install node 22** so `npm test` and the `verify:*` scripts work locally again.
+4. Minor: `SMOKE-1`'s `journal.md` is **347KB** of 620 byte-identical park entries from the
+   pre-fix retry storm, all mislabelled "Session 0" (the park preceded the session
+   increment). It is read for handoff continuity, so it taxes any further session on that
+   task. There is no journal rotation. `SMOKE-1` is `done`, so this is latent.
 
-To silence `SMOKE-1` meanwhile, flip its `state.json` to `"parked"`.
-`caesarakalaeii/caterpillar-smoke` is a throwaway; delete it whenever.
+**Uncommitted work: none.** `main` is `a540f6b`, everything is merged and deployed, and the
+pod is healthy with 0 restarts. `caesar-deployment` has no unpushed commits either (its #48
+merged as `5f2a95ad`); it does carry untracked `.planning/` and `tea_debug.log`, which are
+not mine and were left alone.
 
-**Uncommitted work:**
-
-- **This repo:** the whole clone fix is uncommitted on `main` — `src/state/git.ts`,
-  `src/workspace/worktree.ts`, `src/credential/protocol.ts`,
-  `src/cli/credential-helper.ts`, `src/supervisor/loop.ts`, plus tests
-  (`src/supervisor/loop.test.ts` is new) and this file. `npm run check` and `npm test`
-  are green.
-- **`../caesar-deployment`** has commit `fba9d90` on branch
-  `docs/caterpillar-post-deploy` that was never pushed — the GitHub SSH key dropped out
-  of the agent mid-session (`ssh -T` worked, then stopped; the key `8XOjnN…` vanished
-  from `ssh-add -l`, and the on-disk `id_ed25519` does not authenticate either). Re-add
-  the key and push.
-
-**The SSH agent is still broken** as of this session: `git pull` on this repo fails with
-`sign_and_send_pubkey: signing failed for ED25519 "SSH Key" from agent`. `gh` itself
-authenticates fine (token, not key), so `gh` commands work while `git` over SSH does not.
-
-Unresolved by choice, not by omission: the exposed App private key (see the callout
-under "Live credentials").
+Unresolved by choice, not by omission: the exposed App private key (see the callout under
+"Live credentials").
