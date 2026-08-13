@@ -26,6 +26,7 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
+import { AnswerInbox } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -268,4 +269,118 @@ test("a notification that fails does not undo a task that finished", async () =>
   await running.catch(() => undefined);
 
   assert.equal(settled?.status, "done", "a failed notification must not rewrite task state");
+});
+
+test("an answer from the bridge unparks the task on the REMOTE", async () => {
+  // The inbound half of DESIGN.md §7, which until now was a human editing the state
+  // repo by hand. Asserted on the remote for the same reason as every other test here:
+  // the working copy says `ready` whether or not the push landed.
+  //
+  // The streak reset is not cosmetic. `awaiting-human` is reached from a session that
+  // produced no commit, so a task answered at the no-progress limit would park again on
+  // the very next claim WITHOUT running — the answer would be silently pointless.
+  const ANSWERED = asTaskId("SMOKE-3");
+  await seedTask(ANSWERED);
+
+  const store = new StateStore(statePath, stateGit);
+  const parked: TaskState = {
+    ...seed,
+    id: ANSWERED,
+    status: "awaiting-human",
+    sessions: 4,
+    progress: { lastProgressSession: 1, noProgressStreak: 3 },
+  };
+  await store.writeQuestion(ANSWERED, 4, "Which migration path?");
+  await store.writeState(parked);
+  await store.commitAndPush(`chore(${ANSWERED}): awaiting human`, "origin", "main");
+
+  const inbox = new AnswerInbox();
+  const runner: SessionRunner = {
+    // Claiming it is proof enough that the answer took effect; the session itself is
+    // not what this test is about.
+    run: () => Promise.reject(new Error("session not under test")),
+  };
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit(ANSWERED, "Use the existing migration path.");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(outcome, { kind: "applied", index: 4 });
+
+  const pushed = await pushedState(ANSWERED);
+  assert.notEqual(pushed?.status, "awaiting-human", "the answer must unpark the task");
+  assert.equal(
+    pushed?.progress.noProgressStreak,
+    0,
+    "an answered task must not park again before it runs",
+  );
+
+  const answer = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${ANSWERED}/questions/004-answer.md`,
+  );
+  assert.equal(answer.code, 0, "the answer file must be pushed, not just written locally");
+  assert.match(answer.stdout, /existing migration path/);
+});
+
+test("an answer for a task that is not waiting is refused, not written", async () => {
+  const inbox = new AnswerInbox();
+  const store = new StateStore(statePath, stateGit);
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // TASK is `parked` from the first test in this file — a real state, and not one an
+  // answer may resurrect: nothing asked a question.
+  const outcome = await inbox.submit(TASK, "please continue");
+  const unknown = await inbox.submit(asTaskId("NO-SUCH-TASK"), "hello?");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "not-waiting");
+  assert.deepEqual(unknown, { kind: "unknown-task" });
 });

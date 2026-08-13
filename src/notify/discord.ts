@@ -86,13 +86,7 @@ export class DiscordNotifier implements Notifier {
   }
 
   async notify(notification: Notification): Promise<void> {
-    const body = JSON.stringify({
-      // render() already fits the limit around its frame; this backstop covers the
-      // case the frame ITSELF is oversized, which a long task id is enough to do.
-      content: take(render(notification), CONTENT_LIMIT),
-      // Explicit, because Discord's default is to parse every mention in the text.
-      allowed_mentions: { parse: [] },
-    });
+    const body = messagePayload(render(notification));
     const maxRetries = this.options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
     for (let attempt = 0; ; attempt++) {
@@ -118,6 +112,21 @@ export class DiscordNotifier implements Notifier {
     }
   }
 }
+
+/**
+ * The JSON body for any message this bot sends, by webhook or as itself.
+ *
+ * Shared so both paths get the same two guarantees: content inside the 2000 code-point
+ * limit (over it is a 400 and the message never appears), and mentions suppressed —
+ * Discord parses them by default and this text quotes agent prose.
+ */
+export const messagePayload = (content: string): string =>
+  JSON.stringify({
+    // render() already fits the limit around its frame; this backstop covers the case
+    // the frame ITSELF is oversized, which a long task id is enough to do.
+    content: take(content, CONTENT_LIMIT),
+    allowed_mentions: { parse: [] },
+  });
 
 /** Message body. Pure function so it is testable without a webhook. */
 export const render = (notification: Notification): string => {
