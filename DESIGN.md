@@ -361,6 +361,22 @@ says so.
 > Caterpillar additionally never calls the merge endpoint, but that is code
 > discipline, not enforcement, and code discipline is not a security boundary.
 
+**App setup notes.** Two form fields mislead at creation time:
+
+- **Webhook → untick "Active".** Runners poll outward (§8); there is no inbound
+  endpoint, and leaving it on means a permanently failing webhook plus an ingress we
+  do not want.
+- **Callback URL** is a required field but inert here. It only serves the
+  *user-to-server* OAuth flow; we use *server-to-server* installation tokens, so
+  nothing ever redirects there. Set `https://caterpillar.caes.ar/callback` and leave
+  **"Request user authorization (OAuth) during installation"** and Device Flow off —
+  those are what would make it live. Point it only at a domain we control, and never
+  leave it as a dangling CNAME (a subdomain someone else can claim could receive an
+  OAuth code).
+
+Run `npm run verify:github-app` after installing — it confirms the JWT signs, prints
+the installation id, and proves per-task repo scoping works, without printing a token.
+
 ### 9.2 Why the agent never holds the token
 
 Session transcripts are committed to git. A token appearing in `argv`, in `.git/config`,
