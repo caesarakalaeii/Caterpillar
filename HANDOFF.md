@@ -75,11 +75,11 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | **Structured logging (§11)** | **implemented and deployed (#10)** — JSON lines on stdout |
 | **Tracker intake (§14)** | **implemented, deployed, and PROVEN end to end (#11, #12)** |
-| **Discord webhook, outbound (§11.2)** | **implemented and tested (#14)** — inert until a webhook is sealed |
+| **Discord webhook, outbound (§11.2)** | **LIVE** — sealed, deployed, and verified against the real channel |
 | **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
 | **Toolchain** | **runs natively on node 26 (#18)** — erasable-syntax-only, CI on 22 and 26 |
 | **Journal → prompt** | **bounded (#19)** — repeats collapsed, oldest elided, file untouched |
-| **Discord bridge, inbound (§7)** | **implemented (#20)** — gateway websocket, in-process |
+| **Discord bridge, inbound (§7)** | **implemented (#20)**, disabled — needs `bot-token` + `channel-id` |
 | **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
@@ -263,21 +263,33 @@ will not create a missing parent — `mkdir -p` it in the pod first.
 - **Deleting the PVC destroys the credential**, not just mirrors and worktrees. Recovery
   means re-running the browser login.
 
-### Discord: safe to seal now, and still silent until you do
+### Discord: outbound is LIVE, inbound needs two more keys
 
-The trap the previous handoff described is gone. `DiscordNotifier.notify` makes a real
-webhook POST (§11.2), and a failure only logs `notify.failed` — it cannot park a task that
-finished. Nothing is sealed, so `index.ts` still falls back to `NullNotifier` and the
-supervisor is silent.
+`caterpillar-discord` is sealed, listed in `secret-generator.yaml`, synced by ArgoCD, and
+**verified against the real channel** — webhook id `1537550223604195470`, a
+`**VERIFY** parked` message posted from inside the pod on 2026-08-13. Questions, parks and
+terminal outcomes now reach a human.
 
-To turn it on, three steps in `caesar-deployment`, all the operator's:
+`optional: true` stays on the mount, against the seal script's old advice: `index.ts`
+degrades to `NullNotifier` and a disabled bridge when a key is absent, so a withdrawn
+secret should cost notifications rather than crash-loop a working supervisor.
 
-1. `scripts/seal-caterpillar-secrets.sh discord` — prompts for the URL, never echoes it,
-   writes `secrets/caterpillar-discord.enc.yaml` with a `webhook-url` key.
-2. Add that file to `secrets/secret-generator.yaml`.
-3. Drop `optional: true` from the secret mount in `deployment.yaml`.
+**To enable `!answer` (§7)**, add two keys to the same Secret:
 
-Then prove it from inside the pod, which is where the secret already is:
+1. Create a Discord application and bot, and **tick the MESSAGE_CONTENT privileged
+   intent** — without it every message arrives with empty content and the bridge silently
+   matches nothing. No code can detect this.
+2. Invite the bot to the guild with permission to read and send in the channel.
+3. `scripts/seal-caterpillar-secrets.sh discord` and answer the bot-token and channel-id
+   prompts. **Leave the webhook prompt blank to keep the sealed one** (#50).
+4. Push, then **delete the pod** — these are read once at boot and there is no reloader
+   annotation. `kubectl scale` loses to ArgoCD selfHeal; deleting the pod does not.
+
+`bridge.disabled` in the boot logs is how you tell it is off; `gateway.ready` is how you
+tell it is on.
+
+The webhook can be re-checked from inside the pod at any time, which is where the secret
+already is:
 
 ```bash
 kubectl --context default -n caterpillar exec "$POD" -- sh -c \
@@ -549,14 +561,9 @@ them away.
 
 ## Immediate next action
 
-1. **Seal the Discord secrets.** `webhook-url` for notifications (§11.2), and
-   `bot-token` + `channel-id` for `!answer` (§7). Both halves are inert without them. The
-   value is demonstrated rather than hypothetical: `caterpillar-smoke#2` sat parked on a
-   question nobody was told about, and a human found it by reading logs.
-   **The seal script only prompts for the webhook** — the other two keys have to be added
-   to `caterpillar-discord.enc.yaml` by hand, or the script extended. **The bot also needs
-   the MESSAGE_CONTENT privileged intent** ticked in the developer portal: without it every
-   message arrives with empty content and the bridge silently matches nothing.
+1. **Enable `!answer`** by sealing `bot-token` + `channel-id` — see the Discord section
+   above for the four steps, including the MESSAGE_CONTENT intent that no code can detect.
+   The outbound half is already live.
 2. **Give `!answer` a live test.** It is unit-tested against a fake socket and applied
    over a real git remote, but has never spoken to Discord — no bot token exists. The
    first real question is the test.
