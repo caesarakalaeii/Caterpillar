@@ -54,6 +54,33 @@ interface SpecFrontMatter {
 const asStringArray = (value: unknown): readonly string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
+/**
+ * Strict list parsing for fields where dropping an entry changes behaviour.
+ *
+ * `acceptance` and `repos` must never be filtered silently: YAML turns unquoted
+ * `true`, `no`, `8.0` and friends into non-strings, and quietly discarding one would
+ * shrink the completion gate or the token scope without anyone noticing. Fail loudly
+ * and name the offending entry instead.
+ */
+const requireStringArray = (
+  value: unknown,
+  field: string,
+  task: TaskId,
+): readonly string[] => {
+  if (!Array.isArray(value)) throw new SpecParseError(task, `\`${field}\` must be a list`);
+
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new SpecParseError(
+        task,
+        `\`${field}[${index}]\` must be a string, got ${typeof entry} (${JSON.stringify(entry)}) — ` +
+          `quote it if YAML is coercing it`,
+      );
+    }
+    return entry;
+  });
+};
+
 /** `host/owner/name` or `owner/name` (host defaults to github.com). */
 const parseRepo = (raw: string): RepoRef => {
   const parts = raw.split("/").filter((p) => p.length > 0);
@@ -101,7 +128,7 @@ export class StateStore {
       throw new SpecParseError(task, "`workspace` is required");
     }
 
-    const acceptance = asStringArray(meta.acceptance);
+    const acceptance = requireStringArray(meta.acceptance, "acceptance", task);
     if (acceptance.length === 0) {
       // Enforced at intake too, but re-checked here: a task with no machine-checkable
       // criteria can never satisfy §12, so it could never be marked done.
@@ -112,7 +139,7 @@ export class StateStore {
       );
     }
 
-    const repos = asStringArray(meta.repos).map(parseRepo);
+    const repos = requireStringArray(meta.repos, "repos", task).map(parseRepo);
     if (repos.length === 0) throw new SpecParseError(task, "`repos` must list at least one repo");
 
     return {
@@ -197,6 +224,23 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(index).padStart(3, "0")}-question.md`;
     await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+  }
+
+  /**
+   * The most recent operator answer, if any.
+   *
+   * Included in the next session's prompt after a park is lifted — the answer is the
+   * whole reason the task became claimable again, so it must not be buried in the
+   * journal where the model may skim past it.
+   */
+  async latestAnswer(task: TaskId): Promise<string | undefined> {
+    const dir = join(this.taskDir(task), "questions");
+    if (!existsSync(dir)) return undefined;
+
+    const answers = (await readdir(dir)).filter((f) => f.endsWith("-answer.md")).sort();
+    const last = answers.at(-1);
+    if (last === undefined) return undefined;
+    return readFile(join(dir, last), "utf8");
   }
 
   async readAnswer(task: TaskId, index: number): Promise<string | undefined> {

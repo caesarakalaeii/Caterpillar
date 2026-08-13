@@ -43,6 +43,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
+| `src/agent/runner.ts` | Assembles a session: worktree, tools, prompt, budget. |
+| `src/supervisor/verifier.ts` | Independent completion gates (§12). |
+| `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
 
@@ -76,7 +79,6 @@ granted permissions. Never prints the token.
 
 - Forgejo/Codeberg forge (repo-scoped tokens, PRs, commit status)
 - tracker implementations (Vikunja and GitHub Issues HTTP)
-- `SessionRunner` / `Verifier` / `ProgressProbe` wiring in `src/index.ts`
 - Discord bridge (inbound `!answer`, outbound webhook)
 - intake ingesters
 - `caesar-deployment` manifests and ArgoCD Application

@@ -33,6 +33,8 @@ export interface ControlSignal {
 /** Mutable sink the tools write their decision into. */
 export interface ControlSink {
   signal?: ControlSignal;
+  /** Set by `open_pr` so the supervisor can verify CI against it later. */
+  pr?: PrResult;
 }
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: null });
@@ -89,6 +91,7 @@ export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrR
   parameters: OpenPrParams,
   execute: async (_id, params: Static<typeof OpenPrParams>) => {
     const pr = await ctx.forge.openPr(ctx.repo, params);
+    ctx.control.pr = pr;
     return {
       content: [{ type: "text" as const, text: `Opened PR #${pr.number}: ${pr.url}` }],
       details: pr,

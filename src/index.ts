@@ -6,17 +6,28 @@
  * repo, so recovery is "fetch and reclaim".
  */
 import { createServer } from "node:http";
+import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
-import { asRunnerId } from "./domain/task.ts";
+import { CredentialService } from "./credential/service.ts";
+import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
+import type { ForgeFactory } from "./forge/types.ts";
+import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
-import { NullNotifier } from "./notify/discord.ts";
+import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
+import { loadForgeFactory, SecretBundle } from "./secrets/load.ts";
 import { Git } from "./state/git.ts";
 import { LeaseManager } from "./state/lease.ts";
 import { StateStore } from "./state/store.ts";
-import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./supervisor/loop.ts";
+import { Supervisor } from "./supervisor/loop.ts";
+import { GitProgressProbe } from "./supervisor/probe.ts";
+import { AcceptanceVerifier } from "./supervisor/verifier.ts";
+import type { Tracker } from "./tracker/types.ts";
+import { WorktreeManager } from "./workspace/worktree.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
 const METRICS_PORT = Number.parseInt(process.env["METRICS_PORT"] ?? "9090", 10);
+const CRED_SOCKET = process.env["CRED_SOCKET"] ?? "/run/caterpillar/cred.sock";
+const CRED_HELPER = process.env["CRED_HELPER"] ?? "/usr/local/bin/caterpillar-cred";
 
 /** Serves /metrics for the ServiceMonitor. */
 const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) => {
@@ -36,13 +47,6 @@ const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) =
   return () => server.close();
 };
 
-// TODO: replace with the real implementations once the forge/tracker adapters land.
-const notImplemented = (name: string) => () => Promise.reject(new Error(`${name} not implemented`));
-
-const pendingRunner: SessionRunner = { run: notImplemented("SessionRunner.run") };
-const pendingVerifier: Verifier = { verify: notImplemented("Verifier.verify") };
-const pendingProgress: ProgressProbe = { probe: notImplemented("ProgressProbe.probe") };
-
 const main = async (): Promise<void> => {
   const config = await loadConfig(CONFIG_PATH);
 
@@ -50,11 +54,54 @@ const main = async (): Promise<void> => {
   const store = new StateStore(config.stateRepo.path, git);
   const metrics = new AgentMetrics();
 
+  const forges = new Map<WorkspaceName, ForgeFactory>();
+  const trackers = new Map<WorkspaceName, Tracker>();
+  for (const [name, profile] of config.workspaces) {
+    forges.set(name, await loadForgeFactory(profile, config.secretsDir));
+    // Tracker implementations land next; a workspace without one simply has no
+    // tracker mirroring, which is a supported configuration.
+  }
+  const bindings: WorkspaceBindings = { forges, trackers };
+
+  const worktrees = new WorktreeManager({
+    git,
+    mirrorsDir: config.paths.mirrors,
+    tasksDir: config.paths.tasks,
+    helperPath: CRED_HELPER,
+    socketPath: CRED_SOCKET,
+    identity: {
+      name: "caterpillar",
+      email: "caterpillar@users.noreply.github.com",
+    },
+  });
+
+  const credentials = new CredentialService();
+  await credentials.start(CRED_SOCKET);
+
   const leases = new LeaseManager({
     git,
     remote: "origin",
     runner: asRunnerId(config.runnerId),
     staleAfterSeconds: config.lease.staleAfterSeconds,
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases,
+    runner: new AgentSessionRunner({
+      config,
+      store,
+      worktrees,
+      credentials,
+      llm: createLlmRuntime(config.llm),
+      bindings,
+      metrics,
+    }),
+    verifier: new AcceptanceVerifier({ worktrees, bindings }),
+    progress: new GitProgressProbe({ worktrees }),
+    notifier: await createNotifier(config.secretsDir),
+    metrics,
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
@@ -67,22 +114,21 @@ const main = async (): Promise<void> => {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  const supervisor = new Supervisor({
-    config,
-    store,
-    leases,
-    runner: pendingRunner,
-    verifier: pendingVerifier,
-    progress: pendingProgress,
-    notifier: new NullNotifier(),
-    metrics,
-  });
-
   try {
     await supervisor.run(controller.signal);
   } finally {
     stopMetrics();
+    await credentials.stop();
   }
+};
+
+/** Discord is optional: without a webhook the supervisor runs silently. */
+const createNotifier = async (secretsDir: string): Promise<Notifier> => {
+  const webhookUrl = await new SecretBundle(secretsDir, "caterpillar-discord")
+    .readOptional("webhook-url")
+    .catch(() => undefined);
+
+  return webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl });
 };
 
 main().catch((error: unknown) => {

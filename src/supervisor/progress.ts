@@ -19,6 +19,8 @@ export interface ProgressEvidence {
   readonly acceptanceImproved: boolean;
   /** The agent recorded a completed step in the journal. */
   readonly stepCompleted: boolean;
+  /** Branch head observed now — carried into the record as the next baseline. */
+  readonly headOid?: string;
 }
 
 export const madeProgress = (evidence: ProgressEvidence): boolean =>
@@ -42,10 +44,18 @@ export const recordProgress = (
   previous: ProgressRecord,
   session: number,
   evidence: ProgressEvidence,
-): ProgressRecord =>
-  madeProgress(evidence)
+): ProgressRecord => {
+  const head =
+    evidence.headOid ?? previous.lastHeadOid;
+  const base = madeProgress(evidence)
     ? { lastProgressSession: session, noProgressStreak: 0 }
-    : { lastProgressSession: previous.lastProgressSession, noProgressStreak: previous.noProgressStreak + 1 };
+    : {
+        lastProgressSession: previous.lastProgressSession,
+        noProgressStreak: previous.noProgressStreak + 1,
+      };
+
+  return { ...base, ...(head !== undefined ? { lastHeadOid: head } : {}) };
+};
 
 /** Decide whether a task may start another session. */
 export const checkLimits = (

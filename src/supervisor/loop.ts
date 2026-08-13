@@ -37,12 +37,15 @@ export interface Verifier {
    * Independently checks the §12 gates: acceptance commands exit 0, PR open, CI green.
    * Runs in the supervisor, never in the agent.
    */
-  verify(spec: TaskSpec): Promise<{ readonly passed: boolean; readonly detail: string; readonly prUrl?: string }>;
+  verify(
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<{ readonly passed: boolean; readonly detail: string; readonly prUrl?: string }>;
 }
 
 export interface ProgressProbe {
   /** Gathers evidence that the last session accomplished something. */
-  probe(spec: TaskSpec): Promise<ProgressEvidence>;
+  probe(spec: TaskSpec, state: TaskState): Promise<ProgressEvidence>;
 }
 
 export interface SupervisorDeps {
@@ -168,7 +171,7 @@ export class Supervisor {
     const { store, config, metrics } = this.deps;
 
     const session = state.sessions + 1;
-    const evidence = await this.deps.progress.probe(spec);
+    const evidence = await this.deps.progress.probe(spec, state);
     const progress = recordProgress(state.progress, session, evidence);
 
     await store.appendJournal(
@@ -193,6 +196,9 @@ export class Supervisor {
       sessions: session,
       usage: addUsage(state.usage, outcome.usage),
       progress,
+      // A PR opened this session must survive into later ones — the completion gate
+      // looks it up from state, not from the transcript.
+      ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
     };
 
     await store.writeState(next);
@@ -242,7 +248,7 @@ export class Supervisor {
       }
 
       case "done-claimed": {
-        const result = await this.deps.verifier.verify(spec);
+        const result = await this.deps.verifier.verify(spec, state);
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.

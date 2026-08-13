@@ -111,6 +111,14 @@ export interface ProgressRecord {
   readonly lastProgressSession: number;
   /** Consecutive sessions with no progress. Parks the task at 3 (DESIGN.md §11.1). */
   readonly noProgressStreak: number;
+  /** Branch head at the end of the last session — commits are detected by comparison. */
+  readonly lastHeadOid?: string;
+}
+
+/** A pull request opened for this task. Recorded once, reused for verification. */
+export interface PullRequestRef {
+  readonly number: number;
+  readonly url: string;
 }
 
 /** Mutable control record — `state.json`. */
@@ -124,6 +132,8 @@ export interface TaskState {
   readonly usage: UsageTotals;
   readonly progress: ProgressRecord;
   readonly owner?: TaskOwner;
+  /** Set once the agent opens a PR; the completion gate needs it (§12). */
+  readonly pr?: PullRequestRef;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -154,6 +164,8 @@ export interface SessionOutcome {
   readonly requires?: readonly Capability[];
   /** Set when reason is `error`. */
   readonly error?: string;
+  /** Set when the agent opened a PR during this session. */
+  readonly pr?: PullRequestRef;
   /** Free-text summary appended to the journal. */
   readonly summary: string;
 }

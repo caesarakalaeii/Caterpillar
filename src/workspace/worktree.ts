@@ -37,6 +37,11 @@ const cloneUrl = (repo: RepoRef): string =>
 export class WorktreeManager {
   constructor(private readonly options: WorktreeOptions) {}
 
+  /** A Git bound to a worktree, for callers that need to inspect or commit there. */
+  gitAt(path: string): Git {
+    return this.options.git.at(path);
+  }
+
   /** Ensure a bare mirror exists and is current. */
   async syncMirror(repo: RepoRef): Promise<string> {
     const path = mirrorPath(this.options.mirrorsDir, repo);
@@ -44,7 +49,7 @@ export class WorktreeManager {
     if (!existsSync(path)) {
       await mkdir(path, { recursive: true });
       await this.options.git.run("clone", "--mirror", cloneUrl(repo), path);
-      await this.configure(path, repo);
+      await this.configure(path);
       return path;
     }
 
@@ -65,7 +70,7 @@ export class WorktreeManager {
     const branch = `agent/${task}`;
 
     if (existsSync(path)) {
-      await this.configure(path, repo);
+      await this.configure(path);
       return path;
     }
 
@@ -80,7 +85,7 @@ export class WorktreeManager {
       await git.run("worktree", "add", path, branch);
     }
 
-    await this.configure(path, repo);
+    await this.configure(path);
     return path;
   }
 
@@ -99,17 +104,20 @@ export class WorktreeManager {
    * credential request, every repo on a host looks identical to the helper, and
    * per-repo token selection silently degrades to "first token wins".
    */
-  private async configure(path: string, repo: RepoRef): Promise<void> {
+  private async configure(path: string): Promise<void> {
     const git = this.options.git.at(path);
     const helper = `!${this.options.helperPath} --socket ${this.options.socketPath}`;
 
+    // NOTE: `git config` inside a worktree writes to the repository's COMMON config,
+    // shared by the mirror and every other worktree of it. That is fine — and wanted —
+    // for the helper and identity, which are identical for every task on a repo.
+    //
+    // It is why we must NOT touch `remote.origin.url` here: doing so would rewrite the
+    // mirror's fetch URL from a per-task code path. The mirror is cloned from the HTTPS
+    // URL already, so pushes reach the credential helper without any rewriting.
     await git.run("config", "credential.helper", helper);
     await git.run("config", "credential.useHttpPath", "true");
     await git.run("config", "user.name", this.options.identity.name);
     await git.run("config", "user.email", this.options.identity.email);
-
-    // Push over HTTPS so the credential helper is used; the mirror may have been
-    // cloned from an SSH remote otherwise.
-    await git.tryRun("remote", "set-url", "origin", cloneUrl(repo));
   }
 }
