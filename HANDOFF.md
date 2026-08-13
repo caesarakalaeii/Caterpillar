@@ -79,6 +79,7 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
 | **Toolchain** | **runs natively on node 26 (#18)** — erasable-syntax-only, CI on 22 and 26 |
 | **Journal → prompt** | **bounded (#19)** — repeats collapsed, oldest elided, file untouched |
+| **Discord bridge, inbound (§7)** | **implemented (#20)** — gateway websocket, in-process |
 | **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
@@ -87,10 +88,9 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 
 Not built:
 
-1. **The inbound Discord bridge.** `!answer` (§7) and `!task <repo> <goal>` (§14 path 3)
-   do not exist. A question waits in `tasks/<id>/questions/` until a human commits the
-   answer by hand — the supervisor now *tells* you it is there, but you still answer in
-   git. Outbound is done (§11.2).
+1. **`!task <repo> <goal>`** (§14 path 3). As written it carries no acceptance criteria,
+   and §14 refuses specs that have none — it cannot be added without deciding where they
+   come from. `!answer` (§7) IS built (#20). Intake covers the tracker path.
 2. Nothing else from DESIGN.md is missing.
 
 ## What is actually proven, and what is not
@@ -178,9 +178,13 @@ had none of them. A missing one does not fail the task: `mirror()` logs
 `tracker.mirror-failed` and continues. It fails the tracker VIEW silently, which is worse
 to debug than a crash.
 
-### Answering a question by hand
+### Answering a question
 
-There is no inbound bridge, so this is the operator's job (§7). Two writes to
+**From Discord**, once `bot-token` and `channel-id` are sealed: `!answer <task-id> <text>`
+in the watched channel. The bot replies with what happened — applied, unknown task, or not
+waiting — because silence leaves you unable to tell a typo from an offline bridge.
+
+**By hand** — the fallback, and what the bridge now does for you. Two writes to
 `caterpillar-state`, and the ORDER matters:
 
 1. `tasks/<id>/questions/NNN-answer.md`, matching the question's number. The supervisor
@@ -545,14 +549,17 @@ them away.
 
 ## Immediate next action
 
-1. **Seal a Discord webhook**, if the user wants notifications. Three operator steps and a
-   verify command, with nothing left to implement — and the value is now demonstrated
-   rather than hypothetical: `caterpillar-smoke#2` sat parked on a question that nobody was
-   told about. A human found it by reading logs.
-2. **The inbound bridge** (`!answer`, `!task`). This one IS the `discord-bridge` Deployment
-   §10 anticipates: it needs a gateway session or a public interactions endpoint, neither of
-   which the supervisor's outward-polling design provides. Design it before building it.
-   Until then, answering a question is the manual two-write procedure above.
+1. **Seal the Discord secrets.** `webhook-url` for notifications (§11.2), and
+   `bot-token` + `channel-id` for `!answer` (§7). Both halves are inert without them. The
+   value is demonstrated rather than hypothetical: `caterpillar-smoke#2` sat parked on a
+   question nobody was told about, and a human found it by reading logs.
+   **The seal script only prompts for the webhook** — the other two keys have to be added
+   to `caterpillar-discord.enc.yaml` by hand, or the script extended. **The bot also needs
+   the MESSAGE_CONTENT privileged intent** ticked in the developer portal: without it every
+   message arrives with empty content and the bridge silently matches nothing.
+2. **Give `!answer` a live test.** It is unit-tested against a fake socket and applied
+   over a real git remote, but has never spoken to Discord — no bot token exists. The
+   first real question is the test.
 3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
    The open question is what it should do, not whether it works.
 4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
