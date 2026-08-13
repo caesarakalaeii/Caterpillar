@@ -28,7 +28,7 @@ nix shell nixpkgs#nodejs_22 --command npm test  # one-off, what I used throughou
 ```
 
 - `npm run check` — typecheck (strict, `exactOptionalPropertyTypes`, no `any`)
-- `npm test` — 59 tests, all passing at last commit
+- `npm test` — 73 tests, all passing at last commit
 - Tests need `--experimental-transform-types`, **not** `--experimental-strip-types`:
   strip-only mode cannot parse TypeScript parameter properties, which this codebase
   uses throughout. Already set in `package.json`.
@@ -51,6 +51,7 @@ Built, typechecked, and tested end to end:
 | Vikunja tracker | implemented, unit-tested — **not yet run against the live instance** |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
+| LLM auth: Claude subscription (OAuth) | implemented, tested — `llm.auth: subscription` |
 | Container image + CI | written, **never built** (no docker/podman on this machine) |
 | `caesar-deployment` manifests | written, `kustomize build` clean, **not pushed** |
 
@@ -77,16 +78,32 @@ Application only when you want it live.
 
 Decisions the user made by interview (do not re-litigate):
 
-- **LiteLLM deployed alongside**, rather than pointing at Anthropic directly — keeps
-  §9.6 intact: one spend-cap choke point, and no provider credential outside the proxy.
+- **Claude Pro/Max subscription, not a metered API key.** pi-ai's Anthropic provider
+  ships an OAuth mode (`isSubscription: true`) with PKCE and refresh built in — I
+  initially and wrongly claimed this needed hand-built client impersonation. It does
+  not. There is **no Anthropic API key anywhere** in either repo.
+- **LiteLLM was removed** as a consequence: an OAuth bearer credential cannot be
+  forwarded by a proxy that authenticates with `x-api-key`. DESIGN.md §9.6 is amended
+  to describe both modes; `proxy` is retained in code and config.
 - **State repo on GitHub, authenticated with the existing App**, rather than a deploy
   key — no new secret, at the cost of the App needing an installation on that repo.
 - **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
   from the electric-boogaloo `.env`.
 
-Still missing before it can sync: an **Anthropic API key** (nothing in the repo or the
-`.env` provides one; `scripts/seal-caterpillar-secrets.sh litellm` prompts for it), the
-**state repo**, and the **published image**.
+Still missing before it can sync: the **state repo**, the **published image**, the
+**sealed EB secret**, and the **subscription credential** copied onto the PVC.
+
+### The subscription credential is the sharp edge
+
+`llm.credentialsPath` points at a file on the PVC, and it **cannot become a Secret**.
+Refreshing rotates the refresh token and pi writes it back inside
+`CredentialStore.modify`; a read-only mount means the supervisor works for about an hour
+and then stops. `FileCredentialStore` takes a lock directory so two sessions can't race
+a rotation — the loser would persist a token the provider already invalidated.
+
+Seed it with `npm run llm:login -- --out ./auth.json` on a machine with a browser (a pod
+has nowhere to open one), then `kubectl cp` it in. The pod crash-loops until it's there;
+that's expected, copy the file in and delete the pod.
 
 ## Live credentials
 
@@ -156,7 +173,15 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
   places, and both are needed: `-c commit.gpgsign=false` on every `Git` invocation, and
   `commit.gpgsign false` written into each worktree's config, because the agent commits
   with its own `git` calls through the bash tool.
+- **pi-ai supports Claude subscriptions natively.** `anthropicProvider()` carries an
+  `oauth` auth mode next to `apiKey` — PKCE flow, device code, and token refresh, all
+  in the library. Do not reach for the API key path by reflex; check the provider first.
+- **An OAuth refresh ROTATES the refresh token**, and pi does it inside
+  `CredentialStore.modify`. That single fact decides where the credential can live: not
+  a Secret, not an env var — writable durable storage only.
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
+- **`argocd/root-app.yaml` auto-syncs `argocd/apps/`** with `prune` + `selfHeal`. Adding
+  a file there is a deploy, not a proposal.
 
 ## Constraints the user has set
 

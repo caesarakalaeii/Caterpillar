@@ -93,14 +93,34 @@ export interface WorkspacePathsConfig {
   readonly tasks: string;
 }
 
+/**
+ * How the runner authenticates to the model provider (DESIGN.md §9.6).
+ *
+ * `proxy` — the in-cluster proxy holds the provider credential.
+ * `subscription` — pi-ai's Anthropic OAuth mode against a Claude Pro/Max
+ *   subscription, talking to api.anthropic.com directly. There is no proxy in this
+ *   path: an OAuth bearer credential cannot be forwarded by a proxy that
+ *   authenticates with `x-api-key`.
+ */
+export type LlmAuthMode = "proxy" | "subscription";
+
 export interface LlmConfig {
-  /** In-cluster proxy base URL. The supervisor never holds a provider credential. */
+  readonly auth: LlmAuthMode;
+  /** Proxy base URL. Ignored for `subscription`, which uses pi's own provider. */
   readonly baseUrl: string;
   readonly modelId: string;
-  /** Provider id registered with pi-ai for the proxy. */
+  /** Provider id registered with pi-ai for the proxy. Ignored for `subscription`. */
   readonly providerId: string;
   readonly contextWindow: number;
   readonly maxTokens: number;
+  /**
+   * Where the rotating OAuth credential lives. Required for `subscription`.
+   *
+   * Must be on WRITABLE, durable storage — the PVC, never a mounted Secret.
+   * Refreshing rotates the refresh token, so a read-only mount locks the
+   * supervisor out as soon as the access token expires.
+   */
+  readonly credentialsPath?: string;
 }
 
 export interface RunnerConfig {
