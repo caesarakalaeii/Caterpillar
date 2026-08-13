@@ -49,26 +49,26 @@ Built, typechecked, and tested end to end:
 | Verifier + progress probe | implemented |
 | Multi-repo checkout | implemented, tested |
 | Vikunja tracker | implemented, unit-tested — **not yet run against the live instance** |
+| GitHub Issues tracker | implemented, unit-tested, **verified against live GitHub** (PR #5) |
 | Supervisor → tracker mirroring | implemented (claim / question / park / done) |
 | State-repo credential + bootstrap | implemented, tested — App token, clone-if-missing |
 | LLM auth: Claude subscription (OAuth) | implemented, tested — `llm.auth: subscription` |
 | Container image + CI | **built and pushed by CI** — `ghcr.io/caesarakalaeii/caterpillar:main` |
-| `caesar-deployment` manifests | written, `kustomize build` clean, **not pushed** |
+| State repo | **created and verified** — `caesarakalaeii/caterpillar-state`, private |
+| `caesar-deployment` manifests | **pushed**, caesar-deployment PR #45 — Application withheld |
 
 Not built yet, in the order I would take them:
 
-1. **Finish the deploy**: the four prerequisites in
-   `../caesar-deployment/apps/workloads/caterpillar/README.md`. Then land
+1. **Finish the deploy**: two prerequisites remain of the four in
+   `../caesar-deployment/apps/workloads/caterpillar/README.md` — the sealed EB secret
+   and the subscription credential. Both need a human. Then land
    `argocd/apps/caterpillar.yaml` LAST (see the warning below).
-2. GitHub Issues tracker (`src/tracker/github-issues.ts` is still a stub; `loadTracker`
-   returns `undefined` for it and logs, so a workspace configured for it runs unmirrored
-   rather than half-mirrored).
-3. Discord bridge (inbound `!answer`), intake ingesters.
+2. Discord bridge (inbound `!answer`), intake ingesters.
 
 ## Deployment state (nothing is live)
 
 The Caterpillar side is merged to `main` and CI publishes the image. The manifests are
-written but **uncommitted** in `../caesar-deployment`.
+now pushed as caesar-deployment **PR #45**, deliberately without the Application.
 
 **`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and
 `selfHeal`.** Pushing `argocd/apps/caterpillar.yaml` therefore *deploys immediately*.
@@ -85,13 +85,14 @@ Decisions the user made by interview (do not re-litigate):
   forwarded by a proxy that authenticates with `x-api-key`. DESIGN.md §9.6 is amended
   to describe both modes; `proxy` is retained in code and config.
 - **State repo on GitHub, authenticated with the existing App**, rather than a deploy
-  key — no new secret, at the cost of the App needing an installation on that repo.
+  key — no new secret. The feared cost (an extra installation step) turned out not to
+  exist: installation `153385932` is account-wide, so the repo was covered on creation.
 - **Both workspaces from the start**, reusing the existing Codeberg and Vikunja tokens
   from the electric-boogaloo `.env`.
 
-Still missing before it can sync: the **state repo**, the **sealed EB secret**, and the
-**subscription credential** copied onto the PVC. The image and its pull credential are
-done.
+Still missing before it can sync: the **sealed EB secret** and the **subscription
+credential** copied onto the PVC. Both need a human. The image, its pull credential, and
+the state repo are done.
 
 The GHCR package is private (it inherits the repo's visibility), which is handled the
 way `caesar-deployment` already handles its other private images: `imagePullSecrets:
@@ -124,6 +125,17 @@ The GitHub App exists and is verified working:
 - That secret is inert: no ArgoCD Application references the directory yet, and the
   `caterpillar` namespace does not exist.
 - Verify any time with `npm run verify:github-app -- --pem <p> --app-id <id> --repo <r>`.
+- **The installation is account-wide** ("All repositories" — 65 repos as of this
+  writing). That is why `caterpillar-state` needed no separate install. If it is ever
+  narrowed to selected repos, the state-repo mint returns 422 and the pod crash-loops
+  at bootstrap.
+
+To use the key locally: `sops --decrypt` the secret to a mode-0600 file, extract
+`private-key.pem` with `yq`, and `shred -u` it after. Do not decrypt to stdout — the
+key lands in the terminal, and in an agent session in the transcript.
+
+**The state repo exists**: `caesarakalaeii/caterpillar-state`, private, seeded with a
+README describing the layout. Verified minting `contents: write` scoped to it alone.
 
 Codeberg: the user already has a token covering the whole `ElectricBoogaloo` ecosystem
 and wants to keep it. Not yet stored in a secret.
@@ -199,6 +211,26 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
 - **Check the whole repo before claiming a convention doesn't exist.** I grepped one
   workload, concluded nothing used `imagePullSecrets`, and wrote it into two documents.
   Six workloads use it.
+- **GitHub's issues route returns pull requests too.** Every PR is an issue in the data
+  model, so unfiltered intake would hand the agent its own open PRs as fresh work. The
+  `pull_request` key is the only reliable discriminator.
+- **`POST /issues/{n}/labels` silently CREATES an unknown label**, with a random colour.
+  Vikunja is protected from this by a withheld `labels:create` scope; GitHub has no
+  equivalent to withhold, so `github-issues.ts` checks the repo's labels first and
+  refuses. Do not "simplify" that lookup away.
+- **GitHub distinguishes 401 from 403; Vikunja cannot.** 403 is a valid credential
+  without the permission, 401 is a bad credential. Only 403 becomes `TrackerScopeError`.
+- **The GitHub search API is deliberately unused for intake.** It is eventually
+  consistent — a freshly labelled issue can be invisible for about a minute, which is
+  exactly the window intake runs in — separately rate limited, and its legacy
+  issue-search behaviour is on a deprecation path. Enumerate the installation instead.
+- **`per_page=100` contains the substring `page=1`.** A test stub matching pages with
+  `path.includes("page=1")` answers every page with a full one and paginates forever.
+  This cost a hung suite; the Vikunja tests only escape it because `per_page=50` does
+  not contain `page=1`. Anchor on `&page=N`.
+- **The caesar cluster is the `default` context in `~/.kube/config`**, not anything in
+  `~/.kube/caesar-clusters` — the `k3d-caesar-cluster` context there points at a host
+  that refuses connections. Check `kubectl --context default get ns` for `argocd`.
 
 ## Constraints the user has set
 
@@ -214,6 +246,26 @@ Each of these cost real debugging. They are all encoded in code or tests now; do
   `pi` rather than a vendor SDK. The user asked to be argued with rather than deferred
   to; pi also turned out to be technically better here.
 - Pull before working in a repo.
+
+## Immediate next action
+
+Both open PRs need review and merge: Caterpillar **#5** (GitHub Issues tracker) and
+caesar-deployment **#45** (workload manifests).
+
+Then the two prerequisites that can only be done by a human, in this order:
+
+1. **Seal the EB secret** — `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`.
+   Reads the workspace `.env` in-process and never prints a value. Until this exists,
+   `kustomize build apps/workloads/caterpillar` fails on the missing file, which is
+   expected and harmless while no Application references the directory.
+2. **Seed the subscription credential** — `npm run llm:login -- --out ./auth.json` on a
+   machine with a browser, then `kubectl cp` it onto the PVC and `shred -u` the local
+   copy. This one needs the pod to already exist, so it comes after the first sync.
+
+Vikunja is still unprovisioned (token + the two labels) and blocks only the
+electric-boogaloo workspace's mirroring, not the deploy.
+
+Land `argocd/apps/caterpillar.yaml` LAST — that file is the deploy.
 
 ## Immediate next action
 

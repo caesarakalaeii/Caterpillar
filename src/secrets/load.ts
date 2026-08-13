@@ -13,10 +13,15 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { StateRepoConfig, WorkspaceProfile } from "../config/types.ts";
 import { parseStateRepoUrl, StateRepoCredentials } from "../state/credential.ts";
-import { GitHubAppForgeFactory, type GitHubAppOptions } from "../forge/github-app.ts";
+import {
+  GitHubAppForgeFactory,
+  trackerTokenSource,
+  type GitHubAppOptions,
+} from "../forge/github-app.ts";
 import { ForgejoForgeFactory, type ForgejoOptions } from "../forge/forgejo.ts";
 import type { ForgeFactory } from "../forge/types.ts";
 import type { Tracker } from "../tracker/types.ts";
+import { GitHubIssuesTracker, type GitHubIssuesOptions } from "../tracker/github-issues.ts";
 import { VikunjaTracker, type VikunjaOptions } from "../tracker/vikunja.ts";
 
 export class MissingSecretError extends Error {
@@ -140,7 +145,9 @@ export const loadStateCredentials = async (
  * Build the Tracker for a workspace, or `undefined` when it has none.
  *
  * Expected keys:
- *   vikunja — vikunja-token  (a dedicated agent token, scoped per DESIGN.md §9.5)
+ *   vikunja       — vikunja-token  (a dedicated agent token, scoped per DESIGN.md §9.5)
+ *   github-issues — app-id, installation-id, private-key.pem  (the workspace's own
+ *                   GitHub App; no second credential, see tracker/github-issues.ts)
  *
  * A workspace with no tracker block is a supported configuration: the tracker is a
  * view, never authoritative, so the supervisor runs perfectly well without one.
@@ -152,14 +159,41 @@ export const loadTracker = async (
   const config = profile.tracker;
   if (config === undefined) return undefined;
 
+  const bundle = new SecretBundle(secretsDir, profile.secretRef);
+
   if (config.kind === "github-issues") {
-    // Not implemented yet. Returning undefined rather than a tracker whose every
-    // method throws: a half-wired tracker would fail mid-transition, after the
-    // supervisor had already moved the authoritative state in git.
-    return undefined;
+    if (profile.forge.kind !== "github") {
+      // The tracker borrows the forge's App credential, so there is nothing to mint
+      // from. Caught here rather than at the first transition, which would fail after
+      // the supervisor had already moved the authoritative state in git.
+      throw new Error(
+        `workspace '${profile.name}' uses the github-issues tracker but its forge is ` +
+          `'${profile.forge.kind}' — the tracker mints its token from the GitHub App, ` +
+          `so it needs a github forge in the same workspace`,
+      );
+    }
+
+    const app: GitHubAppOptions = {
+      appId: await bundle.read("app-id"),
+      installationId: await bundle.read("installation-id"),
+      privateKeyPem: await bundle.read("private-key.pem"),
+      apiBase: config.apiBase,
+    };
+    const source = trackerTokenSource(app);
+
+    const options: GitHubIssuesOptions = {
+      apiBase: config.apiBase,
+      owner: profile.forge.owner,
+      ingestLabel: config.ingestLabel,
+      token: () => source.token(),
+      ...(config.wipLabel !== undefined ? { wipLabel: config.wipLabel } : {}),
+      ...(config.needsHumanLabel !== undefined
+        ? { needsHumanLabel: config.needsHumanLabel }
+        : {}),
+    };
+    return new GitHubIssuesTracker(options);
   }
 
-  const bundle = new SecretBundle(secretsDir, profile.secretRef);
   const options: VikunjaOptions = {
     apiBase: config.apiBase,
     token: await bundle.read("vikunja-token"),

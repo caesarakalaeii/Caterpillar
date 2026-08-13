@@ -40,6 +40,24 @@ const TASK_PERMISSIONS = {
   metadata: "read",
 } as const;
 
+/**
+ * Permissions for the GitHub Issues tracker's own token (DESIGN.md §9.5).
+ *
+ * Deliberately NOT `contents`: the tracker reads and annotates issues and must not be
+ * able to touch code, and it is minted installation-wide (no `repositories`) because
+ * intake enumerates every repo the App is installed on rather than one task's scope.
+ */
+const TRACKER_PERMISSIONS = {
+  issues: "write",
+  metadata: "read",
+} as const;
+
+export interface InstallationTokenRequest {
+  /** Omit for an installation-wide token; supply names to scope it narrower. */
+  readonly repositories?: readonly string[];
+  readonly permissions: Readonly<Record<string, string>>;
+}
+
 export interface GitHubAppOptions {
   readonly appId: string;
   readonly installationId: string;
@@ -180,34 +198,11 @@ class GitHubAppForge implements Forge {
 
   /** Exchange the App JWT for an installation token scoped to this task's repos. */
   private async mint(): Promise<GitCredential> {
-    const jwt = signAppJwt(this.options.appId, this.options.privateKeyPem);
-    const route = `/app/installations/${this.options.installationId}/access_tokens`;
-
-    const response = await fetch(`${this.options.apiBase}${route}`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${jwt}`,
-        accept: "application/vnd.github+json",
-        "x-github-api-version": "2022-11-28",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        // Scope to exactly the repos the task declared — narrower than the App.
-        repositories: this.allowed.map((repo) => repo.name),
-        permissions: TASK_PERMISSIONS,
-      }),
+    return mintInstallationToken(this.options, {
+      // Scope to exactly the repos the task declared — narrower than the App.
+      repositories: this.allowed.map((repo) => repo.name),
+      permissions: TASK_PERMISSIONS,
     });
-
-    if (!response.ok) {
-      throw new GitHubApiError(response.status, route, await response.text());
-    }
-
-    const body = (await response.json()) as InstallationTokenResponse;
-    return {
-      username: "x-access-token",
-      password: body.token,
-      expiresAt: Date.parse(body.expires_at),
-    };
   }
 
   private headers(token: string): Record<string, string> {
@@ -232,6 +227,91 @@ class GitHubAppForge implements Forge {
     return (await response.json()) as T;
   }
 }
+
+/**
+ * Exchange an App JWT for an installation access token.
+ *
+ * Shared by the forge and the Issues tracker so there is exactly one place that knows
+ * how a token is minted. The result is write-only to callers: hand it to a credential
+ * helper or an Authorization header, never log it, never put it on argv (DESIGN.md §9.2).
+ *
+ * A 422 here almost always means the App is not installed on the repositories asked
+ * for — the message says so, because the raw GitHub body does not.
+ */
+export const mintInstallationToken = async (
+  options: GitHubAppOptions,
+  request: InstallationTokenRequest,
+): Promise<GitCredential> => {
+  const jwt = signAppJwt(options.appId, options.privateKeyPem);
+  const route = `/app/installations/${options.installationId}/access_tokens`;
+
+  const response = await fetch(`${options.apiBase}${route}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${jwt}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      // Omitted entirely when installation-wide: sending `repositories: []` would
+      // scope the token to NO repositories rather than all of them.
+      ...(request.repositories === undefined ? {} : { repositories: request.repositories }),
+      permissions: request.permissions,
+    }),
+  });
+
+  if (response.status === 422) {
+    throw new GitHubApiError(
+      422,
+      route,
+      "the App is not installed on one of the requested repositories, or was granted " +
+        "none of the requested permissions — check the installation, not the key",
+    );
+  }
+  if (!response.ok) {
+    throw new GitHubApiError(response.status, route, await response.text());
+  }
+
+  const body = (await response.json()) as InstallationTokenResponse;
+  return {
+    username: "x-access-token",
+    password: body.token,
+    expiresAt: Date.parse(body.expires_at),
+  };
+};
+
+/**
+ * A re-minting installation token supplier.
+ *
+ * Installation tokens last an hour, and the supervisor outlives that by design, so
+ * anything holding one long-term has to renew rather than cache forever.
+ */
+export class InstallationTokenSource {
+  private cached: GitCredential | undefined;
+
+  constructor(
+    private readonly options: GitHubAppOptions,
+    private readonly permissions: Readonly<Record<string, string>>,
+  ) {}
+
+  async token(): Promise<string> {
+    const cached = this.cached;
+    if (cached?.expiresAt !== undefined && cached.expiresAt - RENEW_MARGIN_MS > Date.now()) {
+      return cached.password;
+    }
+
+    const minted = await mintInstallationToken(this.options, {
+      permissions: this.permissions,
+    });
+    this.cached = minted;
+    return minted.password;
+  }
+}
+
+/** Installation-wide token source for the Issues tracker. */
+export const trackerTokenSource = (options: GitHubAppOptions): InstallationTokenSource =>
+  new InstallationTokenSource(options, TRACKER_PERMISSIONS);
 
 /**
  * Fold check-runs and combined status into one verdict.
