@@ -306,3 +306,19 @@ test("stripHtml turns a description into readable prose", () => {
   );
   assert.equal(stripHtml("plain"), "plain");
 });
+
+test("stripHtml restores fences around a code block", () => {
+  // Intake's `agent` block is a FENCED block (§14.1), and TipTap stores a code block as
+  // `<pre><code>`, where the ``` markers exist only in the rendering. Stripping tags
+  // alone deletes them, so an item written with the editor's code-block button would
+  // look right in Vikunja and be unparseable to intake.
+  const parsed = stripHtml(
+    "<p>Fix it.</p><pre><code>agent\nacceptance:\n  - &quot;npm test&quot;</code></pre>",
+  );
+
+  assert.match(parsed, /```/, "the fence must survive the HTML round-trip");
+  assert.match(parsed, /acceptance:/);
+  assert.match(parsed, /"npm test"/, "entities inside a code block are still decoded");
+  // Two fences, opening and closing — not one, and not four.
+  assert.equal(parsed.match(/```/g)?.length, 2);
+});

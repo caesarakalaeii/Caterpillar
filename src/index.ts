@@ -11,6 +11,7 @@ import { loadConfig } from "./config/load.ts";
 import { CredentialService } from "./credential/service.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory } from "./forge/types.ts";
+import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
@@ -141,6 +142,14 @@ const main = async (): Promise<void> => {
     metrics,
     logger,
     trackers,
+    // Without this the supervisor polls an empty `tasks/` directory forever and
+    // labelling an issue `agent` does nothing (DESIGN.md §14).
+    intake: new Ingester({
+      store,
+      trackers,
+      logger,
+      maxSessionsPerTask: config.limits.maxSessionsPerTask,
+    }),
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);

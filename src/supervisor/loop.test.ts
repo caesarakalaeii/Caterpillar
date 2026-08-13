@@ -90,6 +90,7 @@ const config: RunnerConfig = {
   handoff: { thresholdFraction: 0.7 },
   limits: { maxSessionsPerTask: 20, noProgressLimit: 3 },
   log: { level: "info" },
+  intake: { intervalSeconds: 300 },
   llm: {
     auth: "proxy",
     baseUrl: "http://localhost",

@@ -139,6 +139,16 @@ export interface RunnerConfig {
   /** Directory of mounted secret files, keyed by `secretRef`. */
   readonly secretsDir: string;
   readonly log: LogConfig;
+  readonly intake: IntakeConfig;
+}
+
+export interface IntakeConfig {
+  /**
+   * Seconds between tracker intake passes. Deliberately NOT the poll interval: a
+   * GitHub pass costs one request per repo in the installation, so polling it would
+   * exhaust the hourly rate limit within minutes (see `intakeDue`).
+   */
+  readonly intervalSeconds: number;
 }
 
 export interface LogConfig {

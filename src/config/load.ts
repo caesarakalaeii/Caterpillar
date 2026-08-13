@@ -35,6 +35,7 @@ interface RawConfig {
   readonly pollSeconds?: unknown;
   readonly secretsDir?: unknown;
   readonly log?: { readonly level?: unknown };
+  readonly intake?: { readonly intervalSeconds?: unknown };
 }
 
 const str = (value: unknown, field: string): string => {
@@ -226,5 +227,8 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     pollSeconds: num(raw.pollSeconds, "pollSeconds", 30),
     secretsDir: str(raw.secretsDir, "secretsDir"),
     log: { level: logLevel(raw.log?.level) },
+    intake: {
+      intervalSeconds: num(raw.intake?.intervalSeconds, "intake.intervalSeconds", 300),
+    },
   };
 };

@@ -17,11 +17,11 @@
  * tokens never cover the state repo, so the audit trail cannot be rewritten by the
  * thing being audited (DESIGN.md §9.3).
  */
-import { mkdir, readFile, readdir, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { Git } from "./git.ts";
 import {
   asTaskId,
@@ -57,10 +57,16 @@ const asStringArray = (value: unknown): readonly string[] =>
 /**
  * Strict list parsing for fields where dropping an entry changes behaviour.
  *
- * `acceptance` and `repos` must never be filtered silently: YAML turns unquoted
- * `true`, `no`, `8.0` and friends into non-strings, and quietly discarding one would
- * shrink the completion gate or the token scope without anyone noticing. Fail loudly
- * and name the offending entry instead.
+ * `acceptance` and `repos` must never be filtered silently: quietly discarding an entry
+ * would shrink the completion gate or the token scope without anyone noticing. Fail
+ * loudly and name the offending entry instead.
+ *
+ * What actually coerces here, checked against the parser rather than assumed: `true`,
+ * `8.0`, `null`, `~` — and an unquoted command containing `: `, which becomes a MAPPING
+ * (`- npm test: unit` parses to `{"npm test": "unit"}`). That last one is the realistic
+ * mistake. `no`, `yes`, `on` and `off` stay strings: the `yaml` package is YAML 1.2,
+ * where only `true`/`false` are booleans, so an earlier version of this note naming `no`
+ * was wrong.
  */
 const requireStringArray = (
   value: unknown,
@@ -151,6 +157,82 @@ export class StateStore {
       acceptance,
       ...(isTrackerRef(meta.tracker) ? { tracker: meta.tracker } : {}),
     };
+  }
+
+  /** True when this task already exists — the basis of intake's idempotency (§14). */
+  async hasTask(task: TaskId): Promise<boolean> {
+    return existsSync(join(this.taskDir(task), "spec.md"));
+  }
+
+  /**
+   * Write `spec.md`. Intake only — the agent never writes a spec (§4.1, §9.3).
+   *
+   * Refuses to overwrite. `spec.md` is immutable, and rewriting the spec of a task that
+   * is already running would change its acceptance criteria mid-flight.
+   *
+   * The front matter is serialised with the YAML library rather than concatenated,
+   * because the goal is tracker prose: a human can paste `---` or `acceptance:` into an
+   * issue body, and hand-built front matter would let that terminate the block early and
+   * silently redefine the completion gate. The goal goes strictly after the closing
+   * delimiter, where `readSpec`'s regex takes everything remaining as prose.
+   */
+  async writeSpec(spec: TaskSpec): Promise<void> {
+    const dir = this.taskDir(spec.id);
+    const path = join(dir, "spec.md");
+    if (existsSync(path)) {
+      throw new Error(`spec.md for ${spec.id} already exists and specs are immutable`);
+    }
+
+    const frontMatter = stringifyYaml({
+      workspace: spec.workspace,
+      // Always fully qualified, so the host never has to be inferred on the way back in.
+      repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
+      requires: [...spec.requires],
+      acceptance: [...spec.acceptance],
+      ...(spec.tracker !== undefined ? { tracker: { ...spec.tracker } } : {}),
+    });
+
+    await mkdir(dir, { recursive: true });
+    await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
+  }
+
+  private intakePath(task: TaskId): string {
+    return join(this.root, "intake", `${task}.json`);
+  }
+
+  /**
+   * Why intake last refused this item, if it did.
+   *
+   * Durable and pushed, not in-memory: the record suppresses a repeat comment on the
+   * tracker, and Keel rolls the pod on every push to main. An in-memory set would
+   * re-comment on every deploy for every malformed item.
+   */
+  async readIntakeRejection(
+    task: TaskId,
+  ): Promise<{ readonly digest: string; readonly reason: string } | undefined> {
+    const path = this.intakePath(task);
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(await readFile(path, "utf8")) as {
+      readonly digest: string;
+      readonly reason: string;
+    };
+  }
+
+  async writeIntakeRejection(
+    task: TaskId,
+    record: { readonly digest: string; readonly reason: string },
+  ): Promise<void> {
+    await mkdir(join(this.root, "intake"), { recursive: true });
+    await writeFile(
+      this.intakePath(task),
+      `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
+  /** Idempotent: the success path clears unconditionally. */
+  async clearIntakeRejection(task: TaskId): Promise<void> {
+    await rm(this.intakePath(task), { force: true });
   }
 
   async readState(task: TaskId): Promise<TaskState> {
@@ -252,7 +334,15 @@ export class StateStore {
 
   /** Commit and push all pending state changes with the supervisor's credential. */
   async commitAndPush(message: string, remote: string, branch: string): Promise<void> {
-    await this.git.run("add", "-A", "tasks");
+    // Each path is staged only when it exists: `git add` fails the WHOLE command on a
+    // pathspec that matches nothing (`fatal: pathspec 'tasks' did not match any files`),
+    // and neither directory is guaranteed. A freshly bootstrapped state repo has no
+    // `tasks/` at all, and a repo that has never refused an intake item has no `intake/`
+    // — so the first rejection on a new runner would otherwise throw here rather than
+    // record anything.
+    for (const path of ["tasks", "intake"]) {
+      if (existsSync(join(this.root, path))) await this.git.run("add", "-A", path);
+    }
     if (!(await this.git.hasUncommittedChanges())) return;
     await this.git.run("commit", "-m", message);
     await this.git.run("push", remote, `HEAD:${branch}`);

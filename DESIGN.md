@@ -136,6 +136,8 @@ workspace's credentials.** This is the same containment property as §9.1, one l
 state-repo/
   runners/
     <runner-id>.json           # capabilities, last seen
+  intake/
+    GH-owner-repo-12.json      # why intake REFUSED an item — see §14
   tasks/
     TASK-123/
       spec.md                  # immutable: goal, acceptance criteria, repos, requires
@@ -739,6 +741,73 @@ the tracker is a *view*, never authoritative. If they disagree, git wins.
 
 A spec without machine-checkable acceptance criteria should be rejected at intake — it
 cannot satisfy §12, so it can never be marked done.
+
+### 14.1 The `agent` block
+
+What a human writes in the tracker item:
+
+````
+```agent
+repos:
+  - owner/name          # optional on GitHub — defaults to the issue's own repo
+requires:               # optional, defaults to none, so any runner may claim
+  - linux
+acceptance:             # REQUIRED, at least one command that must exit 0
+  - "npm test"
+```
+````
+
+A fenced block rather than YAML front matter, because the body is not ours: GitHub renders
+a leading `---` as a horizontal rule, and a Vikunja description arrives as HTML stripped
+back to text (§9.5), where front matter does not survive as front matter.
+
+The `agent` marker is accepted on the fence line **or** as the first line inside the
+block, and every fenced block in the body is scanned rather than just the first — issue
+bodies routinely open with a stack trace or a repro snippet. Both concessions are for
+Vikunja: TipTap's code block carries a *language attribute*, not arbitrary fence text, so
+```` ```agent ```` is simply not expressible there, and its `<pre><code>` markup has no
+literal fences at all — `stripHtml` re-inserts them, or every item written with the
+editor's code-block button would look right in the UI and be unparseable here.
+
+The block is **removed** from the goal handed to the agent. Left in, it reads as a
+checklist the agent may edit or reinterpret, and the acceptance commands are not its to
+change (§12).
+
+Parsing is strict in the same way `spec.md` parsing is: a non-string entry in `acceptance`
+or `repos` is a refusal, never a silent filter. Intake must agree with `readSpec` — writing
+a spec the store then refuses would create a task nothing can claim and nothing can
+explain, which is worse than never creating it. An unknown `requires` capability is also a
+refusal, because `requires` is the claim predicate (§8) and a typo makes the task
+unclaimable by every runner while looking like a stuck scheduler.
+
+### 14.2 Idempotency and refusals
+
+Intake runs on a timer inside the supervisor loop, so both of its failure modes are
+silent and unbounded.
+
+**Duplicates.** The task id is derived from the tracker ref alone — `GH-<owner>-<repo>-<n>`,
+`VK-<project>-<task>` — never from the title, which humans edit. An item whose task
+already exists is skipped. Without this a fresh duplicate task appears every pass.
+
+**Comment spam.** `listAgentItems()` filters on the ingest label alone, so a refused item
+comes back every pass. A refusal is therefore recorded at `intake/<task-id>.json` with a
+digest of the item's title and body, and the item is commented on only when that digest
+changes. The record is durable and pushed rather than in-memory, because Keel rolls the
+pod on every push to `main` and an in-memory set would re-comment on every deploy. Editing
+the item re-opens it; a successful ingest clears the record.
+
+**Interval.** Intake does *not* run on the poll interval. A GitHub pass costs one request
+to enumerate the installation plus one per repo, and the live installation is account-wide
+at 65 repos — ~66 requests a pass. At a 30s poll that is ~132 requests a minute against an
+installation limit of 5000/hour (~83/min), which exhausts the budget within minutes and
+takes the forge calls down with it. Default `intake.intervalSeconds` is 300, so the same
+pass costs ~13/min. The clock is stamped *before* the pass, so a failing tracker waits out
+the interval instead of being retried on every poll.
+
+Ordering inside a single ingest is load-bearing: `state.json` is written first and
+`spec.md` last, because `spec.md` is the existence marker. A crash between the two leaves
+a task the claim loop skips and the next pass recreates cleanly; the reverse order would
+wedge the item as permanently existing and never claimable.
 
 ---
 
