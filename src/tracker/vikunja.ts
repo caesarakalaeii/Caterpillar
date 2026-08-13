@@ -152,6 +152,13 @@ const ENTITIES: ReadonlyMap<string, string> = new Map([
  */
 export const stripHtml = (html: string): string =>
   html
+    // Code blocks become FENCES, not bare text. TipTap stores a code block as
+    // `<pre><code>…</code></pre>`, where the ``` markers exist only in the rendering —
+    // so stripping tags alone would silently delete them. Intake's `agent` block is a
+    // fenced block (§14.1), which would make every Vikunja item written with the
+    // editor's code-block button unparseable while looking correct in the UI.
+    .replace(/<pre[^>]*>\s*(?:<code[^>]*>)?/gi, "\n```\n")
+    .replace(/(?:<\/code>)?\s*<\/pre>/gi, "\n```\n")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/(p|div|li|h[1-6]|tr)>/gi, "\n")
     .replace(/<li[^>]*>/gi, "- ")

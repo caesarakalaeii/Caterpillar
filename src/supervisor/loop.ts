@@ -25,6 +25,7 @@ import {
 import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
+import { intakeDue } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notifier } from "../notify/discord.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
@@ -51,6 +52,11 @@ export interface ProgressProbe {
   probe(spec: TaskSpec, state: TaskState): Promise<ProgressEvidence>;
 }
 
+export interface Intake {
+  /** One pass over every tracker. Returns tasks created (DESIGN.md §14). */
+  ingest(remote: string, branch: string): Promise<number>;
+}
+
 export interface SupervisorDeps {
   readonly config: RunnerConfig;
   readonly store: StateStore;
@@ -62,6 +68,11 @@ export interface SupervisorDeps {
   readonly metrics: AgentMetrics;
   readonly logger: Logger;
   /**
+   * Tracker → task ingestion. Optional: a runner with no trackers configured, or one
+   * fed only by hand-committed specs (§14.4), does not need it.
+   */
+  readonly intake?: Intake;
+  /**
    * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
    * Optional: a workspace without a tracker is a supported configuration.
    */
@@ -69,6 +80,9 @@ export interface SupervisorDeps {
 }
 
 export class Supervisor {
+  /** 0 means "never ran", so the first pass happens at boot. */
+  private lastIntakeAt = 0;
+
   constructor(private readonly deps: SupervisorDeps) {}
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
@@ -83,6 +97,9 @@ export class Supervisor {
 
     while (!signal.aborted) {
       await store.pull("origin", config.stateRepo.branch);
+
+      // Before claiming, so an item ingested now is claimable on this same iteration.
+      await this.maybeIngest();
 
       const claimed = await this.claimNext();
       if (claimed === undefined) {
@@ -116,6 +133,32 @@ export class Supervisor {
           ...errorFields(error),
         });
       }
+    }
+  }
+
+  /**
+   * Run an intake pass if one is due.
+   *
+   * Rate-limited independently of the poll interval — see `intakeDue` for the arithmetic.
+   * Failures never propagate: intake is best-effort and the state repo is authoritative,
+   * so a tracker outage must not stop the supervisor from working tasks it already has.
+   */
+  private async maybeIngest(): Promise<void> {
+    const { intake, config, logger } = this.deps;
+    if (intake === undefined) return;
+    if (!intakeDue(this.lastIntakeAt, Date.now(), config.intake.intervalSeconds)) return;
+
+    // Stamped BEFORE the pass, not after: a pass that throws must still wait out the
+    // interval, or a tracker returning errors would be retried on every poll — the exact
+    // request storm the interval exists to prevent.
+    this.lastIntakeAt = Date.now();
+
+    try {
+      const created = await intake.ingest("origin", config.stateRepo.branch);
+      if (created > 0) logger.info("intake.pass", { created });
+      else logger.debug("intake.pass", { created });
+    } catch (error) {
+      logger.warn("intake.failed", { ...errorFields(error) });
     }
   }
 

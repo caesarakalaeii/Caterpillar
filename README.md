@@ -16,10 +16,27 @@ The first in-cluster task took a spec from the state repo through two sessions a
 context handoff to a merged pull request, with the supervisor's own §12 gates — not the
 agent's word — deciding it was done.
 
-It is also **idle, and will stay idle**: nothing calls `Tracker.listAgentItems()`, so
-the tracker → task path (§14 intake) does not exist yet and the supervisor polls an
-empty `tasks/` directory. Work reaches it only by committing a spec into the state repo
-by hand. See `HANDOFF.md`.
+Work reaches it two ways: label a tracker item `agent` and intake renders a spec (§14),
+or commit a `tasks/<id>/spec.md` into the state repo by hand for full control over the
+acceptance criteria. See `HANDOFF.md`.
+
+To hand a GitHub issue or Vikunja task to the agent, label it `agent` and put an `agent`
+block in the body — `acceptance` is required, since a task with no machine-checkable
+criteria can never be marked done (§12):
+
+````
+```agent
+repos:
+  - owner/name          # optional on GitHub — defaults to the issue's own repo
+acceptance:
+  - "npm test"
+```
+````
+
+An item without one is refused, and commented on **once** explaining what to write.
+
+In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
+*inside* a code block instead — intake accepts either position.
 
 ## Development
 
@@ -62,6 +79,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/runner.ts` | Assembles a session: worktree, tools, prompt, budget. |
+| `src/intake/spec.ts` | Tracker item → `TaskSpec`. Pure, no IO (§14). |
+| `src/intake/ingest.ts` | Idempotent tracker → state-repo ingestion (§14). |
 | `src/supervisor/verifier.ts` | Independent completion gates (§12). |
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
@@ -135,11 +154,9 @@ the two, so the adapter does not conflate them the way Vikunja forces.
 
 ## Not yet built
 
-- **intake ingesters** — the tracker → `TaskSpec` path (§14). Both trackers implement
-  `listAgentItems()`; nothing in the running binary calls it. This is what stands
-  between a live supervisor and a working one.
-- Discord bridge (inbound `!answer`, outbound webhook) — questions land in
-  `tasks/<id>/questions/` in git, and nothing notifies a human that they are there.
+- Discord intake (`!task <repo> <goal>`, §14 path 3) and the Discord bridge (inbound
+  `!answer`, outbound webhook) — questions land in `tasks/<id>/questions/` in git, and
+  nothing notifies a human that they are there.
   Note the outbound half is **wired but not implemented**: `DiscordNotifier.notify`
   throws. It is harmless only because no webhook secret exists, so `index.ts` falls back
   to `NullNotifier` — sealing that secret arms the throw on the first question or park.
