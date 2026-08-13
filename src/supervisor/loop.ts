@@ -89,7 +89,14 @@ export class Supervisor {
           // Another runner owns this task now. Drop everything without writing.
           continue;
         }
-        throw error;
+        if (signal.aborted) throw error;
+
+        // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
+        // exits the process, and because the claim is durable the restarted
+        // supervisor re-claims the same task and dies again — one malformed task
+        // wedges the whole runner permanently. Park it with the reason instead, so
+        // the failure is visible to a human and every other task keeps moving.
+        await this.parkFailed(claimed.lease, claimed.spec, error);
       }
     }
   }
@@ -308,6 +315,28 @@ export class Supervisor {
     await this.push(lease, `chore(${spec.id}): parked`);
     await this.mirror(spec, { kind: "parked", reason });
     await notifier.notify({ kind: "parked", task: spec.id, reason });
+  }
+
+  /**
+   * Park a task whose session raised an error the supervisor cannot attribute.
+   *
+   * Best-effort by design: if parking ITSELF fails — an unreachable state repo, a lost
+   * network — this logs and returns rather than throwing. Propagating here would exit
+   * the process and reintroduce exactly the crash loop it exists to prevent.
+   */
+  private async parkFailed(lease: Lease, spec: TaskSpec, error: unknown): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error);
+
+    try {
+      const state = await this.deps.store.readState(spec.id);
+      await this.park(lease, spec, state, `session failed: ${reason}`);
+    } catch (parkError) {
+      const detail = parkError instanceof Error ? parkError.message : String(parkError);
+      process.stderr.write(
+        `${spec.id}: session failed and the task could not be parked (${detail}) — ` +
+          `original error: ${reason}\n`,
+      );
+    }
   }
 
   /**
