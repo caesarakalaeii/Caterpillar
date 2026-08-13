@@ -27,7 +27,7 @@ import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
-import type { Notifier } from "../notify/discord.ts";
+import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 
@@ -350,7 +350,7 @@ export class Supervisor {
     state: TaskState,
     outcome: SessionOutcome,
   ): Promise<boolean> {
-    const { store, notifier, logger } = this.deps;
+    const { store, logger } = this.deps;
 
     switch (outcome.reason) {
       case "handoff":
@@ -376,12 +376,7 @@ export class Supervisor {
         await this.transition(lease, state, "awaiting-human");
         await this.push(lease, `chore(${spec.id}): awaiting human input`);
         await this.mirror(spec, { kind: "question", question });
-        await notifier.notify({
-          kind: "question",
-          task: spec.id,
-          question,
-          phase: state.phase,
-        });
+        await this.notify({ kind: "question", task: spec.id, question, phase: state.phase });
         return true;
       }
 
@@ -412,7 +407,7 @@ export class Supervisor {
         const prUrl = result.prUrl ?? state.pr?.url ?? "(no PR recorded)";
         logger.info("task.done", { task: spec.id, sessions: state.sessions, prUrl });
         await this.mirror(spec, { kind: "completed", prUrl });
-        await notifier.notify({ kind: "done", task: spec.id, prUrl });
+        await this.notify({ kind: "done", task: spec.id, prUrl });
         return true;
       }
 
@@ -428,11 +423,7 @@ export class Supervisor {
         });
         await this.transition(lease, state, "failed");
         await this.push(lease, `chore(${spec.id}): failed`);
-        await notifier.notify({
-          kind: "failed",
-          task: spec.id,
-          error: outcome.error ?? outcome.summary,
-        });
+        await this.notify({ kind: "failed", task: spec.id, error: outcome.error ?? outcome.summary });
         return true;
     }
   }
@@ -443,13 +434,13 @@ export class Supervisor {
     state: TaskState,
     reason: string,
   ): Promise<void> {
-    const { store, notifier, logger } = this.deps;
+    const { store, logger } = this.deps;
     logger.warn("task.parked", { task: spec.id, sessions: state.sessions, reason });
     await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
     await this.transition(lease, state, "parked");
     await this.push(lease, `chore(${spec.id}): parked`);
     await this.mirror(spec, { kind: "parked", reason });
-    await notifier.notify({ kind: "parked", task: spec.id, reason });
+    await this.notify({ kind: "parked", task: spec.id, reason });
   }
 
   /**
@@ -470,6 +461,27 @@ export class Supervisor {
         task: spec.id,
         originalError: reason,
         ...errorFields(parkError),
+      });
+    }
+  }
+
+  /**
+   * Post to the human signal channel (DESIGN.md §11). Never throws.
+   *
+   * Same reasoning as `mirror`, and the same ordering: always after the authoritative
+   * git write, and a failure only logs. Discord going down — or a webhook deleted in
+   * the UI, which answers 404 forever — must not unwind into `workTask`'s catch and
+   * park a task that was just verified and pushed as `done`. The notification would
+   * then have rewritten the very state it exists to announce.
+   */
+  private async notify(notification: Notification): Promise<void> {
+    try {
+      await this.deps.notifier.notify(notification);
+    } catch (error) {
+      this.deps.logger.warn("notify.failed", {
+        task: notification.task,
+        kind: notification.kind,
+        ...errorFields(error),
       });
     }
   }

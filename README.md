@@ -84,6 +84,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/supervisor/verifier.ts` | Independent completion gates (§12). |
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
+| `src/notify/discord.ts` | Discord webhook — questions, parks, outcomes (§11.2). |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
 | `src/obs/log.ts` | Structured JSON-line logging to stdout (§11). |
 
@@ -105,7 +106,8 @@ awkward, the change is probably wrong.
    eventually consumes the context window it exists to preserve.
 6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
    the state repo is written and pushed, and a mirroring failure only logs — an
-   unreachable tracker must never fail a task.
+   unreachable tracker must never fail a task. Discord is a view on the same terms: a
+   failed notification logs `notify.failed` and never rewrites the state it announces.
 
 ## Verifying a GitHub App setup
 
@@ -152,14 +154,27 @@ lifecycle labels exist on each repo carrying agent work. A 403 is reported as "t
 installation lacks this permission", which is distinct from a 401 — GitHub separates
 the two, so the adapter does not conflate them the way Vikunja forces.
 
+## Verifying the Discord webhook
+
+```bash
+DISCORD_WEBHOOK_URL=... npm run verify:discord
+DISCORD_WEBHOOK_URL=... npm run verify:discord -- --kind question
+```
+
+Renders the message, prints it with its length, and POSTs it to the real channel — the
+only proof the outbound half works, since everything short of a live request is a stub
+agreeing with itself. It leaves one message behind. The URL comes from the environment,
+never argv: its last path segment is the credential, and nothing prints it, including on
+failure.
+
 ## Not yet built
 
-- Discord intake (`!task <repo> <goal>`, §14 path 3) and the Discord bridge (inbound
-  `!answer`, outbound webhook) — questions land in `tasks/<id>/questions/` in git, and
-  nothing notifies a human that they are there.
-  Note the outbound half is **wired but not implemented**: `DiscordNotifier.notify`
-  throws. It is harmless only because no webhook secret exists, so `index.ts` falls back
-  to `NullNotifier` — sealing that secret arms the throw on the first question or park.
+- The **inbound** Discord bridge: `!answer` (§7) and `!task <repo> <goal>` (§14 path 3).
+  A question still lands in `tasks/<id>/questions/` and waits there until a human commits
+  the answer by hand.
+  The **outbound** half is implemented (§11.2). It is active only when a `webhook-url`
+  key exists in the mounted `caterpillar-discord` secret; without one `index.ts` uses
+  `NullNotifier` and the supervisor runs silently.
 
 Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
 live topology, the credential rules, and an unresolved security note.

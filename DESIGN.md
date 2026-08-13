@@ -690,6 +690,41 @@ The fork point is resolved locally (`merge-base` against the mirror's default br
 because the probe runs after `clearActive()` where the credential service refuses to
 answer by design (§9.2) and anything touching the network fails.
 
+### 11.2 The Discord webhook
+
+**Amended when the notifier stopped being a stub.** §10 lists a `discord-bridge`
+Deployment. The OUTBOUND half does not need one and no longer has one: posting a message
+is one HTTPS request the supervisor can make itself, and a separate process would need
+its own copy of the webhook secret to add nothing. A bridge is required only for the
+INBOUND half (`!answer`, `!task` — §7, §14 path 3), which needs a gateway session or a
+public interactions endpoint. When that is built it is a Deployment; the outbound path
+stays where it is.
+
+Four rules, each one a way a notification is silently *lost* rather than loudly broken:
+
+- **Mentions are suppressed explicitly** (`allowed_mentions: {parse: []}`). Discord parses
+  them by default and the prose is agent-authored — it quotes files the agent read, so an
+  `@everyone` in a repo pages the whole server the first time the agent asks a question.
+- **Prose is truncated inside the frame, not at the end of the message.** Over 2000 code
+  points Discord answers 400 and the message never appears, which turns a long question
+  into no question at all. Clipping the assembled string instead would take the reply
+  instruction with it — the one part telling a human what to do next. The full text is in
+  git either way (§7).
+- **429 and 5xx are retried, bounded, with the wait capped.** A webhook is rate limited
+  per webhook, so two tasks finishing together is enough to hit one, and dropping a park
+  defeats the channel. But `notify` is awaited inside the task loop: an obediently
+  honoured `retry_after: 3600` would stop the runner working on anything. Past the cap,
+  losing a signal message is the cheaper failure. A 404 — a webhook deleted in the UI —
+  is permanent and is not retried at all.
+- **Delivery never fails a task.** Same rule as tracker mirroring (§9.5), for the same
+  reason: git is authoritative and Discord is a view. A throw here unwound into the
+  supervisor's session-error path and parked a task that had just been verified and pushed
+  as `done` — the notification rewriting the state it exists to announce. It logs
+  `notify.failed` and continues.
+
+The webhook URL's last path segment is the credential, so it is never included in a
+thrown error: the supervisor logs those verbatim.
+
 ---
 
 ## 12. Definition of done

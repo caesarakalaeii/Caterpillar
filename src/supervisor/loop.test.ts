@@ -12,16 +12,24 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { after, test } from "node:test";
 import type { RunnerConfig } from "../config/types.ts";
-import { asRunnerId, asTaskId, type TaskState } from "../domain/task.ts";
+import {
+  asRunnerId,
+  asTaskId,
+  EMPTY_USAGE,
+  type SessionOutcome,
+  type TaskId,
+  type TaskState,
+} from "../domain/task.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
-import { NullNotifier } from "../notify/discord.ts";
+import { type Notifier, NullNotifier } from "../notify/discord.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
-import { LeaseManager } from "../state/lease.ts";
+import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
+const DONE_TASK = asTaskId("SMOKE-2");
 
 const root = await mkdtemp(join(tmpdir(), "caterpillar-loop-"));
 const origin = join(root, "origin.git");
@@ -42,23 +50,6 @@ await stateGit.run("config", "user.name", "caterpillar");
 await stateGit.run("config", "user.email", "caterpillar@example.invalid");
 await stateGit.run("symbolic-ref", "HEAD", "refs/heads/main");
 
-await mkdir(join(statePath, "tasks", TASK), { recursive: true });
-await writeFile(
-  join(statePath, "tasks", TASK, "spec.md"),
-  [
-    "---",
-    "workspace: test",
-    "repos:",
-    "  - github.com/acme/widget",
-    "acceptance:",
-    '  - "true"',
-    "---",
-    "",
-    "Prove the pipeline runs.",
-    "",
-  ].join("\n"),
-);
-
 const seed: TaskState = {
   id: TASK,
   status: "ready",
@@ -71,13 +62,42 @@ const seed: TaskState = {
   createdAt: "2026-08-13T00:00:00Z",
   updatedAt: "2026-08-13T00:00:00Z",
 };
-await writeFile(
-  join(statePath, "tasks", TASK, "state.json"),
-  `${JSON.stringify(seed, null, 2)}\n`,
-);
-await stateGit.run("add", "-A");
-await stateGit.run("commit", "-m", "seed");
-await stateGit.run("push", "origin", "HEAD:main");
+
+/**
+ * Put a claimable task on the REMOTE.
+ *
+ * Called per test rather than once up front: every supervisor here claims whatever is
+ * `ready`, so a task seeded before the test that wants it gets picked up — and failed —
+ * by the test that ran first.
+ */
+const seedTask = async (id: TaskId): Promise<void> => {
+  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
+  await mkdir(join(statePath, "tasks", id), { recursive: true });
+  await writeFile(
+    join(statePath, "tasks", id, "spec.md"),
+    [
+      "---",
+      "workspace: test",
+      "repos:",
+      "  - github.com/acme/widget",
+      "acceptance:",
+      '  - "true"',
+      "---",
+      "",
+      "Prove the pipeline runs.",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    join(statePath, "tasks", id, "state.json"),
+    `${JSON.stringify({ ...seed, id }, null, 2)}\n`,
+  );
+  await stateGit.run("add", "-A");
+  await stateGit.run("commit", "-m", `seed ${id}`);
+  await stateGit.run("push", "origin", "HEAD:main");
+};
+
+await seedTask(TASK);
 
 const config: RunnerConfig = {
   runnerId: "test-runner",
@@ -105,8 +125,8 @@ const config: RunnerConfig = {
 };
 
 /** What the state repo's REMOTE says — the only evidence a push actually landed. */
-const pushedState = async (): Promise<TaskState | undefined> => {
-  const result = await new Git(origin).tryRun("show", `main:tasks/${TASK}/state.json`);
+const pushedState = async (task: TaskId = TASK): Promise<TaskState | undefined> => {
+  const result = await new Git(origin).tryRun("show", `main:tasks/${task}/state.json`);
   if (result.code !== 0) return undefined;
   return JSON.parse(result.stdout) as TaskState;
 };
@@ -172,4 +192,80 @@ test("a task whose session throws is parked on the REMOTE, not just locally", as
     parked !== undefined,
     "a failing task must reach `parked` on the remote, or it is re-claimed every poll",
   );
+});
+
+test("a notification that fails does not undo a task that finished", async () => {
+  // Discord is a signal channel, not a source of truth (DESIGN.md §11). `notify` used to
+  // be called bare inside `applyOutcome`, so once DiscordNotifier stopped being a stub
+  // that threw unconditionally and started making a real request, a webhook outage —
+  // or a webhook deleted in the UI — unwound into the catch in `workTask` and parked a
+  // task the supervisor had just verified and pushed as `done`.
+  //
+  // The verifier passes here, so `done` is the CORRECT terminal state; anything else on
+  // the remote means the notification rewrote it.
+  await seedTask(DONE_TASK);
+
+  const outcome: SessionOutcome = {
+    reason: "done-claimed",
+    usage: EMPTY_USAGE,
+    contextTokens: 0,
+    summary: "claiming completion",
+  };
+  const runner: SessionRunner = { run: () => Promise.resolve(outcome) };
+  const verifier: Verifier = {
+    verify: () =>
+      Promise.resolve({
+        passed: true,
+        detail: "acceptance commands exited 0",
+        prUrl: "https://example.invalid/pr/1",
+      }),
+  };
+  const progress: ProgressProbe = {
+    probe: () =>
+      Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+  };
+  const notifier: Notifier = {
+    notify: () => Promise.reject(new Error("Discord webhook rejected the message with 404")),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier,
+    progress,
+    notifier,
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Waiting for the LEASE to be released, not merely for a terminal status: with the
+  // bug, `done` is pushed first and only then overwritten by the park, so a poll that
+  // stops at the first terminal state it sees passes either way. The lease is dropped
+  // in `workTask`'s finally, after every write the supervisor is going to make.
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(DONE_TASK);
+    const held = await new Git(origin).tryRun("show-ref", "--verify", leaseRef(DONE_TASK));
+    if (state !== undefined && state.status !== "ready" && held.code !== 0) {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "done", "a failed notification must not rewrite task state");
 });
