@@ -344,8 +344,22 @@ POST /app/installations/{id}/access_tokens
 }
 ```
 
-No merge permission, no admin, no workflow. `TASK-123` cannot touch `caesar-deployment`
-unless its spec says so.
+No admin, no workflow. `TASK-123` cannot touch `caesar-deployment` unless its spec
+says so.
+
+> **Correction — "no merging" is not a token property.** GitHub has no separate merge
+> scope: `PUT /pulls/{n}/merge` is authorised by `pull_requests: write`, the same
+> permission that opens PRs. An App that can open a PR can merge it. The §2 decision
+> therefore cannot be enforced by the credential, and must be enforced by the repo:
+>
+> - a **ruleset / branch protection** on the default branch requiring a pull request
+>   and **at least one approving review**
+> - the App must NOT be on any bypass list
+>
+> GitHub blocks a PR's author from approving it, and the App is the author of its own
+> PRs — so the approval must come from you. That is what actually stops a merge.
+> Caterpillar additionally never calls the merge endpoint, but that is code
+> discipline, not enforcement, and code discipline is not a security boundary.
 
 ### 9.2 Why the agent never holds the token
 
