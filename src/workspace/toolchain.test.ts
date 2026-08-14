@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -316,48 +316,70 @@ test("a reserved variable the supervisor does not set is removed, not inherited"
 
 // ------------------------------------------------------------------------- capabilities
 
+/**
+ * A resolver whose `nix` probe has a decided answer.
+ *
+ * The probe resolves the binary through the PATH it is handed, so a stub on a scratch
+ * PATH settles it without the outcome depending on whether the machine running the tests
+ * happens to have nix. It did depend on that at first, which passed here and failed in CI
+ * — the one host guaranteed not to have nix.
+ */
+const withNix = async (installed: boolean, exitCode = 0): Promise<ToolchainResolver> => {
+  const bin = await scratch();
+  if (installed) {
+    const stub = join(bin, "nix");
+    await writeFile(stub, `#!/bin/sh\nexit ${exitCode}\n`, "utf8");
+    await chmod(stub, 0o755);
+  }
+  return new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: TEST_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: bin },
+  });
+};
+
 test("a runner with nix advertises it without being told to", async () => {
   // The whole point. The deployed ConfigMap says `["linux", "net"]`, an explicit
   // `toolchain: mode: nix` implies `requires: [nix]` at intake, and a runner that has nix
   // but does not say so leaves that task `ready` forever with nothing logged — the exact
   // failure §8.1 removes, arriving through config instead of through the enum.
-  const advertised = await resolver().capabilities(["linux", "net"]);
+  const advertised = await (await withNix(true)).capabilities(["linux", "net"]);
 
   assert.deepEqual([...advertised], ["linux", "net", "nix"]);
 });
 
 test("a runner without nix does not claim it can build environments", async () => {
-  const blind = new ToolchainResolver({
-    logger: SILENT_LOGGER,
-    config: TEST_CONFIG,
-    tasksDir: "/tmp/caterpillar-tasks",
-    baseEnv: { PATH: "/nonexistent" },
-  });
+  const advertised = await (await withNix(false)).capabilities(["linux", "net"]);
 
-  assert.deepEqual([...(await blind.capabilities(["linux", "net"]))], ["linux", "net"]);
+  assert.deepEqual([...advertised], ["linux", "net"]);
+});
+
+test("a nix that is present but does not run is not advertised", async () => {
+  // Installed-but-broken is not the same as installed. Advertising on the strength of the
+  // file existing would have the runner claim tasks it can only park.
+  const advertised = await (await withNix(true, 1)).capabilities(["linux", "net"]);
+
+  assert.deepEqual([...advertised], ["linux", "net"]);
 });
 
 test("an explicit declaration is neither duplicated nor overridden", async () => {
   // Config still wins where it can be right. An operator who lists `nix` on a machine that
   // does not have it yet gets a warning at boot, not a silent removal — they may be about
   // to install it, and a config the runner quietly edits is worse than one that is wrong.
-  const withNix = await resolver().capabilities(["linux", "nix"]);
-  assert.deepEqual([...withNix], ["linux", "nix"]);
+  const present = await (await withNix(true)).capabilities(["linux", "nix"]);
+  assert.deepEqual([...present], ["linux", "nix"]);
 
-  const blind = new ToolchainResolver({
-    logger: SILENT_LOGGER,
-    config: TEST_CONFIG,
-    tasksDir: "/tmp/caterpillar-tasks",
-    baseEnv: { PATH: "/nonexistent" },
-  });
-  assert.deepEqual([...(await blind.capabilities(["linux", "nix"]))], ["linux", "nix"]);
+  const absent = await (await withNix(false)).capabilities(["linux", "nix"]);
+  assert.deepEqual([...absent], ["linux", "nix"]);
 });
 
 test("every derived capability is one the config loader would accept", async () => {
   // Derivation must not be able to invent a capability the rest of the system refuses:
   // `claimNext` compares against this list and intake validates `requires` against it.
-  const advertised = await resolver().capabilities(["linux"]);
+  const advertised = await (await withNix(true)).capabilities(["linux"]);
 
+  assert.ok(advertised.includes("nix"), "expected the stub to be detected");
   for (const capability of advertised) {
     assert.ok(
       KNOWN_CAPABILITIES.includes(capability),
