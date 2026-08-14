@@ -93,6 +93,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/intake/spec.ts` | Tracker item → `TaskSpec`. Pure, no IO (§14). |
 | `src/intake/ingest.ts` | Idempotent tracker → state-repo ingestion (§14). |
 | `src/supervisor/verifier.ts` | Independent completion gates (§12). |
+| `src/review/lenses.ts` | The council's three reviewer prompts (§12.1). |
+| `src/review/decide.ts` | Three verdicts → one decision. Pure, no IO (§12.1). |
+| `src/review/council.ts` | Runs the reviewers in the task's worktree, read-only (§12.1). |
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
 | `src/notify/http.ts` | The retrying JSON client every Discord path shares. |
@@ -119,7 +122,12 @@ awkward, the change is probably wrong.
    PRs and tracker writes go through supervisor-implemented tools. Session transcripts
    are committed to git, so a token in `argv` is a token in git history.
 2. **The agent cannot declare itself done.** `done` only *claims* completion; the
-   supervisor independently runs the acceptance criteria and checks CI.
+   supervisor independently runs the acceptance criteria and checks CI, and then a review
+   council of three reviewers reads the change itself (§12.1). Any one blocking objection
+   sends it back, and an abstention is never an approval. Nothing merges as the identity
+   that opened the PR: GitHub will not let a pull request's author approve it, and that
+   refusal is the only thing making branch protection a real gate — so the council
+   approves and merges through a *second* App, or not at all.
 3. **The agent cannot write the state repo.** Task-scoped tokens never cover it, so the
    audit trail cannot be rewritten by the thing being audited.
 4. **Every push verifies the lease first.** Claim-time exclusion is not enough — a
@@ -142,6 +150,24 @@ npm run verify:github-app -- --pem <key.pem> --app-id <id> --repo <owner/name>
 
 Signs a JWT, prints the installation id, mints a repo-scoped token, and echoes the
 granted permissions. Never prints the token.
+
+## Verifying the reviewer App
+
+```bash
+npm run verify:reviewer -- --pem <reviewer-key.pem> --app-id <id> --repo <owner/name> \
+  --author-app-id <the app that opens PRs>
+```
+
+Signs a JWT, asserts the reviewer is a **different** App from the one that opens pull
+requests, confirms it is installed on the repo, and mints a token with
+`pull_requests: write`. It deliberately approves and merges nothing — there is no harmless
+test merge, and an approval left on a real PR is a lie about who read it.
+
+The one property it cannot prove is whether GitHub counts this App's approval towards your
+branch protection. The first council merge is that test.
+
+Without a `<secretRef>-reviewer` secret the council still runs and still records verdicts;
+a passing task is `done` with its PR open for you to merge (§12.1).
 
 ## Verifying a Codeberg token
 

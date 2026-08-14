@@ -33,6 +33,12 @@ export interface PrResult {
 
 export type CheckConclusion = "pending" | "success" | "failure" | "none";
 
+export interface MergeOptions {
+  /** Defaults to `squash`, which is how every change in these repos has landed. */
+  readonly method?: "merge" | "squash" | "rebase";
+  readonly title?: string;
+}
+
 export interface CheckStatus {
   readonly conclusion: CheckConclusion;
   /** Human-readable detail for the journal and Discord. */
@@ -58,6 +64,26 @@ export interface Forge {
 
   /** CI state for a ref — the second gate in DESIGN.md §12. */
   checks(repo: RepoRef, ref: string): Promise<CheckStatus>;
+
+  /**
+   * Submit an APPROVING review on a pull request.
+   *
+   * Only ever called through a REVIEWER identity, never the one that opened the PR.
+   * GitHub refuses to let an author approve their own pull request, which is precisely
+   * what makes branch protection a real gate rather than a formality (DESIGN.md §9.1) —
+   * so an approval from the authoring App would be rejected, and one that succeeded
+   * would mean the gate had been removed.
+   */
+  approve(repo: RepoRef, pr: number, body: string): Promise<void>;
+
+  /**
+   * Merge a pull request.
+   *
+   * Authorised by the same `pull_requests: write` that opens one — there is no separate
+   * merge scope on either forge. What stops an unreviewed merge is branch protection,
+   * not the token (DESIGN.md §9.1).
+   */
+  merge(repo: RepoRef, pr: number, options?: MergeOptions): Promise<void>;
 
   /**
    * Release any cached credentials. Called when a task completes or parks, so a

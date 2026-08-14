@@ -28,6 +28,9 @@ import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
+import type { ForgeFactory } from "../forge/types.ts";
+import type { Council } from "../review/council.ts";
+import { renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
@@ -95,6 +98,17 @@ export interface SupervisorDeps {
    * Optional: a workspace without a tracker is a supported configuration.
    */
   readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
+  /**
+   * The review council (DESIGN.md §12.1). Optional: without one a task that passes the
+   * §12 gates is done, exactly as it was before the council existed.
+   */
+  readonly council?: Council;
+  /**
+   * Reviewer forge identities by workspace — a SECOND app, not the one that opens PRs.
+   * Optional, and its absence is a supported configuration: the council still runs and
+   * still records verdicts, and merging stays a human act.
+   */
+  readonly reviewers?: ReadonlyMap<WorkspaceName, ForgeFactory>;
 }
 
 export class Supervisor {
@@ -450,13 +464,25 @@ export class Supervisor {
           return false;
         }
 
-        await this.transition(lease, state, "done");
+        // The third gate. Runs only once the §12 pair has passed, so the council is
+        // never asked to re-litigate whether the tests pass — it reads the change.
+        const reviewed = await this.convene(lease, spec, state);
+        if (reviewed.decision === "changes") return false;
+        if (reviewed.decision === "stalled") return true;
+
+        const merge = await this.mergeReviewed(spec, reviewed.state);
+        await this.transition(lease, reviewed.state, "done");
         await this.push(lease, `chore(${spec.id}): done`);
-        // Mirrored only here, after both §12 gates passed and git already says done.
-        const prUrl = result.prUrl ?? state.pr?.url ?? "(no PR recorded)";
-        logger.info("task.done", { task: spec.id, sessions: state.sessions, prUrl });
+        // Mirrored only here, after every gate passed and git already says done.
+        const prUrl = result.prUrl ?? reviewed.state.pr?.url ?? "(no PR recorded)";
+        logger.info("task.done", {
+          task: spec.id,
+          sessions: reviewed.state.sessions,
+          prUrl,
+          merged: merge.merged,
+        });
         await this.mirror(spec, { kind: "completed", prUrl });
-        await this.notify({ kind: "done", task: spec.id, prUrl });
+        await this.notify({ kind: "done", task: spec.id, prUrl, note: merge.note });
         return true;
       }
 
@@ -477,11 +503,129 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Convene the review council (DESIGN.md §12.1).
+   *
+   * `pass` when no council is configured: this is the third gate, not a replacement for
+   * the first two, and a runner without one behaves exactly as it did before.
+   *
+   * The verdict is written and pushed BEFORE anything acts on it. A council that decided
+   * and then lost the pod would otherwise cost its whole spend and be re-run from
+   * scratch, and the next session would never learn what it had said.
+   */
+  private async convene(
+    lease: Lease,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<{
+    readonly state: TaskState;
+    readonly decision: "pass" | "changes" | "stalled";
+  }> {
+    const { council, store, config, metrics, logger } = this.deps;
+    if (council === undefined) return { state, decision: "pass" };
+
+    const { verdict, usage } = await council.review(spec, state);
+    const text = renderVerdict(verdict);
+    const rounds = (state.review?.rounds ?? 0) + (verdict.decision === "changes" ? 1 : 0);
+
+    await store.writeVerdict(spec.id, state.sessions, text);
+    await store.appendJournal(spec.id, state.sessions, text);
+
+    const next: TaskState = {
+      ...state,
+      // The council's own tokens belong to the task that convened it, or a reviewed
+      // task looks cheaper than it was and the cost of reviewing is invisible.
+      usage: addUsage(state.usage, usage),
+      review: { rounds, last: verdict.decision },
+    };
+    await store.writeState(next);
+    metrics.council.inc({ task: spec.id, decision: verdict.decision });
+
+    if (verdict.decision === "pass") {
+      await this.push(lease, `chore(${spec.id}): review council passed`);
+      return { state: next, decision: "pass" };
+    }
+
+    if (rounds >= config.limits.maxReviewRounds) {
+      // The council and the agent are not converging. Parking beats a fourth attempt:
+      // from outside, a task trading itself back and forth looks identical to one that
+      // is working.
+      logger.warn("council.stalled", { task: spec.id, rounds });
+      await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
+        kind: "review-stalled",
+        task: spec.id,
+        rounds,
+        summary: summariseVerdict(verdict),
+        ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
+        canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
+      });
+      return { state: next, decision: "stalled" };
+    }
+
+    await this.transition(lease, next, "ready");
+    await this.push(lease, `chore(${spec.id}): review council requested changes`);
+    await this.notify({
+      kind: "verdict",
+      task: spec.id,
+      summary: summariseVerdict(verdict),
+      ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
+    });
+    return { state: next, decision: "changes" };
+  }
+
+  /**
+   * Approve and merge, through the REVIEWER identity (DESIGN.md §12.1).
+   *
+   * Never throws, and never fails the task. By this point every gate has passed and git
+   * already records the work as complete; a forge that refuses the merge is the same
+   * class of problem as a tracker that refuses a comment (README invariant 6). The
+   * outcome is reported instead, in the message that announces the task is done.
+   *
+   * Without a reviewer identity this does nothing at all. The primary App authored the
+   * PR, and GitHub will not let an author approve their own — so a merge attempt from it
+   * is refused by the very branch protection that makes review meaningful (§9.1).
+   */
+  private async mergeReviewed(
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<{ readonly merged: boolean; readonly note: string }> {
+    const { reviewers, logger } = this.deps;
+
+    const pr = state.pr;
+    const repo = spec.repos[0];
+    if (pr === undefined || repo === undefined) {
+      return { merged: false, note: "No PR was recorded, so nothing was merged." };
+    }
+
+    const factory = reviewers?.get(spec.workspace);
+    if (factory === undefined) {
+      return { merged: false, note: "No reviewer identity is configured — merging is yours." };
+    }
+
+    const forge = await factory.forTask(spec);
+    try {
+      await forge.approve(repo, pr.number, "Approved by the caterpillar review council.");
+      await forge.merge(repo, pr.number);
+      logger.info("pr.merged", { task: spec.id, pr: pr.number });
+      return { merged: true, note: "Approved by the review council and merged." };
+    } catch (error) {
+      logger.warn("pr.merge-failed", { task: spec.id, pr: pr.number, ...errorFields(error) });
+      return {
+        merged: false,
+        note: `Could not merge: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    } finally {
+      await forge.revoke().catch(() => undefined);
+    }
+  }
+
   private async park(
     lease: Lease,
     spec: TaskSpec,
     state: TaskState,
     reason: string,
+    /** Overrides the default park notification when a park has a more specific story. */
+    notification?: Notification,
   ): Promise<void> {
     const { store, logger } = this.deps;
     logger.warn("task.parked", { task: spec.id, sessions: state.sessions, reason });
@@ -489,7 +633,7 @@ export class Supervisor {
     await this.transition(lease, state, "parked");
     await this.push(lease, `chore(${spec.id}): parked`);
     await this.mirror(spec, { kind: "parked", reason });
-    await this.notify({ kind: "parked", task: spec.id, reason });
+    await this.notify(notification ?? { kind: "parked", task: spec.id, reason });
   }
 
   /**
@@ -528,15 +672,24 @@ export class Supervisor {
 
     for (const request of inbox.drain()) {
       try {
-        request.settle(
-          request.kind === "answer" ? await this.applyAnswer(request) : await this.applyPark(request),
-        );
+        request.settle(await this.applyChatRequest(request));
       } catch (error) {
         // Never fatal: a state repo that rejects one request must not stop the runner
         // from working every other task.
         logger.error("chat.failed", { task: request.task, kind: request.kind, ...errorFields(error) });
         request.settle({ kind: "failed", error: error instanceof Error ? error.message : String(error) });
       }
+    }
+  }
+
+  private applyChatRequest(request: ChatRequest): Promise<ChatOutcome> {
+    switch (request.kind) {
+      case "answer":
+        return this.applyAnswer(request);
+      case "park":
+        return this.applyPark(request);
+      case "merge":
+        return this.applyMerge(request);
     }
   }
 
@@ -611,6 +764,54 @@ export class Supervisor {
     } finally {
       await leases.release(lease).catch(() => undefined);
     }
+  }
+
+  /**
+   * Merge a task's PR on request — the `Merge anyway` button on a stalled review.
+   *
+   * The one place a human overrides the council. It goes through the same reviewer
+   * identity the automatic path uses, so it is subject to the same branch protection and
+   * leaves the same approving review behind: an override is recorded on the PR, not
+   * smuggled past it.
+   */
+  private async applyMerge(request: ChatRequest & { readonly kind: "merge" }): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.pr === undefined) return { kind: "not-mergeable", reason: "no PR was ever opened" };
+
+    const spec = await store.readSpec(request.task).catch(() => undefined);
+    if (spec === undefined) return { kind: "not-mergeable", reason: "the task has no readable spec" };
+    if (this.deps.reviewers?.get(spec.workspace) === undefined) {
+      return {
+        kind: "not-mergeable",
+        reason:
+          "no reviewer identity is configured for this workspace, and the app that " +
+          "opened the PR cannot approve its own — merge it yourself",
+      };
+    }
+
+    const merge = await this.mergeReviewed(spec, state);
+    if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
+
+    // Merging a parked task settles it: the work is on the default branch, and leaving
+    // it parked would invite a human to pick up something already shipped.
+    const lease = await leases.claim(request.task);
+    if (lease !== undefined) {
+      try {
+        await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
+        await this.transition(lease, state, "done");
+        await this.push(lease, `chore(${request.task}): merged from chat`);
+      } finally {
+        await leases.release(lease).catch(() => undefined);
+      }
+    } else {
+      // The merge already happened; failing to record it is worth a log, not a retry.
+      logger.warn("merge.unrecorded", { task: request.task, reason: "task is leased elsewhere" });
+    }
+
+    return { kind: "merged", prUrl: state.pr.url };
   }
 
   /**

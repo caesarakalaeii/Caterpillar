@@ -17,6 +17,7 @@
     "test": "node --test 'src/**/*.test.ts'",
     "start": "node src/index.ts",
     "verify:github-app": "node src/cli/verify-github-app.ts",
+    "verify:reviewer": "node src/cli/verify-reviewer.ts",
     "verify:forgejo": "node src/cli/verify-forgejo.ts",
     "verify:vikunja": "node src/cli/verify-vikunja.ts",
     "verify:github-issues": "node src/cli/verify-github-issues.ts",

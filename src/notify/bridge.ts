@@ -144,7 +144,12 @@ export class DiscordBridge {
       return;
     }
 
-    const what = command.kind === "answer" ? `Answering ${command.task}` : `Cancelling ${command.task}`;
+    const what =
+      command.kind === "answer"
+        ? `Answering ${command.task}`
+        : command.kind === "merge"
+          ? `Merging ${command.task}`
+          : `Cancelling ${command.task}`;
     await this.answer(interaction, this.acknowledge(interaction, queued(what, who)));
 
     await this.say(await this.execute(command));
@@ -189,6 +194,11 @@ export class DiscordBridge {
         return describeOutcome(
           command.task,
           await inbox.submit({ kind: "park", task: command.task }),
+        );
+      case "merge":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({ kind: "merge", task: command.task }),
         );
     }
   }

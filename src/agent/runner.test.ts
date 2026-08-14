@@ -72,6 +72,12 @@ class FakeForge implements Forge {
   async checks(): Promise<CheckStatus> {
     return { conclusion: "success", summary: "ok" };
   }
+  async approve(): Promise<void> {
+    throw new Error("a session's forge never approves — that is the reviewer identity");
+  }
+  async merge(): Promise<void> {
+    throw new Error("a session's forge never merges — that is the reviewer identity");
+  }
   async revoke(): Promise<void> {}
 }
 

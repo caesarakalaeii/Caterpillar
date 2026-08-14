@@ -196,6 +196,8 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "open-answer-modal", task: action.task };
     case "park":
       return { kind: "run", command: { kind: "park", task: action.task } };
+    case "merge":
+      return { kind: "run", command: { kind: "merge", task: action.task } };
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }

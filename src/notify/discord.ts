@@ -29,7 +29,37 @@ import { type FetchLike, postJson } from "./http.ts";
 export type Notification =
   | { readonly kind: "question"; readonly task: TaskId; readonly question: string; readonly phase: string }
   | { readonly kind: "parked"; readonly task: TaskId; readonly reason: string }
-  | { readonly kind: "done"; readonly task: TaskId; readonly prUrl: string }
+  | {
+      readonly kind: "done";
+      readonly task: TaskId;
+      readonly prUrl: string;
+      /** What became of the PR — merged by the reviewer identity, or left for a human. */
+      readonly note?: string;
+    }
+  /** The council sent a change back. Informational: the task returns to the agent by itself. */
+  | {
+      readonly kind: "verdict";
+      readonly task: TaskId;
+      readonly summary: string;
+      readonly prUrl?: string;
+    }
+  /**
+   * The council and the agent could not converge (DESIGN.md §12.1). The one place a
+   * human is genuinely in the loop, so it is the one notification that offers a merge.
+   */
+  | {
+      readonly kind: "review-stalled";
+      readonly task: TaskId;
+      readonly rounds: number;
+      readonly summary: string;
+      readonly prUrl?: string;
+      /**
+       * Whether a Merge button would actually work. False without a reviewer identity:
+       * branch protection refuses a merge from the App that authored the PR, so the
+       * button would fail every time it was pressed (§9.1).
+       */
+      readonly canMerge: boolean;
+    }
   | { readonly kind: "failed"; readonly task: TaskId; readonly error: string };
 
 export interface Notifier {
@@ -143,6 +173,23 @@ export const componentsFor = (notification: Notification): readonly ActionRow[] 
       );
     case "done":
       return rows(row(linkButton("View PR", notification.prUrl)));
+    case "verdict":
+      return notification.prUrl === undefined
+        ? undefined
+        : rows(row(linkButton("View PR", notification.prUrl)));
+    case "review-stalled":
+      return rows(
+        row(
+          notification.canMerge
+            ? button({
+                action: { verb: "merge", task: notification.task },
+                label: "Merge anyway",
+                style: BUTTON_STYLE.danger,
+              })
+            : undefined,
+          notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
+        ),
+      );
     case "parked":
     case "failed":
       return undefined;
@@ -167,8 +214,31 @@ const frame = (notification: Notification, hint: boolean): string => {
     }
     case "parked":
       return fit(notification.reason, (text) => `**${task}** parked — ${text}`);
-    case "done":
-      return fit(notification.prUrl, (text) => `**${task}** done — ${text}`);
+    case "done": {
+      const note = notification.note;
+      return fit(notification.prUrl, (text) =>
+        `**${task}** done — ${text}${note === undefined ? "" : `\n${note}`}`,
+      );
+    }
+    case "verdict":
+      return fit(
+        notification.summary,
+        (text) => `**${task}** — review council requested changes.\n${text}\nBack to the agent.`,
+      );
+    case "review-stalled":
+      return fit(
+        notification.summary,
+        (text) =>
+          [
+            `**${task}** parked — the review council requested changes ${notification.rounds} times.`,
+            "",
+            text,
+            "",
+            notification.canMerge
+              ? "Merge it as it stands, or leave it parked and pick it up by hand."
+              : "No reviewer identity is configured, so merging is yours to do.",
+          ].join("\n"),
+      );
     case "failed":
       return fit(notification.error, (text) => `**${task}** failed — ${text}`);
   }
