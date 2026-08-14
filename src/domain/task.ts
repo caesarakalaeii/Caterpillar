@@ -131,6 +131,19 @@ export interface PullRequestRef {
   readonly url: string;
 }
 
+/**
+ * Review council history (DESIGN.md §12.1).
+ *
+ * `rounds` is the ping-pong guard: a council that requests changes sends the task back
+ * to the same implementation agent, which can claim done again, which convenes the
+ * council again. Without a ceiling the pair can trade the task until the session limit,
+ * which reads from outside as a task that is running and getting nowhere.
+ */
+export interface ReviewRecord {
+  readonly rounds: number;
+  readonly last?: "pass" | "changes";
+}
+
 /** Mutable control record — `state.json`. */
 export interface TaskState {
   readonly id: TaskId;
@@ -144,6 +157,8 @@ export interface TaskState {
   readonly owner?: TaskOwner;
   /** Set once the agent opens a PR; the completion gate needs it (§12). */
   readonly pr?: PullRequestRef;
+  /** Absent until the council has run once. Older `state.json` files simply lack it. */
+  readonly review?: ReviewRecord;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

@@ -92,6 +92,7 @@ export class AgentMetrics {
   readonly handoffs = this.registry.counter("caterpillar_handoffs_total", "Session exits by reason");
   readonly leaseAge = this.registry.gauge("caterpillar_lease_age_seconds", "Age of the held lease");
   readonly noProgress = this.registry.gauge("caterpillar_no_progress_streak", "Consecutive sessions without progress");
+  readonly council = this.registry.counter("caterpillar_council_total", "Review council verdicts by decision");
 
   /**
    * Sessions that ended past the safe context point. Must stay 0: it means the

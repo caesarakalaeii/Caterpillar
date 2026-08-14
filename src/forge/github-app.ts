@@ -11,6 +11,11 @@
  * merge scope, so "open PRs but never merge" cannot be enforced by the token. It is
  * enforced by branch protection on the default branch requiring an approving review,
  * which the App cannot supply for its own PR. See DESIGN.md §9.1.
+ *
+ * `approve` and `merge` exist here for the REVIEWER identity (§12.1) — a second App,
+ * installed on the same repos, that is not the author of the PR and can therefore
+ * satisfy that branch protection. The authoring App still never calls either: it has
+ * the permission, GitHub would refuse the approval, and the gate stays real.
  */
 import { createSign } from "node:crypto";
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
@@ -21,6 +26,7 @@ import {
   type Forge,
   type ForgeFactory,
   type GitCredential,
+  type MergeOptions,
   type PrRequest,
   type PrResult,
 } from "./types.ts";
@@ -37,6 +43,20 @@ const TASK_PERMISSIONS = {
   issues: "write",
   checks: "read",
   statuses: "read",
+  metadata: "read",
+} as const;
+
+/**
+ * Permissions for the REVIEWER App's token (DESIGN.md §12.1).
+ *
+ * `contents: write` is here because merging writes the base branch, and GitHub counts
+ * a merge as a content write as well as a pull-request one. It is not here so the
+ * reviewer can push: it never checks anything out, and its only two calls are
+ * `approve` and `merge`.
+ */
+const REVIEWER_PERMISSIONS = {
+  contents: "write",
+  pull_requests: "write",
   metadata: "read",
 } as const;
 
@@ -64,6 +84,11 @@ export interface GitHubAppOptions {
   /** PEM contents. Read from the mounted SOPS secret; never logged. */
   readonly privateKeyPem: string;
   readonly apiBase: string;
+  /**
+   * Permissions minted per task. Defaults to `TASK_PERMISSIONS`; the reviewer identity
+   * asks for a different, smaller set (§12.1). Always narrower than the App itself.
+   */
+  readonly permissions?: Readonly<Record<string, string>>;
 }
 
 interface InstallationTokenResponse {
@@ -188,6 +213,27 @@ class GitHubAppForge implements Forge {
     return summarise(runs, combined);
   }
 
+  async approve(repo: RepoRef, pr: number, body: string): Promise<void> {
+    assertInScope(repo, this.allowed);
+
+    await this.api<unknown>(repo, `/repos/${repo.owner}/${repo.name}/pulls/${pr}/reviews`, {
+      method: "POST",
+      body: JSON.stringify({ event: "APPROVE", body }),
+    });
+  }
+
+  async merge(repo: RepoRef, pr: number, options: MergeOptions = {}): Promise<void> {
+    assertInScope(repo, this.allowed);
+
+    await this.api<unknown>(repo, `/repos/${repo.owner}/${repo.name}/pulls/${pr}/merge`, {
+      method: "PUT",
+      body: JSON.stringify({
+        merge_method: options.method ?? "squash",
+        ...(options.title === undefined ? {} : { commit_title: options.title }),
+      }),
+    });
+  }
+
   async revoke(): Promise<void> {
     const cached = this.cached;
     this.cached = undefined;
@@ -205,7 +251,7 @@ class GitHubAppForge implements Forge {
     return mintInstallationToken(this.options, {
       // Scope to exactly the repos the task declared — narrower than the App.
       repositories: this.allowed.map((repo) => repo.name),
-      permissions: TASK_PERMISSIONS,
+      permissions: this.options.permissions ?? TASK_PERMISSIONS,
     });
   }
 
@@ -389,3 +435,14 @@ export class GitHubAppForgeFactory implements ForgeFactory {
     return new GitHubAppForge(this.options, spec.repos);
   }
 }
+
+/**
+ * A factory for the reviewer identity (DESIGN.md §12.1).
+ *
+ * The same App machinery with a different key and a smaller permission set. It is a
+ * separate GitHub App on purpose: an approving review only counts against branch
+ * protection when it comes from someone other than the PR's author.
+ */
+export const reviewerForgeFactory = (
+  options: Omit<GitHubAppOptions, "permissions">,
+): ForgeFactory => new GitHubAppForgeFactory({ ...options, permissions: REVIEWER_PERMISSIONS });

@@ -850,6 +850,57 @@ Only then `status = done`, Discord gets the terminal message, and the supervisor
 tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
 
+### 12.1 The review council
+
+A third gate, after those two and never instead of them. Both of the first pair measure
+*outcomes* — commands exit 0, CI is green — and neither of them reads the change. A change
+can satisfy both and still be wrong in ways only reading catches: the test that was
+weakened to pass, the error path that swallows, the half of the goal that was quietly not
+implemented.
+
+**Three reviewers, three different lenses** — correctness, design and simplicity,
+acceptance fit — run concurrently in the task's existing worktree. Different rather than
+redundant: three runs of one prompt catch variance, but only a different lens catches a
+failure mode the first one is blind to. Their tool surface is `read`, `bash` and
+`submit_verdict`: no `write`, no `edit`, and none of the implementation agent's control
+verbs. A reviewer cannot open a PR, claim completion, ask a human, or hand off.
+
+**Any blocking objection sends the work back.** Not a majority. Two reviewers who did not
+look at the thing a third found are not evidence against it. The cost of that rule is paid
+on the other side: a blocking objection is expensive — it costs the task a whole session —
+so the lenses are told at length when *not* to raise one, and a preference is recorded as
+a non-blocking comment that merges anyway.
+
+**An abstention is never an approval.** A reviewer whose session errors or runs out of
+context has agreed to nothing, and a council where every reviewer abstained requests
+changes rather than passing. This is the one failure mode that would otherwise merge a
+change nobody read.
+
+**The round cap is what terminates it.** A rejected change goes back to the *same*
+implementation agent, which fixes it and claims done again, which convenes the council
+again. Without a ceiling the two can trade a task until the session limit, which from
+outside is indistinguishable from a task that is working. At `limits.maxReviewRounds`
+(default 3) the task parks and Discord says so.
+
+**Merging needs a second identity.** §9.1 established that "no merging" cannot be a token
+property, and that what actually stops an unreviewed merge is branch protection requiring
+an approving review the App cannot give its own PR. That constraint is unchanged — so the
+council does not merge as the App that opened the PR. A **separate GitHub App**, in its own
+secret (`<secretRef>-reviewer`), installed on the same repositories, posts the approving
+review and then merges. GitHub counts an installation token's review towards a required
+approval, which is exactly why the identity has to be a different one.
+
+Without that second App the council still runs and still records verdicts, and a passing
+task is `done` with its PR open for a human to merge — the behaviour that existed before.
+That degradation is deliberate, and it is also why the `Merge anyway` button on a stalled
+review only appears when a reviewer identity exists: from the authoring App the merge would
+be refused by branch protection every time, and a button that always fails is worse than no
+button.
+
+Verdicts are written to `tasks/<id>/reviews/NNN-verdict.md`, numbered by session and never
+overwritten, and appended to the journal — the journal is what the next session actually
+reads, so a rejection has to arrive there as instructions rather than as a score.
+
 ---
 
 ## 13. Agent tools

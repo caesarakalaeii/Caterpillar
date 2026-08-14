@@ -42,6 +42,12 @@ class FakeForge implements Forge {
   async checks(_repo: RepoRef, _ref: string): Promise<CheckStatus> {
     throw new Error("unused");
   }
+  async approve(): Promise<void> {
+    throw new Error("unused");
+  }
+  async merge(): Promise<void> {
+    throw new Error("unused");
+  }
   async revoke(): Promise<void> {}
 }
 
