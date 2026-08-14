@@ -953,15 +953,23 @@ Only then `status = done`, Discord gets the terminal message, and the supervisor
 tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
 
-> **The image is the gate's execution environment.** Acceptance commands run in the
-> supervisor's container, so an interpreter missing from it makes the first gate
-> *unsatisfiable* for every task that needs one — no matter what the agent does. A repo whose
-> tests run through `tools/test.py` failed with `env: 'python3': No such file or directory`
-> and exit 127, which reads as a badly written acceptance command rather than a missing
-> interpreter, and the agent has no way to fix it from inside a session. `python3`, `curl`
-> and `jq` are therefore part of the base image; per-repo language toolchains (dotnet, lua, a
-> compiler) are **not**, and belong to a capability-matched runner (§8) so that every runner
-> does not pay for every repo.
+> **A missing interpreter makes this gate unsatisfiable, not failed.** Acceptance commands
+> run in the runner's container, so a toolchain absent from it fails every task that needs
+> one no matter what the agent does. Observed: a repo whose tests run through `tools/test.py`
+> exited **127** with `env: 'python3': No such file or directory`. That reads as a badly
+> written acceptance command rather than a missing interpreter, and nothing the agent can do
+> inside a session fixes it.
+>
+> **The toolchain belongs to the target repo, as a nix flake** — not to the base image and
+> not to a capability. A repo declaring its own `dotnet`, `lua` or `python3` means every
+> runner has exactly what that repo needs, the base image stays small, and no runner pays for
+> another repo's dependencies. It also avoids inventing capability tokens per language:
+> `requires` stays about *machine* properties (`gpu`, `usb`, `human-present`) rather than
+> becoming a package list, which is what `KNOWN_CAPABILITIES` would otherwise drift into.
+>
+> **Consequence: a runner must be able to evaluate a flake.** The supervisor image is Alpine
+> and ships no `nix`, so flake-provided acceptance commands cannot run there until it does.
+> That is the prerequisite for this approach, and it is not yet met.
 
 ### 12.1 The review council
 
