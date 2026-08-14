@@ -280,10 +280,15 @@ MESSAGE_CONTENT privileged intent is enabled, which is provable from that log li
 without it Discord closes the socket with 4014 and the connection never reaches ready.
 
 **The bot shares the channel with the webhook and ignores its own side of it.** Verified
-live: a webhook-posted question notification, whose text ends with a literal
-`!answer VERIFY <your answer>`, produced no `bridge.answer` and no reply. Three
-independent guards — the parser ignores anything not starting with `!`, and the gateway
-drops `author.bot` and `webhook_id` messages.
+live, WITH A CONTROL: a webhook-posted question notification ending in a literal
+`!answer VERIFY <your answer>` produced no `bridge.answer`, while a human
+`!answer NO-SUCH-TASK hello` typed into the same channel produced one and drew the reply
+"No task **NO-SUCH-TASK** in the state repo". Without that control the test proves
+nothing — see the trap below. Three independent guards: the parser ignores anything not
+starting with `!`, and the gateway drops `author.bot` and `webhook_id` messages.
+
+The full inbound path is therefore proven end to end — Discord → gateway → parser →
+inbox → poll loop → reply — on `caesarlp`'s message at 2026-08-14T07:00:40Z.
 
 To rotate or re-seal: `scripts/seal-caterpillar-secrets.sh discord`, **leaving any prompt
 blank keeps the sealed value** (#50). Then push and **delete the pod** — all three keys
@@ -400,6 +405,20 @@ them away.
   workstation. This bit again this session — probe tests passed locally and failed CI with
   `Author identity unknown`, because a runner has no global identity at all.
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
+- **`gateway.ready` does NOT mean the bot is in your server.** A bot belonging to zero
+  guilds connects, identifies, and sits there receiving nothing — indistinguishable from
+  a working bridge in a quiet channel. It cost a false "verified live" claim here: the
+  ignore test looked like a pass when the bot simply could not see the message. Check
+  `/users/@me/guilds` (empty means not invited) and `/channels/{id}` (403 `Missing
+  Access` means invited but not permitted), and give any "it correctly ignored X" test a
+  POSITIVE CONTROL that must produce a visible effect.
+- **Inviting needs `scope=bot`.** A link built with only `applications.commands` adds
+  slash commands and joins nothing. The bot user's id IS the application id, so the URL
+  is `https://discord.com/oauth2/authorize?client_id=<app-id>&scope=bot&permissions=68608`
+  — view channel, send messages, read history. A private channel additionally needs a
+  channel-level permission overwrite; role defaults do not reach it.
+- **Guild membership arrives over the LIVE socket.** Inviting the bot while the
+  supervisor is running needs no restart; only the three secret keys are boot-time.
 - **A sealed Secret can be perfectly valid and still refuse to apply.** A Discord channel
   id is a 19-digit number; unquoted, YAML types it as an int, sops preserves the type
   through encryption, and `stringData` takes strings only — the apply dies with `cannot
@@ -573,11 +592,10 @@ them away.
 
 ## Immediate next action
 
-1. **Type one `!answer` in the channel.** Everything else about the bridge is proven —
-   connected, ignoring its own webhook, applying answers over a real git remote in tests —
-   but no human message has ever reached it. `!answer NO-SUCH-TASK hello` is enough: the
-   reply should be "No task **NO-SUCH-TASK** in the state repo", which exercises the whole
-   path (gateway → parser → inbox → poll loop → reply) without touching a real task.
+1. **Answer a REAL question over Discord.** The path is proven with a task that does not
+   exist; the write half — answer file, `status: ready`, streak reset, push — has only ever
+   run against a test git remote. The next real `ask-human` is the test, and it needs no
+   setup: the notification arrives with the task id in it.
 3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
    The open question is what it should do, not whether it works.
 4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
