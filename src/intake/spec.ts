@@ -30,6 +30,7 @@ import {
   type RepoRef,
   type TaskId,
   type TaskSpec,
+  type ToolchainSpec,
   type TrackerRef,
   type WorkspaceName,
 } from "../domain/task.ts";
@@ -140,6 +141,7 @@ interface AgentBlock {
   readonly repos?: unknown;
   readonly requires?: unknown;
   readonly acceptance?: unknown;
+  readonly toolchain?: unknown;
 }
 
 /**
@@ -163,6 +165,33 @@ const strings = (value: unknown, field: string): readonly string[] | string => {
     out.push(entry);
   }
   return out;
+};
+
+/**
+ * `toolchain:` — the dev environment the task's commands run in (DESIGN.md §8.1).
+ *
+ * Optional, and usually absent: a repo carrying its own `flake.nix` is detected at
+ * session start without anyone declaring anything. This exists for the repo that has no
+ * nix expression and needs one anyway.
+ */
+const toolchain = (value: unknown): ToolchainSpec | string => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return "`toolchain` must be a mapping with a `mode` of `nix` or `inherit`";
+  }
+
+  const raw = value as { readonly mode?: unknown; readonly packages?: unknown };
+  if (raw.mode !== "nix" && raw.mode !== "inherit") {
+    return `\`toolchain.mode\` must be \`nix\` or \`inherit\` (got '${String(raw.mode)}')`;
+  }
+
+  if (raw.packages === undefined) return { mode: raw.mode };
+
+  const packages = strings(raw.packages, "toolchain.packages");
+  if (typeof packages === "string") return packages;
+  if (packages.length === 0) {
+    return "`toolchain.packages` is empty — list at least one nixpkgs attribute, or drop the key to use the repository's own nix expression.";
+  }
+  return { mode: raw.mode, packages };
 };
 
 export const renderSpec = (item: TrackerItem, options: RenderOptions): IngestResult => {
@@ -242,6 +271,23 @@ export const renderSpec = (item: TrackerItem, options: RenderOptions): IngestRes
     }
   }
 
+  let declaredToolchain: ToolchainSpec | undefined;
+  if (block.toolchain !== undefined) {
+    const parsed = toolchain(block.toolchain);
+    if (typeof parsed === "string") return reject(parsed);
+    declaredToolchain = parsed;
+  }
+
+  // An EXPLICIT `mode: nix` implies `requires: [nix]`, because a runner without nix cannot
+  // produce the environment and would fail the task mid-session rather than leave it for a
+  // runner that can. A repo's own flake.nix does NOT imply it: the repo is not checked out
+  // at intake, so this cannot know one exists — a runner without nix falls back to the
+  // inherited environment there, which is what it did before §8.1 anyway.
+  const requires =
+    declaredToolchain?.mode === "nix" && !declaredRequires.includes("nix")
+      ? [...declaredRequires, "nix"]
+      : declaredRequires;
+
   // The block is configuration, not instruction: left in the goal it reads as a checklist
   // the agent may edit or reinterpret, and the acceptance commands are not its to change.
   const prose = item.body.replace(found.matched, "").replace(/\n{3,}/g, "\n\n").trim();
@@ -253,8 +299,9 @@ export const renderSpec = (item: TrackerItem, options: RenderOptions): IngestRes
       workspace: options.workspace,
       goal: [`# ${item.title}`, "", prose, "", `Tracker item: ${item.url}`].join("\n").trim(),
       repos,
-      requires: declaredRequires as readonly Capability[],
+      requires: requires as readonly Capability[],
       acceptance,
+      ...(declaredToolchain === undefined ? {} : { toolchain: declaredToolchain }),
       tracker: item.ref,
     },
   };

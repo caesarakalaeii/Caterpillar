@@ -131,7 +131,11 @@ const main = async (): Promise<void> => {
   // ONE resolver for the whole process. The agent's shell, the council's, the plan
   // maintainer's and the acceptance gate's must be the same environment or the gate grades
   // work against a shell the agent never saw (see workspace/toolchain.ts).
-  const toolchain = new ToolchainResolver({ logger });
+  const toolchain = new ToolchainResolver({
+    logger,
+    config: config.toolchain,
+    tasksDir: config.paths.tasks,
+  });
 
   const credentials = new CredentialService();
   await credentials.start(CRED_SOCKET);

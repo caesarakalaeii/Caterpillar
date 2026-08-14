@@ -21,7 +21,7 @@ import {
   type TaskState,
 } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
-import { ToolchainResolver } from "../workspace/toolchain.ts";
+import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { AcceptanceVerifier } from "./verifier.ts";
 
@@ -72,7 +72,12 @@ const verifierFor = (worktree: string, baseEnv: NodeJS.ProcessEnv): AcceptanceVe
   return new AcceptanceVerifier({
     worktrees,
     bindings,
-    toolchain: new ToolchainResolver({ logger: SILENT_LOGGER, baseEnv }),
+    toolchain: new ToolchainResolver({
+      logger: SILENT_LOGGER,
+      config: DEFAULT_TOOLCHAIN_CONFIG,
+      tasksDir: worktree,
+      baseEnv,
+    }),
   });
 };
 

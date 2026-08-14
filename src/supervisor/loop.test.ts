@@ -30,6 +30,7 @@ import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
+import { DEFAULT_TOOLCHAIN_CONFIG } from "../workspace/toolchain.ts";
 import { ChatInbox } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
@@ -107,6 +108,7 @@ await seedTask(TASK);
 const config: RunnerConfig = {
   runnerId: "test-runner",
   capabilities: ["linux"],
+  toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
   paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
   // A heartbeat long enough never to fire: this test is about the failure path, and a

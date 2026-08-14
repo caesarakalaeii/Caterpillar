@@ -45,7 +45,7 @@ import { AgentMetrics } from "../metrics/registry.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
 import { WorktreeManager } from "../workspace/worktree.ts";
-import { ToolchainResolver } from "../workspace/toolchain.ts";
+import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
 import type { RunnerConfig } from "../config/types.ts";
@@ -242,7 +242,11 @@ const buildRunner = (
     llm: { models, model },
     bindings,
     metrics: new AgentMetrics(),
-    toolchain: new ToolchainResolver({ logger: SILENT_LOGGER }),
+    toolchain: new ToolchainResolver({
+      logger: SILENT_LOGGER,
+      config: DEFAULT_TOOLCHAIN_CONFIG,
+      tasksDir: tasks,
+    }),
   });
 
   return { runner, faux };

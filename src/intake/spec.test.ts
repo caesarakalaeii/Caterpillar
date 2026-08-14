@@ -200,6 +200,90 @@ test("declared requires and multiple repos are carried through", async () => {
   assert.deepEqual(result.spec.acceptance, ["npm test", "npm run lint"]);
 });
 
+test("a declared nix toolchain implies requires: [nix]", async () => {
+  // The implication is what stops a task reaching a runner that cannot build its
+  // environment — there, it would fail mid-session instead of waiting for one that can.
+  const result = renderSpec(
+    item(
+      block(
+        [
+          "acceptance:",
+          '  - "lua -v"',
+          "toolchain:",
+          "  mode: nix",
+          "  packages: [lua5_1, luarocks]",
+        ].join("\n"),
+      ),
+    ),
+    { workspace: WORKSPACE, defaultRepo: SELF },
+  );
+
+  assert.equal(result.kind, "spec");
+  if (result.kind !== "spec") return;
+  assert.deepEqual(result.spec.requires, ["nix"]);
+  assert.deepEqual(result.spec.toolchain, { mode: "nix", packages: ["lua5_1", "luarocks"] });
+});
+
+test("an explicit `requires: [nix]` is not duplicated by the implication", async () => {
+  const result = renderSpec(
+    item(
+      block(
+        ["requires:", "  - nix", "acceptance:", '  - "lua -v"', "toolchain:", "  mode: nix", "  packages: [lua5_1]"].join(
+          "\n",
+        ),
+      ),
+    ),
+    { workspace: WORKSPACE, defaultRepo: SELF },
+  );
+
+  assert.equal(result.kind, "spec");
+  if (result.kind !== "spec") return;
+  assert.deepEqual(result.spec.requires, ["nix"]);
+});
+
+test("`mode: inherit` implies nothing — any runner can decline to build an environment", async () => {
+  const result = renderSpec(
+    item(block(["acceptance:", '  - "npm test"', "toolchain:", "  mode: inherit"].join("\n"))),
+    { workspace: WORKSPACE, defaultRepo: SELF },
+  );
+
+  assert.equal(result.kind, "spec");
+  if (result.kind !== "spec") return;
+  assert.deepEqual(result.spec.requires, []);
+  assert.deepEqual(result.spec.toolchain, { mode: "inherit" });
+});
+
+test("an unknown toolchain mode is rejected, naming what is valid", async () => {
+  const result = renderSpec(
+    item(block(["acceptance:", '  - "npm test"', "toolchain:", "  mode: docker"].join("\n"))),
+    { workspace: WORKSPACE, defaultRepo: SELF },
+  );
+
+  assert.equal(result.kind, "rejected");
+  if (result.kind !== "rejected") return;
+  assert.match(result.reason, /`toolchain\.mode` must be `nix` or `inherit`/);
+  assert.match(result.reason, /docker/);
+});
+
+test("a non-string package is rejected rather than dropped", async () => {
+  // Same rule as `acceptance`: quietly discarding an entry produces an environment that
+  // is missing exactly one tool, which reads as a repo problem rather than a typo.
+  const result = renderSpec(
+    item(
+      block(
+        ["acceptance:", '  - "lua -v"', "toolchain:", "  mode: nix", "  packages: [5.1]"].join(
+          "\n",
+        ),
+      ),
+    ),
+    { workspace: WORKSPACE, defaultRepo: SELF },
+  );
+
+  assert.equal(result.kind, "rejected");
+  if (result.kind !== "rejected") return;
+  assert.match(result.reason, /toolchain\.packages\[0\]/);
+});
+
 test("an unknown capability is rejected instead of reaching the claim predicate", async () => {
   // `requires` is the claim predicate. A typo that becomes an unknown capability makes
   // the task unclaimable by every runner forever, which looks like a stuck queue.

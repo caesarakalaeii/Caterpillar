@@ -28,16 +28,12 @@
  * `bash` call the agent makes.
  */
 import { execFile } from "node:child_process";
-import type { TaskSpec } from "../domain/task.ts";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import type { TaskSpec, ToolchainSpec } from "../domain/task.ts";
+import type { ToolchainConfig } from "../config/types.ts";
 import type { Logger } from "../obs/log.ts";
-
-/**
- * How a task's environment is produced.
- *
- * `inherit` — the supervisor's own environment, which is what every task got before this
- * existed and what every task without a declaration still gets.
- */
-export type ToolchainMode = "inherit";
 
 export interface ResolvedEnv {
   /**
@@ -90,6 +86,9 @@ export class ToolchainError extends Error {
 
 export interface ToolchainResolverOptions {
   readonly logger: Logger;
+  readonly config: ToolchainConfig;
+  /** Per-task scratch — the generated flake, the GC-root profile, the cached env. */
+  readonly tasksDir: string;
   /**
    * The environment to inherit from. Injectable so a test does not have to mutate
    * `process.env`, which leaks across node's in-process test runner.
@@ -99,35 +98,213 @@ export interface ToolchainResolverOptions {
 
 export class ToolchainResolver {
   private readonly logger: Logger;
+  private readonly config: ToolchainConfig;
+  private readonly tasksDir: string;
   private readonly baseEnv: NodeJS.ProcessEnv;
   /** Memoised: the shell does not move while the process runs, and every task asks. */
   private shell: Promise<string> | undefined;
 
   constructor(options: ToolchainResolverOptions) {
     this.logger = options.logger;
+    this.config = options.config;
+    this.tasksDir = options.tasksDir;
     this.baseEnv = options.baseEnv ?? process.env;
   }
 
   /**
    * The environment for one task's commands.
    *
-   * `worktree` is unused by `inherit` and is the repo checkout every later mode reads its
-   * declaration from — it is in the signature now so adding one does not touch four call
-   * sites again.
+   * Resolution order, first match wins:
+   *
+   *   1. `spec.toolchain` — what a human wrote in the issue's `agent` block
+   *   2. `<worktree>/flake.nix` — the repo's own devShell
+   *   3. `<worktree>/shell.nix` — the same, pre-flakes
+   *   4. nothing — the runner's environment, exactly as before §8.1
+   *
+   * The repo comes before nothing and after the human on purpose. Most repos that need a
+   * toolchain already describe it for their human contributors, and reusing that
+   * description means the agent works in the environment the tests were written in
+   * rather than one somebody transcribed into a tracker issue.
    */
   async resolve(spec: TaskSpec, worktree: string): Promise<ResolvedEnv> {
-    void worktree;
-    const resolved: ResolvedEnv = {
-      env: { ...this.baseEnv },
-      shell: await this.taskShell(),
-      source: "inherited",
-    };
-    this.logger.debug("toolchain.resolved", {
+    const shell = await this.taskShell();
+    const plan = await this.plan(spec, worktree);
+
+    if (plan === undefined) {
+      return this.log(spec, { env: { ...this.baseEnv }, shell, source: "inherited" });
+    }
+
+    const env = await this.materialise(spec, worktree, plan);
+    return this.log(spec, { env, shell, source: plan.source });
+  }
+
+  private log(spec: TaskSpec, resolved: ResolvedEnv): ResolvedEnv {
+    this.logger.info("toolchain.resolved", {
       task: spec.id,
       source: resolved.source,
       shell: resolved.shell,
     });
     return resolved;
+  }
+
+  /** What to build, or undefined for "inherit". Pure decision, no nix invoked yet. */
+  private async plan(spec: TaskSpec, worktree: string): Promise<NixPlan | undefined> {
+    const declared: ToolchainSpec | undefined = spec.toolchain;
+    if (declared?.mode === "inherit") return undefined;
+
+    if (declared?.mode === "nix" && declared.packages !== undefined) {
+      return {
+        kind: "packages",
+        packages: declared.packages,
+        source: `nix: ${declared.packages.join(", ")}`,
+      };
+    }
+
+    for (const [file, kind] of [
+      ["flake.nix", "flake"],
+      ["shell.nix", "shell"],
+    ] as const) {
+      const contents = await readFile(join(worktree, file), "utf8").catch(() => undefined);
+      if (contents !== undefined) return { kind, contents, source: `${file} devShell` };
+    }
+
+    // An explicit `mode: nix` with no packages and no repo expression is a mistake worth
+    // reporting: the human asked for an environment and named nothing to put in it, and
+    // silently inheriting would hide that until the acceptance gate went red.
+    if (declared?.mode === "nix") {
+      throw new ToolchainError(
+        "declaration",
+        "`toolchain.mode: nix` was declared but nothing says what to build — list " +
+          "`packages`, or add a flake.nix/shell.nix to the repository.",
+      );
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Ask nix for the environment, or read the answer it gave last time.
+   *
+   * Cached against a digest of everything that decides the answer, and persisted next to
+   * the task rather than held in memory: Keel rolls the pod on every push to `main`, so an
+   * in-memory cache would make sessions 2..N of a long task each pay a cold resolve.
+   */
+  private async materialise(
+    spec: TaskSpec,
+    worktree: string,
+    plan: NixPlan,
+  ): Promise<NodeJS.ProcessEnv> {
+    const scratch = join(this.tasksDir, spec.id, ".caterpillar");
+    await mkdir(scratch, { recursive: true });
+
+    const lock =
+      plan.kind === "flake"
+        ? await readFile(join(worktree, "flake.lock"), "utf8").catch(() => "")
+        : "";
+    const digest = cacheDigest(this.config.nixpkgs, plan, lock);
+
+    const cachePath = join(scratch, "env.json");
+    const cached = await readCache(cachePath, digest);
+    if (cached !== undefined) {
+      this.logger.debug("toolchain.cache-hit", { task: spec.id, source: plan.source });
+      return this.merge(cached);
+    }
+
+    const flakeRef = await this.flakeRef(scratch, worktree, plan);
+    const variables = await this.printDevEnv(flakeRef, join(scratch, "dev-profile"), plan);
+
+    await writeFile(cachePath, JSON.stringify({ digest, variables }), "utf8");
+    return this.merge(variables);
+  }
+
+  /** What to hand `nix print-dev-env`. Generates a flake for an explicit package list. */
+  private async flakeRef(
+    scratch: string,
+    worktree: string,
+    plan: NixPlan,
+  ): Promise<readonly string[]> {
+    if (plan.kind === "flake") return [worktree];
+    // `-f` is the pre-flakes entrypoint; `--impure` because a shell.nix is free to read
+    // <nixpkgs> and the environment, which is the whole reason it is not a flake.
+    if (plan.kind === "shell") return ["--impure", "-f", join(worktree, "shell.nix")];
+
+    await writeFile(
+      join(scratch, "flake.nix"),
+      generatedFlake(this.config.nixpkgs, plan.packages),
+      "utf8",
+    );
+    return [scratch];
+  }
+
+  /**
+   * `nix print-dev-env --json`, parsed rather than sourced.
+   *
+   * Sourcing would mean running repo-authored shell in the supervisor's own process.
+   * Parsing keeps the blast radius at "a bad devShell produces a bad PATH for one task".
+   *
+   * `--profile` is not an optimisation: it registers a GC ROOT, without which a
+   * collection between two sessions of the same task can delete the environment the
+   * second session is about to use.
+   */
+  private async printDevEnv(
+    flakeRef: readonly string[],
+    profile: string,
+    plan: NixPlan,
+  ): Promise<Record<string, string>> {
+    const args = ["print-dev-env", "--json", "--profile", profile, ...flakeRef];
+    const { code, stdout, stderr } = await run("nix", args, {
+      env: this.baseEnv,
+      timeoutMs: this.config.timeoutSeconds * 1000,
+    });
+
+    if (code !== 0) {
+      throw new ToolchainError(
+        plan.source,
+        `\`nix ${args.join(" ")}\` exited ${code}:\n${tail(stderr || stdout)}`,
+      );
+    }
+
+    let parsed: PrintDevEnv;
+    try {
+      parsed = JSON.parse(stdout) as PrintDevEnv;
+    } catch (error) {
+      throw new ToolchainError(
+        plan.source,
+        `nix print-dev-env produced output this does not understand: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    const exported: Record<string, string> = {};
+    for (const [name, variable] of Object.entries(parsed.variables ?? {})) {
+      // `var` and `array` entries are the derivation's internal bookkeeping —
+      // `buildInputs`, `stdenv`, `out`. Only `exported` is what a shell inside the
+      // devShell would actually see.
+      if (variable.type === "exported" && typeof variable.value === "string") {
+        exported[name] = variable.value;
+      }
+    }
+    return exported;
+  }
+
+  /**
+   * The devShell's variables on top of the supervisor's, then the supervisor's own
+   * control variables back on top of THAT.
+   *
+   * The last step is the security-relevant one. A devShell is repo-authored: left
+   * unguarded it could point `CRED_HELPER` somewhere else, redirect `CONFIG_PATH`, or
+   * move `HOME` out from under the credential socket. Re-asserting is deliberately not a
+   * denylist — a denylist is a list of the things somebody already thought of, and this
+   * has to hold for variables added to the supervisor later.
+   */
+  private merge(exported: Record<string, string>): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...this.baseEnv, ...exported };
+    for (const name of RESERVED) {
+      if (name in this.baseEnv) env[name] = this.baseEnv[name];
+      else delete env[name];
+    }
+    return env;
   }
 
   private taskShell(): Promise<string> {
@@ -159,6 +336,169 @@ export class ToolchainResolver {
  * command would still not find its toolchain.
  */
 export const TASK_SHELL_ARGS: readonly string[] = ["-c"];
+
+/**
+ * What `materialise` was asked to build, and what to call it in a log line.
+ *
+ * `flake` and `shell` carry identical fields and are still separate members: a single
+ * `kind: "flake" | "shell"` cannot be narrowed away, and the point of the discriminant is
+ * that the compiler proves `flakeRef` handled every case.
+ */
+export type NixPlan =
+  | { readonly kind: "flake"; readonly contents: string; readonly source: string }
+  | { readonly kind: "shell"; readonly contents: string; readonly source: string }
+  | { readonly kind: "packages"; readonly packages: readonly string[]; readonly source: string };
+
+/** The subset of `nix print-dev-env --json` this reads. */
+interface PrintDevEnv {
+  readonly variables?: Record<string, { readonly type?: string; readonly value?: unknown }>;
+}
+
+/**
+ * Defaults for `toolchain` in the runner config.
+ *
+ * Here rather than inline in `config/load.ts` so the numbers sit next to the code that
+ * has to live with them — the timeout next to the nix invocation it bounds, the nixpkgs
+ * pin next to the flake it is substituted into.
+ */
+export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
+  // A release branch, not `nixos-unstable`: an unattended agent that picks up a silent
+  // toolchain bump produces a red acceptance run with no diff to explain it.
+  nixpkgs: "github:NixOS/nixpkgs/nixos-25.05",
+  // Matches the acceptance-command timeout in `supervisor/verifier.ts`. Generous because
+  // a devShell that overrides anything can miss the binary cache and build from source.
+  timeoutSeconds: 900,
+  gcIntervalHours: 24,
+  gcKeepDays: 14,
+};
+
+/**
+ * The cache key: everything that decides what nix would answer.
+ *
+ * Exported because it is the contract between a written entry and a read one, and a test
+ * that recomputed the key by hand would keep passing after the real key changed.
+ *
+ * `flake.lock` is in it, not just `flake.nix`. A `nix flake update` changes not one
+ * character of the expression and every version it resolves to — a cache keyed on the
+ * expression alone would serve the previous toolchain forever.
+ */
+export const cacheDigest = (
+  nixpkgs: string,
+  plan: NixPlan,
+  lock: string,
+): string =>
+  createHash("sha256")
+    .update(CACHE_VERSION)
+    .update(nixpkgs)
+    .update(plan.kind)
+    .update(plan.kind === "packages" ? plan.packages.join(" ") : plan.contents)
+    .update(lock)
+    .digest("hex");
+
+/**
+ * Bumped when the shape of a cache entry changes.
+ *
+ * The cache lives on the PVC and outlives any deploy, so a format change without this
+ * would have a new supervisor reading an old entry as if it were current — which fails as
+ * a wrong environment rather than as a parse error.
+ */
+const CACHE_VERSION = "v1";
+
+/**
+ * Variables the supervisor owns, restored after a devShell has had its say.
+ *
+ * Everything here either points at a credential path or decides where this process reads
+ * its own identity from. A repo-authored devShell moving one of them is the difference
+ * between a task with a lua interpreter and a task holding the wrong end of the
+ * credential helper.
+ */
+const RESERVED: readonly string[] = [
+  "HOME",
+  "RUNNER_ID",
+  "CONFIG_PATH",
+  "CRED_SOCKET",
+  "CRED_HELPER",
+  "GITHUB_API_BASE",
+  "LLM_PROXY_TOKEN",
+  "ANTHROPIC_API_KEY",
+];
+
+/** Enough stderr to diagnose a nix failure, not enough to bury a Discord message. */
+const tail = (output: string): string => output.trim().slice(-2000);
+
+/**
+ * A flake for an explicit package list.
+ *
+ * Deliberately minimal and deliberately PINNED: `nixpkgs` unqualified would resolve
+ * through the registry to whatever the runner last saw, so two runners could give the
+ * same task two different lua versions and only one of them would pass the gate.
+ */
+const generatedFlake = (nixpkgs: string, packages: readonly string[]): string =>
+  `{
+  description = "caterpillar task toolchain — generated, do not edit";
+  inputs.nixpkgs.url = "${nixpkgs}";
+  outputs = { self, nixpkgs }:
+    let
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.\${system});
+    in {
+      devShells = forAll (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [ ${packages.join(" ")} ];
+        };
+      });
+    };
+}
+`;
+
+/** `execFile` with a timeout, resolving rather than throwing so the caller can explain. */
+const run = (
+  command: string,
+  args: readonly string[],
+  options: { readonly env: NodeJS.ProcessEnv; readonly timeoutMs: number },
+): Promise<{ readonly code: number; readonly stdout: string; readonly stderr: string }> =>
+  new Promise((resolve) => {
+    execFile(
+      command,
+      [...args],
+      {
+        env: options.env,
+        timeout: options.timeoutMs,
+        maxBuffer: 16 * 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        const code = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
+        // ENOENT means nix is not installed. Saying so beats "exited 1", because the fix
+        // is a runner change and not a repo change.
+        const detail =
+          error !== null && "code" in error && error.code === "ENOENT"
+            ? `${command} is not installed on this runner`
+            : stderr;
+        resolve({ code, stdout, stderr: detail });
+      },
+    );
+  });
+
+/** A cache entry, or undefined if it is missing, unreadable, or for a different input. */
+const readCache = async (
+  path: string,
+  digest: string,
+): Promise<Record<string, string> | undefined> => {
+  const raw = await readFile(path, "utf8").catch(() => undefined);
+  if (raw === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as {
+      readonly digest?: unknown;
+      readonly variables?: unknown;
+    };
+    if (parsed.digest !== digest) return undefined;
+    return parsed.variables as Record<string, string>;
+  } catch {
+    // A half-written entry is a cache miss, never a crash — the environment is
+    // reproducible, so the only cost of re-resolving is time.
+    return undefined;
+  }
+};
 
 /**
  * Bash, as an absolute path, found through the environment the task will actually run in.

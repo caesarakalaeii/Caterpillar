@@ -31,6 +31,7 @@ import {
   type TaskId,
   type TaskSpec,
   type TaskState,
+  type ToolchainSpec,
   type TrackerRef,
 } from "../domain/task.ts";
 
@@ -63,6 +64,7 @@ interface SpecFrontMatter {
   readonly repos?: unknown;
   readonly requires?: unknown;
   readonly acceptance?: unknown;
+  readonly toolchain?: unknown;
   readonly tracker?: unknown;
 }
 
@@ -114,6 +116,33 @@ const parseRepo = (raw: string): RepoRef => {
     return { host: "github.com", owner, name };
   }
   throw new Error(`cannot parse repo reference '${raw}'`);
+};
+
+/**
+ * `toolchain:` from the front matter (DESIGN.md §8.1).
+ *
+ * Strict, and it must agree with `intake/spec.ts`: intake accepting what this refuses
+ * would write a spec.md that can never be read back, leaving a task in the queue that
+ * nothing can claim and nothing can explain (§14.1).
+ */
+const parseToolchain = (value: unknown, task: TaskId): ToolchainSpec | undefined => {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new SpecParseError(task, "`toolchain` must be a mapping");
+  }
+
+  const raw = value as { readonly mode?: unknown; readonly packages?: unknown };
+  if (raw.mode !== "nix" && raw.mode !== "inherit") {
+    throw new SpecParseError(task, "`toolchain.mode` must be `nix` or `inherit`");
+  }
+  if (raw.packages === undefined) return { mode: raw.mode };
+
+  return {
+    mode: raw.mode,
+    // Strict for the same reason `acceptance` is: silently dropping a package produces an
+    // environment that is missing exactly one tool, which reads as a repo problem.
+    packages: requireStringArray(raw.packages, "toolchain.packages", task),
+  };
 };
 
 export class StateStore {
@@ -177,6 +206,8 @@ export class StateStore {
     const repos = requireStringArray(meta.repos, "repos", task).map(parseRepo);
     if (repos.length === 0) throw new SpecParseError(task, "`repos` must list at least one repo");
 
+    const toolchain = parseToolchain(meta.toolchain, task);
+
     return {
       id: task,
       workspace: asWorkspaceName(meta.workspace),
@@ -185,6 +216,7 @@ export class StateStore {
       repos,
       requires: asStringArray(meta.requires) as readonly Capability[],
       acceptance,
+      ...(toolchain === undefined ? {} : { toolchain }),
       ...(isTrackerRef(meta.tracker) ? { tracker: meta.tracker } : {}),
     };
   }
@@ -222,6 +254,18 @@ export class StateStore {
       repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
       requires: [...spec.requires],
       acceptance: [...spec.acceptance],
+      // Omitted when absent, like `kind`: the overwhelmingly common spec declares no
+      // toolchain, and an empty key in every spec.md would suggest one is expected.
+      ...(spec.toolchain === undefined
+        ? {}
+        : {
+            toolchain: {
+              mode: spec.toolchain.mode,
+              ...(spec.toolchain.packages === undefined
+                ? {}
+                : { packages: [...spec.toolchain.packages] }),
+            },
+          }),
       ...(spec.tracker !== undefined ? { tracker: { ...spec.tracker } } : {}),
     });
 

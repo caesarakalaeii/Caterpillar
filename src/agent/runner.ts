@@ -177,10 +177,19 @@ export class AgentSessionRunner {
               .map(([slug, path]) => `- ${slug} → ${path}`)
               .join("\n")}\nEach is its own git repository on branch agent/${spec.id}.`;
 
+      // Said out loud, because a model that does not know its environment was prepared
+      // reaches for `apt install` or `pip install --user` the moment something is missing,
+      // and both fail slowly inside the container. It also names WHERE the environment
+      // came from, so the fix for a missing tool lands in the right file.
+      const environment =
+        toolchain.source === "inherited"
+          ? ""
+          : `\n\nYour shell already has the dev environment from ${toolchain.source}. Do not install toolchains yourself — if something is missing, add it there.`;
+
       const result = await runSession({
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}`,
+        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}${environment}`,
         initialPrompt: prompt,
         tools,
         budget,

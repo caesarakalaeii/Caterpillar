@@ -33,6 +33,7 @@ import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "../pl
 import { layer, materialise, relayer } from "../plan/materialize.ts";
 import type { Maintainer, PlanRevision, PlanSibling } from "../plan/maintain.ts";
 import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
+import { ToolchainError } from "../workspace/toolchain.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
@@ -990,10 +991,17 @@ export class Supervisor {
    */
   private async parkFailed(lease: Lease, spec: TaskSpec, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
+    // A toolchain that would not materialise is named for what it is. "session failed" is
+    // wrong and misleading here — no session ran, and the fix is a nix expression or a
+    // runner, not anything the agent could have done differently (DESIGN.md §8.1).
+    const detail =
+      error instanceof ToolchainError
+        ? `the dev environment (${error.source}) could not be prepared: ${reason}`
+        : `session failed: ${reason}`;
 
     try {
       const state = await this.deps.store.readState(spec.id);
-      await this.park(lease, spec, state, `session failed: ${reason}`);
+      await this.park(lease, spec, state, detail);
     } catch (parkError) {
       this.deps.logger.error("task.park-failed", {
         task: spec.id,
