@@ -269,30 +269,131 @@ const MIN_CHUNK = 200;
  */
 export const chunkProse = (text: string, budget: number): readonly string[] => {
   const parts: string[] = [];
-  let current = "";
+  let current: string[] = [];
 
+  const used = (): number => size(current.join("\n"));
   const flush = (): void => {
-    if (current.length > 0) parts.push(current);
-    current = "";
+    if (current.length > 0) parts.push(current.join("\n"));
+    current = [];
   };
+  const fits = (block: string): boolean =>
+    used() + (current.length === 0 ? 0 : 1) + size(block) <= budget;
 
-  for (const line of text.split("\n")) {
-    if (size(line) > budget) {
-      flush();
-      for (const piece of hardSplit(line, budget)) parts.push(piece);
+  for (const segment of segments(text)) {
+    if (segment.kind === "text") {
+      for (const line of segment.lines) {
+        if (size(line) > budget) {
+          flush();
+          for (const piece of hardSplit(line, budget)) parts.push(piece);
+          continue;
+        }
+        if (!fits(line)) flush();
+        current.push(line);
+      }
       continue;
     }
-    const candidate = current.length === 0 ? line : `${current}\n${line}`;
-    if (size(candidate) > budget) {
-      flush();
-      current = line;
-    } else {
-      current = candidate;
+
+    // A FENCED BLOCK IS ATOMIC while it can be. Split across two messages it leaves the
+    // first with an unterminated fence — Discord renders the whole tail as code — and the
+    // second opening a block that was never meant to start. Everything after it in the
+    // conversation is then formatted wrong.
+    const whole = fence(segment.open, segment.lines);
+    if (fits(whole)) {
+      current.push(whole);
+      continue;
     }
+    if (size(whole) <= budget) {
+      // It does not fit HERE but fits in a message of its own. Move it whole.
+      flush();
+      current.push(whole);
+      continue;
+    }
+
+    // Genuinely too big for one message. Now it must be split — so each piece closes its
+    // own fence and the next reopens it, carrying the language so highlighting survives.
+    flush();
+    for (const piece of splitFence(segment, budget)) parts.push(piece);
   }
   flush();
 
   return parts.length === 0 ? [""] : parts;
+};
+
+/** An opening fence line: ``` optionally followed by a language. */
+const FENCE = /^[ \t]*```/;
+
+type Segment =
+  | { readonly kind: "text"; readonly lines: readonly string[] }
+  | { readonly kind: "fence"; readonly open: string; readonly lines: readonly string[] };
+
+/**
+ * Split prose into fenced blocks and the text between them.
+ *
+ * A fence left unclosed at the end of the text is treated as running to the end and is
+ * closed on the way out. Agent prose is generated, and a dropped closing fence is a
+ * realistic thing for a model to do — repairing it here costs nothing and stops one
+ * missing line from formatting the rest of the message as code.
+ */
+const segments = (text: string): readonly Segment[] => {
+  const out: Segment[] = [];
+  let text_: string[] = [];
+  let open: string | undefined;
+  let body: string[] = [];
+
+  for (const line of text.split("\n")) {
+    if (open === undefined) {
+      if (FENCE.test(line)) {
+        if (text_.length > 0) out.push({ kind: "text", lines: text_ });
+        text_ = [];
+        open = line.trim();
+      } else {
+        text_.push(line);
+      }
+      continue;
+    }
+    if (FENCE.test(line)) {
+      out.push({ kind: "fence", open, lines: body });
+      open = undefined;
+      body = [];
+      continue;
+    }
+    body.push(line);
+  }
+
+  if (open !== undefined) out.push({ kind: "fence", open, lines: body });
+  if (text_.length > 0) out.push({ kind: "text", lines: text_ });
+  return out;
+};
+
+const fence = (open: string, lines: readonly string[]): string =>
+  [open, ...lines, "```"].join("\n");
+
+/**
+ * Split one over-large fenced block, keeping every piece a well-formed block.
+ *
+ * The budget each piece has for CONTENT is what is left after its own opening and
+ * closing fences — the reason a naive line-splitter cannot be reused here.
+ */
+const splitFence = (segment: Segment & { readonly kind: "fence" }, budget: number): readonly string[] => {
+  const overhead = size(segment.open) + size("```") + 2;
+  const inner = Math.max(budget - overhead, 1);
+
+  const pieces: string[] = [];
+  let body: string[] = [];
+  const flush = (): void => {
+    if (body.length > 0) pieces.push(fence(segment.open, body));
+    body = [];
+  };
+
+  for (const line of segment.lines) {
+    for (const bit of size(line) > inner ? hardSplit(line, inner) : [line]) {
+      if (size([...body, bit].join("\n")) > inner) flush();
+      body.push(bit);
+    }
+  }
+  flush();
+
+  return pieces;
 };
 
 /** Code-point-aware split of one over-long line. Never produces a lone surrogate. */

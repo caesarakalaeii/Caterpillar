@@ -396,6 +396,15 @@ instruction instead of a button — where it does not. The gateway's existing ru
 `author.bot` messages are ignored was written to stop the bridge answering the webhook's
 own `!answer` hint; it now carries the bot's own output too, and is load-bearing twice.
 
+**A fenced code block is atomic.** Splitting one leaves the first message with an
+unterminated fence — Discord renders its whole tail as code — and the second opening a
+block nothing meant to start, so every message after it is formatted wrong. A block that
+does not fit in the remaining room moves whole to the next message. Only a block too big
+for ANY message is split, and then each piece closes its own fence and the next reopens it
+carrying the language, so the pieces are independently well-formed. A fence the agent
+forgot to close is closed on the way out, because generated prose drops one occasionally
+and a single missing line would otherwise format the rest as code.
+
 **In a task's own thread there is no command language.** Every message is the answer,
 verbatim — no `!answer`, no id, and a leading `!answer` is stripped rather than obeyed
 because people type it out of habit. Requiring the prefix was friction in the one place
