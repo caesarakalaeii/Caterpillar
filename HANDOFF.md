@@ -79,7 +79,7 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | **§12 CI gate** | **fixed (#15)** — was unsatisfiable for every Actions/App-only repo |
 | **Toolchain** | **runs natively on node 26 (#18)** — erasable-syntax-only, CI on 22 and 26 |
 | **Journal → prompt** | **bounded (#19)** — repeats collapsed, oldest elided, file untouched |
-| **Discord bridge, inbound (§7)** | **implemented (#20)**, disabled — needs `bot-token` + `channel-id` |
+| **Discord bridge, inbound (§7)** | **LIVE** — `gateway.ready`, watching one channel |
 | **Tracker label lifecycle** | **fixed (#16)** — `needs-human` outlived its question |
 | State-repo credential + bootstrap | implemented, tested |
 | LLM auth: Claude subscription (OAuth) | implemented, tested |
@@ -274,19 +274,23 @@ terminal outcomes now reach a human.
 degrades to `NullNotifier` and a disabled bridge when a key is absent, so a withdrawn
 secret should cost notifications rather than crash-loop a working supervisor.
 
-**To enable `!answer` (§7)**, add two keys to the same Secret:
+**`!answer` is live too.** `bot-token` and `channel-id` are sealed (deployment #51, #52),
+the bot is connected — `gateway.ready` on channel `1537550186388258866` — and the
+MESSAGE_CONTENT privileged intent is enabled, which is provable from that log line alone:
+without it Discord closes the socket with 4014 and the connection never reaches ready.
 
-1. Create a Discord application and bot, and **tick the MESSAGE_CONTENT privileged
-   intent** — without it every message arrives with empty content and the bridge silently
-   matches nothing. No code can detect this.
-2. Invite the bot to the guild with permission to read and send in the channel.
-3. `scripts/seal-caterpillar-secrets.sh discord` and answer the bot-token and channel-id
-   prompts. **Leave the webhook prompt blank to keep the sealed one** (#50).
-4. Push, then **delete the pod** — these are read once at boot and there is no reloader
-   annotation. `kubectl scale` loses to ArgoCD selfHeal; deleting the pod does not.
+**The bot shares the channel with the webhook and ignores its own side of it.** Verified
+live: a webhook-posted question notification, whose text ends with a literal
+`!answer VERIFY <your answer>`, produced no `bridge.answer` and no reply. Three
+independent guards — the parser ignores anything not starting with `!`, and the gateway
+drops `author.bot` and `webhook_id` messages.
 
-`bridge.disabled` in the boot logs is how you tell it is off; `gateway.ready` is how you
-tell it is on.
+To rotate or re-seal: `scripts/seal-caterpillar-secrets.sh discord`, **leaving any prompt
+blank keeps the sealed value** (#50). Then push and **delete the pod** — all three keys
+are read once at boot and there is no reloader annotation. `kubectl scale` loses to ArgoCD
+selfHeal; deleting the pod does not.
+
+`bridge.disabled` in the boot logs means it is off; `gateway.ready` means it is on.
 
 The webhook can be re-checked from inside the pod at any time, which is where the secret
 already is:
@@ -396,6 +400,14 @@ them away.
   workstation. This bit again this session — probe tests passed locally and failed CI with
   `Author identity unknown`, because a runner has no global identity at all.
 - **`gh` push to `caesar-deployment` needs a pull first** — it moves under you.
+- **A sealed Secret can be perfectly valid and still refuse to apply.** A Discord channel
+  id is a 19-digit number; unquoted, YAML types it as an int, sops preserves the type
+  through encryption, and `stringData` takes strings only — the apply dies with `cannot
+  convert int64 to string` and ArgoCD sits `OutOfSync` with the PREVIOUS Secret still
+  mounted. Nothing about the file looks wrong: it decrypts cleanly and carries every key.
+  The seal script now single-quotes every value (#52). Check `kubectl -n argocd get
+  application caterpillar -o jsonpath='{.status.operationState.message}'` when a secret
+  change appears to do nothing.
 - **SOPS in `caesar-deployment` encrypts by PATH** (`path_regex: .*\.enc\.yaml$`), so
   encrypting a `/tmp` file fails with "no matching creation rules found". Write plaintext to
   its final `*.enc.yaml` path (umask 077) and `sops --encrypt --in-place` there.
@@ -561,12 +573,11 @@ them away.
 
 ## Immediate next action
 
-1. **Enable `!answer`** by sealing `bot-token` + `channel-id` — see the Discord section
-   above for the four steps, including the MESSAGE_CONTENT intent that no code can detect.
-   The outbound half is already live.
-2. **Give `!answer` a live test.** It is unit-tested against a fake socket and applied
-   over a real git remote, but has never spoken to Discord — no bot token exists. The
-   first real question is the test.
+1. **Type one `!answer` in the channel.** Everything else about the bridge is proven —
+   connected, ignoring its own webhook, applying answers over a real git remote in tests —
+   but no human message has ever reached it. `!answer NO-SUCH-TASK hello` is enough: the
+   reply should be "No task **NO-SUCH-TASK** in the state repo", which exercises the whole
+   path (gateway → parser → inbox → poll loop → reply) without touching a real task.
 3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
    The open question is what it should do, not whether it works.
 4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
