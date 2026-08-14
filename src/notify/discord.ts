@@ -60,10 +60,29 @@ export type Notification =
        */
       readonly canMerge: boolean;
     }
+  /** A brainstorm's plan cleared the council and became real tasks (DESIGN.md §14.3). */
+  | {
+      readonly kind: "plan-ready";
+      readonly task: TaskId;
+      readonly title: string;
+      readonly tasks: readonly { readonly id: TaskId; readonly wave: number }[];
+    }
+  /** Implementation moved a plan's dependency edges. */
+  | {
+      readonly kind: "plan-revised";
+      readonly task: TaskId;
+      readonly changed: number;
+      readonly note: string;
+    }
   | { readonly kind: "failed"; readonly task: TaskId; readonly error: string };
 
+/** Where a notification goes. A task with a thread talks in it rather than the channel. */
+export interface NotifyTarget {
+  readonly threadId?: string;
+}
+
 export interface Notifier {
-  notify(notification: Notification): Promise<void>;
+  notify(notification: Notification, target?: NotifyTarget): Promise<void>;
 }
 
 export type { FetchLike };
@@ -91,9 +110,13 @@ export class DiscordNotifier implements Notifier {
     this.options = options;
   }
 
-  async notify(notification: Notification): Promise<void> {
+  async notify(notification: Notification, target: NotifyTarget = {}): Promise<void> {
     await postJson({
-      url: this.options.webhookUrl,
+      // A webhook posts into a thread by query parameter — it has no other way to say so.
+      url:
+        target.threadId === undefined
+          ? this.options.webhookUrl
+          : `${this.options.webhookUrl}?thread_id=${target.threadId}`,
       what: "webhook message",
       body: messagePayload(render(notification)),
       ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
@@ -192,6 +215,8 @@ export const componentsFor = (notification: Notification): readonly ActionRow[] 
       );
     case "parked":
     case "failed":
+    case "plan-ready":
+    case "plan-revised":
       return undefined;
   }
 };
@@ -239,6 +264,32 @@ const frame = (notification: Notification, hint: boolean): string => {
               : "No reviewer identity is configured, so merging is yours to do.",
           ].join("\n"),
       );
+    case "plan-ready": {
+      const waves = new Map<number, TaskId[]>();
+      for (const child of notification.tasks) {
+        waves.set(child.wave, [...(waves.get(child.wave) ?? []), child.id]);
+      }
+      const lines = [...waves.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([wave, ids]) => `**Wave ${wave}:** ${ids.map((id) => `\`${id}\``).join(", ")}`);
+
+      return fit(lines.join("\n"), (text) =>
+        [
+          `**${task}** — plan accepted: ${notification.title}`,
+          `${notification.tasks.length} task(s) created.`,
+          "",
+          text,
+          "",
+          "Wave 0 is claimable now. Later waves unblock as their blockers finish.",
+        ].join("\n"),
+      );
+    }
+    case "plan-revised":
+      return fit(
+        notification.note,
+        (text) =>
+          `**${task}** — plan graph revised, ${notification.changed} task(s) rescheduled.\n${text}`,
+      );
     case "failed":
       return fit(notification.error, (text) => `**${task}** failed — ${text}`);
   }
@@ -274,7 +325,7 @@ export const take = (text: string, limit: number): string => {
 
 /** No-op notifier for local runs and tests. */
 export class NullNotifier implements Notifier {
-  async notify(): Promise<void> {
+  async notify(_notification: Notification, _target?: NotifyTarget): Promise<void> {
     // intentionally silent
   }
 }

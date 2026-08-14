@@ -26,7 +26,14 @@ import {
 } from "@earendil-works/pi-agent-core/node";
 import type { Static, TSchema } from "@earendil-works/pi-ai";
 import type { RunnerConfig } from "../config/types.ts";
-import { addUsage, EMPTY_USAGE, type TaskSpec, type TaskState, type UsageTotals } from "../domain/task.ts";
+import {
+  addUsage,
+  EMPTY_USAGE,
+  type ProposedPlan,
+  type TaskSpec,
+  type TaskState,
+  type UsageTotals,
+} from "../domain/task.ts";
 import { ContextBudget } from "../agent/limits.ts";
 import { runSession } from "../agent/session.ts";
 import type { ControlSink } from "../agent/tools.ts";
@@ -34,7 +41,7 @@ import type { LlmRuntime } from "../llm/models.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
-import { PR_LENSES, type Lens } from "./lenses.ts";
+import { PLAN_LENSES, PR_LENSES, type Lens } from "./lenses.ts";
 import { submitVerdictTool, type VerdictSink } from "./tools.ts";
 
 interface ExecContext {
@@ -64,6 +71,8 @@ export interface CouncilResult {
 
 export interface Council {
   review(spec: TaskSpec, state: TaskState): Promise<CouncilResult>;
+  /** The same machinery, different lenses, on a plan that has not been built yet (§14.3). */
+  reviewPlan(spec: TaskSpec, state: TaskState, plan: ProposedPlan): Promise<CouncilResult>;
 }
 
 export interface ReviewCouncilOptions {
@@ -83,20 +92,43 @@ export class ReviewCouncil implements Council {
   }
 
   async review(spec: TaskSpec, state: TaskState): Promise<CouncilResult> {
-    const { worktrees, logger } = this.options;
-    const lenses = this.options.lenses ?? PR_LENSES;
+    const checkout = await this.options.worktrees.ensureTaskCheckout(spec.repos, spec.id);
+    const base = await this.options.worktrees.branchPoint(checkout.root);
 
-    const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id);
-    const worktree = checkout.root;
-    const base = await worktrees.branchPoint(worktree);
+    return this.convene(
+      this.options.lenses ?? PR_LENSES,
+      checkout.root,
+      reviewPrompt(spec, state, base),
+      spec,
+      state,
+    );
+  }
 
-    const prompt = reviewPrompt(spec, state, base);
+  async reviewPlan(
+    spec: TaskSpec,
+    state: TaskState,
+    plan: ProposedPlan,
+  ): Promise<CouncilResult> {
+    // The brainstorm's own worktree. The reviewers read the code the plan is about, which
+    // is the only way to catch a plan that assumes files nobody has written.
+    const checkout = await this.options.worktrees.ensureTaskCheckout(spec.repos, spec.id);
+
+    return this.convene(PLAN_LENSES, checkout.root, planPrompt(spec, plan), spec, state);
+  }
+
+  private async convene(
+    lenses: readonly Lens[],
+    worktree: string,
+    prompt: string,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<CouncilResult> {
+    const { logger } = this.options;
 
     logger.info("council.start", {
       task: spec.id,
       session: state.sessions,
       lenses: lenses.map((l) => l.key).join(","),
-      base: base ?? "(unknown)",
     });
 
     const results = await Promise.all(
@@ -241,5 +273,45 @@ export const reviewPrompt = (
     ...spec.acceptance.map((command) => `- \`${command}\``),
     "",
     "Review the diff through your lens, then call `submit_verdict`.",
+  ].join("\n");
+};
+
+/**
+ * What every plan reviewer is shown.
+ *
+ * The plan is rendered in full rather than summarised. It is the entire artefact under
+ * review, and a reviewer asked to judge whether a goal stands alone cannot do it from a
+ * summary of that goal.
+ */
+export const planPrompt = (spec: TaskSpec, plan: ProposedPlan): string => {
+  const tasks = plan.tasks.flatMap((task) => [
+    `### \`${task.localId}\` — ${task.title}`,
+    "",
+    task.goal.trim(),
+    "",
+    `- **repos:** ${task.repos.length === 0 ? "(inherits the brainstorm's)" : task.repos.join(", ")}`,
+    `- **requires:** ${task.requires.length === 0 ? "(none)" : task.requires.join(", ")}`,
+    `- **acceptance:** ${task.acceptance.map((a) => `\`${a}\``).join(", ") || "(none)"}`,
+    `- **depends on:** ${task.dependsOn.length === 0 ? "(nothing — may start immediately)" : task.dependsOn.join(", ")}`,
+    "",
+  ]);
+
+  return [
+    `# Review the plan for ${spec.id}`,
+    "",
+    `Repos in scope: ${spec.repos.map((r) => `${r.owner}/${r.name}`).join(", ")}`,
+    "",
+    "## The idea it came from",
+    "",
+    spec.goal,
+    "",
+    `## The plan: ${plan.title}`,
+    "",
+    plan.summary.trim(),
+    "",
+    `## The ${plan.tasks.length} proposed task(s)`,
+    "",
+    ...tasks,
+    "Review it through your lens, then call `submit_verdict`.",
   ].join("\n");
 };

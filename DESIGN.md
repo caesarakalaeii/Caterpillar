@@ -82,7 +82,7 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 │                                                            │
 │  intake                                                    │
 │    GitHub issues (label: agent) → task spec                │
-│    Discord !task                → task spec                │
+│    Discord /brainstorm          → plan → task specs        │
 └────────────────────────────────────────────────────────────┘
              ▲                              ▲
              │ git (state repo)             │ https (llm-proxy over wireguard)
@@ -341,9 +341,10 @@ Two things are required and neither is code: the **MESSAGE_CONTENT** privileged 
 `channel-id`, because a bot that acts on any channel it can see is a bot anyone in the
 guild can drive.
 
-`!task` (§14 path 3) is still not built. As written it carries no acceptance criteria, and
-§14 already refuses specs that have none — it cannot be added without deciding where they
-come from. Intake covers the tracker path; a hand-committed spec covers the rest.
+`!task` (§14 path 3) was never built, and is now superseded rather than pending: as
+written it carried no acceptance criteria, and §14 refuses specs that have none.
+`/brainstorm` (§14.3) is the answer — it does not skip the criteria, it produces them by
+refining the idea with a human first.
 
 Parking rather than idling matters here: an 8-hour wait costs nothing, and context is
 rebuilt from the journal regardless.
@@ -924,7 +925,8 @@ Four paths, all converging on a `spec.md`:
 
 1. **GitHub issue** labelled `agent` → ingester renders a spec. (`caesar`)
 2. **Vikunja task** labelled `agent` → ingester renders a spec. (`electric-boogaloo`)
-3. **Discord** `!task <repo> <goal>` → spec (fastest, works from a phone).
+3. **Discord** `/brainstorm` → refine into a plan → child tasks (§14.3). Fastest, works
+   from a phone, and the only path that produces acceptance criteria by asking for them.
 4. **Hand-committed** `tasks/TASK-x/spec.md` (most control over acceptance criteria).
 
 Tracker-sourced specs keep a back-reference (`tracker: {type, id}`) so the supervisor can
@@ -933,6 +935,66 @@ the tracker is a *view*, never authoritative. If they disagree, git wins.
 
 A spec without machine-checkable acceptance criteria should be rejected at intake — it
 cannot satisfy §12, so it can never be marked done.
+
+### 14.3 Brainstorms, plans and waves
+
+Path 3 — `!task <repo> <goal>` — was never built, for a reason §7 records: as written it
+carries no acceptance criteria, and §14 refuses specs that have none. `/brainstorm` is the
+answer to that. It does not skip the criteria; it produces them, by refining the idea with
+a human first.
+
+```
+/brainstorm topic:… repo:…
+   → thread opens, brainstorm task created
+   → agent reads the repo, asks one question at a time via ask_human
+   → submit_plan
+   → review council (plan lenses)
+        ↘ changes → back to the same session
+        ↘ pass    → child tasks, tagged wave + blockedBy
+```
+
+**A brainstorm is a task kind, not a special case.** `kind: brainstorm` in the spec. It
+gets the same lease, the same journal, the same park-and-resume cycle. Two things differ:
+its tools are `read`, `bash`, `ask_human`, `handoff` and `submit_plan` — no `write`, no
+`edit`, no `open_pr`, no `done` — and it is the **only** kind permitted to declare no
+acceptance criteria, because its gate is the council's verdict on its plan rather than
+§12's commands. That exception is narrow and deliberate; everything else still refuses.
+
+**Its id is its Discord thread id** (`BS-<threadId>`). Unique without coordination,
+collision-free across runners, and its own reverse index: a message in a thread resolves
+to a task without a lookup table. The same discipline `taskIdFor` applies to a tracker
+ref — derived from something external and immutable, never from a title.
+
+**Refinement is one question at a time.** `ask_human` already parks the task and releases
+the lease, so a question costs nothing while a human thinks. That makes the expensive
+thing not the round trip but the batch: six questions at once get one answer covering two.
+
+**The agent proposes the decomposition, the supervisor performs it.** `submit_plan` carries
+local ids; real `TaskId`s are assigned by the supervisor, for the same reason it assigns
+everything else — a task id is a directory in the state repo, and the thing being audited
+does not name the audit trail. Validation happens there too: a cycle, a missing acceptance
+criterion, an unknown capability and an unresolvable dependency are all *rejected plans*
+returned to the agent, not crashes.
+
+**`blockedBy` is the authority; `wave` is derived from it** by longest-path layering. A
+task blocked by something in wave 0 and something in wave 2 is in wave 3 — the shortest
+path would put it in 1, alongside a dependency that has not run. Claiming filters on
+`blockedBy` directly (`isClaimable`) and orders by `(wave, id)`; the wave is a scheduling
+hint and a readable label, never the constraint itself.
+
+**Waves describe what MAY run concurrently, not what does.** One runner still works one
+task at a time (§6). Actual parallelism comes from scaling the Deployment, which git-ref
+leasing already makes safe (§5). A wave of four on a single replica is four sequential
+tasks in a defined order — worth having, but not parallel until there are replicas.
+
+**A plan is a prediction, so it is re-checked.** When a task from a plan reaches `done`, a
+short maintenance pass reads what it actually did and may move the edges between its
+remaining siblings. It can do nothing else: creating a task means writing a goal and
+acceptance criteria no human saw, which is a brainstorm's job with a council in front of
+it. When the finished work implies genuinely new work it says so in a note and a human
+runs `/brainstorm`. Every guard is in the supervisor, not the prompt — siblings of the same
+plan only, never a task that has already started, and a revision that would introduce a
+cycle is discarded whole rather than partially.
 
 ### 14.1 The `agent` block
 

@@ -318,6 +318,12 @@ and registers nothing. Re-invite with
 the guild membership it already has is kept and no restart is needed. The failure mode if
 this is skipped is a **403 on registration that reads exactly like a bad bot token**.
 
+**`/brainstorm` opens threads**, so the bot needs two permissions the current invite does
+not grant: **Create Public Threads** (`1 << 35`) and **Send Messages in Threads**
+(`1 << 38`). Combined with the `68608` it already has that is `permissions=309237713920`. Re-invite
+with the same `client_id` — the guild membership is kept and no restart is needed. Without
+them `/brainstorm` fails at `createThread` with a 403 and nothing is created.
+
 **The review council needs a SECOND GitHub App** before it can merge anything (§12.1).
 Not sealed yet, and everything works without it — the council still reviews, and a passing
 task ends `done` with its PR open for you to merge, exactly as today.

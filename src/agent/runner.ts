@@ -38,9 +38,9 @@ import type { Tracker } from "../tracker/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
-import { buildPrompt, SYSTEM_PROMPT } from "./prompt.ts";
+import { BRAINSTORM_SYSTEM_PROMPT, buildPrompt, SYSTEM_PROMPT } from "./prompt.ts";
 import { runSession } from "./session.ts";
-import { controlTools, type ControlSink, type ToolContext } from "./tools.ts";
+import { brainstormTools, controlTools, type ControlSink, type ToolContext } from "./tools.ts";
 
 void _gzipSync;
 
@@ -126,12 +126,21 @@ export class AgentSessionRunner {
       };
 
       const execContext: ExecContext = { env: new NodeExecutionEnv({ cwd: worktree }) };
+      // A brainstorm reads and asks; it does not write. Withholding `write` and `edit`
+      // is not a sandbox — `bash` is still there and a determined session could use it —
+      // but it is the difference between a tool the model reaches for by habit and one
+      // it has to decide to misuse.
+      const brainstorm = spec.kind === "brainstorm";
       const tools: AgentTool[] = [
         bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
-        bindTool(createWriteTool<ExecContext>(), execContext) as AgentTool,
-        bindTool(createEditTool<ExecContext>(), execContext) as AgentTool,
+        ...(brainstorm
+          ? []
+          : [
+              bindTool(createWriteTool<ExecContext>(), execContext) as AgentTool,
+              bindTool(createEditTool<ExecContext>(), execContext) as AgentTool,
+            ]),
         bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,
-        ...controlTools(toolContext),
+        ...(brainstorm ? brainstormTools(toolContext) : controlTools(toolContext)),
       ];
 
       const budget = new ContextBudget({
@@ -155,7 +164,7 @@ export class AgentSessionRunner {
       const result = await runSession({
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}`,
+        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}`,
         initialPrompt: prompt,
         tools,
         budget,
@@ -174,6 +183,8 @@ export class AgentSessionRunner {
         metrics.contextOverruns.inc({ task: spec.id });
       }
 
+      // Only the PR is lifted off the sink here. A proposed plan is not, because unlike
+      // a PR it is not consumed by a later gate — `buildOutcome` carries it directly.
       const pr = control.pr;
       return {
         ...result.outcome,

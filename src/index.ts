@@ -17,11 +17,13 @@ import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
+import { ThreadIndex } from "./notify/threads.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { ChatInbox } from "./supervisor/inbox.ts";
 import { TaskSnapshot } from "./supervisor/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
+import { PlanMaintainer } from "./plan/maintain.ts";
 import { ReviewCouncil } from "./review/council.ts";
 import {
   loadForgeFactory,
@@ -137,6 +139,7 @@ const main = async (): Promise<void> => {
 
   const inbox = new ChatInbox();
   const snapshot = new TaskSnapshot();
+  const threads = new ThreadIndex();
   const discord = await loadDiscord(config.secretsDir, logger);
 
   // Shared by the implementation sessions and the review council — one provider, one
@@ -167,7 +170,9 @@ const main = async (): Promise<void> => {
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
     council: new ReviewCouncil({ config, worktrees, llm, logger }),
+    maintainer: new PlanMaintainer({ config, worktrees, llm, logger }),
     reviewers,
+    threads,
     notifier: discord.notifier,
     inbox,
     snapshot,
@@ -199,7 +204,7 @@ const main = async (): Promise<void> => {
   const bridge =
     discord.bot === undefined
       ? Promise.resolve()
-      : runBridge(discord.bot, inbox, snapshot, logger, controller.signal).catch(
+      : runBridge(discord.bot, inbox, snapshot, threads, logger, controller.signal).catch(
           (error: unknown) => {
             logger.error("bridge.failed", errorFields(error));
           },
@@ -261,16 +266,18 @@ const runBridge = (
   bot: DiscordBot,
   inbox: ChatInbox,
   snapshot: TaskSnapshot,
+  threads: ThreadIndex,
   logger: Logger,
   signal: AbortSignal,
 ): Promise<void> => {
-  const bridge = new DiscordBridge({ bot, inbox, snapshot, logger });
+  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger });
 
   return new DiscordGateway({
     token: bot.token,
     channelId: bot.channelId,
+    threads,
     logger,
-    onMessage: (content, author) => bridge.handleMessage(content, author),
+    onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
   }).run(signal);
 };

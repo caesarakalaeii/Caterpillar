@@ -400,6 +400,7 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
 
   let convened = 0;
   const council: Council = {
+    reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
     review: () => {
       convened += 1;
       return Promise.resolve({
@@ -537,6 +538,7 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
     },
     council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
       review: () =>
         Promise.resolve({
           usage: EMPTY_USAGE,
@@ -578,4 +580,79 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
 
   assert.equal(settled?.status, "done");
   assert.deepEqual(calls, ["approve:11", "merge:11"], "approve must come first, or the merge is refused");
+});
+
+test("a blocked task is not claimed until its blocker is done", async () => {
+  // The property that makes waves safe. Without it two agents can work a task and its
+  // dependency at the same time on different branches, which on a multi-replica runner
+  // is two sessions editing the same code — the exact hazard the graph exists to prevent.
+  //
+  // Both tasks are `ready`. Only the ordering and the blocker filter decide which is
+  // claimable, and the blocked one sorts FIRST alphabetically, so `readdir` order alone
+  // would pick the wrong one.
+  const FIRST = asTaskId("SMOKE-WAVE-1");
+  const SECOND = asTaskId("SMOKE-WAVE-0");
+
+  await seedTask(FIRST, { plan: { parent: asTaskId("BS-1"), wave: 0, blockedBy: [] } });
+  await seedTask(SECOND, {
+    plan: { parent: asTaskId("BS-1"), wave: 1, blockedBy: [FIRST] },
+  });
+
+  const claimed: TaskId[] = [];
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: (spec) => {
+        claimed.push(spec.id);
+        // Park it immediately, so the loop moves on rather than looping on one task.
+        return Promise.resolve({
+          reason: "limit",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "parked by the test",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && (await pushedState(FIRST))?.status !== "parked") {
+    await sleep(100);
+  }
+  // One more poll's worth of grace, so a wrongly-claimed blocked task has every chance
+  // to show up before the assertion.
+  await sleep(1500);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(claimed.includes(FIRST), "the unblocked task must be claimed");
+  assert.equal(
+    claimed.includes(SECOND),
+    false,
+    "a task whose blocker is not `done` must not be claimed, however it sorts",
+  );
+  assert.equal(
+    (await pushedState(SECOND))?.status,
+    "ready",
+    "the blocked task stays ready — blocked is not a status, it is a predicate",
+  );
 });

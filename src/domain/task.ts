@@ -52,6 +52,17 @@ export type TaskStatus =
 /** Coarse progress marker, for reporting only — never used for control flow. */
 export type TaskPhase = "planning" | "implementing" | "verifying" | "review";
 
+/**
+ * What kind of work a task is.
+ *
+ * `implement` is everything that existed before: a goal, a repo, machine-checkable
+ * acceptance criteria, ending in a pull request. `brainstorm` is a refinement
+ * conversation that produces a PLAN and never touches the code — its completion gate is
+ * the review council's verdict on that plan, not §12's acceptance commands, which is why
+ * it is the one task kind permitted to declare none (DESIGN.md §14.3).
+ */
+export type TaskKind = "implement" | "brainstorm";
+
 /** Which forge a repo lives on. Selects the ForgeCredentials implementation. */
 export type ForgeKind = "github" | "forgejo";
 
@@ -83,6 +94,8 @@ export interface TrackerRef {
 export interface TaskSpec {
   readonly id: TaskId;
   readonly workspace: WorkspaceName;
+  /** Defaults to `implement` when the spec does not say. */
+  readonly kind?: TaskKind;
   /** Prose goal handed to the agent verbatim. */
   readonly goal: string;
   /** Repos the agent may touch. Becomes the forge token scope (DESIGN.md §9.1). */
@@ -144,6 +157,20 @@ export interface ReviewRecord {
   readonly last?: "pass" | "changes";
 }
 
+/**
+ * A task's place in a plan (DESIGN.md §14.3).
+ *
+ * `blockedBy` is the authority; `wave` is DERIVED from it by longest-path layering and
+ * stored only so a listing can be read and a claim ordered without recomputing the whole
+ * graph. When they disagree, `blockedBy` is right — recompute.
+ */
+export interface PlanMembership {
+  /** The brainstorm task this one was cut from. */
+  readonly parent: TaskId;
+  readonly wave: number;
+  readonly blockedBy: readonly TaskId[];
+}
+
 /** Mutable control record — `state.json`. */
 export interface TaskState {
   readonly id: TaskId;
@@ -159,6 +186,10 @@ export interface TaskState {
   readonly pr?: PullRequestRef;
   /** Absent until the council has run once. Older `state.json` files simply lack it. */
   readonly review?: ReviewRecord;
+  /** Set on tasks cut from a plan (§14.3). Absent on everything else. */
+  readonly plan?: PlanMembership;
+  /** The Discord thread this task talks in, when it has one. */
+  readonly chat?: { readonly threadId: string };
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -173,6 +204,7 @@ export type SessionExitReason =
   | "handoff"
   | "ask-human"
   | "done-claimed"
+  | "plan-proposed"
   | "blocked"
   | "limit"
   | "error";
@@ -191,8 +223,31 @@ export interface SessionOutcome {
   readonly error?: string;
   /** Set when the agent opened a PR during this session. */
   readonly pr?: PullRequestRef;
+  /** Set when reason is `plan-proposed` — the decomposition awaiting the council. */
+  readonly plan?: ProposedPlan;
   /** Free-text summary appended to the journal. */
   readonly summary: string;
+}
+
+/**
+ * One task a brainstorm proposes. Local ids only — real `TaskId`s do not exist until the
+ * plan is materialised, and the agent must not be able to choose them.
+ */
+export interface ProposedTask {
+  /** Unique within the plan. Referenced by `dependsOn`. */
+  readonly localId: string;
+  readonly title: string;
+  readonly goal: string;
+  readonly repos: readonly string[];
+  readonly requires: readonly string[];
+  readonly acceptance: readonly string[];
+  readonly dependsOn: readonly string[];
+}
+
+export interface ProposedPlan {
+  readonly title: string;
+  readonly summary: string;
+  readonly tasks: readonly ProposedTask[];
 }
 
 export const EMPTY_USAGE: UsageTotals = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
@@ -208,3 +263,22 @@ export const capabilitiesSatisfy = (
   capabilities: readonly Capability[],
   requires: readonly Capability[],
 ): boolean => requires.every((r) => capabilities.includes(r));
+
+/**
+ * True when a task may be claimed right now (DESIGN.md §14.3).
+ *
+ * `ready` is necessary and no longer sufficient: a task cut from a plan waits on its
+ * blockers. A blocker that is missing from the state repo entirely counts as unsatisfied
+ * — a dangling dependency should stall its dependent visibly rather than be treated as
+ * already met, which is what silently ignoring it would do.
+ */
+export const isClaimable = (
+  state: TaskState,
+  statusOf: (id: TaskId) => TaskStatus | undefined,
+): boolean =>
+  state.status === "ready" &&
+  (state.plan?.blockedBy ?? []).every((id) => statusOf(id) === "done");
+
+/** Claim order: earlier waves first, then by id so it is deterministic across runners. */
+export const claimOrder = (a: TaskState, b: TaskState): number =>
+  (a.plan?.wave ?? 0) - (b.plan?.wave ?? 0) || a.id.localeCompare(b.id);

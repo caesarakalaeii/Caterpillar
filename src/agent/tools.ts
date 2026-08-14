@@ -17,7 +17,12 @@
  */
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { Capability, RepoRef, SessionExitReason } from "../domain/task.ts";
+import type {
+  Capability,
+  ProposedPlan,
+  RepoRef,
+  SessionExitReason,
+} from "../domain/task.ts";
 import type { Forge, PrResult } from "../forge/types.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { TrackerRef } from "../domain/task.ts";
@@ -35,6 +40,8 @@ export interface ControlSink {
   signal?: ControlSignal;
   /** Set by `open_pr` so the supervisor can verify CI against it later. */
   pr?: PrResult;
+  /** Set by `submit_plan` on a brainstorm session (DESIGN.md §14.3). */
+  plan?: ProposedPlan;
 }
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: null });
@@ -166,11 +173,80 @@ export const taskNoteTool = (ctx: ToolContext): AgentTool<typeof TaskNoteParams,
   },
 });
 
-/** All control-plane tools for a session. */
+const SubmitPlanParams = Type.Object({
+  title: Type.String({ description: "Short name for the whole plan." }),
+  summary: Type.String({
+    description: "What the plan does and why this shape. A few paragraphs, not an essay.",
+  }),
+  tasks: Type.Array(
+    Type.Object({
+      localId: Type.String({
+        description: "Short id, unique within this plan, e.g. `schema`. Referenced by dependsOn.",
+      }),
+      title: Type.String({ description: "One line." }),
+      goal: Type.String({
+        description:
+          "Everything the implementing agent needs. It will NOT see this conversation — " +
+          "only this text, so name files, commands and constraints explicitly.",
+      }),
+      repos: Type.Array(Type.String(), {
+        description: "`owner/name` or `host/owner/name`. Empty inherits this brainstorm's repos.",
+      }),
+      requires: Type.Array(Type.String(), {
+        description: "Capabilities (linux, k8s, net, gpu, usb, human-present). Usually empty.",
+      }),
+      acceptance: Type.Array(Type.String(), {
+        description:
+          "Commands that must exit 0. REQUIRED — a task with none can never be verified " +
+          "as done, and the plan is refused.",
+      }),
+      dependsOn: Type.Array(Type.String(), {
+        description:
+          "localIds that must be DONE before this can start. List only real ordering " +
+          "constraints: everything unlisted may run in parallel with everything else.",
+      }),
+    }),
+    { description: "The decomposition. Each becomes its own task with its own agent." },
+  ),
+});
+
+export const submitPlanTool = (ctx: ToolContext): AgentTool<typeof SubmitPlanParams, null> => ({
+  name: "submit_plan",
+  label: "Submit plan",
+  description:
+    "Propose the plan and END this session. The review council reads it and either " +
+    "sends it back with changes or cuts it into real tasks. You cannot create tasks " +
+    "yourself, and nothing is created until the council passes it.",
+  parameters: SubmitPlanParams,
+  execute: async (_id, params: Static<typeof SubmitPlanParams>) => {
+    ctx.control.plan = params;
+    ctx.control.signal = {
+      reason: "plan-proposed",
+      summary: `proposed ${params.tasks.length} task(s): ${params.title}`,
+    };
+    return text("Plan recorded. The session will end and the review council will read it.");
+  },
+});
+
+/** All control-plane tools for an implementation session. */
 export const controlTools = (ctx: ToolContext): readonly AgentTool[] => [
   openPrTool(ctx) as AgentTool,
   askHumanTool(ctx) as AgentTool,
   handoffTool(ctx) as AgentTool,
   doneTool(ctx) as AgentTool,
   taskNoteTool(ctx) as AgentTool,
+];
+
+/**
+ * Control-plane tools for a BRAINSTORM session (DESIGN.md §14.3).
+ *
+ * Deliberately not a superset. There is no `open_pr` and no `done`: a brainstorm does not
+ * touch the code and cannot claim completion, because its gate is the council's verdict
+ * on the plan rather than §12's acceptance commands. `ask_human` is the load-bearing one —
+ * it is how refinement actually happens, one question at a time, in the thread.
+ */
+export const brainstormTools = (ctx: ToolContext): readonly AgentTool[] => [
+  askHumanTool(ctx) as AgentTool,
+  handoffTool(ctx) as AgentTool,
+  submitPlanTool(ctx) as AgentTool,
 ];
