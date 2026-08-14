@@ -1,0 +1,145 @@
+/**
+ * The bot's REST half. See DESIGN.md §7.
+ *
+ * Deliberately not the webhook, for two reasons that have both been paid for:
+ *
+ *   - a bridge that can read commands should be able to answer them without a second
+ *     secret, and a reply arriving under the bot's own name is the one a human expects;
+ *   - **only this transport can carry buttons.** Discord refuses interactive components
+ *     from a webhook an application does not own, and `webhook-url` is a webhook created
+ *     in the channel's settings, not by the application. Every message with a component
+ *     on it comes from here.
+ *
+ * The two halves stay independent: an unsealed webhook costs notifications, not replies,
+ * and a missing bot token costs buttons, not the channel.
+ */
+import {
+  messagePayload,
+  type MessageOptions,
+  type Notification,
+  type Notifier,
+  renderInteractive,
+} from "./discord.ts";
+import { type FetchLike, postJson } from "./http.ts";
+
+export const API_BASE = "https://discord.com/api/v10";
+
+/**
+ * How long a brainstorm thread stays visible after the last message, in minutes.
+ * A day: long enough that an overnight question is still in the sidebar in the morning,
+ * short enough that abandoned threads fall out of it on their own.
+ */
+const THREAD_ARCHIVE_MINUTES = 1440;
+
+export interface BotOptions {
+  readonly token: string;
+  /** The channel the bot reads and writes. Everything else in the guild is ignored. */
+  readonly channelId: string;
+  readonly fetch?: FetchLike;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly apiBase?: string;
+}
+
+export interface PostedMessage {
+  readonly id: string;
+  readonly channelId: string;
+}
+
+export class DiscordBot {
+  private readonly options: BotOptions;
+  private readonly apiBase: string;
+
+  constructor(options: BotOptions) {
+    this.options = options;
+    this.apiBase = options.apiBase ?? API_BASE;
+  }
+
+  get channelId(): string {
+    return this.options.channelId;
+  }
+
+  /**
+   * The bot token, for the gateway's IDENTIFY.
+   *
+   * Both halves of §7 authenticate with the same credential, so the composition root
+   * reads it back off the bot rather than threading it separately. It is never logged
+   * and never reaches a subprocess — unlike a forge token (§9.2), it does not go near
+   * an agent, a worktree, or `argv`.
+   */
+  get token(): string {
+    return this.options.token;
+  }
+
+  /**
+   * Send a message as the bot. Returns its id, which is what a thread is opened on.
+   *
+   * `channelId` overrides the configured channel — a thread IS a channel, so posting
+   * into one is the same call with a different id.
+   */
+  async postMessage(options: {
+    readonly content: string;
+    readonly channelId?: string;
+    readonly components?: MessageOptions["components"];
+    readonly flags?: number;
+  }): Promise<PostedMessage> {
+    const channelId = options.channelId ?? this.options.channelId;
+    const response = await this.post(
+      `/channels/${channelId}/messages`,
+      messagePayload(options.content, {
+        ...(options.components === undefined ? {} : { components: options.components }),
+        ...(options.flags === undefined ? {} : { flags: options.flags }),
+      }),
+      "bot message",
+    );
+
+    const body = (await response.json().catch(() => ({}))) as { readonly id?: string };
+    return { id: body.id ?? "", channelId };
+  }
+
+  /** Open a public thread on a message. Returns the thread's channel id. */
+  async createThread(messageId: string, name: string): Promise<string> {
+    const response = await this.post(
+      `/channels/${this.options.channelId}/messages/${messageId}/threads`,
+      JSON.stringify({ name: name.slice(0, 100), auto_archive_duration: THREAD_ARCHIVE_MINUTES }),
+      "thread",
+    );
+
+    const body = (await response.json().catch(() => ({}))) as { readonly id?: string };
+    if (body.id === undefined) throw new Error("Discord created a thread with no id");
+    return body.id;
+  }
+
+  private post(path: string, body: string, what: string): Promise<Response> {
+    return postJson({
+      url: `${this.apiBase}${path}`,
+      body,
+      what,
+      headers: { authorization: `Bot ${this.options.token}` },
+      ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+    });
+  }
+}
+
+/**
+ * Notifications sent as the bot, with buttons.
+ *
+ * Preferred over `DiscordNotifier` whenever a bot token exists, because a question a
+ * human can answer by clicking is the entire point of §7's second half. Falls back to
+ * the plain frame per notification when no component fits — see `renderInteractive`.
+ */
+export class BotNotifier implements Notifier {
+  private readonly bot: DiscordBot;
+
+  constructor(bot: DiscordBot) {
+    this.bot = bot;
+  }
+
+  async notify(notification: Notification): Promise<void> {
+    const rendered = renderInteractive(notification);
+    await this.bot.postMessage({
+      content: rendered.content,
+      ...(rendered.components === undefined ? {} : { components: rendered.components }),
+    });
+  }
+}

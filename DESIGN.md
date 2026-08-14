@@ -348,6 +348,57 @@ come from. Intake covers the tracker path; a hand-committed spec covers the rest
 Parking rather than idling matters here: an 8-hour wait costs nothing, and context is
 rebuilt from the journal regardless.
 
+### 7.1 Slash commands, buttons and modals
+
+`!answer TASK-123 <text>` works, and it is the wrong shape for the thing it does. The task
+id has to be copied out of a notification by hand, into a message where a typo is silent.
+So the chat surface grew commands you pick and buttons you press. Four decisions carry it.
+
+**Interactions arrive over the same gateway socket.** Discord delivers `INTERACTION_CREATE`
+as an ordinary dispatch as long as the application has **no Interactions Endpoint URL** —
+the two delivery methods are mutually exclusive, and this application has never had one.
+That is not a convenience, it is the whole reason buttons are possible here at all: an
+endpoint would have meant ingress, TLS and a public URL for every runner, which is exactly
+what §7 refused when it chose a websocket over the `discord-bridge` Deployment §10
+anticipated.
+
+**Acknowledge in 3 seconds, deliver the outcome separately.** Discord gives an interaction
+three seconds to be answered and then keeps its token alive for fifteen minutes. The
+supervisor settles a request when its poll loop next comes round, which may be several
+hours into a session. The natural design — defer, then follow up on the interaction token —
+therefore works in testing and fails the first time a session runs long. So a click is
+acknowledged immediately with what is knowable at click time, and the real outcome arrives
+afterwards as an ordinary channel message from the bot.
+
+Reads never take that path at all. `/tasks`, `/task` and autocomplete are served from an
+in-memory snapshot the loop refreshes once per poll, from the same sweep that decides what
+to claim. Going through the inbox for a listing would mean waiting on a session to finish
+before being told what it is doing.
+
+**Buttons can only come from the bot.** Discord refuses interactive components from a
+webhook the application does not own, and `webhook-url` is a webhook created in the
+channel's settings. A question notification with an Answer button on it is therefore not
+something the outbound half of §11.2 can send. Notifications now go out as the **bot**
+wherever a bot token exists, and fall back to the webhook — with the typed `!answer`
+instruction instead of a button — where it does not. The gateway's existing rule that
+`author.bot` messages are ignored was written to stop the bridge answering the webhook's
+own `!answer` hint; it now carries the bot's own output too, and is load-bearing twice.
+
+**A click disables the buttons it was made with.** The acknowledgement rewrites the message
+the button sits on, with every button on it disabled. That is what makes a second click
+harmless, and it matters most for the one button that merges. A `custom_id` is capped at
+100 characters and is the only thing a button carries, so it is versioned (`c1:…`) and
+encoding **fails** rather than truncates: a clipped task id is still a valid-looking task
+id addressing a different task. A button from an older deploy is refused rather than
+guessed at — Discord keeps message history forever, and every button in it outlives the
+code that rendered it.
+
+Commands are registered **per guild**, at deploy time, by `npm run discord:register`.
+Guild registration takes effect instantly where global registration is
+eventually-consistent, registration is a full replace so re-running it is a no-op, and it
+is not done at boot because the supervisor restarts on every deploy and would otherwise
+write the identical command set once per pod per rollout.
+
 ---
 
 ## 8. Machine handoff

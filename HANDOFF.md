@@ -291,11 +291,39 @@ The full inbound path is therefore proven end to end — Discord → gateway →
 inbox → poll loop → reply — on `caesarlp`'s message at 2026-08-14T07:00:40Z.
 
 To rotate or re-seal: `scripts/seal-caterpillar-secrets.sh discord`, **leaving any prompt
-blank keeps the sealed value** (#50). Then push and **delete the pod** — all three keys
-are read once at boot and there is no reloader annotation. `kubectl scale` loses to ArgoCD
+blank keeps the sealed value** (#50). Then push and **delete the pod** — every key is
+read once at boot and there is no reloader annotation. `kubectl scale` loses to ArgoCD
 selfHeal; deleting the pod does not.
 
 `bridge.disabled` in the boot logs means it is off; `gateway.ready` means it is on.
+
+**Slash commands and buttons need two more keys** in the same Secret: `application-id`
+and `guild-id`. Neither is sealed yet. Both are plain identifiers rather than credentials,
+and both are 18–19 digit numbers — **single-quote them in the sops file**, or YAML types
+them as ints, sops preserves the type, `stringData` refuses the apply, and ArgoCD sits
+`OutOfSync` with the previous Secret still mounted (#52, the trap below).
+
+Then, once per command-set change:
+
+```bash
+kubectl --context default -n caterpillar exec "$POD" -- sh -c \
+  'SECRETS_DIR=/etc/caterpillar/secrets node dist/cli/register-commands.js'
+```
+
+Guild-scoped, so `/answer` appears in the client immediately. Registration is a full
+replace, so running it twice is a no-op. **The bot must have been invited with
+`applications.commands`** — the live invite used `scope=bot` alone, which joins the guild
+and registers nothing. Re-invite with
+`https://discord.com/oauth2/authorize?client_id=<app-id>&scope=bot+applications.commands&permissions=68608`;
+the guild membership it already has is kept and no restart is needed. The failure mode if
+this is skipped is a **403 on registration that reads exactly like a bad bot token**.
+
+**Notifications now come from the bot, not the webhook**, wherever `bot-token` and
+`channel-id` are both sealed — which they are. That is not cosmetic: Discord refuses
+interactive components from a webhook the application does not own, so an Answer button
+can only be sent by the bot (§7.1). The visible change in the channel is the author of
+every notification. The webhook stays sealed and stays the fallback; `verify:discord`
+still exercises it.
 
 The webhook can be re-checked from inside the pod at any time, which is where the secret
 already is:

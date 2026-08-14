@@ -18,13 +18,8 @@
  *     node dist/cli/verify-discord.js
  */
 import { asTaskId } from "../domain/task.ts";
-import {
-  CONTENT_LIMIT,
-  DiscordNotifier,
-  DiscordWebhookError,
-  type Notification,
-  render,
-} from "../notify/discord.ts";
+import { CONTENT_LIMIT, DiscordNotifier, type Notification, render } from "../notify/discord.ts";
+import { DiscordHttpError } from "../notify/http.ts";
 
 const ENV = "DISCORD_WEBHOOK_URL";
 
@@ -76,7 +71,7 @@ const main = async (): Promise<void> => {
 };
 
 main().catch((error: unknown) => {
-  if (error instanceof DiscordWebhookError) {
+  if (error instanceof DiscordHttpError) {
     console.error(`✗ ${error.message}`);
     if (error.status === 401 || error.status === 404) {
       console.error(

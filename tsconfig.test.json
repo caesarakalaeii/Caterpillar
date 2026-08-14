@@ -4,9 +4,17 @@
   // check` and then failed to LOAD at runtime, taking the whole file's tests with it
   // before one could register. This config exists to close that gap — same strictness,
   // no emit, tests included.
+  //
+  // `exclude` MUST be reset here. It is inherited from the base config, and `include`
+  // does not override it — a file matched by an inherited `exclude` stays excluded no
+  // matter what `include` says. Without this line the config compiled ZERO test files
+  // and silently agreed with everything: a test importing a symbol that no longer
+  // existed passed `npm run check` and only failed under `node --test`, which is the
+  // exact gap this file was added to close.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": []
 }

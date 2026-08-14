@@ -5,22 +5,33 @@
  * into a chat box is decided here, where it can be tested without a socket, a token, or
  * a Discord account.
  *
- * Only `!answer` exists so far. `!task` (§14 path 3) is deliberately not implemented —
- * a spec with no machine-checkable acceptance criteria can never satisfy §12, and
- * `!task <repo> <goal>` as written in the design has nowhere to put them. Intake covers
- * the tracker path, and a hand-committed spec covers the rest.
+ * `Command` is the shared vocabulary of every inbound path — a typed `!answer`, a slash
+ * command, a button click, a modal submission. They converge here so the supervisor has
+ * one handler rather than one per transport, and so a new transport cannot quietly grow
+ * its own semantics.
+ *
+ * The TEXT surface stays deliberately small: `!answer` and nothing else. It exists as
+ * the fallback for a client that cannot render components, and every other verb is a
+ * slash command (`src/notify/slash.ts`), where Discord does the parsing and validation.
+ *
+ * `!task` (§14 path 3) is still not implemented — a spec with no machine-checkable
+ * acceptance criteria can never satisfy §12, and `!task <repo> <goal>` as written in the
+ * design has nowhere to put them. `/brainstorm` is the answer to that, and it produces
+ * acceptance criteria by refining them with a human first.
  */
-import { asTaskId, type TaskId } from "../domain/task.ts";
+import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task.ts";
 
 export type Command =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
+  /** List tasks, optionally filtered. Served from the snapshot, never from git. */
+  | { readonly kind: "list"; readonly status?: TaskStatus }
+  | { readonly kind: "show"; readonly task: TaskId }
+  /** Stop working a task and leave it parked for a human. */
+  | { readonly kind: "park"; readonly task: TaskId }
   /** Recognised prefix, unusable content — worth replying to rather than ignoring. */
   | { readonly kind: "malformed"; readonly reason: string };
 
-/** A task id is a path segment in the state repo; anything else escapes it. */
-const TASK_ID = /^[A-Za-z0-9._-]+$/;
-
-export const HELP = "Usage: `!answer <task-id> <your answer>`";
+export const HELP = "Usage: `!answer <task-id> <your answer>` — or use `/answer`.";
 
 /**
  * Decide what a chat message asks for, if anything.
@@ -37,7 +48,7 @@ export const parseCommand = (content: string): Command | undefined => {
 
   const task = rest[0];
   if (task === undefined) return { kind: "malformed", reason: `Which task? ${HELP}` };
-  if (!TASK_ID.test(task)) {
+  if (!isTaskId(task)) {
     // The id becomes a directory name under `tasks/`. A `../` in it would write
     // outside the task, and a task that does not exist is a better error than a
     // traversal that half-works.

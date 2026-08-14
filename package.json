@@ -21,6 +21,7 @@
     "verify:vikunja": "node src/cli/verify-vikunja.ts",
     "verify:github-issues": "node src/cli/verify-github-issues.ts",
     "verify:discord": "node src/cli/verify-discord.ts",
+    "discord:register": "node src/cli/register-commands.ts",
     "llm:login": "node src/cli/llm-login.ts"
   },
   "dependencies": {

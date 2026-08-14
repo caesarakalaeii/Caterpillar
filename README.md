@@ -95,10 +95,18 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/supervisor/verifier.ts` | Independent completion gates (§12). |
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
-| `src/notify/discord.ts` | Discord webhook — questions, parks, outcomes (§11.2). |
-| `src/notify/gateway.ts` | Discord gateway websocket — the inbound bridge (§7). |
+| `src/notify/http.ts` | The retrying JSON client every Discord path shares. |
+| `src/notify/discord.ts` | Notification rendering + the webhook transport (§11.2). |
+| `src/notify/bot.ts` | The bot's REST half — messages, threads. The only transport that can carry buttons (§7.1). |
+| `src/notify/gateway.ts` | Discord gateway websocket — messages and interactions (§7). |
 | `src/notify/commands.ts` | `!answer` parsing. Pure, no IO (§7). |
+| `src/notify/components.ts` | Buttons and modals, and the `custom_id` codec. Pure (§7.1). |
+| `src/notify/slash.ts` | The registered command set + what an interaction means. Pure (§7.1). |
+| `src/notify/interactions.ts` | Interaction payloads and the 3-second callback (§7.1). |
+| `src/notify/replies.ts` | What the bot says back. Pure, no IO. |
+| `src/notify/bridge.ts` | Joins all four inbound surfaces onto one `Command` union (§7.1). |
 | `src/supervisor/inbox.ts` | Hands chat commands to the poll loop, which owns the repo. |
+| `src/supervisor/snapshot.ts` | In-memory task view, so a listing answers inside Discord's 3s budget. |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
 | `src/obs/log.ts` | Structured JSON-line logging to stdout (§11). |
 
@@ -190,17 +198,39 @@ failure.
   §14 already refuses specs that have none — it cannot be added without deciding where
   they come from. Intake covers the tracker path; a hand-committed spec covers the rest.
 
-Discord itself is built, both halves, and both are inert until their secret keys exist in
-the mounted `caterpillar-discord` secret:
+Discord itself is built, both halves, and every part of it is inert until its secret keys
+exist in the mounted `caterpillar-discord` secret:
 
 | Key | Enables | Without it |
 |---|---|---|
-| `webhook-url` | outbound notifications (§11.2) | `NullNotifier` — the supervisor runs silently |
-| `bot-token` + `channel-id` | inbound `!answer` (§7) | a question waits until a human commits the answer file |
+| `webhook-url` | outbound notifications (§11.2) | `NullNotifier` — the supervisor runs silently, unless a bot token is set |
+| `bot-token` + `channel-id` | inbound `!answer`, slash commands, buttons (§7) — and outbound notifications *with* buttons | a question waits until a human commits the answer file |
+| `application-id` + `guild-id` | `npm run discord:register` (§7.1) | `/answer` and friends never appear in the client; `!answer` still works |
+
+Where both a webhook and a bot token exist, **the bot sends the notifications**. Discord
+refuses interactive components from a webhook the application does not own, so a question
+with an Answer button on it can only come from the bot; the webhook remains the fallback
+and renders the typed `!answer` instruction instead (§7.1).
 
 The bot needs the **MESSAGE_CONTENT** privileged intent enabled in the Discord developer
 portal. Without it every message arrives with empty content and no command ever matches —
 a checkbox, not something code can detect or fix.
+
+## Registering the slash commands
+
+```bash
+npm run discord:register     # reads bot-token, application-id and guild-id from the secret
+DISCORD_BOT_TOKEN=... DISCORD_APPLICATION_ID=... DISCORD_GUILD_ID=... npm run discord:register
+```
+
+Guild-scoped, so the commands appear instantly. Registration is a full replace: the
+`COMMANDS` array in `src/notify/slash.ts` **is** the surface, and re-running this is a
+no-op rather than a duplicate. It is a deploy-time step, not a boot-time one — the
+supervisor restarts on every rollout and would otherwise write the same set once per pod.
+
+The bot must have been invited with the `applications.commands` scope. An invite built
+with `scope=bot` alone joins the guild and registers nothing, and the failure is a 403
+that reads like a bad token.
 
 Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
 live topology, the credential rules, and an unresolved security note.
