@@ -348,6 +348,32 @@ export class StateStore {
     return readFile(join(dir, last), "utf8");
   }
 
+  /**
+   * Record one council verdict (DESIGN.md §12.1).
+   *
+   * Numbered by session and never overwritten, like `questions/`, so a task that went
+   * round the council three times keeps all three verdicts. The journal gets the same
+   * text — that is what the next session reads — but the journal is a narrative and
+   * these are the documents.
+   */
+  async writeVerdict(task: TaskId, index: number, body: string): Promise<void> {
+    const dir = join(this.taskDir(task), "reviews");
+    await mkdir(dir, { recursive: true });
+    const name = `${String(index).padStart(3, "0")}-verdict.md`;
+    await writeFile(join(dir, name), `${body.trim()}\n`, "utf8");
+  }
+
+  /** The most recent verdict, if the council has ever run on this task. */
+  async latestVerdict(task: TaskId): Promise<string | undefined> {
+    const dir = join(this.taskDir(task), "reviews");
+    if (!existsSync(dir)) return undefined;
+
+    const verdicts = (await readdir(dir)).filter((f) => f.endsWith("-verdict.md")).sort();
+    const last = verdicts.at(-1);
+    if (last === undefined) return undefined;
+    return readFile(join(dir, last), "utf8");
+  }
+
   async readAnswer(task: TaskId, index: number): Promise<string | undefined> {
     const name = `${String(index).padStart(3, "0")}-answer.md`;
     const path = join(this.taskDir(task), "questions", name);

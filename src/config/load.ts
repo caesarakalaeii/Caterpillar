@@ -29,7 +29,11 @@ interface RawConfig {
   readonly paths?: { readonly mirrors?: unknown; readonly tasks?: unknown };
   readonly lease?: { readonly heartbeatSeconds?: unknown; readonly staleAfterSeconds?: unknown };
   readonly handoff?: { readonly thresholdFraction?: unknown };
-  readonly limits?: { readonly maxSessionsPerTask?: unknown; readonly noProgressLimit?: unknown };
+  readonly limits?: {
+    readonly maxSessionsPerTask?: unknown;
+    readonly noProgressLimit?: unknown;
+    readonly maxReviewRounds?: unknown;
+  };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
@@ -221,6 +225,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     limits: {
       maxSessionsPerTask: num(raw.limits?.maxSessionsPerTask, "limits.maxSessionsPerTask", 20),
       noProgressLimit: num(raw.limits?.noProgressLimit, "limits.noProgressLimit", 3),
+      maxReviewRounds: num(raw.limits?.maxReviewRounds, "limits.maxReviewRounds", 3),
     },
     llm: llmConfig(llm),
     workspaces,

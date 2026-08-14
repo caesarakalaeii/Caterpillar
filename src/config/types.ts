@@ -64,6 +64,13 @@ export interface LimitsConfig {
   readonly maxSessionsPerTask: number;
   /** Consecutive no-progress sessions before parking. */
   readonly noProgressLimit: number;
+  /**
+   * Times the review council may send one task back before it parks for a human
+   * (DESIGN.md §12.1). The council and the implementation agent can otherwise trade a
+   * task until the session limit, which looks from outside like a task that is running
+   * and getting nowhere.
+   */
+  readonly maxReviewRounds: number;
 }
 
 export interface StateRepoConfig {

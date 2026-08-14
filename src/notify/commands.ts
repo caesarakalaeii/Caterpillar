@@ -28,6 +28,8 @@ export type Command =
   | { readonly kind: "show"; readonly task: TaskId }
   /** Stop working a task and leave it parked for a human. */
   | { readonly kind: "park"; readonly task: TaskId }
+  /** Approve and merge a task's PR despite the council (DESIGN.md §12.1). */
+  | { readonly kind: "merge"; readonly task: TaskId }
   /** Recognised prefix, unusable content — worth replying to rather than ignoring. */
   | { readonly kind: "malformed"; readonly reason: string };
 

@@ -20,6 +20,10 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return `Answered **${task}** (question ${outcome.index}). It is \`ready\` and will be claimed on the next poll.`;
     case "parked":
       return `Parked **${task}**. It will not be claimed again until a human sets it back to \`ready\`.`;
+    case "merged":
+      return `Merged **${task}** — ${outcome.prUrl}`;
+    case "not-mergeable":
+      return `Could not merge **${task}**: ${outcome.reason}`;
     case "unknown-task":
       return `No task **${task}** in the state repo. Check the id from its notification.`;
     case "not-waiting":

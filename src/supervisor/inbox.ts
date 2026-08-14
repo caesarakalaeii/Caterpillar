@@ -19,17 +19,21 @@ import type { TaskId } from "../domain/task.ts";
 export type ChatOutcome =
   | { readonly kind: "applied"; readonly index: number }
   | { readonly kind: "parked" }
+  | { readonly kind: "merged"; readonly prUrl: string }
   | { readonly kind: "unknown-task" }
   /** Answering a task that is not waiting on a question. */
   | { readonly kind: "not-waiting"; readonly status: string }
   /** Parking a task that is already terminal. */
   | { readonly kind: "not-parkable"; readonly status: string }
+  /** Merging was possible in principle but refused — no PR, or no reviewer identity. */
+  | { readonly kind: "not-mergeable"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
 
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
 export type ChatIntent =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
-  | { readonly kind: "park"; readonly task: TaskId };
+  | { readonly kind: "park"; readonly task: TaskId }
+  | { readonly kind: "merge"; readonly task: TaskId };
 
 export type ChatRequest = ChatIntent & {
   /** Settled by the loop once the write has been pushed, or has failed to be. */
