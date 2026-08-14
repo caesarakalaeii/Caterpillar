@@ -363,6 +363,17 @@ endpoint would have meant ingress, TLS and a public URL for every runner, which 
 what §7 refused when it chose a websocket over the `discord-bridge` Deployment §10
 anticipated.
 
+**A question is split, never truncated.** Discord caps a message at 2000 code points and
+§11.2 fitted prose inside that by clipping it. That is right for a park reason — one cut
+short still says a task parked — and wrong for the one payload a human has to act on. The
+first real question to exceed the limit was 3785 code points, offered four options, and
+arrived cut in the middle of option A; B, C and D were never sent, and the Answer button
+sat under a question nobody could answer. Questions now span as many messages as they
+need, split on line boundaries, with the button on the LAST one — on the first it would
+invite an answer to the half that fitted. Six parts is the ceiling, after which the
+message says how many remain and where to read them, because dropping the rest silently
+is the same failure again.
+
 **Acknowledge in 3 seconds, deliver the outcome separately.** Discord gives an interaction
 three seconds to be answered and then keeps its token alive for fifteen minutes. The
 supervisor settles a request when its poll loop next comes round, which may be several
