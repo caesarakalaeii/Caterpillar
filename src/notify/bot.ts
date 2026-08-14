@@ -19,7 +19,7 @@ import {
   type Notification,
   type Notifier,
   type NotifyTarget,
-  renderInteractive,
+  renderParts,
 } from "./discord.ts";
 import { type FetchLike, postJson } from "./http.ts";
 
@@ -137,12 +137,15 @@ export class BotNotifier implements Notifier {
   }
 
   async notify(notification: Notification, target: NotifyTarget = {}): Promise<void> {
-    const rendered = renderInteractive(notification);
-    await this.bot.postMessage({
-      content: rendered.content,
-      // A thread IS a channel, so posting into one is the same call with a different id.
-      ...(target.threadId === undefined ? {} : { channelId: target.threadId }),
-      ...(rendered.components === undefined ? {} : { components: rendered.components }),
-    });
+    // Sequential, not concurrent: Discord does not order simultaneous posts, and a
+    // question whose parts arrive shuffled is barely better than a truncated one.
+    for (const part of renderParts(notification, { interactive: true })) {
+      await this.bot.postMessage({
+        content: part.content,
+        // A thread IS a channel, so posting into one is the same call with a different id.
+        ...(target.threadId === undefined ? {} : { channelId: target.threadId }),
+        ...(part.components === undefined ? {} : { components: part.components }),
+      });
+    }
   }
 }

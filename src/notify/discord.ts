@@ -15,8 +15,13 @@
  * Traps encoded below, all of them ways a notification is silently LOST rather than
  * loudly broken:
  *   - `content` over 2000 code points is a 400 and the message never appears. An
- *     agent-authored question is exactly the payload that blows the limit, and it is
- *     the one where silence costs the most, so prose is truncated inside the frame.
+ *     agent-authored question is exactly the payload that blows the limit.
+ *   - **a QUESTION is never truncated — it is SPLIT.** Truncating one is not a smaller
+ *     notification, it is an unanswerable one: the first real question to exceed the
+ *     limit came in at 3785 code points, offered four options, and arrived cut in the
+ *     middle of option A with B, C and D missing entirely. There was nothing to reply
+ *     to. Everything else here is informational and still truncates, because a park
+ *     reason cut short still says a task parked.
  *   - mentions in that prose are parsed by default. The agent quotes files it read,
  *     so `@everyone` reaching Discord unsuppressed pages the server.
  *   - the URL's last path segment IS the credential. It must not reach an error
@@ -111,18 +116,22 @@ export class DiscordNotifier implements Notifier {
   }
 
   async notify(notification: Notification, target: NotifyTarget = {}): Promise<void> {
-    await postJson({
-      // A webhook posts into a thread by query parameter — it has no other way to say so.
-      url:
-        target.threadId === undefined
-          ? this.options.webhookUrl
-          : `${this.options.webhookUrl}?thread_id=${target.threadId}`,
-      what: "webhook message",
-      body: messagePayload(render(notification)),
-      ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
-      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
-      ...(this.options.maxRetries === undefined ? {} : { maxRetries: this.options.maxRetries }),
-    });
+    // Sequential, not concurrent: Discord does not order simultaneous posts, and a
+    // question whose parts arrive shuffled is barely better than a truncated one.
+    for (const part of renderParts(notification, { interactive: false })) {
+      await postJson({
+        // A webhook posts into a thread by query parameter — no other way to say so.
+        url:
+          target.threadId === undefined
+            ? this.options.webhookUrl
+            : `${this.options.webhookUrl}?thread_id=${target.threadId}`,
+        what: "webhook message",
+        body: messagePayload(part.content),
+        ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+        ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+        ...(this.options.maxRetries === undefined ? {} : { maxRetries: this.options.maxRetries }),
+      });
+    }
   }
 }
 
@@ -179,6 +188,112 @@ export const renderInteractive = (notification: Notification): Rendered => {
   return components === undefined
     ? { content: frame(notification, true) }
     : { content: frame(notification, false), components };
+};
+
+/**
+ * Parts a notification is sent as, in order. One for everything except a QUESTION.
+ *
+ * A question is split rather than truncated, because a truncated question is not a
+ * shorter notification — it is an unanswerable one. Any button goes on the LAST part,
+ * where a reader has arrived having seen the whole thing; putting it on the first would
+ * invite an answer to the half that fitted.
+ */
+export const renderParts = (
+  notification: Notification,
+  options: { readonly interactive: boolean },
+): readonly Rendered[] => {
+  const components = options.interactive ? componentsFor(notification) : undefined;
+  const hint = components === undefined;
+
+  if (notification.kind !== "question") {
+    const content = frame(notification, hint);
+    return [{ content, ...(components === undefined ? {} : { components }) }];
+  }
+
+  const { task, phase, question } = notification;
+  const head = [`**${task}** needs input`, `Phase: ${phase}`, ""].join("\n");
+  const tail = hint ? `\n\nReply: \`!answer ${task} <your answer>\`` : "";
+
+  // One budget for every part, sized against the LARGEST frame any of them can take.
+  // A few dozen wasted characters buys chunking that cannot depend on the part count,
+  // which is not known until after the split.
+  const overhead = Math.max(size(head), size(`**${task}** (99/99)\n`)) + size(tail);
+  const chunks = chunkProse(question, Math.max(CONTENT_LIMIT - overhead, MIN_CHUNK));
+
+  const kept = chunks.slice(0, MAX_PARTS);
+  // A question this long is itself a bug; the cap stops one pathological session from
+  // posting fifty messages, and says where the rest is rather than dropping it silently.
+  const clipped =
+    chunks.length > MAX_PARTS
+      ? `\n\n… ${chunks.length - MAX_PARTS} more part(s) not shown — read \`tasks/${task}/questions/\` in the state repo.`
+      : "";
+
+  return kept.map((chunk, index) => {
+    const last = index === kept.length - 1;
+    const prefix = index === 0 ? head : `**${task}** (${index + 1}/${kept.length})\n`;
+    const suffix = last ? clipped + tail : "";
+
+    // The PROSE gives way to the frame, never the other way round. Clipping the tail of
+    // the assembled string would take the reply instruction with it — and, on a capped
+    // question, the very notice saying more exists. Both are the parts a reader needs
+    // most, and both sit at the end.
+    const room = Math.max(CONTENT_LIMIT - size(prefix) - size(suffix), 0);
+    return {
+      content: `${prefix}${take(chunk, room)}${suffix}`,
+      ...(last && components !== undefined ? { components } : {}),
+    };
+  });
+};
+
+/** Most parts a question is ever split into, before it points at the state repo instead. */
+const MAX_PARTS = 6;
+/** Floor on a part's prose budget, so a pathological task id cannot drive it to zero. */
+const MIN_CHUNK = 200;
+
+/**
+ * Split prose into pieces that each fit `budget` code points.
+ *
+ * Line boundaries first: agent prose is markdown, and a split mid-bullet reads as two
+ * broken bullets rather than one continued list. A single line longer than the budget —
+ * a pasted stack trace, a one-paragraph wall — is hard-split, because the alternative is
+ * a part that does not fit and a 400 from Discord.
+ */
+export const chunkProse = (text: string, budget: number): readonly string[] => {
+  const parts: string[] = [];
+  let current = "";
+
+  const flush = (): void => {
+    if (current.length > 0) parts.push(current);
+    current = "";
+  };
+
+  for (const line of text.split("\n")) {
+    if (size(line) > budget) {
+      flush();
+      for (const piece of hardSplit(line, budget)) parts.push(piece);
+      continue;
+    }
+    const candidate = current.length === 0 ? line : `${current}\n${line}`;
+    if (size(candidate) > budget) {
+      flush();
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  flush();
+
+  return parts.length === 0 ? [""] : parts;
+};
+
+/** Code-point-aware split of one over-long line. Never produces a lone surrogate. */
+const hardSplit = (line: string, budget: number): readonly string[] => {
+  const points = [...line];
+  const pieces: string[] = [];
+  for (let at = 0; at < points.length; at += budget) {
+    pieces.push(points.slice(at, at + budget).join(""));
+  }
+  return pieces;
 };
 
 /** The buttons a notification carries, if any. Pure; undefined means "none fit". */
