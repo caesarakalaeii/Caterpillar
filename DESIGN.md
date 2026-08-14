@@ -591,10 +591,27 @@ Consequences worth knowing before changing any of it:
   task deletes the environment the second session was about to use.
 - **The cache is keyed on `flake.lock` as well as the expression**, and it verifies that the
   store paths it remembers still exist. `nix flake update` changes no character of the
-  expression and every version it resolves to; and `/nix` lives in the image rather than on
-  the PVC, so a deploy replaces the store while `env.json` on the PVC survives it. An
-  unverified hit would not fail loudly — it would hand the agent a PATH of directories that
-  are gone, which looks exactly like the missing toolchain this set out to fix.
+  expression and every version it resolves to. The existence check matters because the cache
+  entry and the store have independent lifetimes: a garbage collection can take a path, and
+  a store that is not on durable storage is replaced wholesale by a deploy while `env.json`
+  survives on the PVC. An unverified hit would not fail loudly — it would hand the agent a
+  PATH of directories that are gone, which looks exactly like the missing toolchain this set
+  out to fix.
+
+**Where the store lives is a deployment concern, not a code one.** The supervisor is
+indifferent: it asks nix, and nix reads `/nix`. Relocating the store with `NIX_STORE_DIR` is
+the one thing that is not an option — store paths carry their literal `/nix/store` prefix
+inside the binaries, so moving it invalidates every binary-cache substitution and forces
+builds from source.
+
+In the cluster a PVC is mounted at `/nix`, seeded from the image's own closure by an
+initContainer (`caesar-deployment`, `apps/workloads/caterpillar`). Without it every deploy
+throws the store away, and since keel rolls the Deployment on every push to `main`, a task
+needing a dotnet SDK would re-download over a gigabyte each time. It is a *separate* volume
+from `caterpillar-work` deliberately: that one holds the rotating Anthropic credential, and
+purging a wedged nix store must never be one `kubectl delete` away from locking the
+supervisor out. Nothing in this repo changes for any of it — which is the point, because a
+machine runner and a local `docker run` have no such mount and must keep working.
 - **nixpkgs is pinned** for generated environments. An unattended agent picking up a silent
   bump produces a red acceptance run with no diff to explain it.
 - **A toolchain that will not build parks the task**, naming nix's own error. Falling

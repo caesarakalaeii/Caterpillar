@@ -73,14 +73,22 @@ RUN printf '#!/bin/sh\nexec node /app/dist/cli/credential-helper.js "$@"\n' \
 
 # The PVC mounts here; ownership is set by the Deployment's fsGroup.
 #
-# /nix is NOT on the PVC and deliberately so. Relocating the store with NIX_STORE_DIR
+# /nix is left exactly where nix expects it. Relocating the store with NIX_STORE_DIR
 # invalidates every binary-cache substitution — store paths are addressed by their literal
-# /nix/store prefix — and mounting a volume over /nix would hide the closure COPYed above.
-# The cost is that a deploy discards whatever was substituted; the resolver's cache checks
-# that the paths it remembers still exist and re-resolves when they do not, so that shows
-# up as a slower first session rather than as a PATH full of directories that are gone.
-# Making the store durable means seeding the volume on first boot, which is a change to the
-# deployment repo and a change here, and is worth doing only if the cold resolves hurt.
+# /nix/store prefix — so the store is durable only where something durable is MOUNTED at
+# /nix, and this image is deliberately indifferent to whether anything is.
+#
+# Unmounted (a machine runner, a local `docker run`) the store is the container's writable
+# layer and a restart discards whatever was substituted. That is a slower first session, not
+# a broken one: the resolver's cache checks that the paths it remembers still exist and
+# re-resolves when they do not, so it can never hand the agent a PATH of directories that
+# are gone.
+#
+# In the cluster a PVC is mounted at /nix and seeded from this closure by an initContainer,
+# because keel rolls the Deployment on every push to `main` and re-substituting a dotnet SDK
+# each time is a gigabyte of download for nothing. That is entirely a deployment-repo
+# concern — nothing here changes for it, which is why the seed copies /nix rather than
+# moving it.
 RUN mkdir -p /work /run/caterpillar && chown -R node:node /work /run/caterpillar \
  && chown -R node:node /nix
 
