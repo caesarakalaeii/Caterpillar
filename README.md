@@ -147,6 +147,27 @@ awkward, the change is probably wrong.
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
    failed notification logs `notify.failed` and never rewrites the state it announces.
 
+## Passing work between machines
+
+Inputs never move. A game install, a USB device, a human — a task that needs one declares
+`requires` and the agent runs where it already is (§8). Only *derived outputs* travel, and
+`publish_artifact` carries the small ones:
+
+```
+publish_artifact(name: "sublevel-scan.json", path: "out/scan.json", note: "754 of 3513 sublevels carry resources")
+```
+
+They land in `tasks/<id>/artifacts/` in the state repo, capped at **1 MiB and 10 per task** —
+every runner clones that repo and git keeps whatever lands there forever, so the cap is the
+design rather than a safety net. An agent that hits it is told to summarise.
+
+Artifacts flow along **`blockedBy` edges**: before a session starts, the supervisor stages
+the artifacts of every task this one is blocked by and names the paths in the prompt. The
+dependency graph a plan already carries decides the flow, so there is no second notion of
+which task feeds which to keep in step.
+
+Large binaries have a designed seam and no implementation — see DESIGN.md §17.1.
+
 ## Adding a runner with capabilities
 
 The cluster pod advertises `linux, net`. A task that declares `requires: [usb]` or

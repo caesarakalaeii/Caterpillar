@@ -8,6 +8,8 @@
  * This class holds NO task state. It returns a SessionOutcome and lets the supervisor
  * decide what that means, so a crash here cannot leave state half-written.
  */
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { gzipSync as _gzipSync } from "node:zlib";
 import {
   createBashTool,
@@ -121,6 +123,7 @@ export class AgentSessionRunner {
         forge,
         repo,
         control,
+        publish: (name, path, note) => this.publishArtifact(spec, worktree, name, path, note),
         ...(tracker !== undefined ? { tracker } : {}),
         ...(spec.tracker !== undefined ? { trackerRef: spec.tracker } : {}),
       };
@@ -152,6 +155,7 @@ export class AgentSessionRunner {
         spec,
         state,
         ...(await this.promptContext(spec, recoveryNote)),
+        ...(await this.stagedSection(spec, state)),
       });
 
       const layout =
@@ -197,6 +201,84 @@ export class AgentSessionRunner {
   }
 
   /**
+   * Store one artifact for this task (DESIGN.md §17).
+   *
+   * Every refusal comes back as TEXT the agent can act on rather than as a thrown error:
+   * a file that is too big is a prompt to summarise, and an exception here would end the
+   * session over something the agent could have fixed in its next turn.
+   *
+   * The path is resolved inside the worktree and checked, because it is model-authored.
+   */
+  private async publishArtifact(
+    spec: TaskSpec,
+    worktree: string,
+    name: string,
+    path: string,
+    note: string,
+  ): Promise<string> {
+    const resolved = resolve(worktree, path);
+    if (!resolved.startsWith(`${resolve(worktree)}/`)) {
+      return `\`${path}\` is outside your working directory; nothing was stored.`;
+    }
+
+    let contents: Buffer;
+    try {
+      contents = await readFile(resolved);
+    } catch {
+      return `Could not read \`${path}\`; nothing was stored.`;
+    }
+
+    try {
+      await this.options.store.writeArtifact(spec.id, name, contents);
+    } catch (error) {
+      return `${error instanceof Error ? error.message : String(error)}. Nothing was stored — summarise it instead.`;
+    }
+
+    await this.options.store.appendJournal(
+      spec.id,
+      // Attributed to the session that produced it, which is the one about to be written.
+      0,
+      `**Artifact:** \`${name}\` (${contents.byteLength} bytes) — ${note}`,
+    );
+    return `Stored \`${name}\` (${contents.byteLength} bytes). Tasks that declare this one as a blocker will find it in their artifacts directory.`;
+  }
+
+  /**
+   * Stage upstream artifacts where the agent can read them (DESIGN.md §17).
+   *
+   * Upstream means `blockedBy` — a task's declared blockers ARE the tasks whose output it
+   * waits on, so the dependency graph a plan already carries decides artifact flow. There
+   * is deliberately no second notion of "which task feeds which" to keep in step with it.
+   *
+   * Staged OUTSIDE the repo checkout: dropping files into the worktree would put them in
+   * `git status`, and the first agent to run `git add -A` would commit another task's
+   * output into a pull request.
+   */
+  private async stageArtifacts(spec: TaskSpec, state: TaskState): Promise<string | undefined> {
+    const { store } = this.options;
+    const upstream = state.plan?.blockedBy ?? [];
+    if (upstream.length === 0) return undefined;
+
+    const root = join(this.options.config.paths.tasks, spec.id, "artifacts-in");
+    const lines: string[] = [];
+
+    for (const producer of upstream) {
+      for (const name of await store.listArtifacts(producer)) {
+        const contents = await store.readArtifact(producer, name);
+        if (contents === undefined) continue;
+        const dir = join(root, producer);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, name), contents);
+        lines.push(`- \`${join(dir, name)}\` — from ${producer}`);
+      }
+    }
+
+    return lines.length === 0
+      ? undefined
+      : ["Tasks you depend on left these for you:", "", ...lines].join("\n");
+  }
+
+  /**
    * Commit anything a crashed session left behind. See DESIGN.md §6.2.
    *
    * Uncommitted work is preserved rather than discarded — the previous session may
@@ -215,6 +297,14 @@ export class AgentSessionRunner {
       "changes have been committed as `wip: recovered from interrupted session`. " +
       "Review that commit before continuing — it may be incomplete."
     );
+  }
+
+  private async stagedSection(
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<{ readonly artifacts?: string }> {
+    const staged = await this.stageArtifacts(spec, state).catch(() => undefined);
+    return staged === undefined ? {} : { artifacts: staged };
   }
 
   /** Journal, handoff and any operator answer that unparked this task. */

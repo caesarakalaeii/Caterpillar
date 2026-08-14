@@ -87,6 +87,13 @@ export interface ToolContext {
   /** Repo PRs are opened against — always the task's primary repo. */
   readonly repo: RepoRef;
   readonly control: ControlSink;
+  /**
+   * Stores a small artifact and returns what to tell the agent (DESIGN.md §17).
+   *
+   * A callback rather than the store itself: the tool must not be able to reach any task
+   * but its own, and a bound function is the narrowest thing that expresses that.
+   */
+  readonly publish?: (name: string, path: string, note: string) => Promise<string>;
 }
 
 export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrResult> => ({
@@ -228,6 +235,50 @@ export const submitPlanTool = (ctx: ToolContext): AgentTool<typeof SubmitPlanPar
   },
 });
 
+const PublishArtifactParams = Type.Object({
+  name: Type.String({
+    description:
+      "File name to store it under, e.g. `sublevel-scan.json`. Letters, digits, dot, " +
+      "dash and underscore only — no directories.",
+  }),
+  path: Type.String({
+    description: "Path to the file, relative to your working directory.",
+  }),
+  note: Type.String({
+    description: "One line on what it is and why the next task will want it.",
+  }),
+});
+
+/**
+ * Hand a small derived output to the tasks that come after this one (DESIGN.md §17).
+ *
+ * Supervisor-mediated for the same reason `open_pr` is: the agent cannot write the state
+ * repo (§9.3), and this writes into it. The cap is deliberately tight and the tool says
+ * so in its own description, because the useful reaction to hitting it is to summarise —
+ * which is nearly always what the next task actually needed.
+ */
+export const publishArtifactTool = (
+  ctx: ToolContext,
+): AgentTool<typeof PublishArtifactParams, null> => ({
+  name: "publish_artifact",
+  label: "Publish artifact",
+  description:
+    "Store a small file where the tasks that depend on THIS one will find it — a " +
+    "manifest, a scan result, a golden file. Max 1 MiB and 10 per task: it is carried " +
+    "in the state repo that every runner clones, so summarise rather than dumping. Only " +
+    "tasks that declare this one as a blocker receive it.",
+  parameters: PublishArtifactParams,
+  execute: async (_id, params: Static<typeof PublishArtifactParams>) => {
+    const publish = ctx.publish;
+    if (publish === undefined) {
+      return text("Artifacts are not available for this task; nothing was stored.");
+    }
+
+    const stored = await publish(params.name, params.path, params.note);
+    return text(stored);
+  },
+});
+
 /** All control-plane tools for an implementation session. */
 export const controlTools = (ctx: ToolContext): readonly AgentTool[] => [
   openPrTool(ctx) as AgentTool,
@@ -235,6 +286,7 @@ export const controlTools = (ctx: ToolContext): readonly AgentTool[] => [
   handoffTool(ctx) as AgentTool,
   doneTool(ctx) as AgentTool,
   taskNoteTool(ctx) as AgentTool,
+  publishArtifactTool(ctx) as AgentTool,
 ];
 
 /**
