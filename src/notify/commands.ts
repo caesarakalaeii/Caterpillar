@@ -51,26 +51,30 @@ export const HELP = "Usage: `!answer <task-id> <your answer>` — or use `/answe
  */
 export const parseCommand = (content: string, thread?: TaskId): Command | undefined => {
   const trimmed = content.trim();
+
+  /**
+   * In a task's own thread there is no command language: the conversation IS the answer.
+   *
+   * Requiring `!answer` here was wrong twice over. It is friction in the one place the
+   * whole point was to remove it — refining an idea is many short replies — and it made
+   * a plausible first word into a task id: `!answer we want B` was read as an answer to
+   * a task called `we`, and the reply was "No task we in the state repo."
+   *
+   * So everything typed in a bound thread is the answer, verbatim. A leading `!answer`
+   * is stripped rather than obeyed, because people type it out of habit, and so is the
+   * thread's own id if they repeat it.
+   */
+  if (thread !== undefined) {
+    const text = stripAnswerPrefix(trimmed, thread);
+    return text.length === 0 ? undefined : { kind: "answer", task: thread, text };
+  }
+
   if (!trimmed.startsWith("!")) return undefined;
 
   const [word = "", ...rest] = trimmed.split(/\s+/);
   if (word.toLowerCase() !== "!answer") return undefined;
 
   const task = rest[0];
-  // Inside a task's own thread the id is implied, so `!answer yes` is the whole command.
-  // Only where the FIRST word is not a plausible id, though: `!answer BS-123 yes` typed
-  // in that task's thread must still mean what it says.
-  if (thread !== undefined && (task === undefined || !isTaskId(task) || task === thread)) {
-    // Sliced rather than re-joined, so an answer keeps its original spacing — it can be
-    // a code block, a list, or a paragraph.
-    const after = task === thread ? trimmed.indexOf(task) + task.length : word.length;
-    const text = trimmed.slice(after).trim();
-    if (text.length === 0) {
-      return { kind: "malformed", reason: `An answer for \`${thread}\` cannot be empty.` };
-    }
-    return { kind: "answer", task: thread, text };
-  }
-
   if (task === undefined) return { kind: "malformed", reason: `Which task? ${HELP}` };
   if (!isTaskId(task)) {
     // The id becomes a directory name under `tasks/`. A `../` in it would write
@@ -87,4 +91,20 @@ export const parseCommand = (content: string, thread?: TaskId): Command | undefi
   }
 
   return { kind: "answer", task: asTaskId(task), text };
+};
+
+/**
+ * Drop a `!answer` a human typed out of habit, and the thread's own id after it.
+ *
+ * Sliced rather than re-joined on whitespace, so the answer keeps its original shape —
+ * it can be a code block, a list, or a paragraph, and a thread is where the long ones
+ * get typed.
+ */
+const stripAnswerPrefix = (trimmed: string, thread: TaskId): string => {
+  const [word = "", next] = trimmed.split(/\s+/);
+  if (word.toLowerCase() !== "!answer") return trimmed;
+
+  let rest = trimmed.slice(word.length).trimStart();
+  if (next === thread) rest = rest.slice(next.length).trimStart();
+  return rest.trim();
 };

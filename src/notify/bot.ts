@@ -97,6 +97,17 @@ export class DiscordBot {
     return { id: body.id ?? "", channelId };
   }
 
+  /**
+   * Show the typing indicator in a channel. Discord keeps it up for ~10 seconds.
+   *
+   * Best-effort and deliberately silent on failure: it is a comfort signal, and a
+   * rate-limited one must never surface as an error next to real work.
+   */
+  async typing(channelId?: string): Promise<void> {
+    await this.post(`/channels/${channelId ?? this.options.channelId}/typing`, "{}", "typing")
+      .catch(() => undefined);
+  }
+
   /** Open a public thread on a message. Returns the thread's channel id. */
   async createThread(messageId: string, name: string): Promise<string> {
     const response = await this.post(
@@ -129,6 +140,40 @@ export class DiscordBot {
  * human can answer by clicking is the entire point of §7's second half. Falls back to
  * the plain frame per notification when no component fits — see `renderInteractive`.
  */
+/**
+ * Discord's typing indicator, held for as long as a session runs. See DESIGN.md §7.1.
+ *
+ * The channel is otherwise silent between a question and its answer — handoffs are
+ * deliberately not notified (§11), so a task that has been thinking for forty minutes
+ * looks identical to one that has died. "Caterpillar is typing…" costs one request every
+ * eight seconds and answers the only question a human actually has while waiting.
+ *
+ * Eight, not ten: Discord holds the indicator for about ten seconds, and refreshing at
+ * exactly that interval leaves a visible gap every cycle.
+ */
+const TYPING_REFRESH_MS = 8_000;
+
+export interface Presence {
+  /** Start showing activity in `channelId`. The returned function stops it. */
+  working(channelId: string): () => void;
+}
+
+export class BotPresence implements Presence {
+  private readonly bot: DiscordBot;
+
+  constructor(bot: DiscordBot) {
+    this.bot = bot;
+  }
+
+  working(channelId: string): () => void {
+    void this.bot.typing(channelId);
+    const timer = setInterval(() => void this.bot.typing(channelId), TYPING_REFRESH_MS);
+    // Unref'd: a comfort signal must never be the reason the process will not exit.
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+}
+
 export class BotNotifier implements Notifier {
   private readonly bot: DiscordBot;
 
@@ -139,7 +184,10 @@ export class BotNotifier implements Notifier {
   async notify(notification: Notification, target: NotifyTarget = {}): Promise<void> {
     // Sequential, not concurrent: Discord does not order simultaneous posts, and a
     // question whose parts arrive shuffled is barely better than a truncated one.
-    for (const part of renderParts(notification, { interactive: true })) {
+    for (const part of renderParts(notification, {
+      interactive: true,
+      inThread: target.threadId !== undefined,
+    })) {
       await this.bot.postMessage({
         content: part.content,
         // A thread IS a channel, so posting into one is the same call with a different id.

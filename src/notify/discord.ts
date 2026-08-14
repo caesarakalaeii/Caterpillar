@@ -200,9 +200,11 @@ export const renderInteractive = (notification: Notification): Rendered => {
  */
 export const renderParts = (
   notification: Notification,
-  options: { readonly interactive: boolean },
+  options: { readonly interactive: boolean; readonly inThread?: boolean },
 ): readonly Rendered[] => {
-  const components = options.interactive ? componentsFor(notification) : undefined;
+  const components = options.interactive
+    ? componentsFor(notification, { inThread: options.inThread === true })
+    : undefined;
   const hint = components === undefined;
 
   if (notification.kind !== "question") {
@@ -212,7 +214,14 @@ export const renderParts = (
 
   const { task, phase, question } = notification;
   const head = [`**${task}** needs input`, `Phase: ${phase}`, ""].join("\n");
-  const tail = hint ? `\n\nReply: \`!answer ${task} <your answer>\`` : "";
+  // In its own thread the answer is just the next message, so the instruction says so.
+  // Elsewhere the task has to be named, because the channel carries every task at once.
+  const tail =
+    options.inThread === true
+      ? "\n\nReply in this thread — no command needed."
+      : hint
+        ? `\n\nReply: \`!answer ${task} <your answer>\``
+        : "";
 
   // One budget for every part, sized against the LARGEST frame any of them can take.
   // A few dozen wasted characters buys chunking that cannot depend on the part count,
@@ -296,19 +305,30 @@ const hardSplit = (line: string, budget: number): readonly string[] => {
   return pieces;
 };
 
-/** The buttons a notification carries, if any. Pure; undefined means "none fit". */
-export const componentsFor = (notification: Notification): readonly ActionRow[] | undefined => {
+/**
+ * The buttons a notification carries, if any. Pure; undefined means "none fit".
+ *
+ * The Answer button exists to spare a human retyping a task id in a busy channel. In the
+ * task's OWN thread there is no id to retype — the next message is the answer — so the
+ * button is pure friction there: a modal to open, for something a keystroke already does.
+ */
+export const componentsFor = (
+  notification: Notification,
+  options: { readonly inThread?: boolean } = {},
+): readonly ActionRow[] | undefined => {
   switch (notification.kind) {
     case "question":
-      return rows(
-        row(
-          button({
-            action: { verb: "ans", task: notification.task },
-            label: "Answer",
-            style: BUTTON_STYLE.primary,
-          }),
-        ),
-      );
+      return options.inThread === true
+        ? undefined
+        : rows(
+            row(
+              button({
+                action: { verb: "ans", task: notification.task },
+                label: "Answer",
+                style: BUTTON_STYLE.primary,
+              }),
+            ),
+          );
     case "done":
       return rows(row(linkButton("View PR", notification.prUrl)));
     case "verdict":

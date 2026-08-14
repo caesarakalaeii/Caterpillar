@@ -9,13 +9,13 @@ import { createServer } from "node:http";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
 import { CredentialService } from "./credential/service.ts";
-import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
+import { asRunnerId, type TaskId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
-import { BotNotifier, DiscordBot } from "./notify/bot.ts";
+import { BotNotifier, BotPresence, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
 import { ThreadIndex } from "./notify/threads.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
@@ -173,6 +173,7 @@ const main = async (): Promise<void> => {
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger }),
     reviewers,
     threads,
+    ...(discord.bot === undefined ? {} : { presence: new BotPresence(discord.bot) }),
     notifier: discord.notifier,
     inbox,
     snapshot,
@@ -199,6 +200,13 @@ const main = async (): Promise<void> => {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
+  // BEFORE the bridge connects, not on the first poll. The index is what tells a message
+  // in a thread which task it belongs to, and the loop only rebuilds it once per cycle —
+  // so a reply arriving in the seconds after a restart hit an empty index, fell through
+  // to channel parsing, and `!answer we want B` was read as an answer to a task called
+  // `we`. Keel rolls this pod on every push to main, which makes that window routine.
+  await hydrateThreads(store, threads, logger);
+
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
   const bridge =
@@ -217,6 +225,27 @@ const main = async (): Promise<void> => {
     await credentials.stop();
     await bridge;
   }
+};
+
+/**
+ * Rebuild the thread index from the state repo.
+ *
+ * The durable copy is `state.chat.threadId`; this is a derived lookup, so it is rebuilt
+ * rather than persisted — a restart heals it, and there is no second index to fall out
+ * of step with the tasks.
+ */
+const hydrateThreads = async (
+  store: StateStore,
+  threads: ThreadIndex,
+  logger: Logger,
+): Promise<void> => {
+  const entries: (readonly [string, TaskId])[] = [];
+  for (const id of await store.listTasks()) {
+    const state = await store.readState(id).catch(() => undefined);
+    if (state?.chat !== undefined) entries.push([state.chat.threadId, id] as const);
+  }
+  threads.replace(entries);
+  logger.info("threads.hydrated", { count: entries.length });
 };
 
 /**

@@ -172,3 +172,29 @@ test("chunking prefers line boundaries", () => {
   for (const c of chunks) assert.doesNotMatch(c, /^\s*$/);
   assert.deepEqual(chunks.join("\n").split("\n"), ["- one", "- two", "- three"]);
 });
+
+test("a question in its own thread carries no Answer button", () => {
+  // The button exists to spare retyping a task id in a busy channel. In the task's own
+  // thread there is no id to retype — the next message is the answer — so it is pure
+  // friction: a modal to open for something a keystroke already does.
+  const parts = renderParts(question("Which option?"), { interactive: true, inThread: true });
+
+  assert.equal(parts[0]?.components, undefined);
+  assert.match(parts[0]?.content ?? "", /Reply in this thread/);
+  assert.doesNotMatch(parts[0]?.content ?? "", /!answer/);
+});
+
+test("the same question in the channel still gets the button", () => {
+  const parts = renderParts(question("Which option?"), { interactive: true });
+
+  assert.ok(parts[0]?.components !== undefined);
+  assert.doesNotMatch(parts[0]?.content ?? "", /Reply in this thread/);
+});
+
+test("a long question in a thread still splits, and the last part says how to reply", () => {
+  const parts = renderParts(question(longQuestion()), { interactive: true, inThread: true });
+
+  assert.ok(parts.length > 1);
+  for (const part of parts) assert.equal(part.components, undefined);
+  assert.match(String(parts.at(-1)?.content), /Reply in this thread/);
+});

@@ -37,6 +37,7 @@ import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
+import type { Presence } from "../notify/bot.ts";
 import type { ThreadIndex } from "../notify/threads.ts";
 import type { ForgeFactory } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
@@ -132,6 +133,12 @@ export interface SupervisorDeps {
    * restart heals it for free — there is no separate durable index to fall out of step.
    */
   readonly threads?: ThreadIndex;
+  /**
+   * Activity signal while a session runs (§7.1). Optional, and purely cosmetic: the
+   * channel is silent between a question and its answer, so a task thinking for forty
+   * minutes otherwise looks exactly like one that has died.
+   */
+  readonly presence?: Presence;
 }
 
 export class Supervisor {
@@ -333,7 +340,15 @@ export class Supervisor {
           phase: state.phase,
         });
 
-        const outcome = await this.deps.runner.run(spec, state);
+        // Held for exactly the session, and stopped in a `finally` — an indicator left
+        // running after a crash would be a lie that outlives the thing it described.
+        const stopTyping = this.showWorking(state);
+        let outcome: SessionOutcome;
+        try {
+          outcome = await this.deps.runner.run(spec, state);
+        } finally {
+          stopTyping();
+        }
 
         logger.info("session.end", {
           task: spec.id,
@@ -1215,6 +1230,25 @@ export class Supervisor {
    * in, so a plan's questions and outcomes stay together instead of interleaving with
    * every other task in the channel.
    */
+  /**
+   * Show activity in the task's thread while it works. Never throws.
+   *
+   * Only for a task that HAS a thread: a typing indicator in the main channel would be
+   * permanent — the runner always has something in flight — and a signal that is always
+   * on carries no information.
+   */
+  private showWorking(state: TaskState): () => void {
+    const threadId = state.chat?.threadId;
+    const presence = this.deps.presence;
+    if (threadId === undefined || presence === undefined) return () => undefined;
+
+    try {
+      return presence.working(threadId);
+    } catch {
+      return () => undefined;
+    }
+  }
+
   private async notifyTask(state: TaskState, notification: Notification): Promise<void> {
     await this.notify(notification, state.chat?.threadId);
   }
