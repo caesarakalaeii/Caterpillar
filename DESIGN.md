@@ -128,6 +128,31 @@ declares which one it belongs to.
 credentials from the profile; **a task in one workspace can never obtain another
 workspace's credentials.** This is the same containment property as §9.1, one level up.
 
+#### A mirror refresh never touches `refs/heads/agent/*`
+
+One bare mirror per repo serves every task on it, and each task's worktree checks out
+`agent/<task>` — a local branch in that shared mirror. `clone --mirror` configures
+`+refs/*:refs/*`, so a plain `fetch --prune` tries to write every remote ref onto the
+identically-named local ref. The moment a task **pushes** its branch, the remote has it, and
+the fetch targets a local head that a worktree holds:
+
+```
+fatal: refusing to fetch into branch 'refs/heads/agent/<task>' checked out at ...
+```
+
+git refuses the *whole* fetch, so one task pushing broke `syncMirror` for every later task
+on that repo, permanently. Worktrees persist on the PVC after a session ends, so this was
+not limited to tasks running concurrently — and it surfaced as `task.parked` two seconds
+after a claim, which reads as a scheduler fault rather than a git one.
+
+Rule: **the mirror fetches `+refs/*:refs/*` minus `^refs/heads/agent/*`.** The mirror exists
+to supply upstream history to create worktrees from; it never needs to fetch back branches
+it pushed itself. Excluding them from the refspec also excludes them from `--prune`, so a
+branch whose remote counterpart a merge deleted is not yanked out from under a live
+worktree. The refspec is passed per invocation, not written into the mirror's config,
+because that config is only written on first clone and every mirror already on a PVC would
+keep the old one.
+
 ## 4. State model
 
 ### 4.1 Layout
@@ -226,6 +251,32 @@ enough; a runner that lost the network but kept working must not resurrect stale
 > **Clock skew matters.** Steal-on-stale compares commit timestamps across machines.
 > Runners must run NTP. The 5-minute threshold is deliberately far larger than plausible
 > skew.
+
+#### The fencing token is a handle, never a value
+
+A `Lease` is a *snapshot* of a token the heartbeat **rotates**. Because `assertHeld`
+compares the OID exactly — and that exactness is the entire fence — a `Lease` held across a
+renewal names a token the ref no longer has, and the next push reports a stolen lease that
+nobody stole.
+
+Rule: **anything that writes after an unbounded await carries a `LeaseHandle`, not a
+`Lease`,** and resolves it immediately before the write. `startHeartbeat` returns one;
+`heldLease` wraps the short claim-write-release paths that have no await worth rotating
+across. No signature offers the choice, because remembering the rule at each call site is
+what failed.
+
+This was not hypothetical. The supervisor read a `Lease` out of the heartbeat *before* a
+council review, and pushed with it 207 seconds and three renewals later. The
+`LeaseLostError` unwound a plan that had already been reviewed and cut into five tasks; the
+next poll's `pull()` (`git reset --hard`) reverted every tracked write, and the five child
+task directories survived only as untracked files on the PVC — where the claim loop found
+and claimed them. It was logged at `warn`.
+
+`current()` is async so it can wait out a renewal already in flight, which closes the same
+failure in its narrow form. It waits for exactly the airborne renewal, not "until none is
+airborne": the caller wants to write, and a caller that never returns is worse than one
+racing a rotation. The residual window between `assertHeld` and the push it guards is
+seconds against a 60s interval, and losing it costs an unwound task, not a corrupted one.
 
 ---
 
@@ -901,6 +952,16 @@ Two independent gates, both required:
 Only then `status = done`, Discord gets the terminal message, and the supervisor closes the
 tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
+
+> **The image is the gate's execution environment.** Acceptance commands run in the
+> supervisor's container, so an interpreter missing from it makes the first gate
+> *unsatisfiable* for every task that needs one — no matter what the agent does. A repo whose
+> tests run through `tools/test.py` failed with `env: 'python3': No such file or directory`
+> and exit 127, which reads as a badly written acceptance command rather than a missing
+> interpreter, and the agent has no way to fix it from inside a session. `python3`, `curl`
+> and `jq` are therefore part of the base image; per-repo language toolchains (dotnet, lua, a
+> compiler) are **not**, and belong to a capability-matched runner (§8) so that every runner
+> does not pay for every repo.
 
 ### 12.1 The review council
 
