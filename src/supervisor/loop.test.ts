@@ -678,3 +678,110 @@ test("a blocked task is not claimed until its blocker is done", async () => {
     "the blocked task stays ready — blocked is not a status, it is a predicate",
   );
 });
+
+test("a council slower than the heartbeat still lands its verdict on the remote", async () => {
+  // THE REGRESSION. `applyOutcome` was handed a `Lease` VALUE read out of the heartbeat
+  // before the council ran. A review takes minutes, a heartbeat rotates the fencing token
+  // every 60s, and `assertHeld` compares the oid exactly — so `convene`'s push CAS'd
+  // against a token three renewals old, threw LeaseLostError, and the task unwound. The
+  // next poll's `pull()` (`git reset --hard`) then reverted every tracked write the
+  // council had made, and the plan it had just approved existed only on the PVC.
+  //
+  // Every other test in this file sets `heartbeatSeconds: 3600` so the heartbeat never
+  // fires, which is precisely why this survived. Here it MUST fire during the review.
+  const SLOW = asTaskId("SMOKE-COUNCIL-2");
+  await seedTask(SLOW, { pr: { number: 11, url: "https://example.invalid/pr/11" } });
+
+  let convened = 0;
+  const council: Council = {
+    reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+    review: async () => {
+      convened += 1;
+      // Comfortably longer than the 1s heartbeat below, so several renewals land while
+      // the review is in flight — the real condition, not a simulated one.
+      await sleep(2_500);
+      return {
+        usage: EMPTY_USAGE,
+        verdict: decide([
+          {
+            lens: "correctness",
+            title: "Correctness",
+            decision: "pass",
+            blocking: false,
+            summary: "Reads correctly.",
+            findings: [],
+          },
+        ]),
+      };
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config: { ...config, lease: { heartbeatSeconds: 1, staleAfterSeconds: 300 } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council,
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(SLOW);
+    if (state?.status === "done") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(
+    settled?.status,
+    "done",
+    "a passing council must reach `done` on the REMOTE — a renewal during the review is " +
+      "normal, not a stolen lease",
+  );
+  assert.equal(settled?.review?.last, "pass", "the council's own state write must survive");
+  assert.equal(
+    convened,
+    1,
+    "one completion claim convenes one council — re-convening means the push was lost and " +
+      "the task got re-claimed",
+  );
+
+  // The verdict document is the artifact a human and the next session both read, and it
+  // is written before the push that was failing.
+  const verdict = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${SLOW}/reviews/001-verdict.md`,
+  );
+  assert.equal(verdict.code, 0, "the verdict must be pushed, not left on the runner's disk");
+});

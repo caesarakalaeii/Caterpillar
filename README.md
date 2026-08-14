@@ -226,9 +226,10 @@ Then work reaches it by capability, never by address (§8): an agent already run
 elsewhere calls `handoff(requires: ["usb"])`, the task returns to `ready`, this runner
 claims it on its next poll and appends to the **same** journal.
 
-Advertise `nix` only if the machine actually has it — a runner that claims a task and then
-cannot build its environment parks it, which is worse than never claiming it. The installer
-warns rather than refusing, because everything else still works without nix.
+`nix` is the one capability you do not have to declare: the runner probes for it at boot and
+advertises it if it is there (§8.1). Listing it explicitly still works and is kept — a
+machine that advertises it without having it gets a warning at boot rather than a silent
+correction, since it may be about to gain it.
 
 ## Verifying a GitHub App setup
 

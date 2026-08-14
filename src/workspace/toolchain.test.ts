@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import type { ToolchainConfig } from "../config/types.ts";
-import { asTaskId, asWorkspaceName, type TaskSpec } from "../domain/task.ts";
+import { asTaskId, asWorkspaceName, KNOWN_CAPABILITIES, type TaskSpec } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import {
   cacheDigest,
@@ -312,6 +312,58 @@ test("a reserved variable the supervisor does not set is removed, not inherited"
   const resolved = await resolver({}, tasksDir).resolve(spec, worktree);
 
   assert.equal(resolved.env["ANTHROPIC_API_KEY"], undefined);
+});
+
+// ------------------------------------------------------------------------- capabilities
+
+test("a runner with nix advertises it without being told to", async () => {
+  // The whole point. The deployed ConfigMap says `["linux", "net"]`, an explicit
+  // `toolchain: mode: nix` implies `requires: [nix]` at intake, and a runner that has nix
+  // but does not say so leaves that task `ready` forever with nothing logged — the exact
+  // failure §8.1 removes, arriving through config instead of through the enum.
+  const advertised = await resolver().capabilities(["linux", "net"]);
+
+  assert.deepEqual([...advertised], ["linux", "net", "nix"]);
+});
+
+test("a runner without nix does not claim it can build environments", async () => {
+  const blind = new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: TEST_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: "/nonexistent" },
+  });
+
+  assert.deepEqual([...(await blind.capabilities(["linux", "net"]))], ["linux", "net"]);
+});
+
+test("an explicit declaration is neither duplicated nor overridden", async () => {
+  // Config still wins where it can be right. An operator who lists `nix` on a machine that
+  // does not have it yet gets a warning at boot, not a silent removal — they may be about
+  // to install it, and a config the runner quietly edits is worse than one that is wrong.
+  const withNix = await resolver().capabilities(["linux", "nix"]);
+  assert.deepEqual([...withNix], ["linux", "nix"]);
+
+  const blind = new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: TEST_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: "/nonexistent" },
+  });
+  assert.deepEqual([...(await blind.capabilities(["linux", "nix"]))], ["linux", "nix"]);
+});
+
+test("every derived capability is one the config loader would accept", async () => {
+  // Derivation must not be able to invent a capability the rest of the system refuses:
+  // `claimNext` compares against this list and intake validates `requires` against it.
+  const advertised = await resolver().capabilities(["linux"]);
+
+  for (const capability of advertised) {
+    assert.ok(
+      KNOWN_CAPABILITIES.includes(capability),
+      `derived '${capability}' is not a known capability`,
+    );
+  }
 });
 
 test("ToolchainError carries the source that failed", () => {

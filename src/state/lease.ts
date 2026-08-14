@@ -33,6 +33,35 @@ export interface Lease {
   readonly oid: string;
 }
 
+/**
+ * A live claim, resolved at the moment of use.
+ *
+ * A `Lease` VALUE is a snapshot of a token the heartbeat ROTATES, so it stops matching the
+ * ref the moment a renewal lands — and `assertHeld` compares the oid exactly, because that
+ * exactness is the fence. Anything that writes after an await of unbounded length must
+ * therefore carry one of these instead of a `Lease` and resolve it immediately before the
+ * write. A council review takes minutes and a 60s heartbeat rotates the token several times
+ * inside one; passing the pre-review snapshot to `assertHeld` reported a stolen lease that
+ * nobody had stolen, and the caller discarded work it had already done.
+ *
+ * `current()` is async so it can wait out a renewal ALREADY IN FLIGHT: a read that races a
+ * renewal's push would otherwise see the ref's new oid while this side still names the old
+ * one — the same false loss, in a much narrower window.
+ */
+export interface LeaseHandle {
+  readonly current: () => Promise<Lease>;
+}
+
+/**
+ * A claim nothing renews.
+ *
+ * For the short paths that claim, write and release with no await worth rotating a token
+ * across. They still take a `LeaseHandle` so that no signature offers the choice.
+ */
+export const heldLease = (lease: Lease): LeaseHandle => ({
+  current: () => Promise.resolve(lease),
+});
+
 export interface LeaseManagerOptions {
   readonly git: Git;
   readonly remote: string;
@@ -149,19 +178,25 @@ export class LeaseManager {
  * recoverable condition, it means someone else owns the work now.
  */
 export const startHeartbeat = (
-  manager: LeaseManager,
+  /** Only `renew` is needed, and saying so is what lets the timing be tested directly. */
+  manager: Pick<LeaseManager, "renew">,
   lease: Lease,
   intervalSeconds: number,
   onLost: (error: LeaseLostError) => void,
-): { readonly stop: () => void; readonly current: () => Lease } => {
+): LeaseHandle & { readonly stop: () => void } => {
   let held = lease;
+  /** Set while a renewal is airborne, so `current()` can wait for the token to settle. */
+  let inFlight: Promise<void> | undefined;
+
   const timer = setInterval(() => {
-    void manager.renew(held).then(
+    inFlight = manager.renew(held).then(
       (renewed) => {
         held = renewed;
+        inFlight = undefined;
       },
       (error: unknown) => {
         clearInterval(timer);
+        inFlight = undefined;
         onLost(
           error instanceof LeaseLostError ? error : new LeaseLostError(held.task),
         );
@@ -171,7 +206,21 @@ export const startHeartbeat = (
   timer.unref();
 
   return {
+    // Stopping does not settle an airborne renewal, so `current()` still has to wait for
+    // one: the push may already have moved the ref.
     stop: () => clearInterval(timer),
-    current: () => held,
+    current: async () => {
+      // Exactly the renewal airborne when asked, not "until none is airborne": looping
+      // would hand control to whatever the interval starts next and could wait forever if
+      // renewals stop completing — the caller wants to write, and a caller that never
+      // returns is worse than one racing a rotation.
+      //
+      // A renewal starting AFTER this point still leaves the pre-existing window between
+      // `assertHeld` and the push it guards. That window is a second or two against a
+      // 60s interval, and losing it costs an unwound task, not a corrupted one.
+      const settling = inFlight;
+      if (settling !== undefined) await settling;
+      return held;
+    },
   };
 };

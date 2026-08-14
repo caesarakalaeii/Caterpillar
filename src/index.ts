@@ -8,6 +8,7 @@
 import { createServer } from "node:http";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
+import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory } from "./forge/types.ts";
@@ -73,8 +74,25 @@ const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) =
 };
 
 const main = async (): Promise<void> => {
-  const config = await loadConfig(CONFIG_PATH);
-  const logger = new JsonLogger({ level: config.log.level });
+  const loaded = await loadConfig(CONFIG_PATH);
+  const logger = new JsonLogger({ level: loaded.log.level });
+
+  // ONE resolver for the whole process. The agent's shell, the council's, the plan
+  // maintainer's and the acceptance gate's must be the same environment or the gate grades
+  // work against a shell the agent never saw (see workspace/toolchain.ts).
+  const toolchain = new ToolchainResolver({
+    logger,
+    config: loaded.toolchain,
+    tasksDir: loaded.paths.tasks,
+  });
+
+  // `nix` is derived from the machine rather than taken from the ConfigMap (DESIGN.md
+  // §8.1). A runner that has nix and does not advertise it leaves every task declaring a
+  // toolchain `ready` forever, claimable by nobody, and says nothing about why.
+  const config: RunnerConfig = {
+    ...loaded,
+    capabilities: await toolchain.capabilities(loaded.capabilities),
+  };
 
   // The state repo's own credential: minted from the App, never served over the
   // credential socket, and never inherited by task worktrees (DESIGN.md §9.3).
@@ -126,15 +144,6 @@ const main = async (): Promise<void> => {
     helperPath: CRED_HELPER,
     socketPath: CRED_SOCKET,
     identity: BOT_IDENTITY,
-  });
-
-  // ONE resolver for the whole process. The agent's shell, the council's, the plan
-  // maintainer's and the acceptance gate's must be the same environment or the gate grades
-  // work against a shell the agent never saw (see workspace/toolchain.ts).
-  const toolchain = new ToolchainResolver({
-    logger,
-    config: config.toolchain,
-    tasksDir: config.paths.tasks,
   });
 
   const credentials = new CredentialService();

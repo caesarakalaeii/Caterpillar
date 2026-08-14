@@ -31,7 +31,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { TaskSpec, ToolchainSpec } from "../domain/task.ts";
+import type { Capability, TaskSpec, ToolchainSpec } from "../domain/task.ts";
 import type { ToolchainConfig } from "../config/types.ts";
 import type { Logger } from "../obs/log.ts";
 
@@ -105,6 +105,8 @@ export class ToolchainResolver {
   private shell: Promise<string> | undefined;
   /** 0 until the first idle poll — see `maybeCollectGarbage`. */
   private lastGcAt = 0;
+  /** Memoised: nix does not appear or vanish while the process runs. */
+  private nix: Promise<boolean> | undefined;
 
   constructor(options: ToolchainResolverOptions) {
     this.logger = options.logger;
@@ -138,6 +140,57 @@ export class ToolchainResolver {
 
     const env = await this.materialise(spec, worktree, plan);
     return this.log(spec, { env, shell, source: plan.source });
+  }
+
+  /**
+   * The capabilities this runner should actually advertise (DESIGN.md §8.1).
+   *
+   * `nix` is DERIVED rather than declared, and it is the only capability that is. Every
+   * other one asserts something no program can check — a GPU is wired in, a human is in
+   * the room — so a person has to say it. "Can this machine build an environment" is
+   * decided by whether nix runs, and asking is both exact and free.
+   *
+   * Deriving it is not tidiness. An explicit `toolchain: mode: nix` implies
+   * `requires: [nix]` at intake, so a runner that HAS nix and does not say so leaves such
+   * a task `ready` forever, claimable by nobody — the precise failure §8.1 exists to
+   * remove, arriving through a stale ConfigMap instead of through the closed enum. And
+   * that failure is silent: nothing logs, nothing errors, the task simply never moves.
+   *
+   * Config still wins where it can be right. A declaration is kept as-is (so an operator
+   * who lists `nix` gets it), and a declaration that the machine cannot honour is a
+   * warning rather than a removal — the operator may be installing nix next.
+   */
+  async capabilities(declared: readonly Capability[]): Promise<readonly Capability[]> {
+    const available = await this.nixAvailable();
+
+    if (declared.includes("nix")) {
+      if (!available) {
+        this.logger.warn("toolchain.capability-unbacked", {
+          capability: "nix",
+          detail: "advertised but nix is not runnable — tasks requiring it will park",
+        });
+      }
+      return declared;
+    }
+
+    if (!available) return declared;
+
+    this.logger.info("toolchain.capability-derived", {
+      capability: "nix",
+      detail: "nix is installed, so this runner advertises it without being told to",
+    });
+    return [...declared, "nix"];
+  }
+
+  private nixAvailable(): Promise<boolean> {
+    // `--version` rather than anything that touches the store: this runs at boot, before
+    // the supervisor serves /healthz, and an unreachable substituter must not delay it.
+    // A nix that runs but has a broken store still parks its tasks, with nix's own error.
+    this.nix ??= run("nix", ["--version"], {
+      env: this.baseEnv,
+      timeoutMs: PROBE_TIMEOUT_MS,
+    }).then(({ code }) => code === 0);
+    return this.nix;
   }
 
   /**
@@ -455,6 +508,15 @@ export const cacheDigest = (
  * a wrong environment rather than as a parse error.
  */
 const CACHE_VERSION = "v1";
+
+/**
+ * Ceiling on the boot-time `nix --version` probe.
+ *
+ * Short on purpose: this runs before the supervisor serves `/healthz`, so a slow answer
+ * delays the readiness probe. Treating a timeout as "no nix" is the safe direction — the
+ * runner advertises less than it can do rather than more.
+ */
+const PROBE_TIMEOUT_MS = 10_000;
 
 /**
  * Variables the supervisor owns, restored after a devShell has had its say.

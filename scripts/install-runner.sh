@@ -73,12 +73,14 @@ done
 command -v git >/dev/null || die "git is not on PATH"
 command -v node >/dev/null || die "node is not on PATH — 22.18 or newer is required"
 
-# A WARNING rather than a die: nothing here is broken without nix, the runner simply
-# inherits its own environment for every task, which is what it did before §8.1. Advertising
-# `nix` without having it is the real mistake — the runner would claim tasks it then parks.
+# `nix` does not need declaring — the supervisor probes for it at boot and advertises it
+# if it is there (DESIGN.md §8.1). Declaring it anyway is honoured, so this only warns
+# about the one combination that misleads: advertised here, absent from the machine, which
+# makes the runner claim tasks it can then only park.
 if [[ " $CAPABILITIES " == *"nix"* ]] && ! command -v nix >/dev/null; then
   note "WARNING: 'nix' is advertised but nix is not on PATH. This runner will claim tasks"
-  note "         that declare a toolchain and then park every one of them."
+  note "         that declare a toolchain and then park every one of them. You do not need"
+  note "         to list 'nix' at all — install it and the runner works it out at boot."
 fi
 
 node_ok=$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write(a>22||(a===22&&b>=18)?"yes":"no")')
