@@ -33,7 +33,7 @@ import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "../pl
 import { layer, materialise, relayer } from "../plan/materialize.ts";
 import type { Maintainer, PlanRevision, PlanSibling } from "../plan/maintain.ts";
 import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
-import { ToolchainError } from "../workspace/toolchain.ts";
+import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
@@ -91,6 +91,12 @@ export interface SupervisorDeps {
   readonly notifier: Notifier;
   readonly metrics: AgentMetrics;
   readonly logger: Logger;
+  /**
+   * The one environment resolver. Here as well as inside the runner and the verifier
+   * because the loop owns the only moment it is safe to collect the nix store: when this
+   * runner has no task in flight.
+   */
+  readonly toolchain: ToolchainResolver;
   /**
    * Tracker → task ingestion. Optional: a runner with no trackers configured, or one
    * fed only by hand-committed specs (§14.4), does not need it.
@@ -178,6 +184,12 @@ export class Supervisor {
 
       const claimed = await this.claimNext(await this.survey());
       if (claimed === undefined) {
+        // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
+        // volume so collecting is a requirement rather than hygiene, but a collection
+        // racing a session on this same runner is a risk with no upside — there is always
+        // another idle poll.
+        await this.deps.toolchain.maybeCollectGarbage();
+
         // Debug, not info: at the default poll interval this is the single noisiest
         // line the supervisor could emit, and an idle runner is not news.
         logger.debug("poll.idle", { pollSeconds: config.pollSeconds });

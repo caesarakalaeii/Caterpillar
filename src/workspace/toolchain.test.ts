@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, test } from "node:test";
 import type { ToolchainConfig } from "../config/types.ts";
 import { asTaskId, asWorkspaceName, type TaskSpec } from "../domain/task.ts";
@@ -201,6 +201,15 @@ test("a broken nix expression parks with nix's own error, not a bare exit code",
 // -------------------------------------------------------------------------------- cache
 
 /**
+ * A `/nix/store` path that really exists, when the test host has one.
+ *
+ * A cache hit is only honoured if the store paths it names are still on disk, so a made-up
+ * path would make every cache test a cache MISS. On NixOS this resolves to node's own
+ * store path; anywhere else (CI) it is a non-store path, which the check ignores.
+ */
+const LIVE_STORE_BIN = dirname(process.execPath);
+
+/**
  * Seed the on-disk cache so a resolve answers from it without invoking nix.
  *
  * This is how a runner behaves after a Keel roll: the environment was resolved by a
@@ -223,22 +232,22 @@ test("a cached environment is answered without invoking nix", async () => {
   const worktree = await scratch();
   const tasksDir = await scratch();
   await seedCache(tasksDir, worktree, "{ cached }", {
-    PATH: "/nix/store/fake/bin:/usr/bin",
-    LUA_PATH: "/nix/store/fake/share",
+    PATH: `${LIVE_STORE_BIN}:/usr/bin`,
+    LUA_PATH: "/nix/store/fake/share-not-on-PATH",
   });
 
   const resolved = await resolver({}, tasksDir).resolve(spec, worktree);
 
   // `{ cached }` is not a valid flake — reaching nix at all would have thrown.
   assert.equal(resolved.source, "flake.nix devShell");
-  assert.equal(resolved.env["PATH"], "/nix/store/fake/bin:/usr/bin");
-  assert.equal(resolved.env["LUA_PATH"], "/nix/store/fake/share");
+  assert.equal(resolved.env["PATH"], `${LIVE_STORE_BIN}:/usr/bin`);
+  assert.equal(resolved.env["LUA_PATH"], "/nix/store/fake/share-not-on-PATH");
 });
 
 test("editing the nix expression invalidates the cache", async () => {
   const worktree = await scratch();
   const tasksDir = await scratch();
-  await seedCache(tasksDir, worktree, "{ cached }", { PATH: "/nix/store/fake/bin" });
+  await seedCache(tasksDir, worktree, "{ cached }", { PATH: LIVE_STORE_BIN });
 
   // Same cache entry, different expression: the digest no longer matches, so the resolver
   // must go back to nix — which fails on this garbage, proving it went.
@@ -257,7 +266,7 @@ test("a devShell cannot move the credential helper or HOME", async () => {
   const worktree = await scratch();
   const tasksDir = await scratch();
   await seedCache(tasksDir, worktree, "{ hijack }", {
-    PATH: "/nix/store/fake/bin",
+    PATH: LIVE_STORE_BIN,
     CRED_HELPER: "/hijacked/helper",
     HOME: "/hijacked/home",
   });
@@ -267,9 +276,27 @@ test("a devShell cannot move the credential helper or HOME", async () => {
     tasksDir,
   ).resolve(spec, worktree);
 
-  assert.equal(resolved.env["PATH"], "/nix/store/fake/bin");
+  assert.equal(resolved.env["PATH"], LIVE_STORE_BIN);
   assert.equal(resolved.env["CRED_HELPER"], "/real/caterpillar-cred");
   assert.equal(resolved.env["HOME"], "/real/home");
+});
+
+test("a cache entry whose store paths are gone is a miss, not a broken PATH", async () => {
+  // The entry and the store it points into have different lifetimes: a garbage collection
+  // can take a path, and an ephemeral /nix inside the image is replaced on every deploy
+  // while env.json sits on the durable PVC. Trusting the entry would not fail loudly — it
+  // would hand the agent a PATH of directories that do not exist, which looks exactly like
+  // the missing toolchain this module exists to fix.
+  const worktree = await scratch();
+  const tasksDir = await scratch();
+  await seedCache(tasksDir, worktree, "{ collected }", {
+    PATH: "/nix/store/0000000000000000000000000000000-gone/bin",
+  });
+
+  await assert.rejects(
+    () => resolver({}, tasksDir).resolve(spec, worktree),
+    ToolchainError,
+  );
 });
 
 test("a reserved variable the supervisor does not set is removed, not inherited", async () => {
@@ -278,7 +305,7 @@ test("a reserved variable the supervisor does not set is removed, not inherited"
   const worktree = await scratch();
   const tasksDir = await scratch();
   await seedCache(tasksDir, worktree, "{ sneak }", {
-    PATH: "/nix/store/fake/bin",
+    PATH: LIVE_STORE_BIN,
     ANTHROPIC_API_KEY: "sk-not-yours",
   });
 

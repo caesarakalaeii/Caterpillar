@@ -470,6 +470,72 @@ claims it on its next poll, appends to the *same* journal, and hands back the sa
 
 Both runners share one narrative. The journal is the continuity, not the process.
 
+### 8.1 Toolchains are provisioned, not matched
+
+**A capability is a fact about a machine that cannot be provisioned** — a GPU, a USB
+device, game files already on disk, a human in the room. A toolchain is the opposite. It
+does not belong in `requires`, and this section records a decision that reverses an earlier
+one.
+
+The Dockerfile used to say that language toolchains "deliberately do NOT live here — that
+is what capability-matched runners are for (§8)". That was a promise §8 could not keep. The
+capability enum is closed, so `requires: [lua]` was refused at intake and no runner could
+have advertised it; opening the enum would not have helped either, because a task requiring
+a toolchain nobody had installed by hand would sit `ready` forever, claimable by nobody and
+looking from outside exactly like a stuck scheduler. Encoding a solvable problem as a claim
+predicate converts it into a deadlock.
+
+So a task's environment is BUILT, by nix, at the start of every session:
+
+```
+1. `toolchain:` in the issue's agent block     explicit, wins
+2. <repo>/flake.nix   devShell
+3. <repo>/shell.nix
+4. nothing                                     the runner's own environment
+```
+
+Most repos need no declaration. A repo that already describes a devShell for its human
+contributors gives the agent the same environment its tests were written in, which is a
+better answer than anything transcribed into a tracker issue — and it is versioned with the
+code, so a toolchain change arrives as a diff rather than as a red gate.
+
+**One capability is still added: `nix`** — "this runner can build a declared environment".
+One, not one per language. An *explicit* declaration implies it at intake, so a runner
+without nix never claims a task it could only park. A repo's own `flake.nix` does not imply
+it, because the repo is not checked out when intake runs; there, a runner without nix
+inherits its own environment, which is what every runner did before this existed.
+
+**The environment is resolved once per session and given to all four spawn sites** — the
+agent's bash tool, the review council, the plan maintainer and the acceptance gate. That is
+the load-bearing part, and it fixed a bug that predates nix: the agent got pi's fallback
+`sh -c` with the supervisor's environment while the verifier got a LOGIN `bash -lc` that
+sourced `/etc/profile` and `~/.profile`. A toolchain reachable from a shell profile was
+therefore visible to the gate and invisible to the agent that had to make it pass. The gate
+is only a gate if it runs what the agent ran.
+
+Consequences worth knowing before changing any of it:
+
+- **`print-dev-env --json` is parsed, not sourced.** Sourcing would execute repo-authored
+  shell in the supervisor's own process. The cost is that `shellHook` does not run, so a
+  repo that builds its PATH inside a hook needs an explicit `packages` list instead.
+- **The supervisor's own variables are re-asserted after the devShell has had its say.** A
+  devShell is repo-authored and must not be able to move `CRED_HELPER`, `CONFIG_PATH` or
+  `HOME`. Re-assertion rather than a denylist, because a denylist is a list of the things
+  somebody already thought of.
+- **`--profile` registers a GC root.** Without it a collection between two sessions of one
+  task deletes the environment the second session was about to use.
+- **The cache is keyed on `flake.lock` as well as the expression**, and it verifies that the
+  store paths it remembers still exist. `nix flake update` changes no character of the
+  expression and every version it resolves to; and `/nix` lives in the image rather than on
+  the PVC, so a deploy replaces the store while `env.json` on the PVC survives it. An
+  unverified hit would not fail loudly — it would hand the agent a PATH of directories that
+  are gone, which looks exactly like the missing toolchain this set out to fix.
+- **nixpkgs is pinned** for generated environments. An unattended agent picking up a silent
+  bump produces a red acceptance run with no diff to explain it.
+- **A toolchain that will not build parks the task**, naming nix's own error. Falling
+  through to the inherited environment would hand the agent a shell missing the exact tool
+  the task is about, and it would spend a session and a few dollars discovering that.
+
 ---
 
 ## 9. Credentials & security

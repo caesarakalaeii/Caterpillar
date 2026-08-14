@@ -177,6 +177,7 @@ const main = async (): Promise<void> => {
       metrics,
       toolchain,
     }),
+    toolchain,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.

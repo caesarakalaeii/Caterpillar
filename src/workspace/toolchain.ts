@@ -29,7 +29,7 @@
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskSpec, ToolchainSpec } from "../domain/task.ts";
 import type { ToolchainConfig } from "../config/types.ts";
@@ -103,6 +103,8 @@ export class ToolchainResolver {
   private readonly baseEnv: NodeJS.ProcessEnv;
   /** Memoised: the shell does not move while the process runs, and every task asks. */
   private shell: Promise<string> | undefined;
+  /** 0 until the first idle poll — see `maybeCollectGarbage`. */
+  private lastGcAt = 0;
 
   constructor(options: ToolchainResolverOptions) {
     this.logger = options.logger;
@@ -136,6 +138,48 @@ export class ToolchainResolver {
 
     const env = await this.materialise(spec, worktree, plan);
     return this.log(spec, { env, shell, source: plan.source });
+  }
+
+  /**
+   * Collect the nix store, if it is time and if there is a nix store to collect.
+   *
+   * Called from the supervisor's idle branch, never mid-session — see the call site.
+   * Best-effort in every direction: a runner with no nix has nothing to collect, and a
+   * collection that fails is a disk-space problem for later, not a reason to stop working
+   * tasks. It never throws.
+   *
+   * `--delete-older-than` rather than a size target, because the thing worth keeping is
+   * "whatever a task used recently" and that is what an age bound expresses. Environments
+   * belonging to live tasks are protected by the GC roots `print-dev-env --profile`
+   * registers, so this cannot collect out from under a task that is merely between
+   * sessions.
+   */
+  async maybeCollectGarbage(): Promise<void> {
+    const now = Date.now();
+    if (this.lastGcAt === 0) {
+      // The first idle poll only starts the clock. Stamping at construction instead would
+      // make a runner that is crash-looping every few minutes collect on every boot.
+      this.lastGcAt = now;
+      return;
+    }
+    if (now < this.lastGcAt + this.config.gcIntervalHours * 60 * 60 * 1000) return;
+    this.lastGcAt = now;
+
+    const args = ["--delete-older-than", `${this.config.gcKeepDays}d`];
+    const { code, stderr } = await run("nix-collect-garbage", args, {
+      env: this.baseEnv,
+      timeoutMs: this.config.timeoutSeconds * 1000,
+    });
+
+    if (code === 0) {
+      this.logger.info("toolchain.gc", { keepDays: this.config.gcKeepDays });
+    } else if (stderr === NOT_INSTALLED("nix-collect-garbage")) {
+      // A runner with no nix has no store to collect and is working as intended. At warn
+      // this would be a daily complaint about a deliberate configuration.
+      this.logger.debug("toolchain.gc-skipped", { reason: "nix is not installed" });
+    } else {
+      this.logger.warn("toolchain.gc-failed", { detail: tail(stderr) });
+    }
   }
 
   private log(spec: TaskSpec, resolved: ResolvedEnv): ResolvedEnv {
@@ -205,9 +249,17 @@ export class ToolchainResolver {
 
     const cachePath = join(scratch, "env.json");
     const cached = await readCache(cachePath, digest);
-    if (cached !== undefined) {
+    if (cached !== undefined && (await storePathsExist(cached))) {
       this.logger.debug("toolchain.cache-hit", { task: spec.id, source: plan.source });
       return this.merge(cached);
+    }
+    if (cached !== undefined) {
+      // The entry is for the right input and names store paths that are gone: a garbage
+      // collection took them, or the store is in the image rather than on the PVC and a
+      // deploy replaced it. Re-resolving is cheap and substitutes them back. Trusting the
+      // entry would not fail — it would hand the agent a PATH of directories that do not
+      // exist, which looks exactly like the missing toolchain this all exists to fix.
+      this.logger.info("toolchain.cache-stale", { task: spec.id, source: plan.source });
     }
 
     const flakeRef = await this.flakeRef(scratch, worktree, plan);
@@ -423,6 +475,16 @@ const RESERVED: readonly string[] = [
   "ANTHROPIC_API_KEY",
 ];
 
+/**
+ * The one message `run` produces itself rather than relaying.
+ *
+ * A named constant because two callers have to agree on it: `printDevEnv` reports it as a
+ * park reason, and `maybeCollectGarbage` recognises it to stay quiet on a runner that
+ * deliberately has no nix.
+ */
+const NOT_INSTALLED = (command: string): string =>
+  `${command} is not installed on this runner`;
+
 /** Enough stderr to diagnose a nix failure, not enough to bury a Discord message. */
 const tail = (output: string): string => output.trim().slice(-2000);
 
@@ -472,12 +534,37 @@ const run = (
         // is a runner change and not a repo change.
         const detail =
           error !== null && "code" in error && error.code === "ENOENT"
-            ? `${command} is not installed on this runner`
+            ? NOT_INSTALLED(command)
             : stderr;
         resolve({ code, stdout, stderr: detail });
       },
     );
   });
+
+/**
+ * Are the store paths this entry names still on disk?
+ *
+ * A cache entry and the store it points into have different lifetimes, and nothing keeps
+ * them in step: `nix-collect-garbage` can take a path, and an ephemeral `/nix` inside the
+ * image is replaced on every deploy while `env.json` sits on the durable PVC. Only the
+ * PATH entries are checked — they are what a missing tool actually shows up as, and
+ * stat-ing every variable in a devShell would cost more than the resolve it is avoiding.
+ */
+const storePathsExist = async (variables: Record<string, string>): Promise<boolean> => {
+  const entries = (variables["PATH"] ?? "")
+    .split(":")
+    .filter((entry) => entry.startsWith("/nix/store/"));
+  if (entries.length === 0) return true;
+
+  for (const entry of entries) {
+    try {
+      await access(entry);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+};
 
 /** A cache entry, or undefined if it is missing, unreadable, or for a different input. */
 const readCache = async (
