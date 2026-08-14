@@ -19,6 +19,8 @@ export interface PromptParts {
   readonly answer?: string;
   /** Note about an interrupted previous session, if recovering. */
   readonly recoveryNote?: string;
+  /** Files left by the tasks this one is blocked by (DESIGN.md §17). */
+  readonly artifacts?: string;
 }
 
 export const SYSTEM_PROMPT = `You are a long-running autonomous coding agent.
@@ -130,6 +132,7 @@ export const buildPrompt = (parts: PromptParts): string => {
 
   const body = [
     section("Recovery note", parts.recoveryNote),
+    section("Artifacts from upstream tasks", parts.artifacts),
     section("Answer from the operator", parts.answer),
     section("Journal so far", parts.journal),
     section("Handoff from the previous session", parts.handoff),

@@ -1187,3 +1187,71 @@ Three things hold the line, and all three are needed:
 `engines.node` is `>=22.18` because 22.18 is the first release that strips types without
 a flag. The container image is unaffected either way: it runs compiled JavaScript from
 `dist/`, and never strips anything.
+
+---
+
+## 17. Artifacts
+
+`artifacts/` has been in the §4.1 layout since the beginning and never had a meaning. It
+gets one here, because capability matching created the need: once a task can run on the
+machine with the game files (§8), its *conclusions* have to reach the tasks that follow it
+on a different machine.
+
+The first thing this design does is refuse most of the problem.
+
+**Inputs never move.** A game install, a USB device, a display, a human — these are the
+reason §8 exists. A task that needs them declares `requires`, and the agent runs where they
+already are. Nothing is transferred, nothing is copied, and the question of how to move
+forty gigabytes of extracted assets never arises because the answer is "don't".
+
+**Only derived outputs travel**, and the useful ones are small: a manifest of which
+sublevels contain what, a probe result, a verdict, a golden file, a log tail. Those go in
+the state repo, in the directory §4.1 already reserved for them:
+
+```
+tasks/<TASK-ID>/artifacts/<name>
+```
+
+Written by a supervisor-mediated `publish_artifact`, because the agent cannot write the
+state repo (§9.3) — the same reason `open_pr` is a tool. Capped at **1 MiB per artifact and
+10 per task**, and the cap is the design rather than a safety net: every runner clones this
+repo and pulls it on every poll, git history keeps whatever lands there forever, and §15
+already worries about transcript bloat for exactly this reason. An agent that hits the cap
+is told to summarise, which is almost always what was wanted.
+
+**Artifacts flow along `blockedBy` edges.** A task's declared blockers are precisely its
+upstream, so before a session starts the supervisor stages their artifacts where the agent
+can read them, and says so in the prompt. No new tool to read one — `read` and `bash`
+already work on a file. This reuses the dependency graph a plan already carries (§14.3),
+which means the plan agent controls artifact flow by declaring dependencies, and there is
+no second, parallel notion of "which task feeds which".
+
+### 17.1 Large artifacts — designed, not built
+
+A pak, an extracted asset tree, a `.usmap`: megabytes to gigabytes, and derived from a
+commercial game, so **not redistributable**. That rules out a public release asset and
+rules out anything the bytes of which end up in git.
+
+The seam is a **pointer**. `publish_artifact` on something over the cap writes
+`artifacts/<name>.json` instead of the bytes:
+
+```json
+{ "store": "minio", "bucket": "caterpillar", "key": "TASK-123/probe.pak",
+  "sha256": "…", "bytes": 41234567, "at": "2026-08-14T12:00:00Z" }
+```
+
+Git keeps the pointer, so git stays authoritative about what exists and which task produced
+it; the store keeps only bytes, and can be replaced without touching a task. Staging
+verifies the `sha256` before handing a file to an agent — a store is a cache, and a cache
+that can lie about its contents is worse than no cache.
+
+The store would be **MinIO, the `pgsty/minio` community fork** — MinIO's own repository went
+read-only and the console was stripped from the OSS line in May 2025; the fork keeps AGPL-3.0
+with CVE backports. Private bucket, no public ingress: the dedicated machine already reaches
+the cluster over wireguard for the LLM proxy (§3), and an artifact store belongs on that same
+path rather than on the internet. One new secret (`caterpillar-artifacts`), and the agent
+never holds it — uploads and downloads are supervisor-mediated exactly like the small path.
+
+None of §17.1 is implemented. It is written down because the pointer format is the part that
+has to be decided before anything depends on it, and because the honest answer to "where do
+the game dumps go" is currently "nowhere, and they should not need to".

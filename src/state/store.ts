@@ -36,6 +36,20 @@ import {
 
 const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
+/** Caps on `artifacts/` (DESIGN.md §17). Deliberately small — see the comment there. */
+export const ARTIFACT_BYTES = 1024 * 1024;
+export const ARTIFACT_COUNT = 10;
+
+/**
+ * An artifact name is a single path segment inside the task directory, chosen by an
+ * AGENT. No separators, no dots that could climb out — the same reasoning as a task id,
+ * and here the input is model-authored rather than merely human-authored.
+ */
+const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+export const isArtifactName = (name: string): boolean =>
+  ARTIFACT_NAME.test(name) && !name.includes("..");
+
 export class SpecParseError extends Error {
   constructor(task: TaskId, detail: string) {
     super(`spec.md for ${task} is invalid: ${detail}`);
@@ -388,6 +402,49 @@ export class StateStore {
     const last = verdicts.at(-1);
     if (last === undefined) return undefined;
     return readFile(join(dir, last), "utf8");
+  }
+
+  /**
+   * Store one small artifact for a task (DESIGN.md §17).
+   *
+   * The caps are the design, not a safety net: every runner clones this repo and pulls it
+   * on every poll, and git keeps whatever lands here forever. An agent that hits one is
+   * told to summarise, which is nearly always what was wanted anyway.
+   */
+  async writeArtifact(task: TaskId, name: string, contents: Buffer): Promise<void> {
+    if (!isArtifactName(name)) {
+      throw new Error(
+        `'${name}' is not a usable artifact name — letters, digits, dot, dash, underscore`,
+      );
+    }
+    if (contents.byteLength > ARTIFACT_BYTES) {
+      throw new Error(
+        `'${name}' is ${contents.byteLength} bytes; the limit is ${ARTIFACT_BYTES}`,
+      );
+    }
+
+    const dir = join(this.taskDir(task), "artifacts");
+    await mkdir(dir, { recursive: true });
+
+    const existing = await this.listArtifacts(task);
+    if (!existing.includes(name) && existing.length >= ARTIFACT_COUNT) {
+      throw new Error(`${task} already has ${existing.length} artifacts; the limit is ${ARTIFACT_COUNT}`);
+    }
+
+    await writeFile(join(dir, name), contents);
+  }
+
+  async listArtifacts(task: TaskId): Promise<readonly string[]> {
+    const dir = join(this.taskDir(task), "artifacts");
+    if (!existsSync(dir)) return [];
+    return (await readdir(dir)).sort();
+  }
+
+  async readArtifact(task: TaskId, name: string): Promise<Buffer | undefined> {
+    if (!isArtifactName(name)) return undefined;
+    const path = join(this.taskDir(task), "artifacts", name);
+    if (!existsSync(path)) return undefined;
+    return readFile(path);
   }
 
   async readAnswer(task: TaskId, index: number): Promise<string | undefined> {
