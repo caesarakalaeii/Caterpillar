@@ -15,10 +15,12 @@ import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
-import { parseCommand } from "./notify/commands.ts";
+import { BotNotifier, DiscordBot } from "./notify/bot.ts";
+import { DiscordBridge } from "./notify/bridge.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
-import { DiscordGateway, postMessage } from "./notify/gateway.ts";
-import { AnswerInbox, type AnswerOutcome } from "./supervisor/inbox.ts";
+import { DiscordGateway } from "./notify/gateway.ts";
+import { ChatInbox } from "./supervisor/inbox.ts";
+import { TaskSnapshot } from "./supervisor/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import { loadForgeFactory, loadStateCredentials, loadTracker, SecretBundle } from "./secrets/load.ts";
 import { ensureStateCheckout } from "./state/bootstrap.ts";
@@ -119,7 +121,9 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
-  const inbox = new AnswerInbox();
+  const inbox = new ChatInbox();
+  const snapshot = new TaskSnapshot();
+  const discord = await loadDiscord(config.secretsDir, logger);
 
   const supervisor = new Supervisor({
     config,
@@ -143,8 +147,9 @@ const main = async (): Promise<void> => {
     }),
     verifier: new AcceptanceVerifier({ worktrees, bindings }),
     progress: new GitProgressProbe({ worktrees }),
-    notifier: await createNotifier(config.secretsDir),
+    notifier: discord.notifier,
     inbox,
+    snapshot,
     metrics,
     logger,
     trackers,
@@ -168,17 +173,16 @@ const main = async (): Promise<void> => {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 
-  // The bridge runs ALONGSIDE the loop, not inside it: a websocket that waits on a
-  // session would deliver nothing for hours. It hands work to the supervisor through
-  // the inbox, which is the only thing that touches the state repo.
-  //
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
-  const bridge = startBridge(config.secretsDir, inbox, logger, controller.signal).catch(
-    (error: unknown) => {
-      logger.error("bridge.failed", errorFields(error));
-    },
-  );
+  const bridge =
+    discord.bot === undefined
+      ? Promise.resolve()
+      : runBridge(discord.bot, inbox, snapshot, logger, controller.signal).catch(
+          (error: unknown) => {
+            logger.error("bridge.failed", errorFields(error));
+          },
+        );
 
   try {
     await supervisor.run(controller.signal);
@@ -190,75 +194,64 @@ const main = async (): Promise<void> => {
 };
 
 /**
- * The inbound bridge (DESIGN.md §7). Optional, and independent of the webhook: a bot
- * token alone gives commands AND replies, because the bot answers as itself.
+ * Resolve the Discord transports from the mounted secret. Every key is optional and a
+ * missing one costs a capability, never a boot.
  *
- * Needs `bot-token` and `channel-id` in the mounted secret. Without both, a question
- * still parks and waits — it is answered by committing the file by hand.
+ * The notifier PREFERS the bot over the webhook wherever both exist, which reverses the
+ * order §11.2 shipped with. The reason is not aesthetic: Discord refuses interactive
+ * components from a webhook the application does not own, and `webhook-url` is a webhook
+ * created in the channel's settings. A question notification with an Answer button on it
+ * can therefore only be sent by the bot. The webhook remains the fallback for a runner
+ * with no bot token, and there it still renders the typed `!answer` instruction instead.
+ *
+ * That the bot now posts the notifications it also reads is safe for the same reason it
+ * always was: the gateway drops `author.bot` messages (`gateway.ts`), a guard that was
+ * written for the webhook's `!answer` hint and now carries the bot's own output too.
  */
-const startBridge = async (
+const loadDiscord = async (
   secretsDir: string,
-  inbox: AnswerInbox,
   logger: Logger,
-  signal: AbortSignal,
-): Promise<void> => {
+): Promise<{ readonly bot?: DiscordBot; readonly notifier: Notifier }> => {
   const bundle = new SecretBundle(secretsDir, "caterpillar-discord");
   const token = await bundle.readOptional("bot-token").catch(() => undefined);
   const channelId = await bundle.readOptional("channel-id").catch(() => undefined);
+  const webhookUrl = await bundle.readOptional("webhook-url").catch(() => undefined);
 
   if (token === undefined || channelId === undefined) {
     logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
-    return;
+    return {
+      notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
+    };
   }
 
-  const reply = async (content: string): Promise<void> => {
-    await postMessage({ token, channelId, content }).catch((error: unknown) => {
-      logger.warn("bridge.reply-failed", errorFields(error));
-    });
-  };
+  const bot = new DiscordBot({ token, channelId });
+  return { bot, notifier: new BotNotifier(bot) };
+};
 
-  const gateway = new DiscordGateway({
-    token,
-    channelId,
+/**
+ * The inbound bridge (DESIGN.md §7).
+ *
+ * Runs alongside the loop, never inside it: a websocket that waits on a session would
+ * deliver nothing for hours. It hands work to the supervisor through the inbox, which is
+ * the only thing that touches the state repo, and answers reads from the snapshot, which
+ * touches nothing at all.
+ */
+const runBridge = (
+  bot: DiscordBot,
+  inbox: ChatInbox,
+  snapshot: TaskSnapshot,
+  logger: Logger,
+  signal: AbortSignal,
+): Promise<void> => {
+  const bridge = new DiscordBridge({ bot, inbox, snapshot, logger });
+
+  return new DiscordGateway({
+    token: bot.token,
+    channelId: bot.channelId,
     logger,
-    onMessage: async (content, author) => {
-      const command = parseCommand(content);
-      if (command === undefined) return;
-
-      if (command.kind === "malformed") {
-        await reply(command.reason);
-        return;
-      }
-
-      logger.info("bridge.answer", { task: command.task, author });
-      await reply(describe(command.task, await inbox.submit(command.task, command.text)));
-    },
-  });
-
-  return gateway.run(signal);
-};
-
-/** What to tell the human. Silence would leave them unable to tell a typo from an outage. */
-const describe = (task: string, outcome: AnswerOutcome): string => {
-  switch (outcome.kind) {
-    case "applied":
-      return `Answered **${task}** (question ${outcome.index}). It is \`ready\` and will be claimed on the next poll.`;
-    case "unknown-task":
-      return `No task **${task}** in the state repo. Check the id from its notification.`;
-    case "not-waiting":
-      return `**${task}** is \`${outcome.status}\`, not waiting on an answer — nothing was written.`;
-    case "failed":
-      return `Could not answer **${task}**: ${outcome.error}`;
-  }
-};
-
-/** Discord is optional: without a webhook the supervisor runs silently. */
-const createNotifier = async (secretsDir: string): Promise<Notifier> => {
-  const webhookUrl = await new SecretBundle(secretsDir, "caterpillar-discord")
-    .readOptional("webhook-url")
-    .catch(() => undefined);
-
-  return webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl });
+    onMessage: (content, author) => bridge.handleMessage(content, author),
+    onInteraction: (interaction) => bridge.handleInteraction(interaction),
+  }).run(signal);
 };
 
 main().catch((error: unknown) => {

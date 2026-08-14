@@ -19,6 +19,16 @@ export const asRunnerId = (value: string): RunnerId => value as RunnerId;
 export const asWorkspaceName = (value: string): WorkspaceName => value as WorkspaceName;
 
 /**
+ * A task id is a directory name under `tasks/`, so anything that is not one of these
+ * characters could escape the task tree. Every id arriving from outside the state repo —
+ * a chat command, a button's `custom_id`, a slash-command option — is checked with this
+ * before it reaches the store.
+ */
+const TASK_ID = /^[A-Za-z0-9._-]+$/;
+
+export const isTaskId = (value: string): value is TaskId => TASK_ID.test(value);
+
+/**
  * A capability a runner advertises and a task may require. Claiming requires
  * `task.requires ⊆ runner.capabilities` (DESIGN.md §8).
  */

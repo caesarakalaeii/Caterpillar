@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { Git } from "../state/git.ts";
-import { asTaskId, type RepoRef } from "../domain/task.ts";
+import type { RepoRef } from "../domain/task.ts";
 import { WorktreeManager } from "./worktree.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };

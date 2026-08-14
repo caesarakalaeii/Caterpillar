@@ -20,8 +20,8 @@
  *   - the bot reads the channel it also POSTS to. Its own notifications end with a
  *     literal "!answer …" hint, so ignoring bots and webhooks is not optional.
  */
-import { messagePayload } from "./discord.ts";
 import type { Logger } from "../obs/log.ts";
+import type { Interaction } from "./interactions.ts";
 
 /** Injection seam for tests. Production uses the global WebSocket. */
 export type SocketLike = {
@@ -38,6 +38,18 @@ export interface GatewayOptions {
   /** Only messages here are read. Everything else in the guild is ignored. */
   readonly channelId: string;
   readonly onMessage: (content: string, author: string) => Promise<void>;
+  /**
+   * Slash commands, buttons and modal submissions.
+   *
+   * Delivered over this same socket because the application has no Interactions
+   * Endpoint URL — the two delivery methods are mutually exclusive, and an endpoint
+   * would have cost the outward-only property this whole file exists to preserve.
+   *
+   * Unlike a message, an interaction is NOT filtered here. Dropping one silently shows
+   * the person who clicked a permanent "This interaction failed", so the decision about
+   * whether it is ours belongs where a reply can still be sent.
+   */
+  readonly onInteraction?: (interaction: Interaction) => Promise<void>;
   readonly logger: Logger;
   readonly socket?: SocketFactory;
   /** Seam for tests; production waits for real. */
@@ -246,7 +258,19 @@ export class DiscordGateway {
   }
 
   private dispatch(payload: Payload): void {
-    const { logger, channelId, onMessage } = this.options;
+    const { logger, channelId, onMessage, onInteraction } = this.options;
+
+    if (payload.t === "INTERACTION_CREATE") {
+      if (onInteraction === undefined) return;
+      const interaction = payload.d as Interaction;
+      void onInteraction(interaction).catch((error: unknown) => {
+        logger.error("gateway.interaction-failed", {
+          type: interaction.type,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
 
     if (payload.t === "READY") {
       const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
@@ -277,34 +301,3 @@ export class DiscordGateway {
     });
   }
 }
-
-/**
- * Reply in the channel AS THE BOT, over the REST API.
- *
- * Deliberately not the webhook: a bridge that can read commands should be able to
- * answer them without a second secret, and a reply that arrives under the bot's own
- * name is the one a human expects. It also keeps the two halves independent — an
- * unsealed webhook costs notifications, not replies.
- */
-export const postMessage = async (options: {
-  readonly token: string;
-  readonly channelId: string;
-  readonly content: string;
-  readonly fetch?: (input: string, init?: RequestInit) => Promise<Response>;
-}): Promise<void> => {
-  const http = options.fetch ?? ((input, init) => fetch(input, init));
-  const response = await http(`https://discord.com/api/v10/channels/${options.channelId}/messages`, {
-    method: "POST",
-    headers: {
-      authorization: `Bot ${options.token}`,
-      "content-type": "application/json",
-    },
-    body: messagePayload(options.content),
-  });
-
-  if (!response.ok) {
-    // Status and body only. The token is a header here, but an error body is echoed
-    // into logs and must not be assumed clean.
-    throw new Error(`Discord reply failed with ${response.status}: ${(await response.text()).slice(0, 200)}`);
-  }
-};

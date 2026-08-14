@@ -29,8 +29,15 @@ import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
-import type { AnswerInbox } from "./inbox.ts";
+import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
+import { summarise, type TaskSnapshot } from "./snapshot.ts";
+
+/** One task's state as read by a single sweep of the task tree. */
+interface TaskRecord {
+  readonly id: TaskId;
+  readonly state: TaskState;
+}
 
 export interface SessionRunner {
   /** Runs one session and returns why it stopped. Never mutates task state. */
@@ -74,10 +81,15 @@ export interface SupervisorDeps {
    */
   readonly intake?: Intake;
   /**
-   * Answers arriving from the inbound Discord bridge (§7). Optional: without a bridge
+   * Requests arriving from the inbound Discord bridge (§7). Optional: without a bridge
    * a question is answered by committing the file by hand.
    */
-  readonly inbox?: AnswerInbox;
+  readonly inbox?: ChatInbox;
+  /**
+   * In-memory view of every task, refreshed once per poll for the chat interface.
+   * Optional: nothing in the loop reads it, and without a bridge nothing needs it.
+   */
+  readonly snapshot?: TaskSnapshot;
   /**
    * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
    * Optional: a workspace without a tracker is a supported configuration.
@@ -110,10 +122,10 @@ export class Supervisor {
 
       // Both before claiming, so a task unparked by either is claimable on this same
       // iteration rather than sitting idle until the next poll.
-      await this.applyAnswers();
+      await this.applyChatRequests();
       await this.maybeIngest();
 
-      const claimed = await this.claimNext();
+      const claimed = await this.claimNext(await this.survey());
       if (claimed === undefined) {
         // Debug, not info: at the default poll interval this is the single noisiest
         // line the supervisor could emit, and an idle runner is not news.
@@ -177,13 +189,38 @@ export class Supervisor {
     }
   }
 
-  /** First claimable task whose requirements this runner satisfies. */
-  private async claimNext(): Promise<{ readonly lease: Lease; readonly spec: TaskSpec } | undefined> {
-    const { store, leases, config } = this.deps;
+  /**
+   * Read every task's state once, and publish the result to the chat snapshot.
+   *
+   * One pass serves both readers. Claiming already had to read every state to find a
+   * `ready` one, so the snapshot rides along for free rather than costing a second
+   * sweep of the task tree on every poll.
+   *
+   * A state that fails to parse is skipped rather than fatal — it is one task the
+   * runner cannot see, not a runner that cannot run.
+   */
+  private async survey(): Promise<readonly TaskRecord[]> {
+    const { store, snapshot } = this.deps;
 
+    const records: TaskRecord[] = [];
     for (const id of await store.listTasks()) {
       const state = await store.readState(id).catch(() => undefined);
-      if (state === undefined || state.status !== "ready") continue;
+      if (state === undefined) continue;
+      records.push({ id, state });
+    }
+
+    snapshot?.replace(records.map((record) => summarise(record.state)));
+    return records;
+  }
+
+  /** First claimable task whose requirements this runner satisfies. */
+  private async claimNext(
+    records: readonly TaskRecord[],
+  ): Promise<{ readonly lease: Lease; readonly spec: TaskSpec } | undefined> {
+    const { store, leases, config } = this.deps;
+
+    for (const { id, state } of records) {
+      if (state.status !== "ready") continue;
       if (!capabilitiesSatisfy(config.capabilities, state.requires)) continue;
 
       const spec = await store.readSpec(id).catch(() => undefined);
@@ -478,65 +515,101 @@ export class Supervisor {
   }
 
   /**
-   * Apply answers submitted by the inbound bridge (DESIGN.md §7).
+   * Apply requests submitted by the inbound bridge (DESIGN.md §7).
    *
    * Runs HERE, on the loop's thread of control, because the loop owns the state repo —
    * a websocket handler writing it concurrently would interleave git invocations in one
    * working copy. Each request is settled with what actually happened, so the human who
-   * typed it gets told rather than guessing from silence.
+   * typed or clicked it gets told rather than guessing from silence.
    */
-  private async applyAnswers(): Promise<void> {
-    const { store, config, logger, inbox } = this.deps;
+  private async applyChatRequests(): Promise<void> {
+    const { logger, inbox } = this.deps;
     if (inbox === undefined) return;
 
     for (const request of inbox.drain()) {
       try {
-        const state = await store.tryReadState(request.task);
-        if (state === undefined) {
-          request.settle({ kind: "unknown-task" });
-          continue;
-        }
-        if (state.status !== "awaiting-human") {
-          request.settle({ kind: "not-waiting", status: state.status });
-          continue;
-        }
-
-        const pending = await store.pendingQuestion(request.task);
-        if (pending === undefined) {
-          // `awaiting-human` with nothing unanswered is a state repo someone edited by
-          // hand. Refusing beats inventing an index and burying the answer.
-          request.settle({ kind: "not-waiting", status: state.status });
-          continue;
-        }
-
-        await store.writeAnswer(request.task, pending.index, request.text);
-        await store.appendJournal(
-          request.task,
-          state.sessions,
-          `**Answer from the operator:**\n\n${request.text}`,
+        request.settle(
+          request.kind === "answer" ? await this.applyAnswer(request) : await this.applyPark(request),
         );
-        await store.writeState({
-          ...state,
-          status: "ready",
-          // The streak that made the task park is not the next session's fault, and a
-          // task resumed at the limit parks again on the very next claim without ever
-          // running. Answering IS the progress.
-          progress: { ...state.progress, noProgressStreak: 0 },
-        });
-        await store.commitAndPush(
-          `chore(${request.task}): answered question ${pending.index}`,
-          "origin",
-          config.stateRepo.branch,
-        );
-
-        logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
-        request.settle({ kind: "applied", index: pending.index });
       } catch (error) {
-        // Never fatal: a state repo that rejects one answer must not stop the runner
+        // Never fatal: a state repo that rejects one request must not stop the runner
         // from working every other task.
-        logger.error("answer.failed", { task: request.task, ...errorFields(error) });
+        logger.error("chat.failed", { task: request.task, kind: request.kind, ...errorFields(error) });
         request.settle({ kind: "failed", error: error instanceof Error ? error.message : String(error) });
       }
+    }
+  }
+
+  private async applyAnswer(request: ChatRequest & { readonly kind: "answer" }): Promise<ChatOutcome> {
+    const { store, config, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.status !== "awaiting-human") return { kind: "not-waiting", status: state.status };
+
+    const pending = await store.pendingQuestion(request.task);
+    if (pending === undefined) {
+      // `awaiting-human` with nothing unanswered is a state repo someone edited by
+      // hand. Refusing beats inventing an index and burying the answer.
+      return { kind: "not-waiting", status: state.status };
+    }
+
+    await store.writeAnswer(request.task, pending.index, request.text);
+    await store.appendJournal(
+      request.task,
+      state.sessions,
+      `**Answer from the operator:**\n\n${request.text}`,
+    );
+    await store.writeState({
+      ...state,
+      status: "ready",
+      // The streak that made the task park is not the next session's fault, and a
+      // task resumed at the limit parks again on the very next claim without ever
+      // running. Answering IS the progress.
+      progress: { ...state.progress, noProgressStreak: 0 },
+    });
+    await store.commitAndPush(
+      `chore(${request.task}): answered question ${pending.index}`,
+      "origin",
+      config.stateRepo.branch,
+    );
+
+    logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
+    return { kind: "applied", index: pending.index };
+  }
+
+  /**
+   * Park a task on request — `/cancel`.
+   *
+   * A RUNNING task is refused rather than interrupted. Its lease is held by whichever
+   * runner is working it, possibly on another machine, and the drain happens between
+   * tasks rather than during one: there is no point at which this could stop a session
+   * mid-turn. Refusing says so; pretending to cancel would leave the task running and
+   * the human believing it was not.
+   *
+   * The lease is taken for the write and released immediately, because every push
+   * verifies ownership first (§5.1) and this one is no exception.
+   */
+  private async applyPark(request: ChatRequest & { readonly kind: "park" }): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (isTerminal(state.status)) return { kind: "not-parkable", status: state.status };
+
+    const lease = await leases.claim(request.task);
+    // Unclaimable means another runner holds it — which is what `running` looks like
+    // from here, and the one case where the stored status may already be stale.
+    if (lease === undefined) return { kind: "not-parkable", status: "running" };
+
+    try {
+      await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
+      await this.transition(lease, state, "parked");
+      await this.push(lease, `chore(${request.task}): parked from chat`);
+      logger.info("task.cancelled", { task: request.task, previous: state.status });
+      return { kind: "parked" };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
     }
   }
 

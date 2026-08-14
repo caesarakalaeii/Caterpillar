@@ -26,7 +26,7 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
-import { AnswerInbox } from "./inbox.ts";
+import { ChatInbox } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -294,7 +294,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
   await store.writeState(parked);
   await store.commitAndPush(`chore(${ANSWERED}): awaiting human`, "origin", "main");
 
-  const inbox = new AnswerInbox();
+  const inbox = new ChatInbox();
   const runner: SessionRunner = {
     // Claiming it is proof enough that the answer took effect; the session itself is
     // not what this test is about.
@@ -323,7 +323,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
-  const outcome = await inbox.submit(ANSWERED, "Use the existing migration path.");
+  const outcome = await inbox.submit({ kind: "answer", task: ANSWERED, text: "Use the existing migration path." });
 
   controller.abort();
   await running.catch(() => undefined);
@@ -347,7 +347,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
 });
 
 test("an answer for a task that is not waiting is refused, not written", async () => {
-  const inbox = new AnswerInbox();
+  const inbox = new ChatInbox();
   const store = new StateStore(statePath, stateGit);
   const supervisor = new Supervisor({
     config,
@@ -375,8 +375,8 @@ test("an answer for a task that is not waiting is refused, not written", async (
 
   // TASK is `parked` from the first test in this file — a real state, and not one an
   // answer may resurrect: nothing asked a question.
-  const outcome = await inbox.submit(TASK, "please continue");
-  const unknown = await inbox.submit(asTaskId("NO-SUCH-TASK"), "hello?");
+  const outcome = await inbox.submit({ kind: "answer", task: TASK, text: "please continue" });
+  const unknown = await inbox.submit({ kind: "answer", task: asTaskId("NO-SUCH-TASK"), text: "hello?" });
 
   controller.abort();
   await running.catch(() => undefined);
