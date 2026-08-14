@@ -22,6 +22,7 @@ import {
   renderParts,
 } from "./discord.ts";
 import { type FetchLike, postJson } from "./http.ts";
+import type { ThreadIndex } from "./threads.ts";
 
 export const API_BASE = "https://discord.com/api/v10";
 
@@ -121,15 +122,57 @@ export class DiscordBot {
     return body.id;
   }
 
-  private post(path: string, body: string, what: string): Promise<Response> {
+  /**
+   * Archive a thread — Discord's "this conversation is over".
+   *
+   * Not deletion: deleting needs Manage Threads, which this bot deliberately does not
+   * have, and an archived thread keeps its history where a deleted one loses the
+   * refinement that produced a plan. Posting in an archived thread un-archives it, so
+   * this closes a conversation without locking anyone out of it.
+   */
+  async archiveThread(threadId: string): Promise<void> {
+    await this.post(`/channels/${threadId}`, JSON.stringify({ archived: true }), "thread archive", "PATCH");
+  }
+
+  private post(path: string, body: string, what: string, method = "POST"): Promise<Response> {
     return postJson({
       url: `${this.apiBase}${path}`,
       body,
       what,
+      method,
       headers: { authorization: `Bot ${this.options.token}` },
       ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
       ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
     });
+  }
+}
+
+/**
+ * Ends a thread's conversation. See DESIGN.md §14.3.
+ *
+ * Order matters: say why FIRST, then archive. An archived thread that just stops, with
+ * no last word, reads as the bot having died rather than having finished.
+ */
+export interface ThreadCloser {
+  close(threadId: string, note: string): Promise<void>;
+}
+
+export class BotThreadCloser implements ThreadCloser {
+  private readonly bot: DiscordBot;
+  private readonly index: ThreadIndex;
+
+  constructor(bot: DiscordBot, index: ThreadIndex) {
+    this.bot = bot;
+    this.index = index;
+  }
+
+  /** Never throws: a task is parked in git before this runs, and git is what counts. */
+  async close(threadId: string, note: string): Promise<void> {
+    // Unbound first, so a message racing the archive is dropped rather than queued as an
+    // answer to a task that has just been parked.
+    this.index.unbind(threadId);
+    await this.bot.postMessage({ content: note, channelId: threadId }).catch(() => undefined);
+    await this.bot.archiveThread(threadId).catch(() => undefined);
   }
 }
 

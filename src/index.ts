@@ -9,15 +9,15 @@ import { createServer } from "node:http";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
 import { CredentialService } from "./credential/service.ts";
-import { asRunnerId, type TaskId, type WorkspaceName } from "./domain/task.ts";
+import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
-import { BotNotifier, BotPresence, DiscordBot } from "./notify/bot.ts";
+import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
-import { ThreadIndex } from "./notify/threads.ts";
+import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { ChatInbox } from "./supervisor/inbox.ts";
@@ -173,7 +173,12 @@ const main = async (): Promise<void> => {
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger }),
     reviewers,
     threads,
-    ...(discord.bot === undefined ? {} : { presence: new BotPresence(discord.bot) }),
+    ...(discord.bot === undefined
+      ? {}
+      : {
+          presence: new BotPresence(discord.bot),
+          closer: new BotThreadCloser(discord.bot, threads),
+        }),
     notifier: discord.notifier,
     inbox,
     snapshot,
@@ -239,11 +244,17 @@ const hydrateThreads = async (
   threads: ThreadIndex,
   logger: Logger,
 ): Promise<void> => {
-  const entries: (readonly [string, TaskId])[] = [];
+  const owners: ThreadOwner[] = [];
   for (const id of await store.listTasks()) {
     const state = await store.readState(id).catch(() => undefined);
-    if (state?.chat !== undefined) entries.push([state.chat.threadId, id] as const);
+    if (state === undefined) continue;
+    owners.push({
+      id,
+      status: state.status,
+      ...(state.chat === undefined ? {} : { threadId: state.chat.threadId }),
+    });
   }
+  const entries = threadBindings(owners);
   threads.replace(entries);
   logger.info("threads.hydrated", { count: entries.length });
 };
