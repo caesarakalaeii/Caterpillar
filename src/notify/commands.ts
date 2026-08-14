@@ -30,6 +30,14 @@ export type Command =
   | { readonly kind: "park"; readonly task: TaskId }
   /** Approve and merge a task's PR despite the council (DESIGN.md §12.1). */
   | { readonly kind: "merge"; readonly task: TaskId }
+  /**
+   * Open a refinement conversation (DESIGN.md §14.3).
+   *
+   * Carries no task id: it CREATES one, in a thread that does not exist until the bridge
+   * has opened it. That is why it is the one command the bridge does IO for before the
+   * loop ever sees it.
+   */
+  | { readonly kind: "brainstorm"; readonly topic: string; readonly repo: string }
   /** Recognised prefix, unusable content — worth replying to rather than ignoring. */
   | { readonly kind: "malformed"; readonly reason: string };
 
@@ -41,7 +49,7 @@ export const HELP = "Usage: `!answer <task-id> <your answer>` — or use `/answe
  * Returns undefined for "not for us", which is the overwhelmingly common case: this
  * runs on every message in the channel, including the supervisor's own notifications.
  */
-export const parseCommand = (content: string): Command | undefined => {
+export const parseCommand = (content: string, thread?: TaskId): Command | undefined => {
   const trimmed = content.trim();
   if (!trimmed.startsWith("!")) return undefined;
 
@@ -49,6 +57,20 @@ export const parseCommand = (content: string): Command | undefined => {
   if (word.toLowerCase() !== "!answer") return undefined;
 
   const task = rest[0];
+  // Inside a task's own thread the id is implied, so `!answer yes` is the whole command.
+  // Only where the FIRST word is not a plausible id, though: `!answer BS-123 yes` typed
+  // in that task's thread must still mean what it says.
+  if (thread !== undefined && (task === undefined || !isTaskId(task) || task === thread)) {
+    // Sliced rather than re-joined, so an answer keeps its original spacing — it can be
+    // a code block, a list, or a paragraph.
+    const after = task === thread ? trimmed.indexOf(task) + task.length : word.length;
+    const text = trimmed.slice(after).trim();
+    if (text.length === 0) {
+      return { kind: "malformed", reason: `An answer for \`${thread}\` cannot be empty.` };
+    }
+    return { kind: "answer", task: thread, text };
+  }
+
   if (task === undefined) return { kind: "malformed", reason: `Which task? ${HELP}` };
   if (!isTaskId(task)) {
     // The id becomes a directory name under `tasks/`. A `../` in it would write

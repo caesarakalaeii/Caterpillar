@@ -18,6 +18,7 @@ import {
   type MessageOptions,
   type Notification,
   type Notifier,
+  type NotifyTarget,
   renderInteractive,
 } from "./discord.ts";
 import { type FetchLike, postJson } from "./http.ts";
@@ -135,10 +136,12 @@ export class BotNotifier implements Notifier {
     this.bot = bot;
   }
 
-  async notify(notification: Notification): Promise<void> {
+  async notify(notification: Notification, target: NotifyTarget = {}): Promise<void> {
     const rendered = renderInteractive(notification);
     await this.bot.postMessage({
       content: rendered.content,
+      // A thread IS a channel, so posting into one is the same call with a different id.
+      ...(target.threadId === undefined ? {} : { channelId: target.threadId }),
       ...(rendered.components === undefined ? {} : { components: rendered.components }),
     });
   }

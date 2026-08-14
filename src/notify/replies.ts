@@ -22,6 +22,10 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return `Parked **${task}**. It will not be claimed again until a human sets it back to \`ready\`.`;
     case "merged":
       return `Merged **${task}** — ${outcome.prUrl}`;
+    case "started":
+      return `Started **${outcome.task}**. It will read the repo and come back with its first question here.`;
+    case "refused":
+      return outcome.reason;
     case "not-mergeable":
       return `Could not merge **${task}**: ${outcome.reason}`;
     case "unknown-task":

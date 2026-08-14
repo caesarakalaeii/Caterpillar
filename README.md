@@ -19,9 +19,10 @@ labelled `agent` became a task 23 seconds later and ran through to `done` and a 
 issue, including one round trip through `ask_human` when the agent hit a supervisor bug it
 could not work around.
 
-Work reaches it two ways: label a tracker item `agent` and intake renders a spec (§14),
-or commit a `tasks/<id>/spec.md` into the state repo by hand for full control over the
-acceptance criteria. See `HANDOFF.md`.
+Work reaches it three ways: label a tracker item `agent` and intake renders a spec (§14);
+run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and then cut
+into wave-tagged tasks (§14.3); or commit a `tasks/<id>/spec.md` into the state repo by
+hand for full control over the acceptance criteria. See `HANDOFF.md`.
 
 To hand a GitHub issue or Vikunja task to the agent, label it `agent` and put an `agent`
 block in the body — `acceptance` is required, since a task with no machine-checkable
@@ -96,6 +97,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/review/lenses.ts` | The council's three reviewer prompts (§12.1). |
 | `src/review/decide.ts` | Three verdicts → one decision. Pure, no IO (§12.1). |
 | `src/review/council.ts` | Runs the reviewers in the task's worktree, read-only (§12.1). |
+| `src/plan/brainstorm.ts` | `/brainstorm` → a brainstorm task. Pure, no IO (§14.3). |
+| `src/plan/materialize.ts` | Plan → child tasks, waves and cycle detection. Pure (§14.3). |
+| `src/plan/maintain.ts` | Re-checks a plan's edges when one of its tasks finishes (§14.3). |
+| `src/notify/threads.ts` | Thread ↔ task, so a reply in a thread needs no id (§14.3). |
 | `src/supervisor/probe.ts` | Progress evidence from git, not self-report. |
 | `src/supervisor/loop.ts` | Claim → run → handoff/park/verify (§6). |
 | `src/notify/http.ts` | The retrying JSON client every Discord path shares. |
@@ -241,6 +246,22 @@ and renders the typed `!answer` instruction instead (§7.1).
 The bot needs the **MESSAGE_CONTENT** privileged intent enabled in the Discord developer
 portal. Without it every message arrives with empty content and no command ever matches —
 a checkbox, not something code can detect or fix.
+
+## Brainstorming a plan
+
+```
+/brainstorm topic:"make intake accept Linear issues" repo:acme/widget
+```
+
+Opens a thread and creates a brainstorm task in it. The agent reads the repo and asks one
+question at a time — answer in the thread, where the task id is implied, so `!answer yes`
+is the whole command. When the shape is settled it proposes a decomposition, the review
+council reads it with plan-specific lenses, and on a pass the tasks are created with a
+`wave` and a `blockedBy` (§14.3).
+
+Waves describe what **may** run concurrently. One runner still works one task at a time —
+actual parallelism means scaling the Deployment, which the git-ref leasing already makes
+safe. A rejected plan creates nothing.
 
 ## Registering the slash commands
 
