@@ -32,7 +32,14 @@ import {
 import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "../plan/brainstorm.ts";
 import { layer, materialise, relayer } from "../plan/materialize.ts";
 import type { Maintainer, PlanRevision, PlanSibling } from "../plan/maintain.ts";
-import { LeaseLostError, type Lease, type LeaseManager, startHeartbeat } from "../state/lease.ts";
+import {
+  heldLease,
+  LeaseLostError,
+  type Lease,
+  type LeaseHandle,
+  type LeaseManager,
+  startHeartbeat,
+} from "../state/lease.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
@@ -341,11 +348,11 @@ export class Supervisor {
           noProgressLimit: config.limits.noProgressLimit,
         });
         if (verdict.kind === "park") {
-          await this.park(heartbeat.current(), spec, state, verdict.reason);
+          await this.park(heartbeat, spec, state, verdict.reason);
           return;
         }
 
-        state = await this.transition(heartbeat.current(), state, "running");
+        state = await this.transition(heartbeat, state, "running");
         metrics.sessions.inc({ task: spec.id });
 
         logger.info("session.start", {
@@ -380,9 +387,9 @@ export class Supervisor {
         metrics.tokens.inc({ task: spec.id, kind: "output" }, outcome.usage.outputTokens);
         metrics.cost.inc({ task: spec.id }, outcome.usage.costUsd);
 
-        state = await this.recordSession(heartbeat.current(), spec, state, outcome);
+        state = await this.recordSession(heartbeat, spec, state, outcome);
 
-        const done = await this.applyOutcome(heartbeat.current(), spec, state, outcome);
+        const done = await this.applyOutcome(heartbeat, spec, state, outcome);
         if (done) return;
       }
     } catch (error) {
@@ -392,22 +399,23 @@ export class Supervisor {
       // error died with "lease is no longer held by this runner", leaving the task
       // `ready` to be re-claimed and to fail again on the very next poll.
       //
-      // The heartbeat is stopped FIRST so the lease oid stops moving underneath the
-      // CAS, and the CURRENT lease is used, not the one claim returned: heartbeats
-      // have renewed it since, so the original oid is already stale.
+      // The heartbeat is stopped FIRST so the lease oid stops moving underneath the CAS.
+      // The heartbeat ITSELF is what gets passed down, never a `Lease` read out of it:
+      // renewals rotate the token, so any snapshot taken here is stale by the time a
+      // push reaches `assertHeld`.
       heartbeat.stop();
       if (error instanceof LeaseLostError) throw error;
       if (signal.aborted) throw error;
-      await this.parkFailed(heartbeat.current(), spec, error);
+      await this.parkFailed(heartbeat, spec, error);
     } finally {
       heartbeat.stop();
-      await leases.release(heartbeat.current()).catch(() => undefined);
+      await leases.release(await heartbeat.current()).catch(() => undefined);
     }
   }
 
   /** Persist the journal and usage for a finished session. */
   private async recordSession(
-    lease: Lease,
+    lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
     outcome: SessionOutcome,
@@ -473,7 +481,7 @@ export class Supervisor {
    * this runner (parked, done, or failed).
    */
   private async applyOutcome(
-    lease: Lease,
+    lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
     outcome: SessionOutcome,
@@ -605,7 +613,7 @@ export class Supervisor {
    * name the audit trail.
    */
   private async applyPlan(
-    lease: Lease,
+    lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
     plan: ProposedPlan,
@@ -720,7 +728,7 @@ export class Supervisor {
    * scratch, and the next session would never learn what it had said.
    */
   private async convene(
-    lease: Lease,
+    lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
   ): Promise<{
@@ -791,7 +799,11 @@ export class Supervisor {
    * the same plan that have not started, and the whole revision is dropped if the result
    * would contain a cycle.
    */
-  private async maintainPlan(lease: Lease, spec: TaskSpec, state: TaskState): Promise<void> {
+  private async maintainPlan(
+    lease: LeaseHandle,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<void> {
     const { maintainer, store, logger } = this.deps;
     const membership = state.plan;
     if (maintainer === undefined || membership === undefined) return;
@@ -965,7 +977,7 @@ export class Supervisor {
   }
 
   private async park(
-    lease: Lease,
+    lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
     reason: string,
@@ -988,7 +1000,7 @@ export class Supervisor {
    * network — this logs and returns rather than throwing. Propagating here would exit
    * the process and reintroduce exactly the crash loop it exists to prevent.
    */
-  private async parkFailed(lease: Lease, spec: TaskSpec, error: unknown): Promise<void> {
+  private async parkFailed(lease: LeaseHandle, spec: TaskSpec, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
 
     try {
@@ -1170,9 +1182,10 @@ export class Supervisor {
     if (lease === undefined) return { kind: "not-parkable", status: "running" };
 
     try {
+      const handle = heldLease(lease);
       await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
-      await this.transition(lease, state, "parked");
-      await this.push(lease, `chore(${request.task}): parked from chat`);
+      await this.transition(handle, state, "parked");
+      await this.push(handle, `chore(${request.task}): parked from chat`);
       logger.info("task.cancelled", { task: request.task, previous: state.status });
 
       // After the push, never before: the thread's last word must describe what git
@@ -1226,9 +1239,10 @@ export class Supervisor {
     const lease = await leases.claim(request.task);
     if (lease !== undefined) {
       try {
+        const handle = heldLease(lease);
         await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
-        await this.transition(lease, state, "done");
-        await this.push(lease, `chore(${request.task}): merged from chat`);
+        await this.transition(handle, state, "done");
+        await this.push(handle, `chore(${request.task}): merged from chat`);
       } finally {
         await leases.release(lease).catch(() => undefined);
       }
@@ -1338,16 +1352,17 @@ export class Supervisor {
   }
 
   private async transition(
-    lease: Lease,
+    lease: LeaseHandle,
     state: TaskState,
     status: TaskStatus,
   ): Promise<TaskState> {
+    const held = await lease.current();
     const next: TaskState = {
       ...state,
       status,
       owner: {
-        runner: lease.runner,
-        leaseOid: lease.oid,
+        runner: held.runner,
+        leaseOid: held.oid,
         since: state.owner?.since ?? new Date().toISOString(),
       },
     };
@@ -1360,8 +1375,10 @@ export class Supervisor {
    * Push state. Verifies lease ownership FIRST — a partitioned runner must not
    * resurrect stale work (DESIGN.md §5.1).
    */
-  private async push(lease: Lease, message: string): Promise<void> {
-    await this.deps.leases.assertHeld(lease);
+  private async push(lease: LeaseHandle, message: string): Promise<void> {
+    // Resolved HERE, not by the caller: everything between the claim and this line may
+    // have taken minutes, and the token has moved if it did.
+    await this.deps.leases.assertHeld(await lease.current());
     await this.deps.store.commitAndPush(
       message,
       "origin",

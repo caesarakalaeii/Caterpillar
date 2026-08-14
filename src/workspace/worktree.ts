@@ -41,6 +41,32 @@ const mirrorPath = (mirrorsDir: string, repo: RepoRef): string =>
 const cloneUrl = (repo: RepoRef): string =>
   `https://${repo.host}/${repo.owner}/${repo.name}.git`;
 
+/**
+ * What a mirror refresh is allowed to touch: everything EXCEPT the branches this runner's
+ * own worktrees have checked out.
+ *
+ * `clone --mirror` configures `+refs/*:refs/*`, so a plain `fetch --prune` tries to write
+ * every remote ref onto the identically-named local ref — including `refs/heads/agent/<task>`
+ * once a task has pushed its branch. That local head is checked out in the task's worktree,
+ * which persists on the PVC after the session ends, so git refuses the whole fetch:
+ *
+ *   fatal: refusing to fetch into branch 'refs/heads/agent/<task>' checked out at ...
+ *
+ * One task pushing therefore broke `syncMirror` for every LATER task on that repo,
+ * permanently — the second task on a repo parked two seconds after being claimed, which
+ * reads as a scheduler fault rather than a git one.
+ *
+ * A negative refspec is the surgical fix: the mirror exists to supply upstream history to
+ * create worktrees from, and it never needs to fetch back the agent branches it pushed
+ * itself. Excluding them from the refspec also excludes them from `--prune`, so a local
+ * branch whose remote counterpart was deleted by a merge survives rather than being
+ * yanked out from under a live worktree.
+ *
+ * Passed per invocation rather than written into the mirror's config, because `configure`
+ * runs only on first clone and every mirror already on a PVC would keep the old refspec.
+ */
+const MIRROR_REFSPECS: readonly string[] = ["+refs/*:refs/*", "^refs/heads/agent/*"];
+
 export class WorktreeManager {
   /**
    * Workspace git, with the supervisor's own credential stripped off.
@@ -109,7 +135,7 @@ export class WorktreeManager {
     }
 
     const mirror = this.git.at(path);
-    await mirror.run("fetch", "--prune", "origin");
+    await mirror.run("fetch", "--prune", "origin", ...MIRROR_REFSPECS);
     return path;
   }
 
