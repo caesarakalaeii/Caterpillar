@@ -147,6 +147,32 @@ awkward, the change is probably wrong.
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
    failed notification logs `notify.failed` and never rewrites the state it announces.
 
+## Adding a runner with capabilities
+
+The cluster pod advertises `linux, net`. A task that declares `requires: [usb]` or
+`human-present` is claimable by **nobody** until a runner that has those exists — it sits
+`ready` forever, looking like a stuck scheduler rather than a missing machine.
+
+```bash
+scripts/install-runner.sh --capabilities linux,usb,human-present --from-cluster
+```
+
+It derives the config from the deployed one (`--from-cluster` reads the ConfigMap, or pass
+`--config FILE`) and overrides only the machine-specific parts: capabilities, the paths,
+and where secrets are read from. That is deliberate — both runners share one state repo, so
+they must agree about workspaces, limits and the model, and a hand-written second config is
+a silent divergence waiting to happen. `--dry-run` prints the config and the unit without
+writing either.
+
+It does **not** fetch secrets or log in to the model. Copy the secret directories yourself
+(`<root>/secrets/<secretRef>/<key>`, the same layout Kubernetes mounts) and run
+`npm run llm:login` on the machine. A script that could pull private keys onto a
+workstation would be a worse problem than a manual copy.
+
+Then work reaches it by capability, never by address (§8): an agent already running
+elsewhere calls `handoff(requires: ["usb"])`, the task returns to `ready`, this runner
+claims it on its next poll and appends to the **same** journal.
+
 ## Verifying a GitHub App setup
 
 ```bash
