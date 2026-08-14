@@ -1,10 +1,18 @@
 # Handoff
 
-State as of 2026-08-13, after the intake → session loop was closed end to end. Every
-link in the chain is now proven in-cluster; what is left is unbuilt, not unverified.
-Overwrite this file rather than appending to
-it — an append-forever handoff eventually consumes the context it exists to preserve (the
-same reason `handoff.md` is overwritten and `journal.md` appends, DESIGN.md §4.1).
+State as of **2026-08-14**, after a session that built the whole usability layer: slash
+commands and buttons (§7.1), the review council (§12.1), brainstorm → plan → waves
+(§14.3), the artifact channel (§17), and a runner installer for capability-matched
+machines (§8).
+
+**The shape of the risk has inverted.** Until yesterday everything built was proven and
+what remained was unbuilt. Now a large amount is built, merged and deployed, and almost
+none of it has been exercised against a real task. Read *What is actually proven* below
+before trusting any of it, and treat this document's claims as dated rather than current.
+
+Overwrite this file rather than appending to it — an append-forever handoff eventually
+consumes the context it exists to preserve (the same reason `handoff.md` is overwritten and
+`journal.md` appends, DESIGN.md §4.1).
 
 ## Orientation
 
@@ -17,21 +25,32 @@ architectural change so far has been recorded by amending the relevant section.
 
 `README.md` has the file-by-file layout and the six load-bearing invariants.
 
-Repo: `~/git/Caterpillar` → `github.com/caesarakalaeii/Caterpillar` (private).
-Manifests: `~/git/caesar-deployment` at `apps/workloads/caterpillar`.
+Repo: `github.com/caesarakalaeii/Caterpillar` (private).
+Manifests: `caesar-deployment` at `apps/workloads/caterpillar`.
 
-> An earlier version of this file said the working copy was `~/Hobby/remote-agent`. **That
-> directory does not exist on this machine** — and neither does `~/Hobby`. Earlier sessions
-> ran on a NixOS box; this one is Arch with a zen kernel and no nix at all. Assume nothing
-> about the host from this document; check.
+> **The host varies between sessions and this file has been wrong about it twice.** One
+> session ran on Arch at `~/git/Caterpillar` with node on PATH and no nix; the next ran on
+> NixOS at `~/Hobby/remote-agent` with nix and **no node on PATH at all**. Assume nothing —
+> `pwd`, and check `command -v node nix` before writing a command that depends on either.
 
 ## Environment
 
-**The node problem is fixed at the source; there is nothing to work around any more.**
+**The node problem is fixed at the source; there is nothing to work around any more** —
+but node is not necessarily on PATH.
 
-- `node` and `npm` are on PATH (`/usr/sbin`) at **node 26.5.0**. There is **no `nix`**.
-- `npm test`, `npm start` and every `verify:*` script **run on it directly** — no flag, no
-  tarball, no compile step. **159 tests, 159 passing** on node 26.
+- Where node IS on PATH: `npm test`, `npm start` and every `verify:*` script run directly.
+  No flag, no tarball, no compile step.
+- On the **NixOS** host it is not. Everything goes through the flake's dev shell:
+
+  ```bash
+  nix develop --command npm run check
+  nix develop --command npm test
+  nix develop --command node src/cli/verify-reviewer.ts --pem … --app-id …
+  ```
+
+  Both argument styles survive `--command`; `npm run x -- --flag` and calling the `.ts`
+  directly were each checked. `sops` and `shellcheck` come from `nix shell nixpkgs#…`.
+- **293 tests, 293 passing** as of 2026-08-14.
 
 Two earlier handoffs described elaborate workarounds here (compile the tests first; then,
 download a node 22 tarball and put it on PATH). Both are gone, and so is their cause. The
@@ -86,12 +105,30 @@ fixed it and also synced a lockfile that was missing the `caterpillar-cred` bin 
 | Container image + CI | built and pushed by CI on every push to `main` |
 | Deployment | **LIVE**, and no longer idle-by-design |
 
-Not built:
+Built 2026-08-14, merged and deployed, **none of it exercised by a real task**:
 
-1. **`!task <repo> <goal>`** (§14 path 3). As written it carries no acceptance criteria,
-   and §14 refuses specs that have none — it cannot be added without deciding where they
-   come from. `!answer` (§7) IS built (#20). Intake covers the tracker path.
-2. Nothing else from DESIGN.md is missing.
+| Area | State |
+|---|---|
+| **Slash commands, buttons, modals (§7.1)** | **LIVE** — 5 commands registered in the guild; `/tasks` used successfully |
+| **Review council (§12.1)** | deployed, `configured=true`; **has never reviewed a diff** |
+| **Reviewer identity** | `caterpillar-reviewer` app 4593009, sealed and live; **has never approved or merged** |
+| **Brainstorm → plan → waves (§14.3)** | deployed; one brainstorm reached `ask_human` and is parked. **No plan has ever been submitted, reviewed or materialised** |
+| **Thread chat + typing indicator** | deployed (#27, #28); untested against a live thread |
+| **Question splitting, fence-safe (§7.1)** | deployed (#26, #29); the 3785-point case is unit-tested, not seen live |
+| **Artifact channel, small path (§17)** | merged (#31); **never used** |
+| **Runner installer (§8)** | merged (#30); **no second runner exists** |
+
+Not built, deliberately:
+
+1. **§17.1, large artifacts.** The pointer format is decided and written down; the MinIO
+   store is not deployed. Nothing needs it yet — small derived outputs are what actually
+   crosses machines, and inputs do not cross at all.
+2. **Forgejo reviewer identity.** `ForgejoForge.approve/merge` exist and are correct, but
+   `loadReviewerFactory` returns undefined for non-GitHub forges, so `electric-boogaloo`
+   logs `configured=false` and its tasks end `done` with the PR open. That is a missing
+   second Codeberg account, not missing code.
+3. **`!task <repo> <goal>`** (§14 path 3) is superseded, not pending. `/brainstorm` is the
+   answer: it produces the acceptance criteria `!task` had nowhere to put.
 
 ## What is actually proven, and what is not
 
@@ -143,13 +180,43 @@ only through `/check-runs` — established it could not work around it (its toke
 CI workflow because the issue had not asked for one. The park cost nothing while the fix
 was written.
 
+### What 2026-08-14 did NOT prove
+
+Everything in the second status table above is **merged, deployed and unexercised**. The
+gap matters because these features sit on the *outcome* path: they only run when a task
+completes or a human interacts, and no task has completed since they landed.
+
+Specifically **never observed once, in any form**:
+
+- a council reviewing a real diff, and therefore whether the three lenses block anything.
+  `caterpillar_council_total{decision="changes"}` staying at 0 across a few tasks would
+  mean they are too permissive to be the last gate before `main` — tighten
+  `src/review/lenses.ts` before leaving it unattended.
+- an autonomous merge. **This is the one that cannot be proven any other way**: whether
+  GitHub counts `caterpillar-reviewer`'s approving review towards the required approval on
+  a protected branch. `verify:reviewer` proves everything up to that line and says so. A
+  failure shows as `pr.merge-failed` in the logs, the task still reaches `done`, and the PR
+  is simply left open — so the failure mode is safe, just silent-ish.
+- `submit_plan`, plan-council review, and materialisation into wave-tagged children. The
+  wave arithmetic and every refusal are unit-tested; the *agent* half never ran.
+- artifact publish/stage, which additionally needs a second runner to be meaningful.
+- the typing indicator, thread archiving, and how a split code block actually renders.
+
+The cheapest way to close most of this at once is to answer the parked brainstorm (below):
+it exercises thread chat → plan council → materialisation, and each child that completes
+then exercises the PR council and the merge.
+
 ## Giving it work
 
-Two paths (§14):
+Three paths (§14):
 
 1. **Label a tracker item `agent`** and put an `agent` block in the body. Within ~5 minutes
    intake renders a spec and the supervisor claims it.
-2. **Commit `tasks/<id>/spec.md`** into `caterpillar-state` by hand — most control over
+2. **`/brainstorm topic:… repo:owner/name`** in Discord (§14.3) — opens a thread, refines
+   the idea one question at a time, and ends in a plan the council reviews and then cuts
+   into wave-tagged tasks. This is the path that produces acceptance criteria rather than
+   demanding them up front. **Never run end to end; see the status table.**
+3. **Commit `tasks/<id>/spec.md`** into `caterpillar-state` by hand — most control over
    acceptance criteria, and the fastest way to test the pipeline without a tracker.
 
 ````
@@ -180,9 +247,19 @@ to debug than a crash.
 
 ### Answering a question
 
-**From Discord**, once `bot-token` and `channel-id` are sealed: `!answer <task-id> <text>`
-in the watched channel. The bot replies with what happened — applied, unknown task, or not
-waiting — because silence leaves you unable to tell a typo from an offline bridge.
+**From Discord**, three ways now, all converging on one handler:
+
+- **In a task's own thread: just type the answer.** No `!answer`, no id — the thread IS the
+  task (§7.1). A leading `!answer` is stripped if typed from habit. Chatting while the agent
+  works gets no reply on purpose; the typing indicator is what says it is busy.
+- **The Answer button** on a question notification opens a modal. It is deliberately absent
+  inside threads, where there is no id to retype.
+- **`/answer <task> <text>`**, or the older `!answer <task-id> <text>` in the watched
+  channel. The bot replies with what happened — applied, unknown task, or not waiting —
+  because silence leaves you unable to tell a typo from an offline bridge.
+
+`/cancel <task>` parks a task and closes its thread. Nothing deletes a task; to reclaim
+disk, `git rm -r tasks/<id>` in the state repo by hand once no lease is held.
 
 **By hand** — the fallback, and what the bridge now does for you. Two writes to
 `caterpillar-state`, and the ORDER matters:
@@ -263,7 +340,7 @@ will not create a missing parent — `mkdir -p` it in the pod first.
 - **Deleting the PVC destroys the credential**, not just mirrors and worktrees. Recovery
   means re-running the browser login.
 
-### Discord: outbound is LIVE, inbound needs two more keys
+### Discord: every half is LIVE
 
 `caterpillar-discord` is sealed, listed in `secret-generator.yaml`, synced by ArgoCD, and
 **verified against the real channel** — webhook id `1537550223604195470`, a
@@ -297,13 +374,17 @@ selfHeal; deleting the pod does not.
 
 `bridge.disabled` in the boot logs means it is off; `gateway.ready` means it is on.
 
-**Slash commands and buttons need two more keys** in the same Secret: `application-id`
-and `guild-id`. Neither is sealed yet. Both are plain identifiers rather than credentials,
-and both are 18–19 digit numbers — **single-quote them in the sops file**, or YAML types
-them as ints, sops preserves the type, `stringData` refuses the apply, and ArgoCD sits
-`OutOfSync` with the previous Secret still mounted (#52, the trap below).
+**Slash commands are LIVE.** All five (`/answer`, `/tasks`, `/task`, `/brainstorm`,
+`/cancel`) are registered in guild `877203185700339742` and confirmed from Discord's own
+`GET /applications/…/commands`. `application-id` (`1537706675988070420`) and `guild-id` are
+sealed alongside the bot token, which was rotated on 2026-08-14 and re-sealed.
 
-Then, once per command-set change:
+The bot's effective permissions in `#caterpillar` were computed from the API — base roles,
+then `@everyone`, role and member overwrites — rather than trusted from the invite URL:
+View Channel, Send Messages, Read Message History, **Create Public Threads** and **Send
+Messages in Threads** are all present, so `/brainstorm` can open a thread.
+
+Re-run this once per command-set change:
 
 ```bash
 kubectl --context default -n caterpillar exec "$POD" -- sh -c \
@@ -344,8 +425,9 @@ request's author approve it — that refusal is the whole reason branch protecti
 gate (§9.1) — so a reviewer sharing the App id can never merge anything. The verifier
 asserts this when given `--author-app-id`.
 
-Untested until the first live council merge: whether GitHub counts this App's approving
-review towards the required approval on `main`. If it does not, the App is on a bypass list
+**The reviewer App is now sealed and live** (`configured=true`); what follows describes how
+it was set up. Untested until the first live council merge: whether GitHub counts this
+App's approving review towards the required approval on `main`. If it does not, the App is on a bypass list
 or the ruleset requires a code owner it is not. Nothing short of a real PR proves it.
 
 **Notifications now come from the bot, not the webhook**, wherever `bot-token` and
@@ -369,6 +451,21 @@ there is no webhook.** It was exercised end to end against a local stand-in serv
 answers 204 like Discord does, which proves the wiring but not the credential.
 
 ## Live credentials
+
+**Two GitHub Apps now. The separation is the security boundary** — GitHub refuses to let a
+pull request's author approve it, which is the only thing making branch protection a real
+gate (§9.1). A "reviewer" sharing the author's app id could never merge anything, and
+`seal_reviewer` refuses that id rather than let it be discovered at the first merge.
+
+| Role | Slug | App ID | Installation | Secret |
+|---|---|---|---|---|
+| author — mints task tokens, pushes, opens PRs | `caterpillar-agent` | **4579022** | 153385932 | `caterpillar-github-app` |
+| reviewer — approves and merges (§12.1) | `caterpillar-reviewer` | **4593009** | 153679546 | `caterpillar-github-app-reviewer` |
+
+The reviewer's token was verified live from the sealed copy: `/app` resolves, a token mints
+`201` scoped to `caesarakalaeii/Caterpillar` with exactly `contents:write`,
+`pull_requests:write`, `metadata:read`. It is **not** on any bypass list, deliberately — it
+has to satisfy the rule, not skip it.
 
 - App slug `caterpillar-agent`, **App ID `4579022`**, **installation ID `153385932`**
 - Private key SOPS-encrypted at
@@ -631,6 +728,58 @@ them away.
 - **Run intake tests TWICE.** Both of its failure modes (duplicate tasks, comment spam) are
   invisible in a single pass.
 
+### Learned on 2026-08-14
+
+Every one of these was found by USING the thing, not by reading it. They share a shape:
+the system reported success while doing nothing, or the wrong thing.
+
+- **`tsconfig.test.json` type-checked ZERO test files.** `exclude` is inherited from the
+  base config and `include` does not override it, so the config added specifically to stop
+  untested syntax reaching runtime agreed with everything. Fixed by `"exclude": []`; it
+  caught a stale import within seconds. If a test config ever passes suspiciously fast, run
+  `tsc -p … --listFiles | grep -c test.ts`.
+- **A truncated question is an unanswerable one.** §11.2's `fit` clipped prose to 2000 code
+  points. Right for a park reason; wrong for the one payload a human must act on. A
+  3785-point question offering four options arrived cut mid-option-A, with B, C and D never
+  sent, and an Answer button under it. Questions now SPLIT (#26).
+- **A split code block breaks every message after it.** An unterminated fence makes Discord
+  render the whole tail as code. Blocks are atomic now and only split when too big for one
+  message, closing and reopening the fence (#29). The invariant to test is per-message
+  fence balance — a test asserting "the text survived" passes against the bug, because the
+  text does survive.
+- **`!answer we want B` answered a task called `we`.** Two causes at once: `we` matches the
+  task-id charset, and the thread index was cold because Keel had just rolled the pod. Both
+  fixed (#27) — a thread has no command language now, and the index hydrates before the
+  gateway connects. **Keel rolls this pod on every push to `main`**, so "just after a
+  restart" is a routine window, not a rare one.
+- **A button in a thread was dead.** The interaction guard compared `channel_id` against the
+  configured channel alone, so every button posted into a brainstorm thread answered "I only
+  act in #caterpillar" (#27).
+- **Silence is right for chat and wrong for a closed conversation.** Once every thread
+  message became an answer, a cancelled task's thread swallowed everything typed into it.
+  Binding is now status-aware: only a non-terminal task's thread is listened to (#28).
+- **`seal-caterpillar-secrets.sh` corrupted values on every re-seal.** `yaml_scalar` wraps a
+  value in single quotes; `existing_key` read them back *with* the quotes and re-wrapped, so
+  each blank-prompt re-seal doubled them and three round trips left a channel id wrapped in
+  fifteen quote characters. Fixed in caesar-deployment #53/#54 — and verified with the OLD
+  function as a positive control, which is how the growth was measured rather than guessed.
+- **`kubectl kustomize --enable-alpha-plugins` silently renders NO Secrets** when the
+  `ksops` binary is absent. It exits 0. I read that as "ksops resolved" and said so in a PR
+  before checking. Install `nixpkgs#kustomize-sops`, symlink it into
+  `$XDG_CONFIG_HOME/kustomize/plugin/viaduct.ai/v1/ksops/`, then `kustomize build
+  --enable-alpha-plugins --enable-exec`.
+- **ksops fails the whole app's sync if a listed file does not exist**, so a sealed secret
+  and its `secret-generator.yaml` line must land in the SAME commit.
+- **Notifications changed author.** With a bot token present the notifier prefers the bot
+  over the webhook, because Discord refuses components from a webhook an application does
+  not own. Expected, but it reads as a regression in the channel if nobody says so.
+- **A bot token reset invalidates REST immediately and the gateway lazily.** After a
+  rotation the socket stayed on its old session while every bot REST call answered 401 — so
+  inbound looked healthy while notifications failed silently. `gateway.ready` proves the
+  token was valid at connect time and nothing since.
+- **A bot's application id is the first segment of its token**, base64-decoded. That works
+  on a revoked token, which is how the app id was recovered without opening the portal.
+
 ## Constraints the user has set
 
 - **Do not read the user's `.env` holding the Codeberg and Vikunja tokens.** The old path
@@ -650,30 +799,51 @@ them away.
 
 ## Immediate next action
 
-1. **Answer a REAL question over Discord.** The path is proven with a task that does not
-   exist; the write half — answer file, `status: ready`, streak reset, push — has only ever
-   run against a test git remote. The next real `ask-human` is the test, and it needs no
-   setup: the notification arrives with the task id in it.
-3. **Give it real work.** The pipeline is proven end to end; nothing is left to smoke-test.
-   The open question is what it should do, not whether it works.
-4. Minor: `caterpillar-smoke#3` (the agent's `greet.sh` PR) is **open and unmerged** — the
-   task is `done`, and merging it was left to a human on purpose. Delete the repo whenever;
-   it is a throwaway.
-5. Minor: `SMOKE-1`'s `journal.md` is still **347KB** on disk — 620 byte-identical park
-   entries from the pre-fix retry storm, all mislabelled "Session 0". It no longer taxes
-   anything: since #19 a journal reaches the prompt as a bounded view, and that one
-   renders as a single entry saying "repeated 620 times". The file is left alone on
-   purpose; it is the audit trail, `SMOKE-1` is `done`, and nothing rewrites history.
+**1. Answer the parked brainstorm.** `BS-1537785980415778816` is `awaiting-human` with a
+3785-code-point question offering four options (A–D) about the SN2 resource track. Its full
+text is in `tasks/BS-1537785980415778816/questions/001-question.md` in the state repo.
 
-**Uncommitted work: none.** `main` was `0666b60` at the start of this session — since
-then #14 (Discord webhook), #15 (CI gate), #16 (`needs-human`), #17 (docs) and #18 (node
-26) were squash-merged, built, and rolled by Keel. **159 tests, 159 passing, on node 26
-with no flags.** The pod is healthy with 0 restarts.
+This is the highest-value single action available, because it is the only cheap way to
+exercise the whole 2026-08-14 build at once: thread chat → `submit_plan` → plan council →
+materialisation into wave-tagged children, and then each child exercises the PR council and
+the autonomous merge.
 
-Of the three, only #15 changes observable behaviour today: #14 is inert until a webhook is
-sealed, and #16 only shows up on the next task that asks a question. `caesar-deployment` has no unpushed commits either (its #48
-merged as `5f2a95ad`); it does carry untracked `.planning/` and `tea_debug.log`, which are
-not mine and were left alone.
+Answer it **in its Discord thread as plain text** — no `!answer`, no id. That path is new
+(#27) and itself unproven against a live thread.
 
-Unresolved by choice, not by omission: the exposed App private key (see the callout under
-"Live credentials").
+**2. Watch the first council run.** Two numbers decide whether any of this is trustworthy:
+
+```bash
+kubectl --context default -n caterpillar logs -f deploy/caterpillar \
+  | grep -E "council|pr\.merg|plan\.|verdict"
+```
+
+- `caterpillar_council_total{decision="changes"}` — if it never leaves 0, the lenses are
+  too permissive to be the last gate before `main`.
+- the first `pr.merged` vs `pr.merge-failed` — the only test of whether GitHub counts the
+  reviewer App's approval against branch protection.
+
+**3. Install a second runner** if the SN2 work needs the game files
+(`scripts/install-runner.sh --capabilities linux,usb,human-present --from-cluster`). It
+generates the config from the deployed ConfigMap and refuses to invent one; you copy the
+secret directories and run `npm run llm:login` yourself. Until a runner advertising
+`human-present` exists, a task requiring it sits `ready` forever and looks like a stuck
+scheduler.
+
+**4. Minor, unchanged:** `caterpillar-smoke#3` is open and unmerged (deliberate; the repo is
+a throwaway). `SMOKE-1`'s `journal.md` is still 347 KB of pre-fix park entries — left alone
+on purpose, it is the audit trail, and since #19 it reaches a prompt as a single collapsed
+line.
+
+**Uncommitted work: none.** `main` is `5819b42`. This session merged #22, #24, #26, #27,
+#28, #29, #30, #31 in Caterpillar and #53/#54/#55 plus the two secret commits in
+`caesar-deployment`. **293 tests, 293 passing.** The pod is healthy, `reviewer.identity
+workspace=caesar configured=true`, `gateway.ready`, 0 errors since boot.
+
+`caesar-deployment` carries untracked `scripts/rotate-allchat-secrets.go`, which is not
+mine and was left alone.
+
+Unresolved by choice, not by omission: the exposed App private key for **4579022** (see the
+callout under "Live credentials"). Note it now has a sibling — the reviewer key for
+**4593009** was sealed cleanly by `seal_reviewer` and has never existed in plaintext in any
+repo. If the author key is ever rotated, that is the pattern to follow.
