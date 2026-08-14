@@ -15,14 +15,18 @@ import type { RunnerConfig } from "../config/types.ts";
 import {
   asRunnerId,
   asTaskId,
+  asWorkspaceName,
   EMPTY_USAGE,
   type SessionOutcome,
   type TaskId,
   type TaskState,
 } from "../domain/task.ts";
+import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { type Notifier, NullNotifier } from "../notify/discord.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
+import type { Council } from "../review/council.ts";
+import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
@@ -71,7 +75,7 @@ const seed: TaskState = {
  * `ready`, so a task seeded before the test that wants it gets picked up — and failed —
  * by the test that ran first.
  */
-const seedTask = async (id: TaskId): Promise<void> => {
+const seedTask = async (id: TaskId, over: Partial<TaskState> = {}): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
   await writeFile(
@@ -91,7 +95,7 @@ const seedTask = async (id: TaskId): Promise<void> => {
   );
   await writeFile(
     join(statePath, "tasks", id, "state.json"),
-    `${JSON.stringify({ ...seed, id }, null, 2)}\n`,
+    `${JSON.stringify({ ...seed, id, ...over }, null, 2)}\n`,
   );
   await stateGit.run("add", "-A");
   await stateGit.run("commit", "-m", `seed ${id}`);
@@ -109,7 +113,7 @@ const config: RunnerConfig = {
   // renewal landing mid-park would muddy which CAS was under test.
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
-  limits: { maxSessionsPerTask: 20, noProgressLimit: 3 },
+  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3 },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
   llm: {
@@ -383,4 +387,272 @@ test("an answer for a task that is not waiting is refused, not written", async (
 
   assert.equal(outcome.kind, "not-waiting");
   assert.deepEqual(unknown, { kind: "unknown-task" });
+});
+
+test("a blocking verdict sends the task back, and a stalemate parks it", async () => {
+  // The council is the third gate, not a second opinion: `done-claimed` with both §12
+  // gates green must still not reach `done` while a reviewer is objecting. And because
+  // the task goes back to the SAME agent, which claims done again, the pair can trade it
+  // forever — so the round cap is the thing that actually terminates this, and it is
+  // asserted here rather than assumed.
+  const STUBBORN = asTaskId("SMOKE-COUNCIL-1");
+  await seedTask(STUBBORN, { pr: { number: 9, url: "https://example.invalid/pr/9" } });
+
+  let convened = 0;
+  const council: Council = {
+    reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+    review: () => {
+      convened += 1;
+      return Promise.resolve({
+        usage: EMPTY_USAGE,
+        verdict: decide([
+          {
+            lens: "correctness",
+            title: "Correctness",
+            decision: "changes",
+            blocking: true,
+            summary: "Throws on an empty repo list.",
+            findings: [{ where: "runner.ts:107", what: "spec.repos[0] is undefined" }],
+          },
+        ]),
+      });
+    },
+  };
+
+  const supervisor = new Supervisor({
+    // Two rounds rather than the default three, so the stalemate is reached before the
+    // test's own deadline rather than because of it.
+    config: { ...config, limits: { ...config.limits, maxReviewRounds: 2 } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council,
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(STUBBORN);
+    if (state?.status === "parked") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "parked", "a task the council keeps rejecting must not run forever");
+  assert.equal(settled?.review?.rounds, 2, "the round cap is what stops it");
+  assert.equal(convened, 2, "the council must be convened once per completion claim");
+
+  // The verdict is a document, not just a log line: the next session reads the journal,
+  // and a human reads the file.
+  const verdict = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${STUBBORN}/reviews/001-verdict.md`,
+  );
+  assert.equal(verdict.code, 0, "each verdict must be pushed, not just written locally");
+  assert.match(verdict.stdout, /CHANGES REQUESTED/);
+  assert.match(verdict.stdout, /runner\.ts:107/);
+});
+
+test("a passing verdict is approved and merged by the reviewer identity", async () => {
+  // The order is the point. GitHub refuses a merge on a protected branch until an
+  // approving review exists, and refuses that review from the PR's own author — so
+  // approve-then-merge through a SECOND identity is the only sequence that works
+  // (DESIGN.md §9.1, §12.1).
+  const MERGED = asTaskId("SMOKE-COUNCIL-2");
+  await seedTask(MERGED, { pr: { number: 11, url: "https://example.invalid/pr/11" } });
+
+  const calls: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
+    openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
+    checks: () => Promise.reject(new Error("unused")),
+    approve: (_repo, pr) => {
+      calls.push(`approve:${pr}`);
+      return Promise.resolve();
+    },
+    merge: (_repo, pr) => {
+      calls.push(`merge:${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: true,
+          detail: "acceptance passed",
+          prUrl: "https://example.invalid/pr/11",
+        }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () =>
+        Promise.resolve({
+          usage: EMPTY_USAGE,
+          verdict: decide([
+            {
+              lens: "correctness",
+              title: "Correctness",
+              decision: "pass",
+              blocking: false,
+              summary: "Reads correctly.",
+              findings: [],
+            },
+          ]),
+        }),
+    },
+    reviewers: new Map([[asWorkspaceName("test"), { forTask: () => Promise.resolve(reviewerForge) }]]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(MERGED);
+    const held = await new Git(origin).tryRun("show-ref", "--verify", leaseRef(MERGED));
+    if (state !== undefined && state.status !== "ready" && held.code !== 0) {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "done");
+  assert.deepEqual(calls, ["approve:11", "merge:11"], "approve must come first, or the merge is refused");
+});
+
+test("a blocked task is not claimed until its blocker is done", async () => {
+  // The property that makes waves safe. Without it two agents can work a task and its
+  // dependency at the same time on different branches, which on a multi-replica runner
+  // is two sessions editing the same code — the exact hazard the graph exists to prevent.
+  //
+  // Both tasks are `ready`. Only the ordering and the blocker filter decide which is
+  // claimable, and the blocked one sorts FIRST alphabetically, so `readdir` order alone
+  // would pick the wrong one.
+  const FIRST = asTaskId("SMOKE-WAVE-1");
+  const SECOND = asTaskId("SMOKE-WAVE-0");
+
+  await seedTask(FIRST, { plan: { parent: asTaskId("BS-1"), wave: 0, blockedBy: [] } });
+  await seedTask(SECOND, {
+    plan: { parent: asTaskId("BS-1"), wave: 1, blockedBy: [FIRST] },
+  });
+
+  const claimed: TaskId[] = [];
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: (spec) => {
+        claimed.push(spec.id);
+        // Park it immediately, so the loop moves on rather than looping on one task.
+        return Promise.resolve({
+          reason: "limit",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "parked by the test",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && (await pushedState(FIRST))?.status !== "parked") {
+    await sleep(100);
+  }
+  // One more poll's worth of grace, so a wrongly-claimed blocked task has every chance
+  // to show up before the assertion.
+  await sleep(1500);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(claimed.includes(FIRST), "the unblocked task must be claimed");
+  assert.equal(
+    claimed.includes(SECOND),
+    false,
+    "a task whose blocker is not `done` must not be claimed, however it sorts",
+  );
+  assert.equal(
+    (await pushedState(SECOND))?.status,
+    "ready",
+    "the blocked task stays ready — blocked is not a status, it is a predicate",
+  );
 });

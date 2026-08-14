@@ -211,7 +211,10 @@ test("a submitted modal answers the task the button came from", async () => {
   for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
   const queued = inbox.drain();
   assert.deepEqual(
-    queued.map((request) => ({ kind: request.kind, task: request.task })),
+    queued.map((request) => ({
+      kind: request.kind,
+      task: request.kind === "brainstorm" ? undefined : request.task,
+    })),
     [{ kind: "answer", task: TASK }],
   );
   for (const request of queued) request.settle({ kind: "applied", index: 3 });
@@ -267,7 +270,7 @@ test("a stale button is answered rather than left showing a failure", async () =
 test("a typed !answer takes the same path as the slash command", async () => {
   const { bridge, inbox, calls } = harness();
 
-  const handled = bridge.handleMessage(`!answer ${TASK} use the existing path`, "operator");
+  const handled = bridge.handleMessage(`!answer ${TASK} use the existing path`, "operator", CHANNEL);
   await settleQueued(inbox, { kind: "applied", index: 3 });
   await handled;
 

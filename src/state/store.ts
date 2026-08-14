@@ -45,6 +45,7 @@ export class SpecParseError extends Error {
 
 interface SpecFrontMatter {
   readonly workspace?: unknown;
+  readonly kind?: unknown;
   readonly repos?: unknown;
   readonly requires?: unknown;
   readonly acceptance?: unknown;
@@ -137,8 +138,19 @@ export class StateStore {
       throw new SpecParseError(task, "`workspace` is required");
     }
 
-    const acceptance = requireStringArray(meta.acceptance, "acceptance", task);
-    if (acceptance.length === 0) {
+    const kind = meta.kind === undefined ? "implement" : meta.kind;
+    if (kind !== "implement" && kind !== "brainstorm") {
+      throw new SpecParseError(task, "`kind` must be `implement` or `brainstorm`");
+    }
+
+    // A brainstorm may declare none: its gate is the review council's verdict on the
+    // plan it produces, not §12's acceptance commands (§14.3). It is the ONLY exception,
+    // and it exists because a refinement conversation has nothing to run.
+    const acceptance =
+      kind === "brainstorm" && meta.acceptance === undefined
+        ? []
+        : requireStringArray(meta.acceptance, "acceptance", task);
+    if (acceptance.length === 0 && kind !== "brainstorm") {
       // Enforced at intake too, but re-checked here: a task with no machine-checkable
       // criteria can never satisfy §12, so it could never be marked done.
       throw new SpecParseError(
@@ -154,6 +166,7 @@ export class StateStore {
     return {
       id: task,
       workspace: asWorkspaceName(meta.workspace),
+      kind,
       goal: goal.trim(),
       repos,
       requires: asStringArray(meta.requires) as readonly Capability[],
@@ -188,6 +201,9 @@ export class StateStore {
 
     const frontMatter = stringifyYaml({
       workspace: spec.workspace,
+      // Omitted when it is the default, so an ordinary spec looks exactly as it did
+      // before this field existed and a hand-written one need not know about it.
+      ...(spec.kind !== undefined && spec.kind !== "implement" ? { kind: spec.kind } : {}),
       // Always fully qualified, so the host never has to be inferred on the way back in.
       repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
       requires: [...spec.requires],
@@ -344,6 +360,32 @@ export class StateStore {
 
     const answers = (await readdir(dir)).filter((f) => f.endsWith("-answer.md")).sort();
     const last = answers.at(-1);
+    if (last === undefined) return undefined;
+    return readFile(join(dir, last), "utf8");
+  }
+
+  /**
+   * Record one council verdict (DESIGN.md §12.1).
+   *
+   * Numbered by session and never overwritten, like `questions/`, so a task that went
+   * round the council three times keeps all three verdicts. The journal gets the same
+   * text — that is what the next session reads — but the journal is a narrative and
+   * these are the documents.
+   */
+  async writeVerdict(task: TaskId, index: number, body: string): Promise<void> {
+    const dir = join(this.taskDir(task), "reviews");
+    await mkdir(dir, { recursive: true });
+    const name = `${String(index).padStart(3, "0")}-verdict.md`;
+    await writeFile(join(dir, name), `${body.trim()}\n`, "utf8");
+  }
+
+  /** The most recent verdict, if the council has ever run on this task. */
+  async latestVerdict(task: TaskId): Promise<string | undefined> {
+    const dir = join(this.taskDir(task), "reviews");
+    if (!existsSync(dir)) return undefined;
+
+    const verdicts = (await readdir(dir)).filter((f) => f.endsWith("-verdict.md")).sort();
+    const last = verdicts.at(-1);
     if (last === undefined) return undefined;
     return readFile(join(dir, last), "utf8");
   }

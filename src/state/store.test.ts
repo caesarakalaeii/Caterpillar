@@ -30,6 +30,10 @@ const store = async (): Promise<StateStore> => {
 const SPEC: TaskSpec = {
   id: asTaskId("GH-acme-widget-12"),
   workspace: asWorkspaceName("caesar"),
+  // `readSpec` normalises the default rather than leaving it undefined, so exactly one
+  // place decides what a spec without a `kind` is. `writeSpec` omits it again, which is
+  // what keeps a hand-written spec free of a field nobody needs to know about.
+  kind: "implement",
   goal: "# Fix the widget\n\nIt drops every second frame.\n\nTracker: https://example.invalid/12",
   repos: [
     { host: "github.com", owner: "acme", name: "widget" },

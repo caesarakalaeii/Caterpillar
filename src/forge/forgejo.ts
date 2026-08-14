@@ -24,6 +24,7 @@ import {
   type Forge,
   type ForgeFactory,
   type GitCredential,
+  type MergeOptions,
   type PrRequest,
   type PrResult,
 } from "./types.ts";
@@ -189,6 +190,35 @@ class ForgejoForge implements Forge {
     );
 
     return summariseCombinedStatus(body);
+  }
+
+  /**
+   * Approve a pull request (DESIGN.md §12.1).
+   *
+   * Forgejo spells the event `APPROVED` where GitHub spells it `APPROVE`. The same
+   * caveat applies on both: this is only ever called through a reviewer identity, and
+   * a token belonging to the PR's author cannot approve it.
+   */
+  async approve(repo: RepoRef, pr: number, body: string): Promise<void> {
+    assertInScope(repo, this.allowed);
+
+    await this.api<unknown>(repo, `/repos/${repo.owner}/${repo.name}/pulls/${pr}/reviews`, {
+      method: "POST",
+      body: JSON.stringify({ event: "APPROVED", body }),
+    });
+  }
+
+  /** Merge a pull request. `Do` is capitalised in Forgejo's API; that is not a typo. */
+  async merge(repo: RepoRef, pr: number, options: MergeOptions = {}): Promise<void> {
+    assertInScope(repo, this.allowed);
+
+    await this.api<unknown>(repo, `/repos/${repo.owner}/${repo.name}/pulls/${pr}/merge`, {
+      method: "POST",
+      body: JSON.stringify({
+        Do: options.method ?? "squash",
+        ...(options.title === undefined ? {} : { MergeTitleField: options.title }),
+      }),
+    });
   }
 
   async revoke(): Promise<void> {

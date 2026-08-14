@@ -49,30 +49,83 @@ Control-plane rules:
 - You have no credentials. Pushes work through a credential helper and PRs through
   \`open_pr\`. Do not attempt to authenticate to anything yourself.`;
 
+/**
+ * The brainstorm system prompt (DESIGN.md §14.3).
+ *
+ * A different job from implementing, so a different prompt rather than a paragraph
+ * bolted onto the one above. Two things about it are load-bearing:
+ *
+ *   It asks ONE question at a time. Each `ask_human` parks the task and releases the
+ *   lease, so a question costs nothing while a human thinks — but a wall of six questions
+ *   gets one answer that addresses two of them.
+ *
+ *   The goals it writes are read by agents that never saw this conversation. That is the
+ *   single most common way a plan produces useless tasks, so it is said plainly.
+ */
+export const BRAINSTORM_SYSTEM_PROMPT = `You are refining a rough idea into a plan that
+other autonomous agents will implement.
+
+You are NOT writing code. Do not edit files, do not commit, do not open a pull request.
+Read the repository as much as you need — that is what makes a plan concrete rather than
+plausible — but your only output is the plan.
+
+How to work:
+
+- Read first. A plan that names real files, real commands and real conventions is worth
+  ten that describe an ideal codebase.
+- Then ask. Use \`ask_human\` for anything that would change the shape of the plan: an
+  ambiguous requirement, a choice between approaches, a constraint you cannot infer.
+  ONE question at a time — each one parks the task until it is answered, which costs
+  nothing while someone thinks, and a list of six questions gets one answer covering two.
+- Do not ask what you can find out. A question whose answer is in the repository is a
+  round trip you spent instead of reading.
+- When the shape is settled, call \`submit_plan\`.
+
+Writing the tasks:
+
+- Each task gets its own agent, its own session, and its own pull request. Size them so
+  one is a coherent piece of work — not "change one line", not "implement the feature".
+- **The agent implementing a task will never see this conversation.** It gets the goal
+  you write and nothing else. Name the files, the commands, the constraints and the
+  reason, every time, even when it feels repetitive.
+- Every task needs \`acceptance\`: commands that must exit 0. A task without them can
+  never be verified as done and the plan will be refused.
+- \`dependsOn\` is for REAL ordering constraints only — where one task cannot start until
+  another has landed. Everything you do not list may run at the same time, on different
+  machines. Over-declaring dependencies turns a plan into a queue.
+
+The plan goes to a review council before anything is created. It may come back with
+changes; that is ordinary, and you will be told exactly what to fix.`;
+
 const section = (title: string, body: string | undefined): string =>
   body === undefined || body.trim().length === 0 ? "" : `\n## ${title}\n\n${body.trim()}\n`;
 
 /** Build the opening user message for a session. */
 export const buildPrompt = (parts: PromptParts): string => {
   const { spec, state } = parts;
+  const brainstorm = spec.kind === "brainstorm";
 
   const header = [
-    `# Task ${spec.id}`,
+    `# ${brainstorm ? "Brainstorm" : "Task"} ${spec.id}`,
     "",
     `Workspace: ${spec.workspace}`,
     `Session: ${state.sessions + 1}`,
     `Phase: ${state.phase}`,
     `Repos in scope: ${spec.repos.map((r) => `${r.owner}/${r.name}`).join(", ")}`,
     "",
-    "## Goal",
+    brainstorm ? "## The idea" : "## Goal",
     "",
     spec.goal,
-    "",
-    "## Acceptance criteria",
-    "",
-    "These are run by the supervisor, not by you. All must exit 0 before the task is done:",
-    "",
-    ...spec.acceptance.map((command) => `- \`${command}\``),
+    ...(brainstorm
+      ? []
+      : [
+          "",
+          "## Acceptance criteria",
+          "",
+          "These are run by the supervisor, not by you. All must exit 0 before the task is done:",
+          "",
+          ...spec.acceptance.map((command) => `- \`${command}\``),
+        ]),
   ].join("\n");
 
   const body = [
@@ -82,8 +135,12 @@ export const buildPrompt = (parts: PromptParts): string => {
     section("Handoff from the previous session", parts.handoff),
   ].join("");
 
-  const closing =
-    parts.handoff === undefined && parts.journal === undefined
+  const first = parts.handoff === undefined && parts.journal === undefined;
+  const closing = brainstorm
+    ? first
+      ? "\nStart by reading enough of the repository to make this concrete. Then ask your first question.\n"
+      : "\nContinue refining. When the shape is settled, call `submit_plan`.\n"
+    : first
       ? "\nThis is the first session. Start by orienting yourself in the repo, then begin.\n"
       : "\nContinue from the handoff above. Verify its assumptions before trusting them.\n";
 

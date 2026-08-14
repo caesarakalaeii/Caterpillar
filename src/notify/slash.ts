@@ -85,6 +85,24 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
     ],
   },
   {
+    name: "brainstorm",
+    description: "Refine an idea into a plan, in a thread, then cut it into tasks",
+    options: [
+      {
+        name: "topic",
+        description: "What you want to build or change. Rough is fine — that is the point.",
+        type: OPTION_STRING,
+        required: true,
+      },
+      {
+        name: "repo",
+        description: "owner/name — the repo to read while refining",
+        type: OPTION_STRING,
+        required: true,
+      },
+    ],
+  },
+  {
     name: "cancel",
     description: "Stop working a task and park it for a human",
     options: [
@@ -176,6 +194,17 @@ const fromCommand = (interaction: Interaction): Intent => {
       const task = taskOption(interaction, "task");
       return isTaskId(task) ? { kind: "run", command: { kind: "park", task } } : malformed(task);
     }
+    case "brainstorm": {
+      const topic = optionValue(interaction, "topic")?.trim() ?? "";
+      const repo = optionValue(interaction, "repo")?.trim() ?? "";
+      if (topic.length === 0) return malformed("A brainstorm needs a topic.");
+      if (repo.length === 0) {
+        // Required rather than inferred: a brainstorm that cannot read the code produces
+        // a plan about an imaginary codebase, which is the expensive kind of wrong.
+        return malformed("A brainstorm needs a repo to read — `owner/name`.");
+      }
+      return { kind: "run", command: { kind: "brainstorm", topic, repo } };
+    }
     default:
       return { kind: "ignored", reason: `unknown command ${name ?? "(none)"}` };
   }
@@ -196,6 +225,8 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "open-answer-modal", task: action.task };
     case "park":
       return { kind: "run", command: { kind: "park", task: action.task } };
+    case "merge":
+      return { kind: "run", command: { kind: "merge", task: action.task } };
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }

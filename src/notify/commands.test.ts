@@ -59,3 +59,45 @@ test("a command missing its id or its answer says so rather than doing nothing",
     assert.match(parsed?.kind === "malformed" ? parsed.reason : "", /!answer/);
   }
 });
+
+test("inside a task's thread the id is implied", () => {
+  // The point of a brainstorm thread: refining an idea is many short answers, and
+  // retyping `BS-1537550186388258866` before each one is exactly the friction the whole
+  // chat surface exists to remove.
+  const thread = asTaskId("BS-1537550186388258866");
+
+  assert.deepEqual(parseCommand("!answer yes, use the existing path", thread), {
+    kind: "answer",
+    task: thread,
+    text: "yes, use the existing path",
+  });
+});
+
+test("an explicit id inside a thread still means what it says", () => {
+  // A thread is a convenience, not a capture. Answering a DIFFERENT task from inside one
+  // must work, or the shortcut becomes a trap.
+  const thread = asTaskId("BS-1537550186388258866");
+  const other = asTaskId("GH-acme-widget-42");
+
+  assert.deepEqual(parseCommand(`!answer ${other} proceed`, thread), {
+    kind: "answer",
+    task: other,
+    text: "proceed",
+  });
+});
+
+test("an implied answer keeps its original formatting", () => {
+  // An answer can be a code block or a list. Re-joining on single spaces would flatten
+  // all of it, which matters more here than in the channel — a thread is where the long
+  // answers get typed.
+  const thread = asTaskId("BS-42");
+  const parsed = parseCommand("!answer use:\n\n```ts\nconst x = 1;\n```", thread);
+
+  assert.equal(parsed?.kind, "answer");
+  assert.match(parsed?.kind === "answer" ? parsed.text : "", /```ts\nconst x = 1;\n```/);
+});
+
+test("an empty answer in a thread is refused, not written", () => {
+  const parsed = parseCommand("!answer   ", asTaskId("BS-42"));
+  assert.equal(parsed?.kind, "malformed");
+});

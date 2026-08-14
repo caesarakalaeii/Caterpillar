@@ -15,6 +15,7 @@ import type { StateRepoConfig, WorkspaceProfile } from "../config/types.ts";
 import { parseStateRepoUrl, StateRepoCredentials } from "../state/credential.ts";
 import {
   GitHubAppForgeFactory,
+  reviewerForgeFactory,
   trackerTokenSource,
   type GitHubAppOptions,
 } from "../forge/github-app.ts";
@@ -117,6 +118,44 @@ export const loadForgeFactory = async (
     ...(tokensByRepo.size > 0 ? { tokensByRepo } : {}),
   };
   return new ForgejoForgeFactory(options);
+};
+
+/**
+ * Build the REVIEWER identity for a workspace, or undefined when it has none.
+ *
+ * A second GitHub App, in its own secret (`<secretRef>-reviewer`), installed on the same
+ * repositories. It is a different App on purpose and cannot be folded into the first:
+ * GitHub refuses to let a pull request's author approve it, and that refusal is the only
+ * thing making branch protection a real gate (DESIGN.md §9.1). An approval has to come
+ * from an identity that did not open the PR.
+ *
+ * Absent is a supported configuration — the council still runs and still records
+ * verdicts, and merging stays a human act (§12.1). Only `github` has one: Forgejo's
+ * equivalent would be a second account's token, which nothing has created yet.
+ */
+export const loadReviewerFactory = async (
+  profile: WorkspaceProfile,
+  secretsDir: string,
+): Promise<ForgeFactory | undefined> => {
+  if (profile.forge.kind !== "github") return undefined;
+
+  const bundle = new SecretBundle(secretsDir, `${profile.secretRef}-reviewer`);
+  const appId = await bundle.readOptional("app-id").catch(() => undefined);
+  const installationId = await bundle.readOptional("installation-id").catch(() => undefined);
+  const privateKeyPem = await bundle.readOptional("private-key.pem").catch(() => undefined);
+
+  // All three or none. A half-configured reviewer would fail at the moment of merging,
+  // which is after every gate has passed and the work is already recorded as complete.
+  if (appId === undefined || installationId === undefined || privateKeyPem === undefined) {
+    return undefined;
+  }
+
+  return reviewerForgeFactory({
+    appId,
+    installationId,
+    privateKeyPem,
+    apiBase: profile.forge.apiBase,
+  });
 };
 
 /**

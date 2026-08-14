@@ -318,6 +318,36 @@ and registers nothing. Re-invite with
 the guild membership it already has is kept and no restart is needed. The failure mode if
 this is skipped is a **403 on registration that reads exactly like a bad bot token**.
 
+**`/brainstorm` opens threads**, so the bot needs two permissions the current invite does
+not grant: **Create Public Threads** (`1 << 35`) and **Send Messages in Threads**
+(`1 << 38`). Combined with the `68608` it already has that is `permissions=309237713920`. Re-invite
+with the same `client_id` — the guild membership is kept and no restart is needed. Without
+them `/brainstorm` fails at `createThread` with a 403 and nothing is created.
+
+**The review council needs a SECOND GitHub App** before it can merge anything (§12.1).
+Not sealed yet, and everything works without it — the council still reviews, and a passing
+task ends `done` with its PR open for you to merge, exactly as today.
+
+To enable auto-merge: create a second App (`caterpillar-reviewer`), install it on the same
+repositories, and seal `app-id`, `installation-id` and `private-key.pem` into a secret named
+`<secretRef>-reviewer` — so `caterpillar-caesar-reviewer` alongside `caterpillar-caesar`.
+All three keys or none; a half-configured reviewer fails at the moment of merging, which is
+after every gate has passed. Verify it first:
+
+```bash
+npm run verify:reviewer -- --pem <reviewer-key.pem> --app-id <id> \
+  --repo caesarakalaeii/Caterpillar --author-app-id <the existing app id>
+```
+
+**It must be a different App from the one that opens PRs.** GitHub refuses to let a pull
+request's author approve it — that refusal is the whole reason branch protection is a real
+gate (§9.1) — so a reviewer sharing the App id can never merge anything. The verifier
+asserts this when given `--author-app-id`.
+
+Untested until the first live council merge: whether GitHub counts this App's approving
+review towards the required approval on `main`. If it does not, the App is on a bypass list
+or the ruleset requires a code owner it is not. Nothing short of a real PR proves it.
+
 **Notifications now come from the bot, not the webhook**, wherever `bot-token` and
 `channel-id` are both sealed — which they are. That is not cosmetic: Discord refuses
 interactive components from a webhook the application does not own, so an Answer button

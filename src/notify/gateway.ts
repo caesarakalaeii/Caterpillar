@@ -37,7 +37,15 @@ export interface GatewayOptions {
   readonly token: string;
   /** Only messages here are read. Everything else in the guild is ignored. */
   readonly channelId: string;
-  readonly onMessage: (content: string, author: string) => Promise<void>;
+  /**
+   * Threads of that channel which are also read (§14.3).
+   *
+   * A message in a thread arrives with `channel_id` set to the THREAD and no reference to
+   * its parent, so there is no way to recognise one without knowing which threads are
+   * ours. Optional: without it only the channel itself is read.
+   */
+  readonly threads?: { knows(channelId: string): boolean };
+  readonly onMessage: (content: string, author: string, channelId: string) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
    *
@@ -286,7 +294,9 @@ export class DiscordGateway {
     if (payload.t !== "MESSAGE_CREATE") return;
 
     const message = payload.d as MessageCreate;
-    if (message.channel_id !== channelId) return;
+    const from = message.channel_id;
+    if (from === undefined) return;
+    if (from !== channelId && this.options.threads?.knows(from) !== true) return;
     // The bridge reads the channel it posts into. Without this it answers its own
     // question notifications, which end with a literal `!answer` hint.
     if (message.author?.bot === true || message.webhook_id !== undefined) return;
@@ -294,7 +304,7 @@ export class DiscordGateway {
     const content = message.content ?? "";
     if (content.length === 0) return;
 
-    void onMessage(content, message.author?.username ?? "someone").catch((error: unknown) => {
+    void onMessage(content, message.author?.username ?? "someone", from).catch((error: unknown) => {
       logger.error("gateway.handler-failed", {
         error: error instanceof Error ? error.message : String(error),
       });

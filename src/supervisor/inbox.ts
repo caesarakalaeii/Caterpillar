@@ -19,17 +19,38 @@ import type { TaskId } from "../domain/task.ts";
 export type ChatOutcome =
   | { readonly kind: "applied"; readonly index: number }
   | { readonly kind: "parked" }
+  | { readonly kind: "merged"; readonly prUrl: string }
+  | { readonly kind: "started"; readonly task: TaskId }
   | { readonly kind: "unknown-task" }
+  /** The request was well-formed but could not be acted on — a repo nothing owns, say. */
+  | { readonly kind: "refused"; readonly reason: string }
   /** Answering a task that is not waiting on a question. */
   | { readonly kind: "not-waiting"; readonly status: string }
   /** Parking a task that is already terminal. */
   | { readonly kind: "not-parkable"; readonly status: string }
+  /** Merging was possible in principle but refused — no PR, or no reviewer identity. */
+  | { readonly kind: "not-mergeable"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
 
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
 export type ChatIntent =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
-  | { readonly kind: "park"; readonly task: TaskId };
+  | { readonly kind: "park"; readonly task: TaskId }
+  | { readonly kind: "merge"; readonly task: TaskId }
+  /**
+   * Create a brainstorm task (DESIGN.md §14.3).
+   *
+   * The thread already exists by the time this arrives — the bridge opened it, because
+   * the task's id is derived from it. This is the one request that carries no task id:
+   * it is the one that mints one.
+   */
+  | {
+      readonly kind: "brainstorm";
+      readonly topic: string;
+      readonly repo: string;
+      readonly threadId: string;
+      readonly author: string;
+    };
 
 export type ChatRequest = ChatIntent & {
   /** Settled by the loop once the write has been pushed, or has failed to be. */
