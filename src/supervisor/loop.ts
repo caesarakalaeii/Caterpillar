@@ -19,6 +19,7 @@ import {
   claimOrder,
   EMPTY_USAGE,
   isClaimable,
+  isTerminal,
   repoSlug,
   type ProposedPlan,
   type SessionOutcome,
@@ -37,8 +38,8 @@ import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
-import type { Presence } from "../notify/bot.ts";
-import type { ThreadIndex } from "../notify/threads.ts";
+import type { Presence, ThreadCloser } from "../notify/bot.ts";
+import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
 import type { ForgeFactory } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
@@ -139,6 +140,11 @@ export interface SupervisorDeps {
    * minutes otherwise looks exactly like one that has died.
    */
   readonly presence?: Presence;
+  /**
+   * Ends a thread's conversation when its task is cancelled (§14.3). Optional, and
+   * cosmetic in the same way the tracker is: the task is parked in git either way.
+   */
+  readonly closer?: ThreadCloser;
 }
 
 export class Supervisor {
@@ -254,10 +260,18 @@ export class Supervisor {
     }
 
     snapshot?.replace(records.map((record) => summarise(record.state)));
+    // Terminal tasks drop out: a message in a bound thread is an ANSWER, so leaving a
+    // finished conversation bound means an abandoned thread silently swallows whatever
+    // is typed into it. `threadBindings` also settles who owns a thread several tasks
+    // share — a plan's children inherit their brainstorm's.
     this.deps.threads?.replace(
-      records
-        .filter((record) => record.state.chat !== undefined)
-        .map((record) => [record.state.chat?.threadId ?? "", record.id] as const),
+      threadBindings(
+        records.map((record) => ({
+          id: record.id,
+          status: record.state.status,
+          ...(record.state.chat === undefined ? {} : { threadId: record.state.chat.threadId }),
+        })),
+      ),
     );
     return records;
   }
@@ -1160,6 +1174,18 @@ export class Supervisor {
       await this.transition(lease, state, "parked");
       await this.push(lease, `chore(${request.task}): parked from chat`);
       logger.info("task.cancelled", { task: request.task, previous: state.status });
+
+      // After the push, never before: the thread's last word must describe what git
+      // already says, and a failure here must not leave a task running with a closed
+      // conversation.
+      const threadId = state.chat?.threadId;
+      if (threadId !== undefined) {
+        await this.deps.closer?.close(
+          threadId,
+          `**${request.task}** was cancelled. This thread is closed — start a new ` +
+            `\`/brainstorm\` if you want to pick the idea up again.`,
+        );
+      }
       return { kind: "parked" };
     } finally {
       await leases.release(lease).catch(() => undefined);
@@ -1344,8 +1370,5 @@ export class Supervisor {
   }
 }
 
-/** Convenience for callers that want to know whether a status is terminal. */
-export const isTerminal = (status: TaskStatus): boolean =>
-  status === "done" || status === "failed" || status === "parked";
-
+export { isTerminal };
 export type { TaskId };

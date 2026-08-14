@@ -410,6 +410,16 @@ to retype. And ordinary chat while the agent is working is answered with **silen
 rather than "not waiting on an answer", which would turn a conversation into a wall of
 refusals.
 
+**A cancelled task's thread is closed, and stops being listened to.** `/cancel` parks the
+task, says so in the thread, and archives it. The binding rule is what makes that safe:
+only a NON-TERMINAL task's thread is bound, so a finished conversation cannot keep
+accepting messages — and since a message in a bound thread is now an answer, leaving one
+bound means an abandoned thread silently swallows everything typed into it. Several tasks
+can share a thread (a plan's children inherit their brainstorm's), so a parent going
+`done` does not close the thread its children still talk in, and when more than one is
+live the task AWAITING an answer owns it. Nothing is deleted: parking stops the work, and
+the journal is the audit trail.
+
 **The typing indicator is what says the agent is alive.** Handoffs are deliberately not
 notified (§11), so between a question and its answer the channel is silent and a task
 thinking for forty minutes looks exactly like one that has died. While a session runs for

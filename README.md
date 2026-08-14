@@ -259,6 +259,12 @@ is the whole command. When the shape is settled it proposes a decomposition, the
 council reads it with plan-specific lenses, and on a pass the tasks are created with a
 `wave` and a `blockedBy` (§14.3).
 
+To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
+so, then archived. The task is never claimed again; the thread keeps its history and
+un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
+`journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
+repo by hand, once no lease is held.
+
 Waves describe what **may** run concurrently. One runner still works one task at a time —
 actual parallelism means scaling the Deployment, which the git-ref leasing already makes
 safe. A rejected plan creates nothing.

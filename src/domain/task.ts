@@ -279,6 +279,16 @@ export const isClaimable = (
   state.status === "ready" &&
   (state.plan?.blockedBy ?? []).every((id) => statusOf(id) === "done");
 
+/**
+ * True when a status is final — nothing will move this task again without a human.
+ *
+ * Lives here rather than beside the loop because more than the loop needs it: the thread
+ * index uses it to decide whether a conversation is still worth listening to, and a
+ * cycle would be the only alternative.
+ */
+export const isTerminal = (status: TaskStatus): boolean =>
+  status === "done" || status === "failed" || status === "parked";
+
 /** Claim order: earlier waves first, then by id so it is deterministic across runners. */
 export const claimOrder = (a: TaskState, b: TaskState): number =>
   (a.plan?.wave ?? 0) - (b.plan?.wave ?? 0) || a.id.localeCompare(b.id);
