@@ -20,10 +20,12 @@ import { DiscordBot } from "./bot.ts";
 import { DiscordBridge } from "./bridge.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, RESPONSE, type Interaction } from "./interactions.ts";
+import { ThreadIndex } from "./threads.ts";
 import { ANSWER_FIELD } from "./slash.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
 const CHANNEL = "1537550186388258866";
+const THREAD = "1537785980415778816";
 const API = "https://discord.test/api/v10";
 
 interface Call {
@@ -46,7 +48,7 @@ const state = (over: Partial<TaskState> = {}): TaskState => ({
   ...over,
 });
 
-const harness = (): {
+const harness = (over: { readonly threads?: ThreadIndex } = {}): {
   readonly bridge: DiscordBridge;
   readonly inbox: ChatInbox;
   readonly calls: Call[];
@@ -70,6 +72,7 @@ const harness = (): {
     inbox,
     snapshot,
     logger: SILENT_LOGGER,
+    ...(over.threads === undefined ? {} : { threads: over.threads }),
     fetch,
   });
 
@@ -276,4 +279,61 @@ test("a typed !answer takes the same path as the slash command", async () => {
 
   assert.equal(calls.length, 1, "a typed command has no interaction to acknowledge");
   assert.match(String((posted(calls)[0]?.body ?? {})["content"]), /Answered/);
+});
+
+test("a button in one of our threads works instead of being refused", () => {
+  // It was not: the channel guard compared against the configured channel alone, so
+  // every Answer button posted into a brainstorm thread answered "I only act in
+  // #caterpillar" — dead on arrival, in the one place questions are asked.
+  const customId = encodeCustomId({ verb: "ans", task: TASK });
+  assert.ok(customId !== undefined);
+
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, calls } = harness({ threads });
+
+  return bridge
+    .handleInteraction(
+      interaction({ type: INTERACTION.component, channel_id: THREAD, data: { custom_id: customId } }),
+    )
+    .then(() => {
+      assert.equal(callback(calls).body["type"], RESPONSE.modal, "it must open the modal");
+    });
+});
+
+test("a button from a channel that is neither ours nor a thread is still refused", () => {
+  const { bridge, calls } = harness({ threads: new ThreadIndex() });
+
+  return bridge
+    .handleInteraction(interaction({ channel_id: "8888", data: { name: "tasks" } }))
+    .then(() => {
+      const data = callback(calls).body["data"] as { readonly content: string };
+      assert.match(data.content, /I only act in/);
+    });
+});
+
+test("plain chat in a thread is submitted as that task's answer", async () => {
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleMessage("we want B", "operator", THREAD);
+  await settleQueued(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.match(String((posted(calls)[0]?.body ?? {})["content"]), /Answered/);
+});
+
+test("chatting while the agent is busy says nothing at all", async () => {
+  // Every line in a thread is an answer now, so replying "not waiting on an answer" to
+  // each one would turn a conversation into a wall of refusals.
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleMessage("actually, hold on", "operator", THREAD);
+  await settleQueued(inbox, { kind: "not-waiting", status: "running" });
+  await handled;
+
+  assert.equal(posted(calls).length, 0, "silence is the correct reply to ordinary chat");
 });

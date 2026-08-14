@@ -73,16 +73,20 @@ test("inside a task's thread the id is implied", () => {
   });
 });
 
-test("an explicit id inside a thread still means what it says", () => {
-  // A thread is a convenience, not a capture. Answering a DIFFERENT task from inside one
-  // must work, or the shortcut becomes a trap.
+test("a thread answers ITS task, even when another id is typed", () => {
+  // Reversed deliberately. A thread is a conversation with exactly one task, and the
+  // ambiguity cost more than the capability: `!answer we want B` was read as an answer
+  // to a task called `we`, because `we` matches the task-id charset.
+  //
+  // Answering a DIFFERENT task from inside a thread is not lost — `/answer` takes an
+  // explicit id and works from anywhere, with autocomplete to get it right.
   const thread = asTaskId("BS-1537550186388258866");
   const other = asTaskId("GH-acme-widget-42");
 
   assert.deepEqual(parseCommand(`!answer ${other} proceed`, thread), {
     kind: "answer",
-    task: other,
-    text: "proceed",
+    task: thread,
+    text: `${other} proceed`,
   });
 });
 
@@ -97,7 +101,60 @@ test("an implied answer keeps its original formatting", () => {
   assert.match(parsed?.kind === "answer" ? parsed.text : "", /```ts\nconst x = 1;\n```/);
 });
 
-test("an empty answer in a thread is refused, not written", () => {
-  const parsed = parseCommand("!answer   ", asTaskId("BS-42"));
-  assert.equal(parsed?.kind, "malformed");
+test("an empty thread message is ignored, not refused", () => {
+  // Changed with the grammar: every message in a thread is now an answer, so an empty
+  // one is nothing said rather than a malformed command. Replying "cannot be empty" to
+  // it would be the bot talking to itself in a conversation it is only half part of.
+  assert.equal(parseCommand("!answer   ", asTaskId("BS-42")), undefined);
+});
+
+test("in a thread, a plain message IS the answer", () => {
+  // Requiring `!answer` in a task's own thread was friction in the one place the chat
+  // surface exists to remove it: refining an idea is many short replies.
+  const thread = asTaskId("BS-1537785980415778816");
+
+  assert.deepEqual(parseCommand("we want B", thread), {
+    kind: "answer",
+    task: thread,
+    text: "we want B",
+  });
+});
+
+test("`!answer we want B` in a thread answers the THREAD, not a task called `we`", () => {
+  // The exact message that failed in production. `we` matches the task-id charset, so
+  // the channel parser took it as an id and replied "No task we in the state repo."
+  const thread = asTaskId("BS-1537785980415778816");
+
+  assert.deepEqual(parseCommand("!answer we want B", thread), {
+    kind: "answer",
+    task: thread,
+    text: "we want B",
+  });
+});
+
+test("a thread reply keeps its formatting and its own id is not swallowed twice", () => {
+  const thread = asTaskId("BS-42");
+
+  assert.equal(
+    parseCommand(`!answer ${thread} use:\n\n\`\`\`ts\nconst x = 1;\n\`\`\``, thread)?.kind,
+    "answer",
+  );
+  const parsed = parseCommand(`!answer ${thread} use:\n\n\`\`\`ts\nconst x = 1;\n\`\`\``, thread);
+  assert.match(parsed?.kind === "answer" ? parsed.text : "", /^use:\n\n```ts/);
+});
+
+test("an empty thread message is ignored rather than refused", () => {
+  // Nothing was said, so there is nothing to reply to. A "cannot be empty" here would
+  // be the bot talking to itself.
+  assert.equal(parseCommand("   ", asTaskId("BS-42")), undefined);
+  assert.equal(parseCommand("!answer", asTaskId("BS-42")), undefined);
+});
+
+test("outside a thread the channel grammar is unchanged", () => {
+  assert.equal(parseCommand("we want B"), undefined, "plain chat in the channel is not a command");
+  assert.deepEqual(parseCommand("!answer GH-acme-widget-42 yes"), {
+    kind: "answer",
+    task: asTaskId("GH-acme-widget-42"),
+    text: "yes",
+  });
 });

@@ -78,6 +78,22 @@ export class DiscordBridge {
     if (command === undefined) return;
 
     this.deps.logger.info("bridge.command", { kind: command.kind, author, thread });
+
+    if (thread !== undefined && command.kind === "answer") {
+      const outcome = await this.deps.inbox.submit({
+        kind: "answer",
+        task: command.task,
+        text: command.text,
+      });
+      // Talking in a thread while the agent is working is ORDINARY, not an error. Every
+      // line here is now an answer, so replying "not waiting on an answer" to each one
+      // would turn a conversation into a wall of refusals. The typing indicator is what
+      // says the agent is busy.
+      if (outcome.kind === "not-waiting") return;
+      await this.say(describeOutcome(command.task, outcome), channelId);
+      return;
+    }
+
     await this.say(await this.execute(command, author), channelId);
   }
 
@@ -106,10 +122,16 @@ export class DiscordBridge {
     // A guild-registered command can be invoked from any channel the bot can see. §7
     // restricts it to one channel deliberately: a bot that acts anywhere it is visible
     // is a bot anyone in the guild can drive.
-    if (interaction.channel_id !== undefined && interaction.channel_id !== bot.channelId) {
+    //
+    // OUR THREADS COUNT. They were not on this list at first, and the effect was that
+    // every button posted into a brainstorm thread answered "I only act in #caterpillar"
+    // — the Answer button under a question was dead on arrival, in the one place
+    // questions are asked.
+    const from = interaction.channel_id;
+    if (from !== undefined && from !== bot.channelId && this.deps.threads?.knows(from) !== true) {
       await this.answer(
         interaction,
-        reply(`I only act in <#${bot.channelId}>.`, { ephemeral: true }),
+        reply(`I only act in <#${bot.channelId}> and its threads.`, { ephemeral: true }),
       );
       return;
     }

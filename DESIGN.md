@@ -396,6 +396,27 @@ instruction instead of a button — where it does not. The gateway's existing ru
 `author.bot` messages are ignored was written to stop the bridge answering the webhook's
 own `!answer` hint; it now carries the bot's own output too, and is load-bearing twice.
 
+**In a task's own thread there is no command language.** Every message is the answer,
+verbatim — no `!answer`, no id, and a leading `!answer` is stripped rather than obeyed
+because people type it out of habit. Requiring the prefix was friction in the one place
+this set out to remove it (refining an idea is many short replies) and it made a plausible
+first word into a task id: `!answer we want B` was read as an answer to a task called
+`we`. Answering a *different* task from inside a thread is not lost — `/answer` takes an
+explicit id, with autocomplete, from anywhere.
+
+Two things follow. A question posted into a thread carries **no Answer button**: the
+button spares a human retyping an id in a busy channel, and in the thread there is no id
+to retype. And ordinary chat while the agent is working is answered with **silence**
+rather than "not waiting on an answer", which would turn a conversation into a wall of
+refusals.
+
+**The typing indicator is what says the agent is alive.** Handoffs are deliberately not
+notified (§11), so between a question and its answer the channel is silent and a task
+thinking for forty minutes looks exactly like one that has died. While a session runs for
+a task with a thread, the bot types in it — one request every eight seconds, best-effort,
+never a reason for anything to fail. Not in the main channel: the runner always has
+something in flight there, and a signal that is always on carries no information.
+
 **A click disables the buttons it was made with.** The acknowledgement rewrites the message
 the button sits on, with every button on it disabled. That is what makes a second click
 harmless, and it matters most for the one button that merges. A `custom_id` is capped at
