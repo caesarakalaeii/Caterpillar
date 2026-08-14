@@ -40,6 +40,7 @@ import { GitProgressProbe } from "./supervisor/probe.ts";
 import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
+import { ToolchainResolver } from "./workspace/toolchain.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
 /** Where state-repo installation tokens are minted. Not a workspace forge. */
@@ -127,6 +128,11 @@ const main = async (): Promise<void> => {
     identity: BOT_IDENTITY,
   });
 
+  // ONE resolver for the whole process. The agent's shell, the council's, the plan
+  // maintainer's and the acceptance gate's must be the same environment or the gate grades
+  // work against a shell the agent never saw (see workspace/toolchain.ts).
+  const toolchain = new ToolchainResolver({ logger });
+
   const credentials = new CredentialService();
   await credentials.start(CRED_SOCKET);
 
@@ -165,12 +171,13 @@ const main = async (): Promise<void> => {
       llm,
       bindings,
       metrics,
+      toolchain,
     }),
-    verifier: new AcceptanceVerifier({ worktrees, bindings }),
+    verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
-    council: new ReviewCouncil({ config, worktrees, llm, logger }),
-    maintainer: new PlanMaintainer({ config, worktrees, llm, logger }),
+    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
+    maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
     threads,
     ...(discord.bot === undefined

@@ -40,6 +40,7 @@ import type { ControlSink } from "../agent/tools.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
 import { PLAN_LENSES, PR_LENSES, type Lens } from "./lenses.ts";
 import { submitVerdictTool, type VerdictSink } from "./tools.ts";
@@ -80,6 +81,7 @@ export interface ReviewCouncilOptions {
   readonly worktrees: WorktreeManager;
   readonly llm: LlmRuntime;
   readonly logger: Logger;
+  readonly toolchain: ToolchainResolver;
   /** Overridable so a future plan council can supply its own (DESIGN.md §12.1). */
   readonly lenses?: readonly Lens[];
 }
@@ -131,8 +133,14 @@ export class ReviewCouncil implements Council {
       lenses: lenses.map((l) => l.key).join(","),
     });
 
+    // Resolved once and shared by all three reviewers. They read the same worktree, so
+    // three resolves would be three identical answers — and a reviewer judging the code
+    // in a different environment from the one that produced it is the failure this
+    // module exists to prevent (see `workspace/toolchain.ts`).
+    const toolchain = await this.options.toolchain.resolve(spec, worktree);
+
     const results = await Promise.all(
-      lenses.map((lens) => this.runReviewer(lens, worktree, prompt, spec)),
+      lenses.map((lens) => this.runReviewer(lens, worktree, prompt, spec, toolchain)),
     );
 
     const verdict = decide(results.map((r) => r.verdict));
@@ -162,6 +170,7 @@ export class ReviewCouncil implements Council {
     worktree: string,
     prompt: string,
     spec: TaskSpec,
+    toolchain: ResolvedEnv,
   ): Promise<{ readonly verdict: ReviewerVerdict; readonly usage: UsageTotals }> {
     const { llm, config, logger } = this.options;
 
@@ -171,7 +180,13 @@ export class ReviewCouncil implements Council {
     // submitted its verdict stops immediately instead of continuing to read the repo.
     const control: ControlSink = {};
 
-    const execContext: ExecContext = { env: new NodeExecutionEnv({ cwd: worktree }) };
+    const execContext: ExecContext = {
+      env: new NodeExecutionEnv({
+        cwd: worktree,
+        shellPath: toolchain.shell,
+        shellEnv: toolchain.env,
+      }),
+    };
     const tools: AgentTool[] = [
       bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
       bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,

@@ -25,6 +25,7 @@
 import { parse as parseYaml } from "yaml";
 import {
   asTaskId,
+  KNOWN_CAPABILITIES,
   type Capability,
   type RepoRef,
   type TaskId,
@@ -69,15 +70,6 @@ const findAgentBlock = (
   }
   return undefined;
 };
-
-const KNOWN_CAPABILITIES: readonly Capability[] = [
-  "linux",
-  "k8s",
-  "net",
-  "gpu",
-  "usb",
-  "human-present",
-];
 
 /** How a human is told what to write. Repeated verbatim into the tracker comment. */
 const TEMPLATE = [

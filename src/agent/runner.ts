@@ -38,6 +38,7 @@ import type { AgentMetrics } from "../metrics/registry.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import type { ToolchainResolver } from "../workspace/toolchain.ts";
 import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { BRAINSTORM_SYSTEM_PROMPT, buildPrompt, SYSTEM_PROMPT } from "./prompt.ts";
@@ -83,6 +84,7 @@ export interface AgentSessionRunnerOptions {
   readonly llm: LlmRuntime;
   readonly bindings: WorkspaceBindings;
   readonly metrics: AgentMetrics;
+  readonly toolchain: ToolchainResolver;
 }
 
 export class WorkspaceNotConfiguredError extends Error {
@@ -128,7 +130,17 @@ export class AgentSessionRunner {
         ...(spec.tracker !== undefined ? { trackerRef: spec.tracker } : {}),
       };
 
-      const execContext: ExecContext = { env: new NodeExecutionEnv({ cwd: worktree }) };
+      // The agent's shell, the review council's, the plan maintainer's and the acceptance
+      // gate's all come from here. Resolved once per session rather than per command:
+      // wrapping each command would put quoting between the model and its own shell.
+      const toolchain = await this.options.toolchain.resolve(spec, worktree);
+      const execContext: ExecContext = {
+        env: new NodeExecutionEnv({
+          cwd: worktree,
+          shellPath: toolchain.shell,
+          shellEnv: toolchain.env,
+        }),
+      };
       // A brainstorm reads and asks; it does not write. Withholding `write` and `edit`
       // is not a sandbox — `bash` is still there and a determined session could use it —
       // but it is the difference between a tool the model reaches for by habit and one

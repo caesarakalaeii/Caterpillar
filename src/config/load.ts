@@ -6,7 +6,12 @@
  * mounted secret directory, so a config dump can never leak a credential.
  */
 import { readFile } from "node:fs/promises";
-import { asWorkspaceName, type Capability, type WorkspaceName } from "../domain/task.ts";
+import {
+  asWorkspaceName,
+  KNOWN_CAPABILITIES,
+  type Capability,
+  type WorkspaceName,
+} from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import type { LlmConfig, RunnerConfig, WorkspaceProfile } from "./types.ts";
 
@@ -68,15 +73,6 @@ const logLevel = (value: unknown): LogLevel => {
   }
   return value as LogLevel;
 };
-
-const KNOWN_CAPABILITIES: readonly Capability[] = [
-  "linux",
-  "k8s",
-  "net",
-  "gpu",
-  "usb",
-  "human-present",
-];
 
 const capabilities = (value: unknown): readonly Capability[] => {
   if (!Array.isArray(value)) throw new ConfigError("capabilities must be an array");

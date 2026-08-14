@@ -31,6 +31,12 @@ export const isTaskId = (value: string): value is TaskId => TASK_ID.test(value);
 /**
  * A capability a runner advertises and a task may require. Claiming requires
  * `task.requires ⊆ runner.capabilities` (DESIGN.md §8).
+ *
+ * A capability is a fact about a machine that CANNOT be provisioned — a GPU, a USB
+ * device, game files already on disk, a human in the room. Anything a runner could
+ * install for itself does not belong here: as a claim predicate it would turn a solvable
+ * problem into a task no runner ever claims, which reads from outside as a stuck
+ * scheduler rather than a missing tool.
  */
 export type Capability =
   | "linux"
@@ -39,6 +45,26 @@ export type Capability =
   | "gpu"
   | "usb"
   | "human-present";
+
+/**
+ * The single list. `config/load.ts` and `intake/spec.ts` both validate against it, and
+ * they must agree — config accepting a capability intake refuses (or the reverse) is a
+ * runner that advertises something no task can ask for.
+ *
+ * `as const satisfies` rather than a typed annotation so the array stays a literal tuple:
+ * both are erased at load time, which `erasableSyntaxOnly` requires (DESIGN.md §16).
+ *
+ * A fourth copy lives in `scripts/install-runner.sh`, which cannot import. It is guarded
+ * by a drift test in `domain/task.test.ts` instead.
+ */
+export const KNOWN_CAPABILITIES = [
+  "linux",
+  "k8s",
+  "net",
+  "gpu",
+  "usb",
+  "human-present",
+] as const satisfies readonly Capability[];
 
 /** Lifecycle state of a task. Authoritative value lives in `state.json`. */
 export type TaskStatus =
