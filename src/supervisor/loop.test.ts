@@ -30,6 +30,7 @@ import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
+import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { ChatInbox } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
@@ -107,6 +108,7 @@ await seedTask(TASK);
 const config: RunnerConfig = {
   runnerId: "test-runner",
   capabilities: ["linux"],
+  toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
   paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
   // A heartbeat long enough never to fire: this test is about the failure path, and a
@@ -128,6 +130,19 @@ const config: RunnerConfig = {
   pollSeconds: 1,
   secretsDir: join(root, "secrets"),
 };
+
+/**
+ * Every task here declares no toolchain, so this only ever answers "inherited".
+ *
+ * `gcIntervalHours: 0` would make the idle branch collect the store on the second poll,
+ * which these tests hit constantly at `pollSeconds: 1` — the default keeps it out of the
+ * way. The first call only stamps the clock, so no collection happens either way.
+ */
+const TEST_TOOLCHAIN = new ToolchainResolver({
+  logger: SILENT_LOGGER,
+  config: DEFAULT_TOOLCHAIN_CONFIG,
+  tasksDir: join(root, "tasks"),
+});
 
 /** What the state repo's REMOTE says — the only evidence a push actually landed. */
 const pushedState = async (task: TaskId = TASK): Promise<TaskState | undefined> => {
@@ -174,6 +189,7 @@ test("a task whose session throws is parked on the REMOTE, not just locally", as
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();
@@ -248,6 +264,7 @@ test("a notification that fails does not undo a task that finished", async () =>
     notifier,
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();
@@ -322,6 +339,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
     inbox,
   });
 
@@ -371,6 +389,7 @@ test("an answer for a task that is not waiting is refused, not written", async (
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
     inbox,
   });
 
@@ -448,6 +467,7 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();
@@ -558,6 +578,7 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();
@@ -628,6 +649,7 @@ test("a blocked task is not claimed until its blocker is done", async () => {
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();
@@ -721,6 +743,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
   });
 
   const controller = new AbortController();

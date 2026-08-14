@@ -12,6 +12,11 @@ import { execFile } from "node:child_process";
 import type { RepoRef, TaskSpec, TaskState } from "../domain/task.ts";
 import type { Forge, ForgeFactory } from "../forge/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import {
+  TASK_SHELL_ARGS,
+  type ResolvedEnv,
+  type ToolchainResolver,
+} from "../workspace/toolchain.ts";
 import type { WorkspaceBindings } from "../agent/runner.ts";
 
 export interface VerificationResult {
@@ -29,12 +34,16 @@ export interface CommandResult {
 /** Timeout per acceptance command. A hung test must not wedge the supervisor. */
 const COMMAND_TIMEOUT_MS = 15 * 60 * 1000;
 
-const runCommand = (command: string, cwd: string): Promise<CommandResult> =>
+const runCommand = (
+  command: string,
+  cwd: string,
+  toolchain: ResolvedEnv,
+): Promise<CommandResult> =>
   new Promise((resolve) => {
     execFile(
-      "bash",
-      ["-lc", command],
-      { cwd, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
+      toolchain.shell,
+      [...TASK_SHELL_ARGS, command],
+      { cwd, env: toolchain.env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => {
         const code = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
         resolve({ command, code, output: `${stdout}\n${stderr}`.trim() });
@@ -45,6 +54,12 @@ const runCommand = (command: string, cwd: string): Promise<CommandResult> =>
 export interface AcceptanceVerifierOptions {
   readonly worktrees: WorktreeManager;
   readonly bindings: WorkspaceBindings;
+  /**
+   * The same resolver the agent's session used. The gate has to run in the environment
+   * the agent was given, or it grades work against a shell the agent never saw
+   * (see `workspace/toolchain.ts`).
+   */
+  readonly toolchain: ToolchainResolver;
 }
 
 export class AcceptanceVerifier {
@@ -69,10 +84,11 @@ export class AcceptanceVerifier {
   /** Gate 1 — the declared commands, run by us in the task's worktree. */
   private async runAcceptance(spec: TaskSpec, repo: RepoRef): Promise<VerificationResult> {
     const worktree = await this.options.worktrees.ensureWorktree(repo, spec.id);
+    const toolchain = await this.options.toolchain.resolve(spec, worktree);
     const failures: CommandResult[] = [];
 
     for (const command of spec.acceptance) {
-      const result = await runCommand(command, worktree);
+      const result = await runCommand(command, worktree, toolchain);
       if (result.code !== 0) failures.push(result);
     }
 

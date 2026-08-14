@@ -28,7 +28,37 @@ FROM node:22-alpine
 # git: the entire state model. openssh-client: git's ssh transport for repos that use
 # it. ca-certificates: TLS to the forges. bash/coreutils: the agent's shell expects a
 # real one, and busybox's differs enough to break heredocs and process substitution.
+#
+# bash is now mandatory rather than merely expected: the agent's shell and the acceptance
+# gate's are the same binary by construction (src/workspace/toolchain.ts), and a runner
+# that cannot find one refuses to start a session instead of quietly falling back to sh.
 RUN apk add --no-cache git openssh-client ca-certificates bash coreutils tini
+
+# nix, for building a task's dev environment (DESIGN.md §8.1).
+#
+# Language toolchains a specific repo needs — lua, go, a compiler — still do not live in
+# this image, but the reason has changed. It used to be "that is what capability-matched
+# runners are for", which was a promise the design could not keep: a capability is a fact
+# about a machine that cannot be provisioned, so `requires: [lua]` was never expressible
+# and such a task would have waited for a runner that could never advertise it. Toolchains
+# are BUILT per task now, and this is what builds them.
+#
+# COPYed from the official image rather than `apk add nix`, because a nix store path is a
+# self-contained closure: the binaries carry their own libc and do not care that this base
+# is musl. That property is the whole reason this works on alpine, and it is the same one
+# that makes cache.nixos.org usable here.
+#
+# Pinned, like everything else. nix is what guarantees a reproducible environment;
+# installing whatever is current would put the one unpinned dependency underneath all the
+# pinned ones.
+COPY --from=nixos/nix:2.31.2 /nix /nix
+
+ENV PATH="/nix/var/nix/profiles/default/bin:${PATH}" \
+    NIX_CONFIG="experimental-features = nix-command flakes"
+
+# Fails the BUILD rather than the pod. Without it a broken copy ships, every task that
+# declares a toolchain parks, and the first sign of it is a Discord message hours later.
+RUN nix --version && nix-collect-garbage --version
 
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
@@ -42,7 +72,17 @@ RUN printf '#!/bin/sh\nexec node /app/dist/cli/credential-helper.js "$@"\n' \
  && chmod 0755 /usr/local/bin/caterpillar-cred
 
 # The PVC mounts here; ownership is set by the Deployment's fsGroup.
-RUN mkdir -p /work /run/caterpillar && chown -R node:node /work /run/caterpillar
+#
+# /nix is NOT on the PVC and deliberately so. Relocating the store with NIX_STORE_DIR
+# invalidates every binary-cache substitution — store paths are addressed by their literal
+# /nix/store prefix — and mounting a volume over /nix would hide the closure COPYed above.
+# The cost is that a deploy discards whatever was substituted; the resolver's cache checks
+# that the paths it remembers still exist and re-resolves when they do not, so that shows
+# up as a slower first session rather than as a PATH full of directories that are gone.
+# Making the store durable means seeding the volume on first boot, which is a change to the
+# deployment repo and a change here, and is worth doing only if the cold resolves hurt.
+RUN mkdir -p /work /run/caterpillar && chown -R node:node /work /run/caterpillar \
+ && chown -R node:node /nix
 
 USER node
 ENV NODE_ENV=production

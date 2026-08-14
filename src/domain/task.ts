@@ -31,6 +31,12 @@ export const isTaskId = (value: string): value is TaskId => TASK_ID.test(value);
 /**
  * A capability a runner advertises and a task may require. Claiming requires
  * `task.requires ⊆ runner.capabilities` (DESIGN.md §8).
+ *
+ * A capability is a fact about a machine that CANNOT be provisioned — a GPU, a USB
+ * device, game files already on disk, a human in the room. Anything a runner could
+ * install for itself does not belong here: as a claim predicate it would turn a solvable
+ * problem into a task no runner ever claims, which reads from outside as a stuck
+ * scheduler rather than a missing tool.
  */
 export type Capability =
   | "linux"
@@ -38,7 +44,34 @@ export type Capability =
   | "net"
   | "gpu"
   | "usb"
-  | "human-present";
+  | "human-present"
+  /**
+   * This runner can materialise a declared dev environment (DESIGN.md §8.1). ONE
+   * capability, not one per language: `lua`, `go`, `python` and the rest are not
+   * capabilities at all, they are things a runner with this one installs for itself.
+   */
+  | "nix";
+
+/**
+ * The single list. `config/load.ts` and `intake/spec.ts` both validate against it, and
+ * they must agree — config accepting a capability intake refuses (or the reverse) is a
+ * runner that advertises something no task can ask for.
+ *
+ * `as const satisfies` rather than a typed annotation so the array stays a literal tuple:
+ * both are erased at load time, which `erasableSyntaxOnly` requires (DESIGN.md §16).
+ *
+ * A fourth copy lives in `scripts/install-runner.sh`, which cannot import. It is guarded
+ * by a drift test in `domain/task.test.ts` instead.
+ */
+export const KNOWN_CAPABILITIES = [
+  "linux",
+  "k8s",
+  "net",
+  "gpu",
+  "usb",
+  "human-present",
+  "nix",
+] as const satisfies readonly Capability[];
 
 /** Lifecycle state of a task. Authoritative value lives in `state.json`. */
 export type TaskStatus =
@@ -107,7 +140,32 @@ export interface TaskSpec {
    * SUPERVISOR, never by the agent (DESIGN.md §12).
    */
   readonly acceptance: readonly string[];
+  /**
+   * The dev environment the task's commands run in (DESIGN.md §8.1). Absent is the
+   * common case: the repo's own `flake.nix` is found without anyone declaring it, and a
+   * repo with no nix expression inherits the runner's environment as before.
+   */
+  readonly toolchain?: ToolchainSpec;
   readonly tracker?: TrackerRef;
+}
+
+/**
+ * How a task's environment is produced.
+ *
+ * `inherit` — the runner's own environment. What every task got before §8.1 existed.
+ * `nix` — materialised from `packages`, or from the repo's own nix expression when
+ *   `packages` is absent.
+ */
+export type ToolchainMode = "inherit" | "nix";
+
+export interface ToolchainSpec {
+  readonly mode: ToolchainMode;
+  /**
+   * nixpkgs attribute names — `lua5_1`, `luarocks`, `go`, `nodejs_22`. Absent means "use
+   * whatever the repo declares", which is the better answer when the repo declares
+   * anything: the agent then gets the same environment a human contributor gets.
+   */
+  readonly packages?: readonly string[];
 }
 
 /** Cumulative token/cost spend across every session of a task. */

@@ -42,6 +42,37 @@ An item without one is refused, and commented on **once** explaining what to wri
 In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
 *inside* a code block instead — intake accepts either position.
 
+### Dev environments
+
+A repo needing a toolchain the runner does not have — lua, go, a compiler — usually needs
+to say nothing at all. At the start of every session the runner looks for a `flake.nix` or
+`shell.nix` **in the repo** and builds that devShell, so the agent works in the same
+environment the tests were written in, and the acceptance gate runs in it too (§8.1).
+
+Declare one only when the repo has no nix expression:
+
+````
+```agent
+repos:
+  - owner/name
+acceptance:
+  - "lua -v && busted"
+toolchain:
+  mode: nix
+  packages: [lua5_1, luarocks, gcc]
+```
+````
+
+`packages` are nixpkgs attribute names. Declaring `mode: nix` also adds `nix` to the task's
+`requires`, so only a runner that can build the environment will claim it. `mode: inherit`
+is the escape hatch: it uses the runner's own environment and ignores a `flake.nix` the
+repo carries for its humans.
+
+**A toolchain is not a capability.** `requires` is for facts about a machine that cannot be
+provisioned — a GPU, a USB device, a human. Anything a runner can install for itself
+belongs here instead; putting it in `requires` produces a task no runner ever claims, which
+reads as a stuck scheduler rather than a missing tool.
+
 ## Development
 
 Any node from **22.18** up, including 26. There is no build step for development and no
@@ -86,6 +117,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
+| `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
@@ -193,6 +225,11 @@ workstation would be a worse problem than a manual copy.
 Then work reaches it by capability, never by address (§8): an agent already running
 elsewhere calls `handoff(requires: ["usb"])`, the task returns to `ready`, this runner
 claims it on its next poll and appends to the **same** journal.
+
+`nix` is the one capability you do not have to declare: the runner probes for it at boot and
+advertises it if it is there (§8.1). Listing it explicitly still works and is kept — a
+machine that advertises it without having it gets a warning at boot rather than a silent
+correction, since it may be about to gain it.
 
 ## Verifying a GitHub App setup
 

@@ -6,8 +6,14 @@
  * mounted secret directory, so a config dump can never leak a credential.
  */
 import { readFile } from "node:fs/promises";
-import { asWorkspaceName, type Capability, type WorkspaceName } from "../domain/task.ts";
+import {
+  asWorkspaceName,
+  KNOWN_CAPABILITIES,
+  type Capability,
+  type WorkspaceName,
+} from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
+import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
 import type { LlmConfig, RunnerConfig, WorkspaceProfile } from "./types.ts";
 
 export class ConfigError extends Error {
@@ -34,6 +40,12 @@ interface RawConfig {
     readonly noProgressLimit?: unknown;
     readonly maxReviewRounds?: unknown;
   };
+  readonly toolchain?: {
+    readonly nixpkgs?: unknown;
+    readonly timeoutSeconds?: unknown;
+    readonly gcIntervalHours?: unknown;
+    readonly gcKeepDays?: unknown;
+  };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
@@ -42,7 +54,8 @@ interface RawConfig {
   readonly intake?: { readonly intervalSeconds?: unknown };
 }
 
-const str = (value: unknown, field: string): string => {
+const str = (value: unknown, field: string, fallback?: string): string => {
+  if (value === undefined && fallback !== undefined) return fallback;
   if (typeof value !== "string" || value.length === 0) {
     throw new ConfigError(`${field} must be a non-empty string`);
   }
@@ -68,15 +81,6 @@ const logLevel = (value: unknown): LogLevel => {
   }
   return value as LogLevel;
 };
-
-const KNOWN_CAPABILITIES: readonly Capability[] = [
-  "linux",
-  "k8s",
-  "net",
-  "gpu",
-  "usb",
-  "human-present",
-];
 
 const capabilities = (value: unknown): readonly Capability[] => {
   if (!Array.isArray(value)) throw new ConfigError("capabilities must be an array");
@@ -203,6 +207,20 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
+    toolchain: {
+      nixpkgs: str(raw.toolchain?.nixpkgs, "toolchain.nixpkgs", DEFAULTS.nixpkgs),
+      timeoutSeconds: num(
+        raw.toolchain?.timeoutSeconds,
+        "toolchain.timeoutSeconds",
+        DEFAULTS.timeoutSeconds,
+      ),
+      gcIntervalHours: num(
+        raw.toolchain?.gcIntervalHours,
+        "toolchain.gcIntervalHours",
+        DEFAULTS.gcIntervalHours,
+      ),
+      gcKeepDays: num(raw.toolchain?.gcKeepDays, "toolchain.gcKeepDays", DEFAULTS.gcKeepDays),
+    },
     stateRepo: {
       url: str(raw.stateRepo?.url, "stateRepo.url"),
       branch: str(raw.stateRepo?.branch, "stateRepo.branch"),

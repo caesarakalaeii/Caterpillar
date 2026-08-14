@@ -36,6 +36,7 @@ import type { ControlSink } from "../agent/tools.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import type { ToolchainResolver } from "../workspace/toolchain.ts";
 
 interface ExecContext {
   readonly env: NodeExecutionEnv;
@@ -130,6 +131,7 @@ export interface PlanMaintainerOptions {
   readonly worktrees: WorktreeManager;
   readonly llm: LlmRuntime;
   readonly logger: Logger;
+  readonly toolchain: ToolchainResolver;
 }
 
 export class PlanMaintainer implements Maintainer {
@@ -154,7 +156,14 @@ export class PlanMaintainer implements Maintainer {
 
     try {
       const checkout = await worktrees.ensureTaskCheckout(finished.repos, finished.id);
-      const execContext: ExecContext = { env: new NodeExecutionEnv({ cwd: checkout.root }) };
+      const toolchain = await this.options.toolchain.resolve(finished, checkout.root);
+      const execContext: ExecContext = {
+        env: new NodeExecutionEnv({
+          cwd: checkout.root,
+          shellPath: toolchain.shell,
+          shellEnv: toolchain.env,
+        }),
+      };
 
       const result = await runSession({
         models: llm.models,

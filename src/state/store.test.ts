@@ -7,7 +7,7 @@
  * can claim and nothing can explain, which is strictly worse than never creating it.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -60,6 +60,44 @@ test("a spec with no tracker ref round-trips too", async () => {
 
   await subject.writeSpec(spec);
   assert.deepEqual(await subject.readSpec(spec.id), spec);
+});
+
+test("a declared toolchain round-trips, packages and all", async () => {
+  // The half of the §14.1 contract that lives here: intake writes this shape, and a spec
+  // this cannot read back is a task nothing can claim and nothing can explain.
+  const subject = await store();
+  const spec: TaskSpec = {
+    ...SPEC,
+    id: asTaskId("GH-acme-widget-13"),
+    requires: ["linux", "nix"],
+    toolchain: { mode: "nix", packages: ["lua5_1", "luarocks"] },
+  };
+
+  await subject.writeSpec(spec);
+  assert.deepEqual(await subject.readSpec(spec.id), spec);
+});
+
+test("a toolchain with no packages round-trips without gaining an empty list", async () => {
+  // `mode: nix` alone means "use the repository's own nix expression". An empty
+  // `packages: []` coming back would mean "build an environment containing nothing".
+  const subject = await store();
+  const spec: TaskSpec = {
+    ...SPEC,
+    id: asTaskId("GH-acme-widget-14"),
+    toolchain: { mode: "inherit" },
+  };
+
+  await subject.writeSpec(spec);
+  assert.deepEqual(await subject.readSpec(spec.id), spec);
+});
+
+test("a spec with no toolchain gains no toolchain key", async () => {
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  const raw = await readFile(join(subject.taskDir(SPEC.id), "spec.md"), "utf8");
+  assert.ok(!raw.includes("toolchain"), "an undeclared toolchain must not appear in spec.md");
+  assert.equal((await subject.readSpec(SPEC.id)).toolchain, undefined);
 });
 
 test("a goal containing a front-matter delimiter does not corrupt the spec", async () => {

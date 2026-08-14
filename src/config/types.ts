@@ -131,9 +131,35 @@ export interface LlmConfig {
   readonly credentialsPath?: string;
 }
 
+/** How this runner materialises a task's dev environment (DESIGN.md §8.1). */
+export interface ToolchainConfig {
+  /**
+   * Flake reference supplying the packages an explicit `toolchain.packages` names.
+   * PINNED to a revision, never `nixpkgs` unqualified: an unattended agent that picks up
+   * a silent nixpkgs bump produces a red acceptance run with no diff to explain it.
+   */
+  readonly nixpkgs: string;
+  /**
+   * Ceiling on one environment resolve. Generous by default — a devShell that overrides
+   * anything can miss the binary cache and build from source — but bounded, because a
+   * nix evaluation that never returns would wedge the supervisor exactly like a hung
+   * acceptance command would.
+   */
+  readonly timeoutSeconds: number;
+  /**
+   * Hours between `nix-collect-garbage` passes. The store shares a 20Gi PVC with the
+   * mirrors and every task's worktree, so this is a requirement rather than hygiene.
+   * Live environments are protected by the GC roots the resolver registers.
+   */
+  readonly gcIntervalHours: number;
+  /** Days a store path survives with no GC root. */
+  readonly gcKeepDays: number;
+}
+
 export interface RunnerConfig {
   readonly runnerId: string;
   readonly capabilities: readonly Capability[];
+  readonly toolchain: ToolchainConfig;
   readonly stateRepo: StateRepoConfig;
   readonly paths: WorkspacePathsConfig;
   readonly lease: LeaseConfig;

@@ -13,7 +13,10 @@
 #   scripts/install-runner.sh --capabilities linux,usb,human-present --from-cluster
 #   scripts/install-runner.sh --capabilities linux,gpu --config ./config.json
 #
-#   --capabilities  comma-separated, from: linux k8s net gpu usb human-present
+#   --capabilities  comma-separated, from: linux k8s net gpu usb human-present nix
+#                     `nix` means this machine can BUILD a task's dev environment
+#                     (DESIGN.md §8.1). Language toolchains are not capabilities —
+#                     a runner with `nix` installs lua, go or python for itself.
 #   --from-cluster  read the deployed config with kubectl and adapt it (recommended)
 #   --config FILE   adapt this config instead
 #   --root DIR      where state, mirrors, worktrees and credentials live
@@ -37,7 +40,7 @@ USER_UNIT=0
 DRY_RUN=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KNOWN_CAPABILITIES="linux k8s net gpu usb human-present"
+KNOWN_CAPABILITIES="linux k8s net gpu usb human-present nix"
 
 die() { echo "install-runner: $*" >&2; exit 1; }
 note() { echo "install-runner: $*"; }
@@ -69,6 +72,16 @@ done
 
 command -v git >/dev/null || die "git is not on PATH"
 command -v node >/dev/null || die "node is not on PATH — 22.18 or newer is required"
+
+# `nix` does not need declaring — the supervisor probes for it at boot and advertises it
+# if it is there (DESIGN.md §8.1). Declaring it anyway is honoured, so this only warns
+# about the one combination that misleads: advertised here, absent from the machine, which
+# makes the runner claim tasks it can then only park.
+if [[ " $CAPABILITIES " == *"nix"* ]] && ! command -v nix >/dev/null; then
+  note "WARNING: 'nix' is advertised but nix is not on PATH. This runner will claim tasks"
+  note "         that declare a toolchain and then park every one of them. You do not need"
+  note "         to list 'nix' at all — install it and the runner works it out at boot."
+fi
 
 node_ok=$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write(a>22||(a===22&&b>=18)?"yes":"no")')
 [[ "$node_ok" == "yes" ]] \
