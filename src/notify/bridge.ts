@@ -245,6 +245,11 @@ export class DiscordBridge {
           command.task,
           await inbox.submit({ kind: "park", task: command.task }),
         );
+      case "resume":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({ kind: "resume", task: command.task }),
+        );
       case "merge":
         return describeOutcome(
           command.task,

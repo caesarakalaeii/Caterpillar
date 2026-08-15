@@ -19,6 +19,23 @@ import type { TaskId } from "../domain/task.ts";
 export type ChatOutcome =
   | { readonly kind: "applied"; readonly index: number }
   | { readonly kind: "parked" }
+  /**
+   * A parked task is back in the queue.
+   *
+   * `exhausted` is set when the task will meet a limit again almost immediately — it has
+   * used its sessions, or its no-progress streak is already at the threshold. Resuming
+   * deliberately does not reset those counters, so saying nothing would let the human
+   * discover it when the task parks itself thirty seconds later.
+   */
+  | { readonly kind: "resumed"; readonly from: string; readonly exhausted?: string }
+  /**
+   * Resuming a task that is not parked.
+   *
+   * Separate from `not-parkable` rather than sharing it: the two refusals are opposites
+   * ("already terminal" vs "not terminal yet"), and one message that tried to cover both
+   * would have to be vague about which.
+   */
+  | { readonly kind: "not-resumable"; readonly status: string }
   | { readonly kind: "merged"; readonly prUrl: string }
   | { readonly kind: "started"; readonly task: TaskId }
   | { readonly kind: "unknown-task" }
@@ -36,6 +53,17 @@ export type ChatOutcome =
 export type ChatIntent =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
   | { readonly kind: "park"; readonly task: TaskId }
+  /**
+   * Put a parked task back in the queue — `/resume`.
+   *
+   * The inverse of `park`, and it exists because `parked` is TERMINAL (`isTerminal`):
+   * nothing in the loop moves a task out of it, so without this the only way back is an
+   * operator editing `state.json` in the state repo by hand. That is not a smaller
+   * version of this command, it is a race — the loop owns the state repo working copy,
+   * and an out-of-band push lands between its pull and its push, rejecting the latter.
+   * Observed, not theorised: it cost a task a session and then failed its park too.
+   */
+  | { readonly kind: "resume"; readonly task: TaskId }
   | { readonly kind: "merge"; readonly task: TaskId }
   /**
    * Create a brainstorm task (DESIGN.md §14.3).

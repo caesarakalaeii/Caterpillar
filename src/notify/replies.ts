@@ -19,7 +19,13 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
     case "applied":
       return `Answered **${task}** (question ${outcome.index}). It is \`ready\` and will be claimed on the next poll.`;
     case "parked":
-      return `Parked **${task}**. It will not be claimed again until a human sets it back to \`ready\`.`;
+      return `Parked **${task}**. It will not be claimed again until someone runs \`/resume ${task}\`.`;
+    case "resumed":
+      return outcome.exhausted === undefined
+        ? `Resumed **${task}**. It is \`ready\` and will be claimed on the next poll.`
+        : `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again after its next session unless the limit is raised.`;
+    case "not-resumable":
+      return `**${task}** is \`${outcome.status}\`, not \`parked\` — nothing was written.`;
     case "merged":
       return `Merged **${task}** — ${outcome.prUrl}`;
     case "started":

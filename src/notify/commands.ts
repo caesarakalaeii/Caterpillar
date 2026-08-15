@@ -28,6 +28,8 @@ export type Command =
   | { readonly kind: "show"; readonly task: TaskId }
   /** Stop working a task and leave it parked for a human. */
   | { readonly kind: "park"; readonly task: TaskId }
+  /** Put a parked task back in the queue. The inverse of `park`. */
+  | { readonly kind: "resume"; readonly task: TaskId }
   /** Approve and merge a task's PR despite the council (DESIGN.md §12.1). */
   | { readonly kind: "merge"; readonly task: TaskId }
   /**
