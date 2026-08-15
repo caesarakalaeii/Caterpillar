@@ -192,12 +192,23 @@ export class DiscordBridge {
       return;
     }
 
-    const what =
-      command.kind === "answer"
-        ? `Answering ${command.task}`
-        : command.kind === "merge"
-          ? `Merging ${command.task}`
-          : `Cancelling ${command.task}`;
+    // A switch rather than a ternary chain, and deliberately without a default: the chain
+    // this replaces ended in `Cancelling`, so adding `/resume` silently acknowledged a
+    // resume as a cancellation — it did the right thing and said the opposite, which is
+    // the worst of the two. With no default, the next command added here fails to compile
+    // instead of inheriting somebody else's wording.
+    const what = ((): string => {
+      switch (command.kind) {
+        case "answer":
+          return `Answering ${command.task}`;
+        case "merge":
+          return `Merging ${command.task}`;
+        case "resume":
+          return `Resuming ${command.task}`;
+        case "park":
+          return `Cancelling ${command.task}`;
+      }
+    })();
     await this.answer(interaction, this.acknowledge(interaction, queued(what, who)));
 
     await this.say(await this.execute(command, who));
