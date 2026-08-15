@@ -211,14 +211,32 @@ export class WorktreeManager {
    * shares the mirror's refs, so the fork point is a plain local `merge-base`.
    */
   async branchPoint(worktree: string): Promise<string | undefined> {
+    const base = await this.defaultBranch(worktree);
+    if (base === undefined) return undefined;
+
+    const forkPoint = await this.git.at(worktree).tryRun("merge-base", "HEAD", base);
+    return forkPoint.code === 0 ? forkPoint.stdout.trim() : undefined;
+  }
+
+  /**
+   * The name of the branch a task's work forks from — the mirror's default.
+   *
+   * A mirror's `HEAD` is a symbolic ref to its default branch, and a linked worktree
+   * shares the mirror's refs, so this is a local lookup with no network.
+   */
+  async defaultBranch(worktree: string): Promise<string | undefined> {
     const mirror = this.git.at(await this.commonDir(worktree));
     const base = await mirror.tryRun("symbolic-ref", "--short", "HEAD");
-    if (base.code !== 0) return undefined;
+    return base.code === 0 ? base.stdout.trim() : undefined;
+  }
 
-    const forkPoint = await this.git
-      .at(worktree)
-      .tryRun("merge-base", "HEAD", base.stdout.trim());
-    return forkPoint.code === 0 ? forkPoint.stdout.trim() : undefined;
+  /**
+   * Does `ref` carry `path`? Answered from the shared object store, never the worktree's
+   * checked-out files, so it can ask about a branch this worktree is not on.
+   */
+  async hasFileOn(worktree: string, ref: string, path: string): Promise<boolean> {
+    const result = await this.git.at(worktree).tryRun("cat-file", "-e", `${ref}:${path}`);
+    return result.code === 0;
   }
 
   /**
