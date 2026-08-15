@@ -13,6 +13,7 @@ import {
   TASK_SHELL_ARGS,
   ToolchainError,
   ToolchainResolver,
+  type RepoInspector,
 } from "./toolchain.ts";
 
 const spec: TaskSpec = {
@@ -395,4 +396,96 @@ test("ToolchainError carries the source that failed", () => {
   assert.equal(error.source, "flake.nix devShell");
   assert.equal(error.message, "evaluation failed");
   assert.ok(error instanceof Error);
+});
+
+// ------------------------------------------------------------------- stale branch note
+
+/** A repo whose default branch is `main` and which carries exactly `files`. */
+const inspector = (files: readonly string[]): RepoInspector => ({
+  defaultBranch: () => Promise.resolve("main"),
+  hasFileOn: (_worktree, _ref, path) => Promise.resolve(files.includes(path)),
+});
+
+const withInspector = (repo: RepoInspector | undefined): ToolchainResolver =>
+  new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: TEST_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: process.env["PATH"] ?? "" },
+    ...(repo === undefined ? {} : { repo: () => repo }),
+  });
+
+test("a worktree that predates the repo's flake is told so, not left to guess", async () => {
+  // The failure this exists for: a task's worktree is cut from the default branch once
+  // and lives on the PVC for the life of the task, so a flake added afterwards is
+  // invisible to it. The resolver falls back correctly and the agent gets a shell missing
+  // exactly the tools the task is about. Two of the first three real tasks hit this.
+  const resolved = await withInspector(inspector(["flake.nix"])).resolve(
+    spec,
+    await scratch(),
+  );
+
+  assert.equal(resolved.source, "inherited");
+  assert.match(resolved.note ?? "", /predates/);
+  assert.match(resolved.note ?? "", /git merge main/);
+});
+
+test("a repo with no nix expression at all says nothing", async () => {
+  // The note must be specific to a STALE branch. "Your branch is behind" is true of
+  // almost every branch almost always; a repo that simply has no flake is not a problem
+  // and must not be reported as one.
+  const resolved = await withInspector(inspector([])).resolve(spec, await scratch());
+
+  assert.equal(resolved.source, "inherited");
+  assert.equal(resolved.note, undefined);
+});
+
+test("a worktree that HAS the flake is never called stale", async () => {
+  const worktree = await scratch();
+  const tasksDir = await scratch();
+  await writeFile(join(worktree, "flake.nix"), "{ broken }", "utf8");
+
+  // Reaching nix at all proves detection chose the devShell over the fallback; the build
+  // failing afterwards is beside the point here.
+  await assert.rejects(
+    () =>
+      new ToolchainResolver({
+        logger: SILENT_LOGGER,
+        config: TEST_CONFIG,
+        tasksDir,
+        baseEnv: { PATH: process.env["PATH"] ?? "" },
+        repo: () => inspector(["flake.nix"]),
+      }).resolve(spec, worktree),
+    ToolchainError,
+  );
+});
+
+test("shell.nix on the default branch counts too", async () => {
+  const resolved = await withInspector(inspector(["shell.nix"])).resolve(
+    spec,
+    await scratch(),
+  );
+
+  assert.match(resolved.note ?? "", /shell\.nix/);
+});
+
+test("without an inspector the fallback is unchanged and silent", async () => {
+  // The inspector is optional, and its absence must not turn a working fallback into an
+  // error — a machine runner wired without one still resolves, it just cannot explain.
+  const resolved = await withInspector(undefined).resolve(spec, await scratch());
+
+  assert.equal(resolved.source, "inherited");
+  assert.equal(resolved.note, undefined);
+});
+
+test("a git that cannot answer degrades to silence, never to a failed session", async () => {
+  const hostile: RepoInspector = {
+    defaultBranch: () => Promise.reject(new Error("not a git repository")),
+    hasFileOn: () => Promise.reject(new Error("not a git repository")),
+  };
+
+  const resolved = await withInspector(hostile).resolve(spec, await scratch());
+
+  assert.equal(resolved.source, "inherited");
+  assert.equal(resolved.note, undefined);
 });

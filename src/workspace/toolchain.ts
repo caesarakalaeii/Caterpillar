@@ -60,6 +60,30 @@ export interface ResolvedEnv {
    * back to an environment months later.
    */
   readonly source: string;
+  /**
+   * Something the agent needs told about its own environment, or absent when there is
+   * nothing to say.
+   *
+   * Today that is exactly one thing: the environment fell back to `inherited` because
+   * this worktree has no nix expression, while the branch it forked from now does. That
+   * is a stale branch, and without saying so the agent is handed a silently degraded
+   * shell and left to work out why its tools are missing — which is the failure this
+   * whole module exists to remove, arriving one level up.
+   */
+  readonly note?: string;
+}
+
+/**
+ * The little bit of git the resolver needs to tell a stale branch from a repo that simply
+ * has no nix expression.
+ *
+ * An interface rather than a `WorktreeManager` import: the resolver has no business
+ * knowing about mirrors, and a test needs to answer these two questions without a repo.
+ * `WorktreeManager` satisfies it structurally.
+ */
+export interface RepoInspector {
+  defaultBranch(worktree: string): Promise<string | undefined>;
+  hasFileOn(worktree: string, ref: string, path: string): Promise<boolean>;
 }
 
 /**
@@ -90,6 +114,17 @@ export interface ToolchainResolverOptions {
   /** Per-task scratch — the generated flake, the GC-root profile, the cached env. */
   readonly tasksDir: string;
   /**
+   * Optional. Without it a fallback to `inherited` is still correct, just silent about
+   * whether the repo had a nix expression the worktree cannot see.
+   *
+   * A function rather than the value, because boot is a cycle: this resolver derives the
+   * `nix` capability, which completes the config, which opens the state checkout, which
+   * builds the `WorktreeManager` that implements this. Nothing needs the inspector until
+   * the first `resolve()`, long after that cycle has closed, so deferring the lookup is
+   * the honest way to express the order rather than shuffling the wiring to hide it.
+   */
+  readonly repo?: () => RepoInspector | undefined;
+  /**
    * The environment to inherit from. Injectable so a test does not have to mutate
    * `process.env`, which leaks across node's in-process test runner.
    */
@@ -108,11 +143,14 @@ export class ToolchainResolver {
   /** Memoised: nix does not appear or vanish while the process runs. */
   private nix: Promise<boolean> | undefined;
 
+  private readonly repo: (() => RepoInspector | undefined) | undefined;
+
   constructor(options: ToolchainResolverOptions) {
     this.logger = options.logger;
     this.config = options.config;
     this.tasksDir = options.tasksDir;
     this.baseEnv = options.baseEnv ?? process.env;
+    this.repo = options.repo;
   }
 
   /**
@@ -135,11 +173,69 @@ export class ToolchainResolver {
     const plan = await this.plan(spec, worktree);
 
     if (plan === undefined) {
-      return this.log(spec, { env: { ...this.baseEnv }, shell, source: "inherited" });
+      const note = await this.staleBranchNote(spec, worktree);
+      return this.log(spec, {
+        env: { ...this.baseEnv },
+        shell,
+        source: "inherited",
+        ...(note === undefined ? {} : { note }),
+      });
     }
 
     const env = await this.materialise(spec, worktree, plan);
     return this.log(spec, { env, shell, source: plan.source });
+  }
+
+  /**
+   * Why the environment is `inherited`, when the answer is "this branch is out of date".
+   *
+   * A task's worktree is cut from the default branch ONCE and then lives on the PVC for
+   * the life of the task. A repo that gains a `flake.nix` after that keeps it on its
+   * default branch, invisible to every task already in flight — the resolver finds no nix
+   * expression, falls back correctly, and the agent gets a shell missing exactly the
+   * tools the task is about.
+   *
+   * That is not hypothetical and it is not rare: it happened to two of the first three
+   * tasks to run after §8.1 shipped, because the flake landed the same morning. One agent
+   * diagnosed it unaided and merged the default branch itself; the other spent a session
+   * and did not. The difference should not be luck.
+   *
+   * Deliberately narrow. "Your branch is behind" is true of almost every branch almost
+   * always and would be noise; "the branch you forked from has a nix expression and you
+   * do not" is specific, actionable, and only ever true when it matters.
+   */
+  private async staleBranchNote(spec: TaskSpec, worktree: string): Promise<string | undefined> {
+    const repo = this.repo?.();
+    if (repo === undefined) return undefined;
+
+    // Never a reason to fail a session: this exists to explain a fallback, so a git that
+    // cannot answer leaves the fallback exactly as unexplained as it was before.
+    const base = await repo.defaultBranch(worktree).catch(() => undefined);
+    if (base === undefined) return undefined;
+
+    const expression = await (async (): Promise<string | undefined> => {
+      for (const candidate of ["flake.nix", "shell.nix"]) {
+        if (await repo.hasFileOn(worktree, base, candidate).catch(() => false)) return candidate;
+      }
+      return undefined;
+    })();
+    if (expression === undefined) return undefined;
+
+    this.logger.warn("toolchain.stale-branch", {
+      task: spec.id,
+      base,
+      expression,
+      detail: `${base} has ${expression}; this worktree does not, so the environment is inherited`,
+    });
+
+    return (
+      `Your working branch predates this repository's \`${expression}\`, which exists on ` +
+      `\`${base}\`. Nothing built your environment, so you have only what the runner ` +
+      `itself carries — if a tool this task needs is missing, that is why. Run ` +
+      `\`git merge ${base}\` (or rebase onto it) and the NEXT session's environment is ` +
+      `built from that \`${expression}\`. Do not work around a missing toolchain by ` +
+      `editing the repository's test runner or its nix files.`
+    );
   }
 
   /**

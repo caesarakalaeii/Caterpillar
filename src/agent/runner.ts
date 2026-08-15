@@ -186,10 +186,17 @@ export class AgentSessionRunner {
           ? ""
           : `\n\nYour shell already has the dev environment from ${toolchain.source}. Do not install toolchains yourself — if something is missing, add it there.`;
 
+      // The resolver only speaks up when it has something the agent cannot see for itself
+      // — today, that its branch predates the repo's nix expression. Said in the system
+      // prompt rather than logged, because the log is not where the agent is looking when
+      // its tools turn out to be missing.
+      const environmentNote =
+        toolchain.note === undefined ? "" : `\n\n${toolchain.note}`;
+
       const result = await runSession({
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}${environment}`,
+        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,
         initialPrompt: prompt,
         tools,
         budget,

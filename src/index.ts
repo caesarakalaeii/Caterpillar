@@ -84,6 +84,10 @@ const main = async (): Promise<void> => {
     logger,
     config: loaded.toolchain,
     tasksDir: loaded.paths.tasks,
+    // So a fallback to `inherited` can say whether the repo HAS a nix expression this
+    // worktree simply predates, rather than leaving the agent to infer it from missing
+    // tools (DESIGN.md §8.1).
+    repo: () => worktrees,
   });
 
   // `nix` is derived from the machine rather than taken from the ConfigMap (DESIGN.md
