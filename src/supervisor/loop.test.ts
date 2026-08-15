@@ -31,7 +31,7 @@ import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
-import { ChatInbox } from "./inbox.ts";
+import { ChatInbox, type ChatOutcome } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -784,4 +784,114 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
     `main:tasks/${SLOW}/reviews/001-verdict.md`,
   );
   assert.equal(verdict.code, 0, "the verdict must be pushed, not left on the runner's disk");
+});
+
+/**
+ * `/resume` — the inverse of `/cancel`, and the reason it has to exist.
+ *
+ * `parked` is terminal, so before this command the only way back was an operator editing
+ * `state.json` in the state repo by hand. That is not a manual version of this: the loop
+ * owns the working copy, so an out-of-band push lands between its pull and its push and
+ * the push is rejected. It happened, and it took a task's session with it.
+ *
+ * Driven through the real inbox against a real remote, and asserted on the PUSHED state,
+ * for the same reason the park test is: a resume that only writes locally is undone by
+ * the next `pull()`.
+ */
+const resumeSupervisor = (
+  store: StateStore,
+  inbox: ChatInbox,
+): Supervisor =>
+  new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Claiming it is the proof; the session itself is not what these tests are about.
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+/** Run one inbox request against a live supervisor and stop it again. */
+const throughInbox = async (
+  store: StateStore,
+  intent: Parameters<ChatInbox["submit"]>[0],
+): Promise<ChatOutcome> => {
+  const inbox = new ChatInbox();
+  const supervisor = resumeSupervisor(store, inbox);
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit(intent);
+  controller.abort();
+  await running.catch(() => undefined);
+  return outcome;
+};
+
+test("/resume puts a parked task back on the REMOTE, not just locally", async () => {
+  const RESUMED = asTaskId("RESUME-1");
+  await seedTask(RESUMED, { status: "parked", sessions: 2 });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: RESUMED });
+
+  assert.deepEqual(outcome, { kind: "resumed", from: "parked" });
+
+  const pushed = await pushedState(RESUMED);
+  assert.equal(pushed?.status, "ready", "a resumed task must be `ready` on the remote");
+
+  const journal = await new Git(origin).tryRun("show", `main:tasks/${RESUMED}/journal.md`);
+  assert.equal(journal.code, 0, "the journal entry must be pushed, not just written");
+  assert.match(journal.stdout, /Resumed/);
+});
+
+test("/resume refuses a task that is not parked, and writes nothing", async () => {
+  // The opposite refusal from `/cancel`'s, which is why it is its own outcome: `done`
+  // and `ready` are both wrong to resume, for opposite reasons.
+  const LIVE = asTaskId("RESUME-2");
+  await seedTask(LIVE, { status: "ready" });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: LIVE });
+
+  assert.deepEqual(outcome, { kind: "not-resumable", status: "ready" });
+  assert.equal((await pushedState(LIVE))?.status, "ready", "nothing should have been written");
+});
+
+test("/resume on an unknown task says so rather than creating one", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, {
+    kind: "resume",
+    task: asTaskId("NO-SUCH-TASK-RESUME"),
+  });
+
+  assert.deepEqual(outcome, { kind: "unknown-task" });
+});
+
+test("/resume warns when the task will meet the same limit again", async () => {
+  // Resuming deliberately does not reset the counters — the fix for "it used its twenty
+  // sessions" is a human raising the limit, not a command that quietly forgives it. So
+  // the reply has to say so, or the human finds out when it parks itself again.
+  const SPENT = asTaskId("RESUME-3");
+  await seedTask(SPENT, { status: "parked", sessions: 20 });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: SPENT });
+
+  assert.equal(outcome.kind, "resumed");
+  if (outcome.kind !== "resumed") return;
+  assert.match(outcome.exhausted ?? "", /20 of 20 sessions/);
+  assert.equal((await pushedState(SPENT))?.status, "ready", "it is still resumed, just warned about");
 });

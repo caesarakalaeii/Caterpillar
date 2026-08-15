@@ -115,6 +115,19 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
       },
     ],
   },
+  {
+    name: "resume",
+    description: "Put a parked task back in the queue",
+    options: [
+      {
+        name: "task",
+        description: "Task id",
+        type: OPTION_STRING,
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
 ];
 
 /**
@@ -193,6 +206,10 @@ const fromCommand = (interaction: Interaction): Intent => {
     case "cancel": {
       const task = taskOption(interaction, "task");
       return isTaskId(task) ? { kind: "run", command: { kind: "park", task } } : malformed(task);
+    }
+    case "resume": {
+      const task = taskOption(interaction, "task");
+      return isTaskId(task) ? { kind: "run", command: { kind: "resume", task } } : malformed(task);
     }
     case "brainstorm": {
       const topic = optionValue(interaction, "topic")?.trim() ?? "";

@@ -1069,6 +1069,8 @@ export class Supervisor {
         return this.applyAnswer(request);
       case "park":
         return this.applyPark(request);
+      case "resume":
+        return this.applyResume(request);
       case "merge":
         return this.applyMerge(request);
       case "brainstorm":
@@ -1220,6 +1222,69 @@ export class Supervisor {
         );
       }
       return { kind: "parked" };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Put a parked task back in the queue — `/resume`. The inverse of `applyPark`.
+   *
+   * `parked` is terminal (`isTerminal`), so nothing in the loop leaves it. Until this
+   * existed the only way back was an operator editing `state.json` in the state repo,
+   * which is not a manual version of this command but a different and worse thing: the
+   * loop owns that working copy, so an out-of-band push lands between its pull and its
+   * push and the push is rejected. That is not hypothetical — it cost BS-1537785980415778816-03
+   * a session, and then `parkFailed` could not park it either, for the same reason.
+   *
+   * ONLY from `parked`. `failed` is left alone deliberately: it means a session ended in
+   * a way the supervisor could not attribute to the task, and re-queueing that without a
+   * human reading the journal invites the same failure on a loop. `done` is not
+   * re-openable at all — a new task is the honest way to ask for more work.
+   *
+   * What it deliberately does NOT do is reset `sessions`, `noProgressStreak` or the
+   * review rounds. A task parked for exhausting a limit will park again on its next
+   * session, and that is correct: the fix for "it used its twenty sessions" is a human
+   * deciding to raise the limit, not a command that quietly forgives it. The reply says
+   * so rather than letting the human discover it thirty seconds later.
+   */
+  private async applyResume(
+    request: ChatRequest & { readonly kind: "resume" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger, config } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.status !== "parked") return { kind: "not-resumable", status: state.status };
+
+    // Taken for the write and released immediately, exactly as `applyPark` does: every
+    // push verifies lease ownership first (§5.1), and a resume is no exception. A parked
+    // task is held by nobody, so this only fails if another runner got here first.
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) return { kind: "not-resumable", status: "running" };
+
+    try {
+      const handle = heldLease(lease);
+      await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
+      await this.transition(handle, state, "ready");
+      await this.push(handle, `chore(${request.task}): resumed from chat`);
+      logger.info("task.resumed", {
+        task: request.task,
+        sessions: state.sessions,
+        maxSessions: state.limits.maxSessions,
+        noProgressStreak: state.progress.noProgressStreak,
+      });
+
+      // The limits it will meet again, so the human hears it now rather than after the
+      // next session parks it for the same reason it was parked the first time.
+      const exhausted =
+        state.sessions >= state.limits.maxSessions
+          ? `it has used ${state.sessions} of ${state.limits.maxSessions} sessions`
+          : state.progress.noProgressStreak >= config.limits.noProgressLimit
+            ? `its no-progress streak is ${state.progress.noProgressStreak}`
+            : undefined;
+
+      return { kind: "resumed", from: "parked", ...(exhausted === undefined ? {} : { exhausted }) };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }
