@@ -120,6 +120,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 |---|---|
 | `src/domain/task.ts` | Core vocabulary. Depends on nothing. |
 | `src/config/` | Runner + workspace profiles. **Never holds secrets.** |
+| `src/config/scope.ts` | The configured bound on repos a task may reach (§9.1). |
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |

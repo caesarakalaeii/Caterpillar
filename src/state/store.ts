@@ -546,19 +546,35 @@ export class StateStore {
       }
 
       await this.git.run("fetch", remote, branch);
-      const rebased = await this.git.tryRun("rebase", `${remote}/${branch}`);
-      if (rebased.code !== 0) {
-        // Two runners wrote the same file. Leave the repo usable rather than mid-rebase:
-        // the caller's changes are still in the local commit, and the next poll's pull
-        // will report the divergence rather than silently discarding one side.
-        await this.git.tryRun("rebase", "--abort");
-        throw new GitError(["rebase", `${remote}/${branch}`], rebased);
-      }
+      await this.rebaseOnto(remote, branch);
     }
     throw new Error(
       `state push to ${remote}/${branch} was rejected ${PUSH_ATTEMPTS} times running — ` +
         `something else is writing the state branch faster than this runner can rebase`,
     );
+  }
+
+  /**
+   * Replay local commits on top of the remote.
+   *
+   * The working tree is discarded first, deliberately. `git rebase` refuses outright on a
+   * dirty tree, and this runs from the poll loop, which would then log the same failure
+   * and retry it forever — a livelock in the recovery path, which is worse than the
+   * failure it recovers from. Discarding uncommitted changes is also exactly what the old
+   * `reset --hard <remote>` did, so nothing is lost here that survived before: the point
+   * of this method is protecting local COMMITS, which that reset destroyed.
+   */
+  private async rebaseOnto(remote: string, branch: string): Promise<void> {
+    await this.git.run("reset", "--hard", "HEAD");
+
+    const rebased = await this.git.tryRun("rebase", `${remote}/${branch}`);
+    if (rebased.code === 0) return;
+
+    // Two writers touched the same file. Leave the repo usable rather than mid-rebase —
+    // a checkout stuck in a rebase fails every subsequent git call with a message about
+    // the rebase rather than about the conflict.
+    await this.git.tryRun("rebase", "--abort");
+    throw new GitError(["rebase", `${remote}/${branch}`], rebased);
   }
 
   /**
@@ -578,11 +594,7 @@ export class StateStore {
     const unpushed = ahead.code === 0 && ahead.stdout.trim() !== "0";
 
     if (unpushed) {
-      const rebased = await this.git.tryRun("rebase", `${remote}/${branch}`);
-      if (rebased.code !== 0) {
-        await this.git.tryRun("rebase", "--abort");
-        throw new GitError(["rebase", `${remote}/${branch}`], rebased);
-      }
+      await this.rebaseOnto(remote, branch);
     } else {
       await this.git.run("reset", "--hard", `${remote}/${branch}`);
     }

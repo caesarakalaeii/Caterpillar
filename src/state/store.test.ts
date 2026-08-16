@@ -331,3 +331,32 @@ test("pull removes untracked task directories a failed push left behind", async 
 
   assert.deepEqual(await store.listTasks(), [], "a task that is not in git is not a task");
 });
+
+test("a dirty working tree does not livelock the rebase path", async () => {
+  // `git rebase` refuses outright on a dirty tree. Since `pull` runs from the poll loop
+  // — which logs and retries — a throw here would repeat forever, a livelock in the
+  // recovery path. Uncommitted changes were already discarded by the old
+  // `reset --hard <remote>`, so dropping them costs nothing that survived before; the
+  // local COMMIT is the thing being protected.
+  const { store, bare, other, root } = await sharedStateRepo();
+
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-4"), { digest: "d", reason: "r" });
+  await store.commitAndPush("chore: local work", "origin", "main");
+
+  // Now diverge again, and leave the tree dirty on top of an unpushed commit.
+  await other.run("fetch", "--quiet", "origin", "main");
+  await other.run("reset", "--hard", "--quiet", "origin/main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves again");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-5"), { digest: "d", reason: "r" });
+  await store.commitAndPush("chore: more local work", "origin", "main");
+  await writeFile(join(root, "README.md"), "locally scribbled on\n", "utf8");
+
+  await store.pull("origin", "main");
+
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^intake\/GH-acme-widget-5\.json$/m);
+});
