@@ -111,6 +111,47 @@ export interface RepoRef {
 
 export const repoSlug = (repo: RepoRef): string => `${repo.owner}/${repo.name}`;
 
+/**
+ * A host, owner or repo name that is safe to put in a URL and in a path.
+ *
+ * Every component of a `RepoRef` becomes BOTH a segment of a clone URL and a directory
+ * under `paths.mirrors`, so an unvalidated one is two bugs at once. `repos: ../../x`
+ * used to parse into `{host: "..", owner: "..", name: "x"}`, and the mirror path for it
+ * resolves above the directory the workspace believes it owns — which `syncMirror`
+ * then removes and rebuilds. Requiring a leading alphanumeric rejects `.` and `..`
+ * without needing to special-case them.
+ */
+const REPO_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]*(:\d+)?$/;
+const REPO_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * `host/owner/name`, or `owner/name` with the host defaulting to github.com.
+ *
+ * ONE implementation on purpose. This used to be copied into intake, the store and the
+ * plan materialiser; three copies meant a repo reference that intake refused could
+ * still arrive through a plan, and the validation added to one was absent from the
+ * other two.
+ *
+ * Returns undefined rather than throwing: every caller has a better error to give than
+ * a stack trace, and two of the three turn it into a human-facing refusal.
+ */
+export const parseRepoRef = (raw: string): RepoRef | undefined => {
+  const parts = raw.split("/").filter((p) => p.length > 0);
+
+  const [host, owner, name] =
+    parts.length === 3
+      ? (parts as [string, string, string])
+      : parts.length === 2
+        ? (["github.com", ...(parts as [string, string])] as [string, string, string])
+        : [undefined, undefined, undefined];
+
+  if (host === undefined || owner === undefined || name === undefined) return undefined;
+  if (!REPO_HOST.test(host)) return undefined;
+  if (!REPO_SEGMENT.test(owner) || !REPO_SEGMENT.test(name)) return undefined;
+
+  return { host, owner, name };
+};
+
 /** Back-reference to the tracker item a task was ingested from. */
 export interface TrackerRef {
   readonly kind: TrackerKind;
@@ -271,7 +312,17 @@ export type SessionExitReason =
    * credential. NOT attributable to the task, which is the whole reason it is not
    * `error`: the task is released untouched and the RUNNER backs off (DESIGN.md §6.3).
    */
-  | "provider-unavailable";
+  | "provider-unavailable"
+  /**
+   * Something outside the session stopped it: the pod is shutting down, the lease was
+   * lost, a human cancelled, or the session ran past its wall clock.
+   *
+   * Not attributable to the task either, and deliberately distinct from
+   * `provider-unavailable` because it says nothing about the provider and must not
+   * start a cooldown. The task is left claimable; whoever caused the interruption is
+   * responsible for whatever happens next.
+   */
+  | "interrupted";
 
 /** Why the provider stopped answering, as far as its own error message admits. */
 export type OutageKind =
@@ -356,16 +407,31 @@ export const capabilitiesSatisfy = (
 /**
  * True when a task may be claimed right now (DESIGN.md §14.3).
  *
- * `ready` is necessary and no longer sufficient: a task cut from a plan waits on its
- * blockers. A blocker that is missing from the state repo entirely counts as unsatisfied
- * — a dangling dependency should stall its dependent visibly rather than be treated as
- * already met, which is what silently ignoring it would do.
+ * A task cut from a plan waits on its blockers. A blocker that is missing from the state
+ * repo entirely counts as unsatisfied — a dangling dependency should stall its dependent
+ * visibly rather than be treated as already met, which is what silently ignoring it
+ * would do.
+ *
+ * `running` IS claimable, and that is not a loophole — it is what makes crash recovery
+ * work at all. From the end of session 1 onward the pushed `state.json` says `running`,
+ * because `recordSession` writes the same status object it was handed. So every task
+ * past its first session that ends by any route other than a clean terminal transition
+ * — a killed pod, a Keel roll on every push to main, even a graceful SIGTERM — is left
+ * `running` on the remote with nothing that ever moves it back. Excluding it here made
+ * the stale-lease steal in `LeaseManager.claim` unreachable for exactly the tasks that
+ * needed it, which stranded one task per deploy, silently, forever.
+ *
+ * What decides whether a `running` task may actually be taken is the lease CAS, not this
+ * predicate: a successful claim means the lease was absent or stale, i.e. the previous
+ * holder is gone. Only that is an exclusion test, because only that is atomic. This
+ * function is a filter over a snapshot read seconds earlier, and a filter over stale
+ * data cannot establish exclusivity no matter which statuses it admits.
  */
 export const isClaimable = (
   state: TaskState,
   statusOf: (id: TaskId) => TaskStatus | undefined,
 ): boolean =>
-  state.status === "ready" &&
+  (state.status === "ready" || state.status === "running") &&
   (state.plan?.blockedBy ?? []).every((id) => statusOf(id) === "done");
 
 /**

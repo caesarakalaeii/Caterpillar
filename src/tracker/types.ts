@@ -16,6 +16,18 @@ export interface TrackerItem {
   readonly title: string;
   readonly body: string;
   readonly url: string;
+  /**
+   * Whether the item's AUTHOR is someone whose text may become a task.
+   *
+   * The label is applied by a maintainer, but the body is written — and can be edited
+   * afterwards, forever — by the author. Since the `agent` block's `acceptance` list is
+   * executed as shell in the supervisor's own process, "a maintainer labelled it" is not
+   * on its own an authorisation to run the body.
+   *
+   * Each adapter decides this in its own terms, because trust means different things per
+   * tracker: GitHub has arm's-length contributors, a self-hosted Vikunja does not.
+   */
+  readonly authorTrusted: boolean;
 }
 
 export type TrackerTransition =

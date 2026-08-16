@@ -26,6 +26,7 @@ import { parse as parseYaml } from "yaml";
 import {
   asTaskId,
   KNOWN_CAPABILITIES,
+  parseRepoRef,
   type Capability,
   type RepoRef,
   type TaskId,
@@ -34,6 +35,7 @@ import {
   type TrackerRef,
   type WorkspaceName,
 } from "../domain/task.ts";
+import { assertWorkspaceScope, type WorkspaceScope } from "../forge/types.ts";
 import type { TrackerItem } from "../tracker/types.ts";
 
 /**
@@ -94,6 +96,15 @@ export interface RenderOptions {
    * means that repo, while a Vikunja task has none and must say.
    */
   readonly defaultRepo?: RepoRef;
+  /**
+   * The bound the workspace's credential cannot reach past (§9.1).
+   *
+   * Required, not optional. The credential service refuses an out-of-scope repo anyway,
+   * so this is not the wall — but a refusal HERE reaches the human who wrote the issue,
+   * as a comment naming the repo, instead of surfacing three steps later as a clone
+   * that mysteriously cannot authenticate.
+   */
+  readonly scope: WorkspaceScope;
 }
 
 /**
@@ -119,20 +130,6 @@ export const taskIdFor = (ref: TrackerRef): TaskId => {
   const prefix = PREFIX[ref.kind] ?? segment(ref.kind).toUpperCase();
   const parts = [prefix, ...(ref.container === undefined ? [] : [segment(ref.container)]), segment(ref.id)];
   return asTaskId(parts.filter((p) => p.length > 0).join("-"));
-};
-
-/** `host/owner/name` or `owner/name` (host defaults to github.com). */
-const parseRepo = (raw: string): RepoRef | undefined => {
-  const parts = raw.split("/").filter((p) => p.length > 0);
-  if (parts.length === 3) {
-    const [host, owner, name] = parts as [string, string, string];
-    return { host, owner, name };
-  }
-  if (parts.length === 2) {
-    const [owner, name] = parts as [string, string];
-    return { host: "github.com", owner, name };
-  }
-  return undefined;
 };
 
 const reject = (reason: string): IngestResult => ({ kind: "rejected", reason });
@@ -245,7 +242,7 @@ export const renderSpec = (item: TrackerItem, options: RenderOptions): IngestRes
   } else {
     const parsed: RepoRef[] = [];
     for (const raw of declaredRepos) {
-      const repo = parseRepo(raw);
+      const repo = parseRepoRef(raw);
       if (repo === undefined) {
         return reject(
           `\`repos\` entry '${raw}' is not a repository reference — expected ` +
@@ -255,6 +252,14 @@ export const renderSpec = (item: TrackerItem, options: RenderOptions): IngestRes
       parsed.push(repo);
     }
     repos = parsed;
+  }
+
+  for (const repo of repos) {
+    try {
+      assertWorkspaceScope(repo, options.scope);
+    } catch (error) {
+      return reject(error instanceof Error ? error.message : String(error));
+    }
   }
 
   const declaredRequires = block.requires === undefined ? [] : strings(block.requires, "requires");

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, asWorkspaceName, type RepoRef, type TaskSpec } from "../domain/task.ts";
 import { ForgejoForgeFactory, MissingRepoTokenError, summariseCombinedStatus } from "./forgejo.ts";
-import { RepoOutOfScopeError } from "./types.ts";
+import { RepoOffWorkspaceError, RepoOutOfScopeError } from "./types.ts";
 
 const REPO: RepoRef = { host: "codeberg.org", owner: "ElectricBoogaloo", name: "eb-api" };
 
@@ -19,12 +19,15 @@ const factory = (
   owners: readonly [string, string][],
   repos: readonly [string, string][] = [],
 ) =>
-  new ForgejoForgeFactory({
-    apiBase: "https://codeberg.org/api/v1",
-    username: "bot",
-    tokensByOwner: new Map(owners),
-    ...(repos.length > 0 ? { tokensByRepo: new Map(repos) } : {}),
-  });
+  new ForgejoForgeFactory(
+    {
+      apiBase: "https://codeberg.org/api/v1",
+      username: "bot",
+      tokensByOwner: new Map(owners),
+      ...(repos.length > 0 ? { tokensByRepo: new Map(repos) } : {}),
+    },
+    { host: "codeberg.org" },
+  );
 
 test("serves the owner-wide token for a declared repo", async () => {
   // Owner-wide is the normal unit on Codeberg: these ecosystems are worked as one
@@ -45,6 +48,18 @@ test("a repo outside the task's spec is refused before any request", async () =>
   await assert.rejects(
     () => forge.credential({ ...REPO, name: "other" }),
     RepoOutOfScopeError,
+  );
+});
+
+test("a repo on another host is refused when the task is built, not when it is used", async () => {
+  // The Codeberg token is owner-wide and never expires, so serving one to a host the
+  // operator did not configure is a permanent compromise. `spec.repos` cannot be the
+  // check — it is rendered from an issue body, so a hostile entry matches itself.
+  const hostile: RepoRef = { ...REPO, host: "evil.example.com" };
+
+  await assert.rejects(
+    () => factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO, hostile])),
+    RepoOffWorkspaceError,
   );
 });
 

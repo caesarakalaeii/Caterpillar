@@ -278,6 +278,18 @@ it must **abort immediately** — no pushes to the task branch, no state writes.
 Rule: **every push verifies lease ownership first.** Mutual exclusion on claiming is not
 enough; a runner that lost the network but kept working must not resurrect stale work.
 
+**And every IRREVERSIBLE act, not only every push.** A push is cheap to fence because it
+is cheap to lose — a rejected one costs a retry. A merge is not: it lands on the default
+branch, it crosses a system boundary, and no later check can take it back. Fencing it
+afterwards fences nothing. The gap that made this concrete: `convene` takes minutes (207s
+observed), and in that window the lease can go stale, an operator can `/cancel`, and
+another runner can park the task and push — after which the council returns `pass` and
+the original runner merges the PR for a task the human already cancelled. `assertHeld`
+then threw, and the throw was logged at warn and discarded, because by then there was
+nothing left to protect. So `assertHeld` runs immediately *before* the merge, and the
+`Merge anyway` button claims the lease before merging rather than after, refusing when
+another runner holds it.
+
 > **Clock skew matters.** Steal-on-stale compares commit timestamps across machines.
 > Runners must run NTP. The 5-minute threshold is deliberately far larger than plausible
 > skew.
@@ -375,6 +387,27 @@ On reclaim, the new session:
 2. Appends a journal entry recording the interruption.
 3. Replays context from `spec.md` + `journal.md` + `handoff.md`.
 
+**A reclaim requires `running` to be claimable, and for a long time it was not.** From
+the end of session 1 the pushed `state.json` says `running` — `recordSession` writes the
+status object it was handed — so this is the state EVERY interrupted task is in, not an
+edge case. `isClaimable` accepted only `ready`, and `claimNext` filters on it *before*
+calling `LeaseManager.claim`, which meant the stale-lease steal below could never run for
+the tasks it exists to serve. Every route out of a session other than a clean terminal
+transition stranded the task permanently: a killed pod, a lost lease, and a graceful
+SIGTERM alike — and Keel rolls the pod on every push to main, so this fired on each
+deploy, with no notification.
+
+Nothing was lost when it happened (branch commits and the journal survive, and `/cancel`
+then `/resume` recovers it), which is precisely why it went unnoticed: the symptom is a
+task that is simply never worked again.
+
+The predicate now admits `running` and lets the CAS adjudicate. That is the correct
+division: `isClaimable` filters a snapshot read seconds earlier, and a filter over stale
+data cannot establish exclusivity whatever statuses it admits — only the atomic
+compare-and-swap on the lease ref can, and a successful one already means the lease was
+absent or stale. Terminal and parked statuses stay excluded, because those are decisions
+rather than interruptions.
+
 The last session's transcript may be missing or truncated — that is acceptable, because
 the journal, not the transcript, is the source of truth.
 
@@ -454,6 +487,49 @@ Sessions also retry transient provider errors twice before giving up, which pi d
 do by default (`maxRetries: 0`). A single 500 used to cost a whole session.
 
 ---
+
+### 6.4 A session can be stopped
+
+Four things may stop a session in flight, and they arrive as one `AbortSignal` threaded
+into `agent.prompt()` via pi's `abort()`:
+
+1. **Pod shutdown.** SIGTERM aborted the loop *between* tasks only, so a graceful stop
+   waited for the whole session.
+2. **A lost lease.** The heartbeat's failure callback used to set a flag read at the top
+   of the session loop, so a lease lost at t=60s let the session run out the rest of its
+   budget — still minting a fresh token for every push, via a `CredentialService.active`
+   that outlived the lease justifying it — while another runner worked the same branch.
+   The callback now aborts and clears the credential at that moment.
+3. **`/cancel`.** See below.
+4. **The wall clock** (`limits.maxSessionSeconds`, four hours). Not a budget: pi's bash
+   tool documents `timeout` as optional with **no default**, so the model decides whether
+   a command may block forever. `npm run dev`, a test runner waiting on stdin, a
+   `nix build` against a dead cache — the promise never settles, and everything in the
+   supervisor is single-threaded, so the poll loop, the chat drain and intake stop with
+   it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
+   indicator stays on: a runner that looks healthier the longer it is wedged.
+
+An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
+session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and
+deliberately distinct from it: no provider misbehaved, so no cooldown starts. Charging a
+task a session for a deploy would also count it against the no-progress streak, which is
+how a pod restart could park a task that was doing fine.
+
+**`/cancel` needs the queue read while the session runs.** `ChatInbox` is drained in the
+poll loop, which is blocked for the entire duration of a session — so a cancel sat in the
+queue until the session it was meant to stop had already finished, and the operator's
+Discord reply hung until then. `workTask` therefore watches for park requests naming its
+own task and takes only those (`takeWhere`), leaving everything else queued: the rest
+write the state repo, and this session holds the lease those writes would have to fence
+against. The reply says `cancelling`, not `parked`, because the session may take a turn
+boundary to unwind and the human is waiting on a Discord interaction.
+
+Stopping the session is **not** cancelling the task, and the difference is easy to miss:
+an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
+means the next poll re-claims it and starts over while the operator watches the thing
+they cancelled carry on working. `workTask` therefore parks it under the lease it still
+holds, before releasing. A cancel that raced a lost lease does not — it has no standing
+to write, and `park` fences anyway.
 
 ## 7. Human interaction
 
@@ -754,13 +830,41 @@ Minted per task, scoped **narrower than the App itself**:
 ```jsonc
 POST /app/installations/{id}/access_tokens
 {
-  "repositories": ["all-chat"],            // only repos named in spec.md
+  "repositories": ["all-chat"],            // repos named in spec.md, ∩ the workspace scope
   "permissions": { "contents": "write", "pull_requests": "write" }
 }
 ```
 
-No admin, no workflow. `TASK-123` cannot touch `caesar-deployment` unless its spec
-says so.
+No admin, no workflow.
+
+> **`spec.repos` is a narrowing filter, not the boundary.** It reads like one, and it
+> was treated as one for a while, and that was wrong: `spec.md` is rendered from a
+> GitHub issue body, a Vikunja description, or a plan the previous session wrote. All
+> three are outside the operator's control, and an outside contributor can edit their
+> own issue body after a maintainer has labelled it. Checking a credential request
+> against `spec.repos` — which is what `assertInScope` does on its own — compares an
+> attacker-chosen value against an attacker-chosen list. It always succeeds.
+>
+> The real bound is the **`WorkspaceScope`** (`src/config/scope.ts`), built from the
+> ConfigMap and nothing else:
+>
+> - `repo.host` must equal the workspace's own `forge.host`. Without this, a spec
+>   naming `evil.example.com/<owner>/<repo>` gets cloned from that host with the
+>   credential helper attached; the server answers `401`, git offers the credential,
+>   and the helper hands over a live token. On Codeberg that token is owner-wide and
+>   never expires.
+> - the **state repo is excluded**, compared case-insensitively because GitHub
+>   resolves `Caterpillar-State` and `caterpillar-state` to the same repository. This
+>   is what makes §9.3 true in code rather than by convention.
+>
+> Enforced in four places, deliberately redundantly: at `renderSpec` and `materialise`
+> so a human or an agent gets a refusal naming the repo, in `ForgeFactory.forTask` so
+> nothing is cloned, and in `CredentialService.answer` plus `Forge.credential` because
+> that is where a token actually leaves the supervisor. Only the last two are the
+> boundary; the first two exist so the failure is legible.
+
+With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec says so
+**and** `caesar-deployment` is on the workspace's forge and is not the state repo.
 
 > **Correction — "no merging" is not a token property.** GitHub has no separate merge
 > scope: `PUT /pulls/{n}/merge` is authorised by `pull_requests: write`, the same
@@ -839,9 +943,13 @@ interface ForgeCredentials {
 }
 ```
 
-Two implementations, `GitHubAppForge` and `ForgejoForge`, selected by the repo's host. The
-agent's `open_pr()` tool and the credential helper are **identical either way** — the agent
-never learns which forge it is on, let alone the token.
+Two implementations, `GitHubAppForge` and `ForgejoForge`, selected by the task's
+**workspace** — `spec.workspace` picks the profile, and the profile names the forge. NOT
+by the repo's host, which is the reading this sentence used to invite: one task binds one
+forge to one credential bundle, so a repo whose host disagrees with its workspace's
+`forge.host` has no credential that could serve it and is refused rather than routed
+(§9.1). The agent's `open_pr()` tool and the credential helper are **identical either
+way** — the agent never learns which forge it is on, let alone the token.
 
 **Codeberg specifics.** Codeberg runs Forgejo `16.0.0-dev` (checked 2026-08-13), which is
 past v15.0, so **repository-scoped access tokens are available**:
@@ -1020,7 +1128,7 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 | `Deployment` | supervisor, 1 replica, `Recreate` strategy |
 | `PVC` | git mirrors + worktrees |
 | `Secret` (SOPS) | GitHub App PEM, Discord webhook, proxy token |
-| `ConfigMap` | capabilities, thresholds, repo allowlist |
+| `ConfigMap` | capabilities, thresholds, workspace forge host (the repo scope, §9.1) |
 | `Deployment` | llm-proxy |
 | `Deployment` | discord-bridge |
 | `ServiceMonitor` | scrape supervisor `/metrics` |
@@ -1345,6 +1453,29 @@ plan only, never a task that has already started, and a revision that would intr
 cycle is discarded whole rather than partially.
 
 ### 14.1 The `agent` block
+
+**Who wrote it is checked before what it says.** On GitHub the item's author must hold
+`OWNER`, `MEMBER` or `COLLABORATOR` — push access, in other words. `CONTRIBUTOR` is
+deliberately not enough: GitHub grants it for one merged commit, which on a public repo
+is close to "anyone who has ever been helpful once".
+
+The label cannot carry this on its own, and the reason is a sequencing property rather
+than a trust one. A maintainer applies `agent` to an item; the AUTHOR keeps the right to
+edit the body afterwards, forever. Intake re-reads the body on every pass, so the text
+that gets executed is not the text anyone approved. Since `acceptance` runs as shell in
+the supervisor's own process, before the CI gate, the gap between "labelled" and
+"executed" is a gap between two different documents.
+
+The refusal for an untrusted author deliberately does **not** quote the template back.
+Everywhere else a refusal explains exactly what to write, which is right when the reader
+is allowed to write it; here it would be a set of instructions for making the body
+executable, handed to the one person who must not have them. The comment says a
+maintainer should open their own item instead.
+
+Vikunja has no equivalent check and needs none: writing to a project requires an account
+someone provisioned, and the agent's token only sees projects that account was granted.
+There is no arm's-length contributor. `VikunjaTracker` says so at the line that sets
+`authorTrusted`, so a future public instance has one place to change.
 
 What a human writes in the tracker item:
 

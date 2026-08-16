@@ -115,7 +115,7 @@ const config: RunnerConfig = {
   // renewal landing mid-park would muddy which CAS was under test.
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
-  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3 },
+  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 3600 },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
   llm: {
@@ -1240,4 +1240,162 @@ test("/resume clears the no-progress streak, or the task parks again without run
     "awaiting-human",
     "a resumed task must reach a session — parking again without running is the bug",
   );
+});
+
+test("a git failure in the poll loop is logged and retried, not fatal", async () => {
+  // `store.pull`, `applyChatRequests`, `maybeIngest`, `survey` and `claimNext` all sat
+  // OUTSIDE any try — only `workTask` was wrapped. `Git.run` throws on every non-zero
+  // exit, and `resolveEnv` awaits a token mint over an untimed fetch roughly hourly, so
+  // one blip unwound out of `run()` into main's `finally`. That closes /healthz and the
+  // credential socket, then blocks forever on `await bridge` — a live process, still
+  // answering Discord from a frozen snapshot, polling nothing, that systemd would never
+  // restart because it never exited.
+  const store = new StateStore(statePath, stateGit);
+  let pulls = 0;
+  const flaky: StateStore = Object.create(store, {
+    pull: {
+      value: async (remote: string, branch: string): Promise<void> => {
+        pulls += 1;
+        // Fail the first two, exactly as a transient network or credential blip would.
+        if (pulls <= 2) throw new Error("fatal: unable to access 'origin': network is down");
+        await store.pull(remote, branch);
+      },
+    },
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store: flaky,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && pulls < 3) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    pulls >= 3,
+    `the loop must survive a failing pull and try again — it stopped after ${pulls}`,
+  );
+});
+
+test("/cancel stops a session running on this runner instead of refusing it", async () => {
+  // `applyPark` used to refuse a running task outright, so the only way to stop a
+  // session was deleting the pod — which then stranded the task, because an interrupted
+  // task is pushed as `running` and nothing moved it back (§6.2). The two bugs made
+  // each other unfixable from the operator's side.
+  const CANCELLED = asTaskId("SMOKE-CANCEL");
+  await seedTask(CANCELLED);
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new ChatInbox();
+
+  // A session that runs until something aborts it — a hung `bash` call, in effect.
+  //
+  // `keepalive` is load-bearing, not decoration. A real hung session holds a live child
+  // process, and that handle keeps the event loop alive; a promise waiting on an abort
+  // event holds NOTHING. Every timer the supervisor arms for the duration of a session
+  // is deliberately unref'd — `watchCancels`, the wall clock, the heartbeat — so that a
+  // process with nothing left to do is never held up by one. In production that is safe
+  // because `index.ts` is always listening on a metrics port and a credential socket.
+  // A bare Supervisor has neither, so without this the loop drains mid-session and node
+  // ends the test with "Promise resolution is still pending" before the cancel is ever
+  // answered. That is the stub being unfaithful to a hang, not the supervisor misbehaving
+  // — it failed on node 22 and passed on 26.
+  let sawAbort = false;
+  const runner: SessionRunner = {
+    run: (_spec, _state, signal) =>
+      new Promise<SessionOutcome>((resolve) => {
+        const keepalive = setInterval(() => {}, 1_000);
+        signal.addEventListener("abort", () => {
+          clearInterval(keepalive);
+          sawAbort = true;
+          resolve({
+            reason: "interrupted",
+            usage: EMPTY_USAGE,
+            contextTokens: 0,
+            summary: "stopped from outside",
+          });
+        });
+      }),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Wait until the session is actually in flight, or the cancel would find nothing.
+  const started = Date.now() + 30_000;
+  while (Date.now() < started) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "running") break;
+    await sleep(50);
+  }
+
+  const outcome = await inbox.submit({ kind: "park", task: CANCELLED });
+  assert.equal(outcome.kind, "cancelling", "a running session must be stoppable");
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !sawAbort) await sleep(50);
+
+  // ...and the task must actually END UP parked. Aborting the session is only half of
+  // a cancel: an interrupted task is left `running`, which is claimable again, so
+  // without the park the very next poll would start the session over.
+  let parked: TaskState | undefined;
+  const settled = Date.now() + 30_000;
+  while (Date.now() < settled) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "parked") {
+      parked = state;
+      break;
+    }
+    await sleep(50);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(sawAbort, "the abort must reach the session, not just the reply");
+  assert.ok(parked !== undefined, "a cancelled task must end up parked, not re-claimed");
 });

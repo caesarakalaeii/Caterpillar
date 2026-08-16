@@ -45,6 +45,15 @@ export type ChatOutcome =
   | { readonly kind: "not-waiting"; readonly status: string }
   /** Parking a task that is already terminal. */
   | { readonly kind: "not-parkable"; readonly status: string }
+  /**
+   * A running session on THIS runner was asked to stop.
+   *
+   * Distinct from `parked`: the session stops at the next turn boundary and the park
+   * lands on the poll after that, so saying "parked" here would be a second or two
+   * early — and the difference is visible, because the thread keeps showing the typing
+   * indicator until the session actually unwinds.
+   */
+  | { readonly kind: "cancelling" }
   /** Merging was possible in principle but refused — no PR, or no reviewer identity. */
   | { readonly kind: "not-mergeable"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
@@ -104,6 +113,26 @@ export class ChatInbox {
   drain(): readonly ChatRequest[] {
     const taken = this.queue;
     this.queue = [];
+    return taken;
+  }
+
+  /**
+   * Take just the requests matching `select`, leaving the rest queued.
+   *
+   * Exists for exactly one caller: the supervisor watching for a `/cancel` while a
+   * session is in flight. The normal `drain` runs in the poll loop, which is BLOCKED for
+   * the whole duration of a session — so a cancel submitted while the agent is working
+   * sat in the queue until the session it was meant to stop had already finished, and
+   * the operator's Discord reply hung until then too.
+   *
+   * Deliberately not a general "process requests during a session": everything else in
+   * the queue writes the state repo, and the running session holds the lease those
+   * writes would have to fence against. A cancel is safe because it writes nothing — it
+   * aborts, and the write happens on the poll that follows.
+   */
+  takeWhere(select: (request: ChatRequest) => boolean): readonly ChatRequest[] {
+    const taken = this.queue.filter(select);
+    if (taken.length > 0) this.queue = this.queue.filter((request) => !select(request));
     return taken;
   }
 

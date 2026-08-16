@@ -21,6 +21,7 @@ import { createSign } from "node:crypto";
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
 import {
   assertInScope,
+  assertWorkspaceScope,
   type CheckConclusion,
   type CheckStatus,
   type Forge,
@@ -29,7 +30,17 @@ import {
   type MergeOptions,
   type PrRequest,
   type PrResult,
+  type WorkspaceScope,
 } from "./types.ts";
+
+/**
+ * Check-run pagination. 100 is GitHub's maximum page size; 10 pages is 1000 runs, far
+ * past any real matrix, and the ceiling exists so a pathological ref cannot spin here.
+ * Hitting it leaves the list short of `total_count`, which `summarise` reports as
+ * pending rather than folding into a verdict.
+ */
+const CHECK_RUN_PAGE_SIZE = 100;
+const CHECK_RUN_PAGES = 10;
 
 /** Re-mint this long before expiry so a slow push never straddles the boundary. */
 const RENEW_MARGIN_MS = 10 * 60 * 1000;
@@ -102,6 +113,14 @@ interface PullRequestResponse {
 }
 
 interface CheckRunsResponse {
+  /**
+   * How many check-runs exist for the ref, as opposed to how many this page carries.
+   *
+   * Was not declared at all, which is what made the truncation undetectable: one
+   * unpaginated request returns GitHub's default of 30, and `summarise` folded that
+   * partial list into a verdict as if it were the whole story.
+   */
+  readonly total_count?: number;
   readonly check_runs: readonly {
     readonly status: string;
     readonly conclusion: string | null;
@@ -156,13 +175,19 @@ class GitHubAppForge implements Forge {
 
   private readonly options: GitHubAppOptions;
   private readonly allowed: readonly RepoRef[];
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: GitHubAppOptions, allowed: readonly RepoRef[]) {
+  constructor(options: GitHubAppOptions, allowed: readonly RepoRef[], scope: WorkspaceScope) {
     this.options = options;
     this.allowed = allowed;
+    this.scope = scope;
   }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
+    // Both, in this order. `allowed` narrows to what the task asked for; `scope` is the
+    // bound the task did not get to choose. The factory checked the same thing, but a
+    // token is what leaves this method, so it is re-checked where it is minted.
+    assertWorkspaceScope(repo, this.scope);
     assertInScope(repo, this.allowed);
 
     const cached = this.cached;
@@ -206,11 +231,38 @@ class GitHubAppForge implements Forge {
     assertInScope(repo, this.allowed);
 
     const [runs, combined] = await Promise.all([
-      this.api<CheckRunsResponse>(repo, `/repos/${repo.owner}/${repo.name}/commits/${ref}/check-runs`),
+      this.checkRuns(repo, ref),
       this.api<CombinedStatusResponse>(repo, `/repos/${repo.owner}/${repo.name}/commits/${ref}/status`),
     ]);
 
     return summarise(runs, combined);
+  }
+
+  /**
+   * Every check-run for a ref, not the first page of them.
+   *
+   * This was one request with no `per_page` and no page loop, so it returned GitHub's
+   * default of 30. A matrix build whose failing job landed on page 2 came back as
+   * `{conclusion: "success"}`, passed the §12 CI gate, and was squash-merged red. The
+   * tracker sibling in this repo has paginated properly since it was written; this was
+   * an omission rather than a deliberate cap.
+   */
+  private async checkRuns(repo: RepoRef, ref: string): Promise<CheckRunsResponse> {
+    const base = `/repos/${repo.owner}/${repo.name}/commits/${ref}/check-runs`;
+    const runs: CheckRunsResponse["check_runs"][number][] = [];
+    let total = 0;
+
+    for (let page = 1; page <= CHECK_RUN_PAGES; page += 1) {
+      const body = await this.api<CheckRunsResponse>(
+        repo,
+        `${base}?per_page=${CHECK_RUN_PAGE_SIZE}&page=${page}`,
+      );
+      runs.push(...body.check_runs);
+      total = body.total_count ?? runs.length;
+      if (runs.length >= total || body.check_runs.length === 0) break;
+    }
+
+    return { total_count: total, check_runs: runs };
   }
 
   async approve(repo: RepoRef, pr: number, body: string): Promise<void> {
@@ -394,6 +446,20 @@ export const summarise = (
    * green PR was rejected as "CI has not finished" on every claim, forever. Legacy
    * commit statuses are the minority case now, so this is the common path, not an edge.
    */
+  // An incomplete list cannot produce a verdict in EITHER direction: the runs we did not
+  // see could be failing, and calling it pending is the answer that costs a retry rather
+  // than a red merge. Reported as pending rather than thrown so the gate reads it as
+  // "not yet", which is what it is.
+  const expected = runs.total_count ?? runs.check_runs.length;
+  if (runs.check_runs.length < expected) {
+    return {
+      conclusion: "pending",
+      summary:
+        `only ${runs.check_runs.length} of ${expected} check-run(s) could be read — ` +
+        `refusing to judge CI on a partial list`,
+    };
+  }
+
   const hasStatuses = combined.total_count > 0;
   const hasSignal = runs.check_runs.length > 0 || hasStatuses;
   if (!hasSignal) {
@@ -426,13 +492,19 @@ export const summarise = (
 
 export class GitHubAppForgeFactory implements ForgeFactory {
   private readonly options: GitHubAppOptions;
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: GitHubAppOptions) {
+  constructor(options: GitHubAppOptions, scope: WorkspaceScope) {
     this.options = options;
+    this.scope = scope;
   }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
-    return new GitHubAppForge(this.options, spec.repos);
+    // Refuse the whole task rather than the individual request. A spec naming a repo
+    // this workspace cannot reach is a spec that will fail somewhere later anyway, and
+    // failing here names the offending repo while nothing has been cloned yet.
+    for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
+    return new GitHubAppForge(this.options, spec.repos, this.scope);
   }
 }
 
@@ -445,4 +517,6 @@ export class GitHubAppForgeFactory implements ForgeFactory {
  */
 export const reviewerForgeFactory = (
   options: Omit<GitHubAppOptions, "permissions">,
-): ForgeFactory => new GitHubAppForgeFactory({ ...options, permissions: REVIEWER_PERMISSIONS });
+  scope: WorkspaceScope,
+): ForgeFactory =>
+  new GitHubAppForgeFactory({ ...options, permissions: REVIEWER_PERMISSIONS }, scope);

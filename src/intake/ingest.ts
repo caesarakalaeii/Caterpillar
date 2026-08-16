@@ -25,8 +25,9 @@ import {
 } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
 import type { StateStore } from "../state/store.ts";
+import type { WorkspaceScope } from "../forge/types.ts";
 import type { Tracker, TrackerItem } from "../tracker/types.ts";
-import { renderSpec, taskIdFor } from "./spec.ts";
+import { renderSpec, taskIdFor, type IngestResult } from "./spec.ts";
 
 /**
  * Whether an intake pass is due.
@@ -63,6 +64,11 @@ export interface IngesterDeps {
   readonly store: StateStore;
   /** Trackers to ingest from, by workspace. A workspace without one is supported. */
   readonly trackers: ReadonlyMap<WorkspaceName, Tracker>;
+  /**
+   * The configured repo bound per workspace (§9.1). An item naming a repo outside it is
+   * refused at intake, where the refusal reaches the human who wrote it.
+   */
+  readonly scopes: ReadonlyMap<WorkspaceName, WorkspaceScope>;
   readonly logger: Logger;
   /** Session cap stamped into each new task's `state.json`. */
   readonly maxSessionsPerTask: number;
@@ -163,10 +169,34 @@ export class Ingester {
     }
 
     const self = selfRepo(item.ref);
-    const rendered = renderSpec(item, {
-      workspace,
-      ...(self !== undefined ? { defaultRepo: self } : {}),
-    });
+    const scope = this.deps.scopes.get(workspace);
+    if (scope === undefined) {
+      // Refusing beats guessing. A workspace with a tracker but no forge profile is a
+      // misconfiguration, and inventing a permissive scope would turn it into a leak.
+      logger.warn("intake.no-scope", { task: id, workspace, tracker: tracker.kind });
+      return "skipped";
+    }
+
+    const rendered: IngestResult = item.authorTrusted
+      ? renderSpec(item, {
+          workspace,
+          scope,
+          ...(self !== undefined ? { defaultRepo: self } : {}),
+        })
+      : {
+          kind: "rejected",
+          // Deliberately NOT the `agent` block template. The template is instructions for
+          // making this body executable, and handing them to an author we have just
+          // declined to trust is the one comment that turns a refusal into a tutorial.
+          // The person who needs to act is the maintainer who applied the label.
+          reason:
+            "The author of this item does not have write access to this repository, so " +
+            "its body is not run as a task. An `agent` block's `acceptance` list is " +
+            "executed as shell on the runner, and the body can be edited by its author " +
+            "after the label is applied — so the label alone cannot authorise it.\n\n" +
+            "If this work should go to the agent, a maintainer should open it as their " +
+            "own item, referencing this one.",
+        };
 
     if (rendered.kind === "rejected") {
       const digest = digestOf(item);

@@ -71,6 +71,17 @@ export interface LimitsConfig {
    * and getting nowhere.
    */
   readonly maxReviewRounds: number;
+  /**
+   * Wall-clock ceiling on ONE session, in seconds.
+   *
+   * Not a budget — a hang detector. pi's bash tool documents `timeout` as optional with
+   * no default, so the model decides whether a command can block forever, and everything
+   * in the supervisor is single-threaded: a `npm run dev` that never returns stops the
+   * poll loop, the chat drain and intake with it, while the heartbeat keeps renewing the
+   * lease and /healthz keeps answering 200. Generous on purpose; a session that
+   * legitimately needs longer than this is one nobody is watching.
+   */
+  readonly maxSessionSeconds: number;
 }
 
 export interface StateRepoConfig {

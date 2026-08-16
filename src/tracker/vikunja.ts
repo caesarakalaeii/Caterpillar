@@ -227,6 +227,13 @@ export class VikunjaTracker implements Tracker {
           title: task.title ?? `task ${task.id}`,
           body: stripHtml(task.description ?? ""),
           url: this.webUrl(task.id),
+          // Always trusted, and this is a statement about the deployment rather than a
+          // shortcut: a Vikunja instance has no arm's-length contributor: writing to a
+          // project at all requires an account someone provisioned, and the agent's
+          // token only sees projects that account was granted. There is no equivalent of
+          // a stranger opening an issue on a public repo. If that ever stops being true
+          // — a public or self-registration instance — this is the line to change.
+          authorTrusted: true,
         });
       }
     }

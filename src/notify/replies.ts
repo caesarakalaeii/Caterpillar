@@ -43,6 +43,11 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return `**${task}** is \`${outcome.status}\`, not waiting on an answer — nothing was written.`;
     case "not-parkable":
       return `**${task}** is already \`${outcome.status}\` — nothing was written.`;
+    case "cancelling":
+      return (
+        `Stopping **${task}**. The session finishes the step it is on, then unwinds — ` +
+        `it will show as \`parked\` within a poll. Nothing from this session is recorded.`
+      );
     case "failed":
       return `Could not act on **${task}**: ${outcome.error}`;
   }

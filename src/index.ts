@@ -8,10 +8,11 @@
 import { createServer } from "node:http";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
+import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
-import type { ForgeFactory } from "./forge/types.ts";
+import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
@@ -115,15 +116,21 @@ const main = async (): Promise<void> => {
   const store = new StateStore(config.stateRepo.path, git);
   const metrics = new AgentMetrics();
 
+  // Parsed once: every workspace's scope excludes the same state repo, and a task
+  // credential that could reach it would make the audit trail agent-writable (§9.3).
+  const stateRepo = stateRepoRef(config.stateRepo);
+
   const forges = new Map<WorkspaceName, ForgeFactory>();
   const trackers = new Map<WorkspaceName, Tracker>();
   const reviewers = new Map<WorkspaceName, ForgeFactory>();
+  const scopes = new Map<WorkspaceName, WorkspaceScope>();
   for (const [name, profile] of config.workspaces) {
-    forges.set(name, await loadForgeFactory(profile, config.secretsDir));
+    scopes.set(name, workspaceScopeOf(profile, stateRepo));
+    forges.set(name, await loadForgeFactory(profile, config.secretsDir, stateRepo));
 
     // The second identity (§12.1). Absent is normal and supported: the council still
     // reviews, and merging stays a human act.
-    const reviewer = await loadReviewerFactory(profile, config.secretsDir);
+    const reviewer = await loadReviewerFactory(profile, config.secretsDir, stateRepo);
     if (reviewer !== undefined) reviewers.set(name, reviewer);
     logger.info("reviewer.identity", { workspace: name, configured: reviewer !== undefined });
 
@@ -205,6 +212,7 @@ const main = async (): Promise<void> => {
           closer: new BotThreadCloser(discord.bot, threads),
         }),
     notifier: discord.notifier,
+    credentials,
     inbox,
     snapshot,
     metrics,
@@ -215,6 +223,7 @@ const main = async (): Promise<void> => {
     intake: new Ingester({
       store,
       trackers,
+      scopes,
       logger,
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
     }),
@@ -251,6 +260,12 @@ const main = async (): Promise<void> => {
   try {
     await supervisor.run(controller.signal);
   } finally {
+    // FIRST, and unconditionally. `runBridge`'s loop only exits when this signal aborts,
+    // and only the SIGTERM/SIGINT handlers used to abort it — so a throw out of
+    // `supervisor.run` reached `await bridge` and blocked there forever, having already
+    // closed /healthz and the credential socket. The Discord websocket kept the event
+    // loop alive, so the process never exited, and `Restart=always` never fired.
+    controller.abort();
     stopMetrics();
     await credentials.stop();
     await bridge;
@@ -347,10 +362,35 @@ const runBridge = (
   }).run(signal);
 };
 
-main().catch((error: unknown) => {
-  // A failure here can predate `loadConfig`, so this logger takes the default level
-  // rather than the configured one — a boot failure must never be the thing that gets
-  // filtered out.
-  new JsonLogger().error("supervisor.boot-failed", errorFields(error));
-  process.exitCode = 1;
-});
+/**
+ * Die loudly rather than linger.
+ *
+ * Every failure path here has the same shape: something the supervisor cannot recover
+ * from happens, and the process stays alive because a websocket or a listening socket is
+ * still holding the event loop open. A runner that is up but not working is the worst of
+ * the three states — Kubernetes will not restart it, systemd will not restart it, and
+ * `/healthz` says 200 — so each of these exits on purpose.
+ *
+ * `process.exit` rather than `exitCode`: setting the code only takes effect once the loop
+ * drains, which is exactly what is not going to happen.
+ */
+const die = (event: string, error: unknown): never => {
+  new JsonLogger().error(event, errorFields(error));
+  process.exit(1);
+};
+
+process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
+process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
+
+main().then(
+  () => {
+    // A clean return means the signal aborted and shutdown completed.
+    process.exit(0);
+  },
+  (error: unknown) => {
+    // A failure here can predate `loadConfig`, so this logger takes the default level
+    // rather than the configured one — a boot failure must never be the thing that gets
+    // filtered out.
+    die("supervisor.boot-failed", error);
+  },
+);

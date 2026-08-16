@@ -39,6 +39,17 @@ acceptance:
 
 An item without one is refused, and commented on **once** explaining what to write.
 
+**On GitHub the author must have push access** — `OWNER`, `MEMBER` or `COLLABORATOR`.
+Labelling someone else's issue is not enough to run it, because the author can edit their
+own body after the label is applied and `acceptance` is executed as shell on the runner.
+To hand an outside contributor's request to the agent, open your own issue referencing
+theirs. Vikunja has no such check and needs none — writing to a project already requires
+an account someone provisioned (§14.1).
+
+Repos are bounded too: an item may only name repos on its workspace's own forge, and
+never the state repo (§9.1). A `codeberg.org/...` sibling in a GitHub workspace is
+refused rather than half-working.
+
 In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
 *inside* a code block instead — intake accepts either position.
 
@@ -109,6 +120,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 |---|---|
 | `src/domain/task.ts` | Core vocabulary. Depends on nothing. |
 | `src/config/` | Runner + workspace profiles. **Never holds secrets.** |
+| `src/config/scope.ts` | The configured bound on repos a task may reach (§9.1). |
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
@@ -359,8 +371,10 @@ council reads it with plan-specific lenses, and on a pass the tasks are created 
 `wave` and a `blockedBy` (§14.3).
 
 To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
-so, then archived. The task is never claimed again; the thread keeps its history and
-un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
+so, then archived. It works on a task that is *running*, not only on an idle one: the
+session stops at the next turn boundary, nothing from it is recorded, and the park lands
+on the following poll (the reply says `cancelling` until then). The task is never claimed
+again; the thread keeps its history and un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
 `journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
 repo by hand, once no lease is held.
 

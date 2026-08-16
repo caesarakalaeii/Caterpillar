@@ -7,12 +7,17 @@ import { renderSpec, taskIdFor } from "./spec.ts";
 
 const WORKSPACE = asWorkspaceName("caesar");
 const SELF: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
+const SCOPE = {
+  host: "github.com",
+  stateRepo: { host: "github.com", owner: "acme", name: "caterpillar-state" },
+};
 
 const item = (body: string, title = "Make the thing work"): TrackerItem => ({
   ref: { kind: "github-issues", id: "12", container: "acme/widget" },
   title,
   body,
   url: "https://github.com/acme/widget/issues/12",
+  authorTrusted: true,
 });
 
 const block = (yaml: string): string => ["```agent", yaml, "```"].join("\n");
@@ -28,7 +33,7 @@ test("renders a spec from an agent block", async () => {
         "Reproduce with `npm run demo`.",
       ].join("\n"),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -56,7 +61,7 @@ test("the goal keeps the prose and the title but drops the agent block", async (
         "Reproduce with `npm run demo`.",
       ].join("\n"),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -73,6 +78,7 @@ test("an item with no agent block is rejected", async () => {
   const result = renderSpec(item("Please fix the widget, it is broken."), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
 
   assert.equal(result.kind, "rejected");
@@ -90,6 +96,7 @@ test("an agent block without acceptance criteria is rejected", async () => {
   const result = renderSpec(item(block(["repos:", "  - acme/widget"].join("\n"))), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
 
   assert.equal(result.kind, "rejected");
@@ -101,6 +108,7 @@ test("an empty acceptance list is rejected", async () => {
   const result = renderSpec(item(block("acceptance: []")), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
   assert.equal(result.kind, "rejected");
 });
@@ -114,7 +122,7 @@ test("a non-string acceptance entry is rejected rather than dropped", async () =
   // can explain, which is worse than never creating it.
   const mapping = renderSpec(
     item(block(["acceptance:", "  - npm test: unit", '  - "npm run lint"'].join("\n"))),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(mapping.kind, "rejected");
@@ -127,6 +135,7 @@ test("a non-string acceptance entry is rejected rather than dropped", async () =
   const boolean = renderSpec(item(block(["acceptance:", "  - true"].join("\n"))), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
   assert.equal(boolean.kind, "rejected");
 });
@@ -135,6 +144,7 @@ test("repos defaults to the repo the item itself lives in", async () => {
   const result = renderSpec(item(block(["acceptance:", '  - "npm test"'].join("\n"))), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
 
   assert.equal(result.kind, "spec");
@@ -150,8 +160,9 @@ test("an item with no repo to fall back on must declare one", async () => {
       title: "Do the thing",
       body: block(["acceptance:", '  - "npm test"'].join("\n")),
       url: "https://tasks.example.invalid/tasks/42",
+      authorTrusted: true,
     },
-    { workspace: WORKSPACE },
+    { workspace: WORKSPACE, scope: SCOPE },
   );
 
   assert.equal(result.kind, "rejected");
@@ -163,6 +174,7 @@ test("requires defaults to empty so any runner may claim the task", async () => 
   const result = renderSpec(item(block(["acceptance:", '  - "npm test"'].join("\n"))), {
     workspace: WORKSPACE,
     defaultRepo: SELF,
+    scope: SCOPE,
   });
 
   assert.equal(result.kind, "spec");
@@ -177,7 +189,7 @@ test("declared requires and multiple repos are carried through", async () => {
         [
           "repos:",
           "  - acme/widget",
-          "  - codeberg.org/acme/sibling",
+          "  - acme/sibling",
           "requires:",
           "  - linux",
           "  - k8s",
@@ -187,7 +199,7 @@ test("declared requires and multiple repos are carried through", async () => {
         ].join("\n"),
       ),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -195,9 +207,52 @@ test("declared requires and multiple repos are carried through", async () => {
   assert.deepEqual(result.spec.requires, ["linux", "k8s"]);
   assert.deepEqual(result.spec.repos, [
     SELF,
-    { host: "codeberg.org", owner: "acme", name: "sibling" },
+    { host: "github.com", owner: "acme", name: "sibling" },
   ]);
   assert.deepEqual(result.spec.acceptance, ["npm test", "npm run lint"]);
+});
+
+test("a sibling on another forge is refused, not silently accepted", async () => {
+  // This used to be asserted the other way round, and the assertion was wrong in a way
+  // that mattered: one task binds ONE forge, so a `codeberg.org` sibling in a github
+  // workspace would have had a GitHub token pointed at Codeberg. It never worked — it
+  // just failed later, after the clone had already offered the credential to the host.
+  const result = renderSpec(
+    item(block(["repos:", "  - acme/widget", "  - codeberg.org/acme/sibling", "acceptance:", '  - "npm test"'].join("\n"))),
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
+  );
+
+  assert.equal(result.kind, "rejected");
+  if (result.kind !== "rejected") return;
+  assert.match(result.reason, /codeberg\.org/);
+  assert.match(result.reason, /github\.com/);
+});
+
+test("the supervisor's own state repo is refused", async () => {
+  // DESIGN.md §9.3. Nothing else stops an issue body from naming it, and a task with a
+  // `contents: write` token for the state repo can rewrite the record of its own work.
+  const result = renderSpec(
+    item(block(["repos:", "  - acme/caterpillar-state", "acceptance:", '  - "npm test"'].join("\n"))),
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
+  );
+
+  assert.equal(result.kind, "rejected");
+  if (result.kind !== "rejected") return;
+  assert.match(result.reason, /state repo/);
+});
+
+test("a repo reference that is really a path traversal is refused", async () => {
+  // `../../x` used to parse into `{host: "..", owner: "..", name: "x"}`, and the mirror
+  // path for that resolves above the directory the workspace owns — which syncMirror
+  // then removes and rebuilds.
+  const result = renderSpec(
+    item(block(["repos:", "  - ../../etc/passwd", "acceptance:", '  - "npm test"'].join("\n"))),
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
+  );
+
+  assert.equal(result.kind, "rejected");
+  if (result.kind !== "rejected") return;
+  assert.match(result.reason, /not a repository reference/);
 });
 
 test("a declared nix toolchain implies requires: [nix]", async () => {
@@ -215,7 +270,7 @@ test("a declared nix toolchain implies requires: [nix]", async () => {
         ].join("\n"),
       ),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -233,7 +288,7 @@ test("an explicit `requires: [nix]` is not duplicated by the implication", async
         ),
       ),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -244,7 +299,7 @@ test("an explicit `requires: [nix]` is not duplicated by the implication", async
 test("`mode: inherit` implies nothing — any runner can decline to build an environment", async () => {
   const result = renderSpec(
     item(block(["acceptance:", '  - "npm test"', "toolchain:", "  mode: inherit"].join("\n"))),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -256,7 +311,7 @@ test("`mode: inherit` implies nothing — any runner can decline to build an env
 test("an unknown toolchain mode is rejected, naming what is valid", async () => {
   const result = renderSpec(
     item(block(["acceptance:", '  - "npm test"', "toolchain:", "  mode: docker"].join("\n"))),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "rejected");
@@ -276,7 +331,7 @@ test("a non-string package is rejected rather than dropped", async () => {
         ),
       ),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "rejected");
@@ -289,7 +344,7 @@ test("an unknown capability is rejected instead of reaching the claim predicate"
   // the task unclaimable by every runner forever, which looks like a stuck queue.
   const result = renderSpec(
     item(block(["requires:", "  - linix", "acceptance:", '  - "npm test"'].join("\n"))),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "rejected");
@@ -311,7 +366,7 @@ test("an unrelated code block before the agent block is not mistaken for it", as
         block(["acceptance:", '  - "npm test"'].join("\n")),
       ].join("\n"),
     ),
-    { workspace: WORKSPACE, defaultRepo: SELF },
+    { workspace: WORKSPACE, defaultRepo: SELF, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec");
@@ -337,8 +392,9 @@ test("a Vikunja description survives the HTML round-trip into a spec", async () 
       title: "Widget drops frames",
       body: stripHtml(description),
       url: "https://tasks.example.invalid/tasks/42",
+      authorTrusted: true,
     },
-    { workspace: WORKSPACE },
+    { workspace: WORKSPACE, scope: SCOPE },
   );
 
   assert.equal(result.kind, "spec", "a Vikunja item must be ingestable");

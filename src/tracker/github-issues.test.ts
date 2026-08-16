@@ -122,6 +122,31 @@ test("pull requests are dropped from intake — every PR is also an issue", asyn
   assert.equal(items[0]?.url, "https://gh/42");
 });
 
+test("author_association decides whether an issue's body may become a task", async () => {
+  // Read off the list response, so gating on it costs no extra request. CONTRIBUTOR is
+  // NOT trusted: GitHub grants it for a single merged commit, which on a public repo is
+  // close to "anyone who has ever been helpful once".
+  const { fetch } = stub((_method, path) =>
+    path.startsWith("installation/repositories")
+      ? { repositories: [repo("widget")] }
+      : [
+          { number: 1, title: "from the owner", author_association: "OWNER" },
+          { number: 2, title: "from a collaborator", author_association: "COLLABORATOR" },
+          { number: 3, title: "from an org member", author_association: "MEMBER" },
+          { number: 4, title: "from a drive-by contributor", author_association: "CONTRIBUTOR" },
+          { number: 5, title: "from a stranger", author_association: "NONE" },
+          { number: 6, title: "from an ancient GHES that omits the field" },
+        ],
+  );
+
+  const items = await tracker(fetch).listAgentItems();
+
+  assert.deepEqual(
+    items.map((i) => i.authorTrusted),
+    [true, true, true, false, false, false],
+  );
+});
+
 test("an issue with no body arrives as null and becomes empty prose", async () => {
   const { fetch } = stub((_method, path) =>
     path.startsWith("installation/repositories")

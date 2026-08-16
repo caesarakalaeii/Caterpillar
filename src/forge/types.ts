@@ -119,3 +119,72 @@ export const assertInScope = (repo: RepoRef, allowed: readonly RepoRef[]): void 
   );
   if (!ok) throw new RepoOutOfScopeError(repo, allowed);
 };
+
+/**
+ * The bound the CONFIGURATION puts on the repos a task may name.
+ *
+ * `spec.repos` is not a security boundary and never was: it is free text out of an
+ * issue body, a Discord message, or a plan the previous agent wrote. Checking a
+ * credential request against it — which is what `assertInScope` alone does — compares
+ * an attacker-chosen value with an attacker-chosen list. This is the check that is
+ * anchored to something the operator wrote: the workspace's own forge host, and the
+ * state repo that no task may ever reach (DESIGN.md §9.3).
+ */
+export interface WorkspaceScope {
+  /** `forge.host` of the workspace profile. A repo anywhere else is refused. */
+  readonly host: string;
+  /**
+   * The supervisor's state repo, when it is known. Optional only because a local
+   * development checkout may have a URL we cannot parse into a ref; in the cluster it
+   * is always present.
+   */
+  readonly stateRepo?: RepoRef;
+}
+
+export class RepoOffWorkspaceError extends Error {
+  constructor(repo: RepoRef, host: string) {
+    super(
+      `repo ${repo.host}/${repo.owner}/${repo.name} is not on '${host}', the forge this ` +
+        `workspace holds a credential for. A task may only name repos on its own forge — ` +
+        `a foreign host would be cloned with the credential helper attached, which is how ` +
+        `a token reaches a server the operator never configured`,
+    );
+    this.name = "RepoOffWorkspaceError";
+  }
+}
+
+export class StateRepoOutOfScopeError extends Error {
+  constructor(repo: RepoRef) {
+    super(
+      `repo ${repo.host}/${repo.owner}/${repo.name} is the supervisor's own state repo — ` +
+        `no task credential may reach it (DESIGN.md §9.3). The audit trail cannot be ` +
+        `writable by the thing being audited`,
+    );
+    this.name = "StateRepoOutOfScopeError";
+  }
+}
+
+/**
+ * Compare two refs the way the forges resolve them.
+ *
+ * Case-INSENSITIVE, deliberately: DNS is case-insensitive, and GitHub resolves
+ * `Caterpillar-State` and `caterpillar-state` to the same repository. An exclusion
+ * that `===` can be walked around by changing one letter is not an exclusion.
+ */
+export const isSameRepo = (a: RepoRef, b: RepoRef): boolean =>
+  a.host.toLowerCase() === b.host.toLowerCase() &&
+  a.owner.toLowerCase() === b.owner.toLowerCase() &&
+  a.name.toLowerCase() === b.name.toLowerCase();
+
+/**
+ * Guard against the configured bound. Throws unless `repo` is one this workspace's
+ * credential is allowed to reach at all — regardless of what the task declared.
+ */
+export const assertWorkspaceScope = (repo: RepoRef, scope: WorkspaceScope): void => {
+  if (repo.host.toLowerCase() !== scope.host.toLowerCase()) {
+    throw new RepoOffWorkspaceError(repo, scope.host);
+  }
+  if (scope.stateRepo !== undefined && isSameRepo(repo, scope.stateRepo)) {
+    throw new StateRepoOutOfScopeError(repo);
+  }
+};

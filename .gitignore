@@ -6,8 +6,10 @@
 !*.enc.yaml
 
 # --- Build output ---
+# No trailing slash: a worktree symlinks node_modules at the main checkout, and
+# `node_modules/` matches directories only, so the symlink was committable.
 dist/
-node_modules/
+node_modules
 
 # --- Runtime workspace (PVC-backed in the cluster) ---
 /work/

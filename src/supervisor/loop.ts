@@ -1,8 +1,10 @@
 /**
  * The supervisor loop. See DESIGN.md §6.
  *
- * One task at a time per runner. Scale by adding replicas — the git-ref leasing
- * already makes that safe (DESIGN.md §2, Concurrency).
+ * One task at a time per runner. Scale by adding replicas — the git-ref leasing makes
+ * the TASKS safe (DESIGN.md §2, Concurrency). Note what it does not make safe: leases are
+ * per task, and the state branch is one shared resource that every runner pushes to, so
+ * that half rests on `StateStore.push` rebasing rather than on the lease.
  *
  * Invariants this loop is responsible for:
  *   - never run a session without a held lease
@@ -11,6 +13,7 @@
  *   - always persist the journal before exiting, including on error
  */
 import { setTimeout as sleep } from "node:timers/promises";
+import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import {
   addUsage,
@@ -50,7 +53,7 @@ import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
 import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
-import type { ForgeFactory } from "../forge/types.ts";
+import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
@@ -59,6 +62,14 @@ import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise, type TaskSnapshot } from "./snapshot.ts";
 
+/**
+ * How often a running session checks for a `/cancel`.
+ *
+ * A human is waiting on the reply, so this is seconds rather than a poll interval; it
+ * costs one array filter over a queue that is almost always empty.
+ */
+const CANCEL_POLL_MS = 2000;
+
 /** One task's state as read by a single sweep of the task tree. */
 interface TaskRecord {
   readonly id: TaskId;
@@ -66,8 +77,15 @@ interface TaskRecord {
 }
 
 export interface SessionRunner {
-  /** Runs one session and returns why it stopped. Never mutates task state. */
-  run(spec: TaskSpec, state: TaskState): Promise<SessionOutcome>;
+  /**
+   * Runs one session and returns why it stopped. Never mutates task state.
+   *
+   * `signal` aborts the session in flight — pod shutdown, a lost lease, a human
+   * `/cancel`, or the wall clock. Honouring it is what stops a hung tool call from
+   * wedging the whole runner: everything here is single-threaded, so a `bash` call that
+   * never returns used to stop the poll, the chat drain and intake along with it.
+   */
+  run(spec: TaskSpec, state: TaskState, signal: AbortSignal): Promise<SessionOutcome>;
 }
 
 export interface Verifier {
@@ -107,6 +125,12 @@ export interface SupervisorDeps {
    * runner has no task in flight.
    */
   readonly toolchain: ToolchainResolver;
+  /**
+   * The credential service, so a lost lease can revoke the task's credential at the
+   * moment it is lost rather than when the session eventually returns. Optional because
+   * nothing else in the loop needs it and the tests do not build one.
+   */
+  readonly credentials?: { clearActive(): void };
   /**
    * Tracker → task ingestion. Optional: a runner with no trackers configured, or one
    * fed only by hand-committed specs (§14.4), does not need it.
@@ -186,7 +210,7 @@ export class Supervisor {
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
   async run(signal: AbortSignal): Promise<void> {
-    const { config, store, logger } = this.deps;
+    const { config, logger } = this.deps;
 
     logger.info("supervisor.start", {
       runner: config.runnerId,
@@ -195,56 +219,77 @@ export class Supervisor {
     });
 
     while (!signal.aborted) {
-      await store.pull("origin", config.stateRepo.branch);
+      // The whole iteration, for the same reason `workTask` below is wrapped: a failure
+      // here belongs to one poll, not to the process. `store.pull` throws on any non-zero
+      // git exit, `resolveEnv` awaits a token mint over an untimed fetch roughly hourly,
+      // and `claimNext` reaches the network through `ls-remote` — so a blip in any of
+      // them used to unwind out of `run()` into main's `finally`, which closes /healthz
+      // and the credential socket and then blocks forever on `await bridge`. The result
+      // was a live process, still answering Discord from a frozen snapshot, that polled
+      // nothing and that systemd would never restart because it never exited.
+      try {
+        await this.pollOnce(signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        logger.error("poll.failed", errorFields(error));
+        await sleep(config.pollSeconds * 1000);
+      }
+    }
+  }
 
-      // Both before claiming, so a task unparked by either is claimable on this same
-      // iteration rather than sitting idle until the next poll. Both also run DURING a
-      // provider cooldown: answering a question and ingesting an issue cost no tokens,
-      // and a queue that keeps filling while the provider is down is the correct
-      // behaviour — it is only starting sessions that has to stop.
-      await this.applyChatRequests();
-      await this.maybeIngest();
+  /** One iteration of the poll loop. Throws only what the caller should log and retry. */
+  private async pollOnce(signal: AbortSignal): Promise<void> {
+    const { config, store, logger } = this.deps;
 
-      if (await this.coolingDown()) continue;
+    await store.pull("origin", config.stateRepo.branch);
 
-      const claimed = await this.claimNext(await this.survey());
-      if (claimed === undefined) {
+    // Both before claiming, so a task unparked by either is claimable on this same
+    // iteration rather than sitting idle until the next poll. Both also run DURING a
+    // provider cooldown: answering a question and ingesting an issue cost no tokens,
+    // and a queue that keeps filling while the provider is down is the correct
+    // behaviour — it is only starting sessions that has to stop.
+    await this.applyChatRequests();
+    await this.maybeIngest();
+
+    if (await this.coolingDown()) return;
+
+    const claimed = await this.claimNext(await this.survey());
+    if (claimed === undefined) {
         // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
         // volume so collecting is a requirement rather than hygiene, but a collection
         // racing a session on this same runner is a risk with no upside — there is always
         // another idle poll.
         await this.deps.toolchain.maybeCollectGarbage();
 
-        // Debug, not info: at the default poll interval this is the single noisiest
-        // line the supervisor could emit, and an idle runner is not news.
-        logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
-        await sleep(config.pollSeconds * 1000);
-        continue;
-      }
+      // Debug, not info: at the default poll interval this is the single noisiest
+      // line the supervisor could emit, and an idle runner is not news.
+      logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
+      await sleep(config.pollSeconds * 1000);
+      return;
+    }
 
-      try {
-        await this.workTask(claimed.lease, claimed.spec, signal);
-      } catch (error) {
-        if (error instanceof LeaseLostError) {
-          // Another runner owns this task now. Drop everything without writing.
-          logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
-          continue;
-        }
-        if (signal.aborted) throw error;
-
-        // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
-        // exits the process, and because the claim is durable the restarted
-        // supervisor re-claims the same task and dies again — one malformed task
-        // wedges the whole runner permanently.
-        //
-        // `workTask` parks anything attributable to the task while it still holds the
-        // lease, so reaching this point means the failure escaped that path. Log it
-        // and keep polling rather than exiting.
-        logger.error("supervisor.unhandled", {
-          task: claimed.spec.id,
-          ...errorFields(error),
-        });
+    try {
+      await this.workTask(claimed.lease, claimed.spec, signal);
+    } catch (error) {
+      if (error instanceof LeaseLostError) {
+        // Another runner owns this task now. Drop everything without writing.
+        logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
+        return;
       }
+      if (signal.aborted) throw error;
+
+      // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
+      // exits the process, and because the claim is durable the restarted
+      // supervisor re-claims the same task and dies again — one malformed task
+      // wedges the whole runner permanently.
+      //
+      // `workTask` parks anything attributable to the task while it still holds the
+      // lease, so reaching this point means the failure escaped that path. Log it
+      // and keep polling rather than exiting.
+      logger.error("supervisor.unhandled", {
+        task: claimed.spec.id,
+        ...errorFields(error),
+      });
     }
   }
 
@@ -358,6 +403,26 @@ export class Supervisor {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
+      // The CAS is what established this was safe to take, so by here the previous
+      // holder is gone. Say so: a reclaim is a pod that died mid-task, and the whole
+      // failure used to be invisible — the task simply stopped, with no line anywhere
+      // connecting it to the deploy that killed it.
+      if (state.status === "running") {
+        this.deps.logger.warn("task.reclaimed", {
+          task: id,
+          runner: lease.runner,
+          sessions: state.sessions,
+        });
+        await store.appendJournal(
+          id,
+          state.sessions,
+          "The runner holding this task stopped without parking or finishing it — a " +
+            "restart, a lost lease, or a killed pod. The lease has since gone stale, so " +
+            `${lease.runner} has taken it over. Work already pushed to the task branch ` +
+            "is intact; anything the previous session had not committed is not.",
+        );
+      }
+
       this.deps.logger.info("task.claimed", {
         task: id,
         runner: lease.runner,
@@ -373,11 +438,42 @@ export class Supervisor {
   /**
    * Drive one task through as many sessions as it needs, until it parks or completes.
    *
-   * The heartbeat runs for the whole duration; if it fails, `abortOnLeaseLoss` fires
-   * and the next lease check throws, unwinding without writing anything.
+   * The heartbeat runs for the whole duration; if it fails the session is aborted at
+   * once and the next lease check throws, unwinding without writing anything.
    */
   private async workTask(lease: Lease, spec: TaskSpec, signal: AbortSignal): Promise<void> {
     const { store, leases, config, metrics, logger } = this.deps;
+
+    // Everything that may stop a session in flight, as one signal. Losing the lease used
+    // to set a flag that was only read at the TOP of the loop, so a lease lost at t=60s
+    // let the session run out the rest of its budget — still minting tokens for every
+    // push — while another runner worked the same branch.
+    const interrupt = new AbortController();
+    const stopOnShutdown = (): void => interrupt.abort();
+    signal.addEventListener("abort", stopOnShutdown, { once: true });
+
+    // The poll loop — and with it the inbox drain — is blocked for the whole duration of
+    // a session, so a `/cancel` submitted while the agent is working would otherwise sit
+    // in the queue until the session it was meant to stop had already ended, with the
+    // operator's Discord reply hanging until then. This watches for that ONE request and
+    // leaves everything else queued: the rest write the state repo, and this session
+    // holds the lease those writes would have to fence against.
+    let cancelled = false;
+    const watchCancels = setInterval(() => {
+      const requests = this.deps.inbox?.takeWhere(
+        (request) => request.kind === "park" && request.task === spec.id,
+      );
+      if (requests === undefined || requests.length === 0) return;
+
+      logger.info("task.cancel-requested", { task: spec.id });
+      cancelled = true;
+      interrupt.abort();
+      // Settled now rather than after the park, because the human is waiting on a
+      // Discord interaction and the session may take a turn boundary to unwind.
+      // `cancelling` says exactly that, and the park follows below.
+      for (const request of requests) request.settle({ kind: "cancelling" });
+    }, CANCEL_POLL_MS);
+    watchCancels.unref();
 
     let lost: LeaseLostError | undefined;
     const heartbeat = startHeartbeat(
@@ -386,6 +482,12 @@ export class Supervisor {
       config.lease.heartbeatSeconds,
       (error) => {
         lost = error;
+        // Immediately, not at the next loop iteration. The credential goes with it:
+        // `CredentialService.active` outlived the lease that justified it, so a session
+        // that had already lost its claim kept getting fresh tokens minted on demand.
+        logger.warn("lease.lost-mid-session", { task: spec.id, ...errorFields(error) });
+        this.deps.credentials?.clearActive();
+        interrupt.abort();
       },
     );
 
@@ -415,10 +517,27 @@ export class Supervisor {
         // Held for exactly the session, and stopped in a `finally` — an indicator left
         // running after a crash would be a lie that outlives the thing it described.
         const stopTyping = this.showWorking(state);
+        // The wall clock. pi's bash tool documents `timeout` as optional with no
+        // default, so the MODEL chooses whether a command can hang — `npm run dev`, a
+        // test runner waiting on stdin, or a nix build against a dead cache never
+        // settles, and everything here is single-threaded, so the poll, the chat drain
+        // and intake stop with it. The ceiling is generous: it exists to bound a hang,
+        // not to bound honest work.
+        const deadline = setTimeout(() => {
+          logger.error("session.timeout", {
+            task: spec.id,
+            session: state.sessions + 1,
+            maxSeconds: config.limits.maxSessionSeconds,
+          });
+          interrupt.abort();
+        }, config.limits.maxSessionSeconds * 1000);
+        deadline.unref();
+
         let outcome: SessionOutcome;
         try {
-          outcome = await this.deps.runner.run(spec, state);
+          outcome = await this.deps.runner.run(spec, state, interrupt.signal);
         } finally {
+          clearTimeout(deadline);
           stopTyping();
         }
 
@@ -437,6 +556,33 @@ export class Supervisor {
         metrics.tokens.inc({ task: spec.id, kind: "input" }, outcome.usage.inputTokens);
         metrics.tokens.inc({ task: spec.id, kind: "output" }, outcome.usage.outputTokens);
         metrics.cost.inc({ task: spec.id }, outcome.usage.costUsd);
+
+        if (outcome.reason === "interrupted") {
+          // Nothing about the SESSION is recorded. It did not reach a decision, and
+          // writing a session count and a journal entry for a pod restart would charge
+          // the task for an interruption that says nothing about it — the same reasoning
+          // as `releaseAfterOutage`, minus the cooldown, because no provider misbehaved.
+          logger.info("session.interrupted", {
+            task: spec.id,
+            session: state.sessions + 1,
+            cancelled,
+            leaseLost: lost !== undefined,
+            shuttingDown: signal.aborted,
+          });
+
+          // A CANCEL is different from the other three, and this is the half that is easy
+          // to miss: stopping the session is not cancelling the task. An interrupted task
+          // is left `running`, which is claimable (§6.2) — so without this the very next
+          // poll would re-claim it and start the session over, and the operator would
+          // watch the thing they cancelled carry on working.
+          //
+          // Only when the lease is still ours: a cancel that raced a lost lease has no
+          // standing to write, and `park` fences anyway.
+          if (cancelled && lost === undefined) {
+            await this.park(heartbeat, spec, state, "cancelled from chat");
+          }
+          return;
+        }
 
         if (outcome.reason === "provider-unavailable") {
           // `outage` is set by `buildOutcome` for every one of these; the fallback is
@@ -480,6 +626,8 @@ export class Supervisor {
       await this.parkFailed(heartbeat, spec, error);
     } finally {
       heartbeat.stop();
+      clearInterval(watchCancels);
+      signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
   }
@@ -616,6 +764,16 @@ export class Supervisor {
         // waits for the provider, with the task already released and the runner cooling.
         if (reviewed.decision === "stalled" || reviewed.decision === "outage") return true;
 
+        // BEFORE the merge, not after. `push` fences, but a merge is irreversible and
+        // crosses a system boundary, so fencing it afterwards fences nothing: `convene`
+        // takes minutes (§5.1 records 207s), and in that window a lease can go stale, an
+        // operator can `/cancel`, and another runner can park the task and push. The
+        // council would then return `pass` and this runner would merge a PR for a task
+        // the human had already cancelled — with `assertHeld` throwing afterwards, and
+        // the throw logged at warn and discarded. §5.1 says every push verifies lease
+        // ownership first; a merge deserves the same, first.
+        await this.deps.leases.assertHeld(await lease.current());
+
         const merge = await this.mergeReviewed(spec, reviewed.state);
         await this.transition(lease, reviewed.state, "done");
         await this.push(lease, `chore(${spec.id}): done`);
@@ -662,6 +820,13 @@ export class Supervisor {
         // not recording it is the entire point (see `releaseAfterOutage`). Kept so the
         // switch stays exhaustive — a new exit reason with no home here should be a
         // compile error — and harmless if it is ever reached: the task stays claimable.
+        await this.transition(lease, state, "ready");
+        return true;
+
+      case "interrupted":
+        // Also unreachable for the same reason — `workTask` returns on this before
+        // recording. Left claimable rather than parked: an interruption says nothing
+        // about the task, and parking it would demand a human for a pod restart.
         await this.transition(lease, state, "ready");
         return true;
 
@@ -732,6 +897,9 @@ export class Supervisor {
           parent: spec.id,
           workspace: spec.workspace,
           defaultRepos: spec.repos,
+          // The plan is the agent's own text. Without this a session could hand its
+          // successor a credential for any repo it named (§9.1).
+          scope: this.workspaceScope(spec.workspace),
         })
       : ({ kind: "rejected", reason: rejection } as const);
 
@@ -1170,6 +1338,20 @@ export class Supervisor {
     }
   }
 
+  /**
+   * The configured bound on the repos a workspace's credential may reach (§9.1).
+   *
+   * Throws for an unconfigured workspace rather than returning a permissive default: a
+   * scope that cannot be resolved must not become a scope that allows everything.
+   */
+  private workspaceScope(workspace: WorkspaceName): WorkspaceScope {
+    const profile = this.deps.config.workspaces.get(workspace);
+    if (profile === undefined) {
+      throw new Error(`no workspace profile configured for '${workspace}'`);
+    }
+    return workspaceScopeOf(profile, stateRepoRef(this.deps.config.stateRepo));
+  }
+
   private async park(
     lease: LeaseHandle,
     spec: TaskSpec,
@@ -1363,11 +1545,15 @@ export class Supervisor {
   /**
    * Park a task on request — `/cancel`.
    *
-   * A RUNNING task is refused rather than interrupted. Its lease is held by whichever
-   * runner is working it, possibly on another machine, and the drain happens between
-   * tasks rather than during one: there is no point at which this could stop a session
-   * mid-turn. Refusing says so; pretending to cancel would leave the task running and
-   * the human believing it was not.
+   * A task running ON THIS RUNNER never reaches here: `workTask` intercepts its own
+   * task's park requests while the session is in flight and aborts it, because the poll
+   * loop — and with it this drain — is blocked for the whole duration of a session. That
+   * path used to refuse outright, which left deleting the pod as the only way to stop a
+   * session, and that in turn stranded the task (§6.2).
+   *
+   * A task running on ANOTHER runner IS refused here. Nothing in this process can reach
+   * into that one, and pretending to cancel would leave the task running with the human
+   * believing it was not.
    *
    * The lease is taken for the write and released immediately, because every push
    * verifies ownership first (§5.1) and this one is no exception.
@@ -1515,27 +1701,42 @@ export class Supervisor {
       };
     }
 
-    const merge = await this.mergeReviewed(spec, state);
-    if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
-
-    // Merging a parked task settles it: the work is on the default branch, and leaving
-    // it parked would invite a human to pick up something already shipped.
+    // The lease FIRST, then the merge. This ran the other way round, which meant a task
+    // being actively worked by another runner could have its PR merged out from under
+    // the session still writing to that branch — the claim below would then fail, and
+    // the only trace was a `merge.unrecorded` warning about an irreversible act that had
+    // already happened. Refusing is the safe direction: nothing has been merged, and the
+    // human gets told why.
     const lease = await leases.claim(request.task);
-    if (lease !== undefined) {
+    if (lease === undefined) {
+      return {
+        kind: "not-mergeable",
+        reason:
+          "another runner holds this task right now — it is still being worked, so " +
+          "merging would land a branch that is still moving. Try again once it parks.",
+      };
+    }
+
+    try {
+      const merge = await this.mergeReviewed(spec, state);
+      if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
+
+      // Merging a parked task settles it: the work is on the default branch, and leaving
+      // it parked would invite a human to pick up something already shipped.
+      const handle = heldLease(lease);
       try {
-        const handle = heldLease(lease);
         await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
         await this.transition(handle, state, "done");
         await this.push(handle, `chore(${request.task}): merged from chat`);
-      } finally {
-        await leases.release(lease).catch(() => undefined);
+      } catch (error) {
+        // The merge already happened; failing to record it is worth a log, not a retry.
+        logger.warn("merge.unrecorded", { task: request.task, ...errorFields(error) });
       }
-    } else {
-      // The merge already happened; failing to record it is worth a log, not a retry.
-      logger.warn("merge.unrecorded", { task: request.task, reason: "task is leased elsewhere" });
-    }
 
-    return { kind: "merged", prUrl: state.pr.url };
+      return { kind: "merged", prUrl: state.pr.url };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
   }
 
   /**

@@ -39,6 +39,7 @@ interface RawConfig {
     readonly maxSessionsPerTask?: unknown;
     readonly noProgressLimit?: unknown;
     readonly maxReviewRounds?: unknown;
+    readonly maxSessionSeconds?: unknown;
   };
   readonly toolchain?: {
     readonly nixpkgs?: unknown;
@@ -250,6 +251,10 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       maxSessionsPerTask: num(raw.limits?.maxSessionsPerTask, "limits.maxSessionsPerTask", 20),
       noProgressLimit: num(raw.limits?.noProgressLimit, "limits.noProgressLimit", 3),
       maxReviewRounds: num(raw.limits?.maxReviewRounds, "limits.maxReviewRounds", 3),
+      // Four hours. Long enough that no honest session has ever come close — the longest
+      // observed is well under one — and short enough that a hung tool call is caught
+      // within a shift rather than discovered by someone wondering why the queue stopped.
+      maxSessionSeconds: num(raw.limits?.maxSessionSeconds, "limits.maxSessionSeconds", 4 * 60 * 60),
     },
     llm: llmConfig(llm),
     workspaces,
