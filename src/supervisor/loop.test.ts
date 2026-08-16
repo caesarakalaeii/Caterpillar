@@ -1217,11 +1217,15 @@ test("/resume clears the no-progress streak, or the task parks again without run
 
   // Polled rather than slept: this supervisor claims every `ready` task in the shared
   // state repo, so how many claims come before this one is not this test's business.
+  //
+  // `running` is deliberately not a stopping point. `recordSession` pushes it before
+  // `applyOutcome` decides anything, so waiting for "no longer ready" catches a state
+  // that is about to change — which passed on a fast machine and failed in CI.
   let settled: TaskState | undefined;
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
     const state = await pushedState(STUCK);
-    if (state !== undefined && state.status !== "ready") {
+    if (state !== undefined && state.status !== "ready" && state.status !== "running") {
       settled = state;
       break;
     }
