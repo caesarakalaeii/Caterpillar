@@ -134,6 +134,7 @@ const config: RunnerConfig = {
   secretsDir: join(root, "secrets"),
   // No web view in the loop's tests: these exercise the supervisor, and a listening
   // socket per fixture is a port collision waiting for a parallel run.
+  digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   web: {
     enabled: false,
     port: 8080,
@@ -1408,4 +1409,54 @@ test("/cancel stops a session running on this runner instead of refusing it", as
 
   assert.ok(sawAbort, "the abort must reach the session, not just the reply");
   assert.ok(parked !== undefined, "a cancelled task must end up parked, not re-claimed");
+});
+
+test("a digest that is due is published from the poll loop, and a failing one is not fatal", async () => {
+  // The digest runs on the poll loop (§19), which is the only clock the supervisor has.
+  // That puts it on the same thread as claiming, so the two properties that matter are
+  // that it is actually reached on an ordinary poll, and that it can never be the reason
+  // the loop stops — a report ABOUT the fleet must not be able to stop the fleet.
+  const calls: Date[] = [];
+  const digest = {
+    maybePublish: (now: Date): Promise<void> => {
+      calls.push(now);
+      return Promise.reject(new Error("the state repo rejected the digest push"));
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    digest,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && calls.length < 2) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    calls.length >= 2,
+    `the loop must keep polling after a digest throws — it called it ${calls.length} time(s)`,
+  );
 });

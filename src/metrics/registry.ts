@@ -126,6 +126,19 @@ export class AgentMetrics {
     "seconds until this runner will start a session again — 0 when healthy",
   );
 
+  /**
+   * Daily digests this runner published (DESIGN.md §19).
+   *
+   * Labelled by whether the day was quiet, because the two failures look identical
+   * otherwise: a fleet that did nothing and a collector that stopped seeing what it did
+   * both produce a digest a day. One series that never leaves `quiet="true"` is the
+   * second one.
+   */
+  readonly digests = this.registry.counter(
+    "caterpillar_digests_total",
+    "daily digests published by this runner",
+  );
+
   render(): string {
     return this.registry.render();
   }

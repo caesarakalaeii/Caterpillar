@@ -284,3 +284,84 @@ test("a question containing a code block renders parts that are each well-formed
     assert.ok([...part.content].length <= CONTENT_LIMIT);
   }
 });
+
+/* ------------------------------------------------------------------- digests */
+
+const digest = (body: string): Notification => ({
+  kind: "digest",
+  date: "2026-08-16",
+  summary: "2 done · 14 sessions · $7.40",
+  body,
+});
+
+/** A day's document: several tasks, each with commits under it. */
+const longDigest = (tasks: number): string =>
+  [
+    "# Daily digest — 2026-08-16",
+    "",
+    "15 Aug, 18:00 → 16 Aug, 18:00 · Europe/Berlin",
+    "",
+    "## Moved today",
+    "",
+    ...Array.from({ length: tasks }, (_, i) => [
+      `### \`TASK-${i + 1}\` — a task that did something`,
+      "",
+      `running → **done** · 3 sessions · $1.20 · [pull request](https://example.invalid/pr/${i})`,
+      "",
+      "`acme/widget` · 2 commits · 6 files, +120/-30",
+      "",
+      `- fix(widget): stop dropping every second frame in task ${i + 1}`,
+      `- test(widget): cover the frame drop in task ${i + 1}`,
+      "",
+    ]).flat(),
+  ].join("\n");
+
+test("a digest too long for one message is split, not truncated", () => {
+  const body = longDigest(12);
+  assert.ok(size(body) > CONTENT_LIMIT, `fixture must exceed the limit, was ${size(body)}`);
+
+  const parts = renderParts(digest(body), { interactive: true });
+
+  assert.ok(parts.length > 1);
+  for (const [i, part] of parts.entries()) {
+    assert.ok(size(part.content) <= CONTENT_LIMIT, `part ${i} was ${size(part.content)}`);
+  }
+});
+
+test("every task in the digest survives the split", () => {
+  // The same property a question has: the last task in a day is as much the point as the
+  // first, and a digest cut at the limit is silent about everything after the cut.
+  const body = longDigest(12);
+  const joined = renderParts(digest(body), { interactive: true })
+    .map((p) => p.content)
+    .join("\n");
+
+  for (const line of body.split("\n").filter((l) => l.trim().length > 0)) {
+    assert.ok(joined.includes(line), `lost: ${line.slice(0, 60)}…`);
+  }
+});
+
+test("a continuation part says which day and which part it is", () => {
+  // It arrives in a channel carrying every task at once, possibly minutes after part one.
+  const parts = renderParts(digest(longDigest(12)), { interactive: true });
+
+  assert.doesNotMatch(String(parts[0]?.content), /\(1\//, "the document opens with its own heading");
+  assert.match(String(parts[1]?.content), /2026-08-16/);
+  assert.match(String(parts[1]?.content), /\(2\/\d\)/);
+});
+
+test("a digest that fits is exactly one message, and carries no buttons", () => {
+  const parts = renderParts(digest("# Daily digest — 2026-08-16\n\nNothing moved."), {
+    interactive: true,
+  });
+
+  assert.equal(parts.length, 1);
+  assert.equal(parts[0]?.components, undefined, "a four-part message has no one part to hang one on");
+});
+
+test("an enormous digest is capped and points at the state repo", () => {
+  const parts = renderParts(digest(longDigest(400)), { interactive: true });
+
+  assert.ok(parts.length <= 4, `capped, got ${parts.length}`);
+  assert.match(String(parts.at(-1)?.content), /digests\/2026-08-16\.md/);
+});

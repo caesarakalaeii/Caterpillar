@@ -11,6 +11,7 @@
  * two small file reads per task, on a request a human made.
  */
 import type { RunnerConfig } from "../config/types.ts";
+import { goalHeadline } from "../domain/task.ts";
 import type {
   Capability,
   TaskId,
@@ -98,6 +99,32 @@ export interface TaskDetail {
   /** Present only when THIS runner is the one executing the task right now. */
   readonly live?: LiveDetail;
 }
+
+/**
+ * One published digest, and the dates either side of it (DESIGN.md §19).
+ *
+ * The document is served verbatim rather than re-rendered from the state repo's history.
+ * It is the record of what was ANNOUNCED, and a page that recomputed it would quietly
+ * disagree with the message that went to Discord the moment either renderer changed.
+ */
+export interface DigestView {
+  readonly date: string;
+  readonly body: string;
+  /** Every published date, newest first. */
+  readonly dates: readonly string[];
+}
+
+export const digests = (store: StateStore): Promise<readonly string[]> => store.listDigests();
+
+export const digestView = async (
+  store: StateStore,
+  date: string,
+): Promise<DigestView | undefined> => {
+  const body = await store.readDigest(date);
+  if (body === undefined) return undefined;
+
+  return { date, body, dates: await store.listDigests() };
+};
 
 export interface FleetOptions {
   readonly store: StateStore;
@@ -253,14 +280,8 @@ export const taskDetail = async (
 };
 
 /** The first heading or first non-blank line of a goal, as a one-line name. */
-const headline = (goal: string | undefined): string | undefined => {
-  if (goal === undefined) return undefined;
-  for (const line of goal.split("\n")) {
-    const trimmed = line.replace(/^#+\s*/, "").trim();
-    if (trimmed !== "") return trimmed;
-  }
-  return undefined;
-};
+const headline = (goal: string | undefined): string | undefined =>
+  goal === undefined ? undefined : goalHeadline(goal);
 
 /**
  * Everything this runner is willing to say about itself.

@@ -94,6 +94,7 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | Thread chat + typing indicator | deployed; thread answering exercised (3 answers) |
 | Artifact channel, small path (§17) | merged; **never used** |
 | Runner installer (§8) | merged; **no second runner exists yet** |
+| **Daily digest (§19)** | implemented and tested; **off until the ConfigMap enables it** — nothing is published yet |
 | Container image + CI | built and pushed by CI on every push to `main` |
 | Deployment | **LIVE** |
 
@@ -340,6 +341,17 @@ Deployment. Watch it with `gh run watch`, then poll the pod name — it changes,
 directory. `log.level` and `intake.intervalSeconds` are **absent** from the deployed
 ConfigMap, so both run on code defaults (`info`, `300`). Lease settings are
 `heartbeatSeconds: 60`, `staleAfterSeconds: 300`.
+
+**The daily digest is off in the deployed ConfigMap.** It needs no secret, no port and no
+Deployment — only a `digest` block in `config.json` in `caesar-deployment`:
+
+```json
+"digest": { "enabled": true, "hour": 18, "timezone": "Europe/Berlin", "summarise": true }
+```
+
+Adding it starts one document a day in the Discord channel, `digests/<date>.md` in the state
+repo, and `/digests` in the web view. With one runner the claim protocol is inert; it exists
+so a second runner cannot double-post (§19).
 
 **`argocd/root-app.yaml` auto-syncs `argocd/apps/` from `main` with `prune` and `selfHeal`**
 — adding a file there is a deploy, not a proposal. **The live app-of-apps is named `root`,

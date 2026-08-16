@@ -1842,3 +1842,144 @@ first.
 Spec and journal prose is shown as the markdown SOURCE it is. A markdown renderer is either
 a dependency or a hand-rolled parser, and both are a new place for agent-authored text to
 become markup.
+
+---
+
+## 19. The daily digest
+
+Every channel the supervisor already has answers a question about *now*. Discord signals
+one event at a time, the web view shows the fleet as it stands this second, and Grafana
+draws rates. None of them answers **"what did this thing do today"** — which is the
+question an operator actually has at the end of a day, and the one an autonomous fleet
+makes hardest to answer, because most of the work happened while nobody was watching.
+
+So: one document a day, published at a configured local hour, into all three places it
+could sensibly go — the Discord channel, the state repo, and the web view.
+
+### It is measured from git, not remembered
+
+The digest is collected by diffing the state repo between two commits: the one at the
+window's start and the one at its end. Nothing new is recorded as the day happens, and
+there is no event log to keep in step with reality.
+
+The alternative — reading the current `state.json` of every task — cannot answer the
+question at all. A snapshot has no memory: a task that ran four sessions today and one
+that has not moved since Tuesday are identical in it, and every number it carries is a
+LIFETIME total. A digest built that way reports a long-running task's whole history as
+though the fleet had spent it this afternoon, and does so again tomorrow with bigger
+numbers.
+
+Two commits also make a **catch-up digest correct**. "The end of the day" is a commit, not
+`HEAD`, so a digest published the next morning describes the day it names rather than
+folding that morning's work into it.
+
+The journal is exploited rather than parsed: `journal.md` is append-only by design (§4.1),
+so the day's entries are exactly the suffix the earlier copy does not have. No session
+headings are matched, and nothing breaks when their format changes.
+
+### A day ends when the operator's day ends
+
+The window is **local**, in a named IANA zone. In Berlin the last two hours of every summer
+day belong to tomorrow in UTC, so a digest keyed on the UTC date reports two hours of work
+under the wrong heading for half the year, silently. A fixed offset is refused for the same
+reason inverted: `+02:00` is correct for five months and an hour wrong for seven.
+
+The window runs **between publications**, not from local midnight: the digest for the 16th
+covers 18:00 on the 15th to 18:00 on the 16th. Midnight-to-publication is the obvious
+alternative and it loses an evening a day — work done after the cutoff falls into a window
+that has already been published and is reported by nothing. Consecutive windows meet
+exactly, so every hour is reported once.
+
+### One runner publishes, and the ref is how that is settled
+
+Every runner reaches 18:00 at the same instant and all of them can read the whole state
+repo, so this is a race by construction. It is settled with the mechanism §5 already
+proved: `refs/digests/<date>` is created by a compare-and-swap against an empty expected
+value, which exactly one push in the fleet can win. Nothing renews it and nothing steals
+it — unlike a task lease, a published day does not become unpublished.
+
+The ordering inside is **claim, then publish, and release the claim if publishing failed**,
+because the two failures are not symmetric. Publishing twice is embarrassing and visible.
+A day that is MARKED published and never was is silent: the ref says done, no message
+arrives, and nobody finds out until they go looking for a digest that never existed.
+
+A failed CAS cannot distinguish a lost race from a dead network — both are a rejected
+push — so the ref's existence is checked afterwards. Getting that backwards would write
+off a day nobody published.
+
+At most one digest is published per poll, oldest first. Catch-up reaches back exactly one
+day: a pod rolled through the cutoff (Keel rolls this pod on every push to main) still owes
+yesterday, but a runner returning after a week must not post seven digests into a channel.
+
+### The prose is the only part that is written rather than measured
+
+The counts, the transitions, the costs, the diffstats and the commit subjects are all
+facts. One paragraph is not: a model is given those facts, the agents' own journal entries
+for the window, and the paths each task touched, and asked to say what changed.
+
+It has **no tools**. It cannot read a file, run a command or reach a repo — it describes
+the evidence it was handed, so the worst it can do is describe it badly. It runs
+unattended, once a day, and its output goes to a channel where nobody will diff it against
+the repo.
+
+It also cannot fail the digest. A provider outage, a refusal, a model that says nothing —
+each becomes a line in the document saying why there is no paragraph. Saying so out loud
+matters: a digest that silently lost its prose looks exactly like one whose summariser was
+never configured. A quiet day skips the model entirely; the document already says nothing
+moved, and paying to have that restated is a cost that is invisible per day and obvious per
+month.
+
+`digest.summarise` turns it off separately from `digest.enabled`, so a runner minding its
+spend keeps the report and drops the paragraph.
+
+### The diffs come from mirrors, and their absence is declared
+
+Everything else in a digest is in the state repo, which every runner has. The code is not:
+a task branch lives in the bare mirror of the runner that WORKED it. So the publishing
+runner can see some tasks' diffs and not others.
+
+That asymmetry is stated rather than hidden. A repo with no local mirror produces a line
+saying the diff cannot be read from here — never `0 files changed`, which is a false
+statement about a merged pull request rather than a smaller one. Nothing is fetched to
+close the gap: the digest reads what is already on disk, needs no credential, and cannot
+be the reason a repo gets cloned.
+
+### Three destinations, one document
+
+The same markdown goes to Discord, to `digests/<date>.md` in the state repo, and to the web
+view. A digest that said different things in different places would be one nobody could
+quote.
+
+Git is written **before** Discord, and a Discord failure never undoes it — the same rule as
+every other notification (§11.2), and stronger here: a throw would release a claim whose
+digest is already committed, and the retry would publish the day twice.
+
+Discord's 2000-code-point limit is handled by SPLITTING, like a question and unlike
+everything else (§11.2). A truncated park reason still says a task parked; a digest cut at
+the limit is silent about every task after the cut, and the reader cannot tell that
+anything was. Past four messages it stops and names the file instead.
+
+### Off by default
+
+`digest.enabled` defaults to false, like `web.enabled` and for a related reason: publishing
+writes to the shared state repo and posts to the shared channel. A runner someone started
+on a workstation must not begin doing either because it was upgraded. The claim protocol
+makes a second publisher harmless, not welcome.
+
+### It cannot be the thing that fails
+
+Two rules, both learned from the paths around it.
+
+**One malformed task costs that task.** A `state.json` that parses and is not shaped like
+one — a hand edit, a half-finished migration — is skipped and NAMED in the document, rather
+than thrown over. The collector is deterministic, so a digest that throws is a digest that
+fails identically on every retry: the day would never be published at all, and the release
+path would hand the claim back forever. The same reasoning covers an unparseable `spec.md`
+(it costs a title) and a timestamp that will not parse (it is printed verbatim — `Intl`
+answers an invalid date with a `RangeError`).
+
+**A shutdown hands the day back.** Writing the paragraph is the one call in a digest that
+waits on a network, so the pod's abort signal reaches it. Aborted, the day is released
+rather than half-published: the next boot publishes it whole, prose included. The
+alternative is the silent failure again — a claimed day, torn down mid-publish, that
+nothing ever revisits.

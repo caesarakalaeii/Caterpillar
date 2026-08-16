@@ -93,6 +93,23 @@ export class WorktreeManager {
   }
 
   /**
+   * A Git bound to this repo's mirror AS IT ALREADY IS, or nothing when there is none.
+   *
+   * Deliberately does not clone or fetch, which is what separates it from `syncMirror`:
+   * the caller is the daily digest (DESIGN.md §19), which reads history that is already on
+   * disk and must be able to run without a credential, without the network, and without
+   * making a runner's report the reason a repo gets cloned. A runner that never worked a
+   * task has no mirror for it, and the answer to that is "this runner cannot say" rather
+   * than a fetch nobody asked for.
+   */
+  localMirror(repo: RepoRef): Git | undefined {
+    const path = mirrorPath(this.options.mirrorsDir, repo);
+    // The same existence test `syncMirror` uses: a directory left behind by a failed clone
+    // is not a mirror, and reading one answers every question with a git error.
+    return existsSync(join(path, "HEAD")) ? this.git.at(path) : undefined;
+  }
+
+  /**
    * Ensure a bare mirror exists and is current.
    *
    * The existence test is for `HEAD` inside the mirror, NOT for the directory. A

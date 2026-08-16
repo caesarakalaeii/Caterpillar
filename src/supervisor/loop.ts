@@ -109,6 +109,17 @@ export interface Intake {
   ingest(remote: string, branch: string): Promise<IntakePass>;
 }
 
+export interface Digester {
+  /**
+   * Publish the day's digest if one is due, and if this runner wins the claim for it
+   * (DESIGN.md §19). Called every poll; does nothing on almost all of them.
+   *
+   * The signal is the pod's. Writing the digest's one paragraph is a model call, and a
+   * shutdown must not wait on the provider to answer it.
+   */
+  maybePublish(now: Date, signal?: AbortSignal): Promise<void>;
+}
+
 export interface SupervisorDeps {
   readonly config: RunnerConfig;
   readonly store: StateStore;
@@ -136,6 +147,11 @@ export interface SupervisorDeps {
    * fed only by hand-committed specs (§14.4), does not need it.
    */
   readonly intake?: Intake;
+  /**
+   * The daily digest (§19). Optional, and off by default: a digest is published to a
+   * shared channel and a shared repo, so a runner has to be told to publish one.
+   */
+  readonly digest?: Digester;
   /**
    * Requests arriving from the inbound Discord bridge (§7). Optional: without a bridge
    * a question is answered by committing the file by hand.
@@ -250,6 +266,7 @@ export class Supervisor {
     // behaviour — it is only starting sessions that has to stop.
     await this.applyChatRequests();
     await this.maybeIngest();
+    await this.maybeDigest(signal);
 
     if (await this.coolingDown()) return;
 
@@ -339,6 +356,29 @@ export class Supervisor {
       logger.info("intake.pass", { ...(await intake.ingest("origin", config.stateRepo.branch)) });
     } catch (error) {
       logger.warn("intake.failed", { ...errorFields(error) });
+    }
+  }
+
+  /**
+   * Publish the day's digest, if one is due (DESIGN.md §19).
+   *
+   * Ahead of the cooldown gate, like intake, and for the same reason: a day that has ended
+   * has ended whether or not the provider is answering, and everything in a digest except
+   * its one paragraph of prose is measured from git and costs no tokens. A digest
+   * published during an outage simply says why it has no prose.
+   *
+   * Failures never propagate. `DailyDigest` already swallows its own and releases its
+   * claim so the day can be retried; this catch is for the one thing it cannot handle —
+   * itself throwing — because a report about the fleet must never be what stops the fleet.
+   */
+  private async maybeDigest(signal: AbortSignal): Promise<void> {
+    const { digest, logger } = this.deps;
+    if (digest === undefined) return;
+
+    try {
+      await digest.maybePublish(new Date(), signal);
+    } catch (error) {
+      logger.warn("digest.pass-failed", errorFields(error));
     }
   }
 
@@ -1786,7 +1826,9 @@ export class Supervisor {
       );
     } catch (error) {
       this.deps.logger.warn("notify.failed", {
-        task: notification.task,
+        // The digest is about the fleet, not about a task, so it is the one notification
+        // with nothing to name here (§19).
+        ...(notification.kind === "digest" ? {} : { task: notification.task }),
         kind: notification.kind,
         ...errorFields(error),
       });

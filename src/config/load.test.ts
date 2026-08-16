@@ -1,9 +1,12 @@
 /**
- * Tests for the `web` section (DESIGN.md §18).
+ * Tests for the sections whose DEFAULTS are load-bearing — `web` (DESIGN.md §18) and
+ * `digest` (§19).
  *
- * The defaults are the security boundary: a runner that has not been told to serve a web
- * view must not open a port that answers with agent transcripts, and one that HAS been
- * told must not silently accept unauthenticated requests because a field was misspelt.
+ * Both default to off, and both do something outward-facing when they are on: one opens a
+ * port that answers with agent transcripts, the other posts to a shared channel and
+ * commits to a shared repo. A runner someone started on a laptop must not begin doing
+ * either because it was upgraded, and one that HAS been told to must not silently do it
+ * wrongly — unauthenticated, or at an hour a misspelt zone quietly turned into UTC.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -99,4 +102,38 @@ test("a port that is not a port is refused", async () => {
   await assert.rejects(() => load({ web: { enabled: true, port: 0 } }), ConfigError);
   await assert.rejects(() => load({ web: { enabled: true, port: 70000 } }), ConfigError);
   await assert.rejects(() => load({ web: { enabled: true, port: 8080.5 } }), ConfigError);
+});
+
+test("a config that says nothing about the digest does not publish one", async () => {
+  const config = await load({});
+
+  assert.equal(config.digest.enabled, false);
+  assert.equal(config.digest.hour, 18);
+  assert.equal(config.digest.timeZone, "Europe/Berlin");
+  assert.equal(config.digest.summarise, true, "the prose is the point of asking for one");
+});
+
+test("the digest hour is a wall-clock hour, not a number", async () => {
+  await assert.rejects(() => load({ digest: { enabled: true, hour: 24 } }), ConfigError);
+  await assert.rejects(() => load({ digest: { enabled: true, hour: -1 } }), ConfigError);
+  await assert.rejects(() => load({ digest: { enabled: true, hour: 18.5 } }), ConfigError);
+});
+
+test("a timezone that is not a zone is refused, even with the digest off", async () => {
+  // Checked while disabled on purpose. Otherwise the typo is found the day someone
+  // enables it — in the cluster, at 18:00, inside the poll loop.
+  await assert.rejects(() => load({ digest: { timezone: "Europe/Duesseldorf" } }), ConfigError);
+  await assert.rejects(() => load({ digest: { enabled: true, timezone: "+02:00" } }), ConfigError);
+
+  const config = await load({ digest: { enabled: true, timezone: "UTC", hour: 0 } });
+  assert.equal(config.digest.timeZone, "UTC");
+  assert.equal(config.digest.hour, 0);
+});
+
+test("the prose can be turned off without losing the digest", async () => {
+  const config = await load({ digest: { enabled: true, summarise: false } });
+
+  assert.equal(config.digest.enabled, true);
+  assert.equal(config.digest.summarise, false);
+  await assert.rejects(() => load({ digest: { summarise: "no" } }), ConfigError);
 });
