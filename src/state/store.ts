@@ -26,6 +26,7 @@ import type { Git } from "./git.ts";
 import {
   asTaskId,
   asWorkspaceName,
+  parseRepoRef,
   type Capability,
   type RepoRef,
   type TaskId,
@@ -106,16 +107,9 @@ const requireStringArray = (
 
 /** `host/owner/name` or `owner/name` (host defaults to github.com). */
 const parseRepo = (raw: string): RepoRef => {
-  const parts = raw.split("/").filter((p) => p.length > 0);
-  if (parts.length === 3) {
-    const [host, owner, name] = parts as [string, string, string];
-    return { host, owner, name };
-  }
-  if (parts.length === 2) {
-    const [owner, name] = parts as [string, string];
-    return { host: "github.com", owner, name };
-  }
-  throw new Error(`cannot parse repo reference '${raw}'`);
+  const parsed = parseRepoRef(raw);
+  if (parsed === undefined) throw new Error(`cannot parse repo reference '${raw}'`);
+  return parsed;
 };
 
 /**

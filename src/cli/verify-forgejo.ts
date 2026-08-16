@@ -55,11 +55,16 @@ const main = async (): Promise<void> => {
   // Verify as an owner-wide token, which is how these are normally issued: an
   // ecosystem is worked as one workspace plus sibling clones, so a task spanning
   // several repos of the same owner must all resolve from this one credential.
-  const factory = new ForgejoForgeFactory({
-    apiBase,
-    username: arg("--username") ?? repo.owner,
-    tokensByOwner: new Map([[repo.owner, token]]),
-  });
+  const factory = new ForgejoForgeFactory(
+    {
+      apiBase,
+      username: arg("--username") ?? repo.owner,
+      tokensByOwner: new Map([[repo.owner, token]]),
+    },
+    // The same host the API base points at — verifying against one host with a token
+    // for another is the misconfiguration this scope exists to catch.
+    { host },
+  );
 
   const spec: TaskSpec = {
     id: asTaskId("VERIFY"),

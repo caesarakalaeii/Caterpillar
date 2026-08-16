@@ -99,7 +99,15 @@ const ingesterFor = (
   store: StateStore,
   trackers: ReadonlyMap<WorkspaceName, Tracker>,
 ): Ingester =>
-  new Ingester({ store, trackers, logger: SILENT_LOGGER, maxSessionsPerTask: 20 });
+  new Ingester({
+    store,
+    trackers,
+    // Every workspace the tests use, on github.com — the scope only bites when an item
+    // names a repo somewhere else, which `spec.test.ts` covers directly.
+    scopes: new Map([...trackers.keys()].map((name) => [name, { host: "github.com" }])),
+    logger: SILENT_LOGGER,
+    maxSessionsPerTask: 20,
+  });
 
 test("intake is due at boot, then only once per interval", async () => {
   // Intake must NOT ride the supervisor's poll interval. A GitHub pass costs ~66 requests

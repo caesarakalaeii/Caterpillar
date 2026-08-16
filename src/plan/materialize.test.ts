@@ -19,6 +19,7 @@ const options = {
   parent: PARENT,
   workspace: asWorkspaceName("caesar"),
   defaultRepos: [REPO],
+  scope: { host: "github.com", stateRepo: { host: "github.com", owner: "acme", name: "state" } },
 };
 
 const task = (
@@ -128,16 +129,34 @@ test("a task inherits the brainstorm's repos when it names none", () => {
   assert.deepEqual(result.kind === "plan" ? result.tasks[0]?.spec.repos : [], [REPO]);
 });
 
-test("a task may name its own repos, qualified or not", () => {
+test("a task may name its own repos, qualified or not, within the workspace's forge", () => {
   const result = materialise(
-    plan([{ ...task("a"), repos: ["other/thing", "codeberg.org/eb/api"] }]),
+    plan([{ ...task("a"), repos: ["other/thing", "github.com/eb/api"] }]),
     options,
   );
   assert.equal(result.kind, "plan");
   assert.deepEqual(result.kind === "plan" ? result.tasks[0]?.spec.repos : [], [
     { host: "github.com", owner: "other", name: "thing" },
-    { host: "codeberg.org", owner: "eb", name: "api" },
+    { host: "github.com", owner: "eb", name: "api" },
   ]);
+});
+
+test("a child naming a repo on another forge is refused", () => {
+  // The plan is the AGENT's text: `submit_plan` takes free-form `repos` strings, and the
+  // only gate before the children are written `ready` is a council of LLM lenses that
+  // review decomposition, not scope. This assertion used to run the other way round,
+  // which meant a session could choose its successor's credential scope.
+  const result = materialise(
+    plan([{ ...task("a"), repos: ["codeberg.org/eb/api"] }]),
+    options,
+  );
+  assert.equal(result.kind, "rejected");
+});
+
+test("a child naming the state repo is refused", () => {
+  // §9.3 — otherwise a plan can hand its own children write access to the audit trail.
+  const result = materialise(plan([{ ...task("a"), repos: ["acme/state"] }]), options);
+  assert.equal(result.kind, "rejected");
 });
 
 test("children are implementation tasks, never more brainstorms", () => {

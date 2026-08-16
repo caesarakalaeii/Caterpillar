@@ -11,7 +11,9 @@
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { workspaceScopeOf } from "../config/scope.ts";
 import type { StateRepoConfig, WorkspaceProfile } from "../config/types.ts";
+import type { RepoRef } from "../domain/task.ts";
 import { parseStateRepoUrl, StateRepoCredentials } from "../state/credential.ts";
 import {
   GitHubAppForgeFactory,
@@ -68,8 +70,10 @@ export class SecretBundle {
 export const loadForgeFactory = async (
   profile: WorkspaceProfile,
   secretsDir: string,
+  stateRepo: RepoRef | undefined,
 ): Promise<ForgeFactory> => {
   const bundle = new SecretBundle(secretsDir, profile.secretRef);
+  const scope = workspaceScopeOf(profile, stateRepo);
 
   if (profile.forge.kind === "github") {
     const options: GitHubAppOptions = {
@@ -78,7 +82,7 @@ export const loadForgeFactory = async (
       privateKeyPem: await bundle.read("private-key.pem"),
       apiBase: profile.forge.apiBase,
     };
-    return new GitHubAppForgeFactory(options);
+    return new GitHubAppForgeFactory(options, scope);
   }
 
   const raw = await bundle.read("tokens.json");
@@ -117,7 +121,7 @@ export const loadForgeFactory = async (
     tokensByOwner,
     ...(tokensByRepo.size > 0 ? { tokensByRepo } : {}),
   };
-  return new ForgejoForgeFactory(options);
+  return new ForgejoForgeFactory(options, scope);
 };
 
 /**
@@ -136,6 +140,7 @@ export const loadForgeFactory = async (
 export const loadReviewerFactory = async (
   profile: WorkspaceProfile,
   secretsDir: string,
+  stateRepo: RepoRef | undefined,
 ): Promise<ForgeFactory | undefined> => {
   if (profile.forge.kind !== "github") return undefined;
 
@@ -150,12 +155,10 @@ export const loadReviewerFactory = async (
     return undefined;
   }
 
-  return reviewerForgeFactory({
-    appId,
-    installationId,
-    privateKeyPem,
-    apiBase: profile.forge.apiBase,
-  });
+  return reviewerForgeFactory(
+    { appId, installationId, privateKeyPem, apiBase: profile.forge.apiBase },
+    workspaceScopeOf(profile, stateRepo),
+  );
 };
 
 /**

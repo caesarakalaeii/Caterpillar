@@ -20,6 +20,8 @@ import { CredentialService } from "./service.ts";
 const HELPER = fileURLToPath(new URL("../cli/credential-helper.ts", import.meta.url));
 
 const REPO: RepoRef = { host: "github.com", owner: "caesarakalaeii", name: "Caterpillar" };
+const STATE_REPO: RepoRef = { host: "github.com", owner: "caesarakalaeii", name: "caterpillar-state" };
+const SCOPE = { host: "github.com", stateRepo: STATE_REPO };
 
 class FakeForge implements Forge {
   readonly kind = "fake";
@@ -89,7 +91,7 @@ after(async () => {
 
 test("serves a credential for a repo in the active task's scope", async () => {
   const forge = new FakeForge([REPO]);
-  service.setActive({ forge, repos: [REPO] });
+  service.setActive({ forge, repos: [REPO], scope: SCOPE });
 
   const output = await runHelper(
     socketPath,
@@ -102,7 +104,7 @@ test("serves a credential for a repo in the active task's scope", async () => {
 
 test("refuses a repo outside the active task's scope", async () => {
   const forge = new FakeForge([REPO]);
-  service.setActive({ forge, repos: [REPO] });
+  service.setActive({ forge, repos: [REPO], scope: SCOPE });
 
   const output = await runHelper(
     socketPath,
@@ -134,7 +136,7 @@ test("real git gets a usable credential out of the helper", async () => {
   // The operator's own config is neutralised: a global `url.<ssh>.insteadOf` or a
   // configured `gh` helper would otherwise answer first and hide a broken helper.
   const forge = new FakeForge([REPO]);
-  service.setActive({ forge, repos: [REPO] });
+  service.setActive({ forge, repos: [REPO], scope: SCOPE });
 
   const output = await new Promise<string>((resolve, reject) => {
     const child = spawn(
@@ -174,12 +176,79 @@ test("real git gets a usable credential out of the helper", async () => {
 
 test("refuses when git sent no path (useHttpPath not enabled)", async () => {
   const forge = new FakeForge([REPO]);
-  service.setActive({ forge, repos: [REPO] });
+  service.setActive({ forge, repos: [REPO], scope: SCOPE });
 
   const output = await runHelper(socketPath, "protocol=https\nhost=github.com\n\n");
 
   // Without a path we cannot tell repos apart, so serving anything would risk
   // handing the wrong repo's token to a push.
+  assert.equal(output, "");
+  assert.equal(forge.minted, 0);
+});
+
+test("refuses a host the workspace does not own, even when the task declared it", async () => {
+  // The attack this exists to stop: `spec.repos` is free text from an issue body, and
+  // the clone URL is built from `repo.host`. Matching the request against the task's
+  // own declared list is a tautology — the attacker wrote the list. A runner that
+  // clones `evil.example.com/caesarakalaeii/Caterpillar` with the helper attached gets
+  // a 401 back, and the helper must NOT answer it.
+  const hostile: RepoRef = { host: "evil.example.com", owner: "caesarakalaeii", name: "Caterpillar" };
+  const forge = new FakeForge([REPO, hostile]);
+  service.setActive({ forge, repos: [REPO, hostile], scope: SCOPE });
+
+  const output = await runHelper(
+    socketPath,
+    "protocol=https\nhost=evil.example.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+  );
+
+  assert.equal(output, "");
+  assert.equal(forge.minted, 0);
+});
+
+test("refuses the supervisor's own state repo", async () => {
+  // DESIGN.md §9.3: the audit trail cannot be writable by the thing being audited.
+  // The state repo is on the same host as the workspace, so the host check does not
+  // reach it — it needs naming explicitly.
+  const forge = new FakeForge([REPO, STATE_REPO]);
+  service.setActive({ forge, repos: [REPO, STATE_REPO], scope: SCOPE });
+
+  const output = await runHelper(
+    socketPath,
+    "protocol=https\nhost=github.com\npath=caesarakalaeii/caterpillar-state.git\n\n",
+  );
+
+  assert.equal(output, "");
+  assert.equal(forge.minted, 0);
+});
+
+test("refuses the state repo under a different casing", async () => {
+  // GitHub resolves `Caterpillar-State` and `caterpillar-state` to the same repo, so a
+  // case-sensitive comparison is not an exclusion at all.
+  const disguised: RepoRef = { host: "GitHub.com", owner: "CaesarAkalaeii", name: "Caterpillar-State" };
+  const forge = new FakeForge([REPO, disguised]);
+  service.setActive({ forge, repos: [REPO, disguised], scope: SCOPE });
+
+  const output = await runHelper(
+    socketPath,
+    "protocol=https\nhost=GitHub.com\npath=CaesarAkalaeii/Caterpillar-State.git\n\n",
+  );
+
+  assert.equal(output, "");
+  assert.equal(forge.minted, 0);
+});
+
+test("refuses a plaintext http request for an in-scope repo", async () => {
+  // `credential.useHttpPath=true` is set on config the agent can add remotes to, so an
+  // `http://` remote for a real in-scope repo would otherwise get the installation
+  // token sent as cleartext Basic auth.
+  const forge = new FakeForge([REPO]);
+  service.setActive({ forge, repos: [REPO], scope: SCOPE });
+
+  const output = await runHelper(
+    socketPath,
+    "protocol=http\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+  );
+
   assert.equal(output, "");
   assert.equal(forge.minted, 0);
 });

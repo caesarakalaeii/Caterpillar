@@ -20,6 +20,7 @@
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
 import {
   assertInScope,
+  assertWorkspaceScope,
   type CheckStatus,
   type Forge,
   type ForgeFactory,
@@ -27,6 +28,7 @@ import {
   type MergeOptions,
   type PrRequest,
   type PrResult,
+  type WorkspaceScope,
 } from "./types.ts";
 
 export interface ForgejoOptions {
@@ -146,13 +148,19 @@ class ForgejoForge implements Forge {
 
   private readonly options: ForgejoOptions;
   private readonly allowed: readonly RepoRef[];
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: ForgejoOptions, allowed: readonly RepoRef[]) {
+  constructor(options: ForgejoOptions, allowed: readonly RepoRef[], scope: WorkspaceScope) {
     this.options = options;
     this.allowed = allowed;
+    this.scope = scope;
   }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
+    // Order matters, and it matters more here than on GitHub: a Forgejo token is
+    // owner-wide and does not expire, so one served to the wrong host is a permanent
+    // compromise rather than an hour's exposure.
+    assertWorkspaceScope(repo, this.scope);
     assertInScope(repo, this.allowed);
     const token = this.tokenFor(repo);
 
@@ -229,10 +237,14 @@ class ForgejoForge implements Forge {
    * Resolve the token for a repo: a specific override first, then the owner-wide
    * token.
    *
-   * `assertInScope` has already run, so this is not the security boundary — the task's
-   * declared `repos` list is. On Forgejo the token cannot be narrowed at use time
-   * anyway (there is no mint step), so scoping is enforced by the spec plus whatever
-   * the token itself was created with.
+   * `assertWorkspaceScope` and `assertInScope` have both already run. The first is the
+   * security boundary: the workspace's configured host, which the task did not choose.
+   * The second only narrows to what the task asked for, and the task's `repos` list is
+   * attacker-influenceable text — it was treated as the boundary once, and that is
+   * exactly how a Codeberg owner-wide token could be pointed at another host.
+   *
+   * On Forgejo the token cannot be narrowed at use time (there is no mint step), so
+   * what the token itself was created with is the last line rather than the first.
    */
   private tokenFor(repo: RepoRef): string {
     const slug = `${repo.owner}/${repo.name}`;
@@ -265,12 +277,15 @@ class ForgejoForge implements Forge {
 
 export class ForgejoForgeFactory implements ForgeFactory {
   private readonly options: ForgejoOptions;
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: ForgejoOptions) {
+  constructor(options: ForgejoOptions, scope: WorkspaceScope) {
     this.options = options;
+    this.scope = scope;
   }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
-    return new ForgejoForge(this.options, spec.repos);
+    for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
+    return new ForgejoForge(this.options, spec.repos, this.scope);
   }
 }

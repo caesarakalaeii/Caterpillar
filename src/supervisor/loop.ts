@@ -11,6 +11,7 @@
  *   - always persist the journal before exiting, including on error
  */
 import { setTimeout as sleep } from "node:timers/promises";
+import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import {
   addUsage,
@@ -50,7 +51,7 @@ import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
 import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
-import type { ForgeFactory } from "../forge/types.ts";
+import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
@@ -732,6 +733,9 @@ export class Supervisor {
           parent: spec.id,
           workspace: spec.workspace,
           defaultRepos: spec.repos,
+          // The plan is the agent's own text. Without this a session could hand its
+          // successor a credential for any repo it named (§9.1).
+          scope: this.workspaceScope(spec.workspace),
         })
       : ({ kind: "rejected", reason: rejection } as const);
 
@@ -1168,6 +1172,20 @@ export class Supervisor {
         retryInSeconds: waitSeconds,
       });
     }
+  }
+
+  /**
+   * The configured bound on the repos a workspace's credential may reach (§9.1).
+   *
+   * Throws for an unconfigured workspace rather than returning a permissive default: a
+   * scope that cannot be resolved must not become a scope that allows everything.
+   */
+  private workspaceScope(workspace: WorkspaceName): WorkspaceScope {
+    const profile = this.deps.config.workspaces.get(workspace);
+    if (profile === undefined) {
+      throw new Error(`no workspace profile configured for '${workspace}'`);
+    }
+    return workspaceScopeOf(profile, stateRepoRef(this.deps.config.stateRepo));
   }
 
   private async park(

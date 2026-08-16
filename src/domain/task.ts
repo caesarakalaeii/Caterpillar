@@ -111,6 +111,47 @@ export interface RepoRef {
 
 export const repoSlug = (repo: RepoRef): string => `${repo.owner}/${repo.name}`;
 
+/**
+ * A host, owner or repo name that is safe to put in a URL and in a path.
+ *
+ * Every component of a `RepoRef` becomes BOTH a segment of a clone URL and a directory
+ * under `paths.mirrors`, so an unvalidated one is two bugs at once. `repos: ../../x`
+ * used to parse into `{host: "..", owner: "..", name: "x"}`, and the mirror path for it
+ * resolves above the directory the workspace believes it owns — which `syncMirror`
+ * then removes and rebuilds. Requiring a leading alphanumeric rejects `.` and `..`
+ * without needing to special-case them.
+ */
+const REPO_HOST = /^[A-Za-z0-9][A-Za-z0-9.-]*(:\d+)?$/;
+const REPO_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * `host/owner/name`, or `owner/name` with the host defaulting to github.com.
+ *
+ * ONE implementation on purpose. This used to be copied into intake, the store and the
+ * plan materialiser; three copies meant a repo reference that intake refused could
+ * still arrive through a plan, and the validation added to one was absent from the
+ * other two.
+ *
+ * Returns undefined rather than throwing: every caller has a better error to give than
+ * a stack trace, and two of the three turn it into a human-facing refusal.
+ */
+export const parseRepoRef = (raw: string): RepoRef | undefined => {
+  const parts = raw.split("/").filter((p) => p.length > 0);
+
+  const [host, owner, name] =
+    parts.length === 3
+      ? (parts as [string, string, string])
+      : parts.length === 2
+        ? (["github.com", ...(parts as [string, string])] as [string, string, string])
+        : [undefined, undefined, undefined];
+
+  if (host === undefined || owner === undefined || name === undefined) return undefined;
+  if (!REPO_HOST.test(host)) return undefined;
+  if (!REPO_SEGMENT.test(owner) || !REPO_SEGMENT.test(name)) return undefined;
+
+  return { host, owner, name };
+};
+
 /** Back-reference to the tracker item a task was ingested from. */
 export interface TrackerRef {
   readonly kind: TrackerKind;

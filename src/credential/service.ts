@@ -17,13 +17,19 @@ import { createServer, type Server, type Socket } from "node:net";
 import { chmod, mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { RepoRef } from "../domain/task.ts";
-import type { Forge } from "../forge/types.ts";
+import { assertWorkspaceScope, type Forge, type WorkspaceScope } from "../forge/types.ts";
 import { parseRepoPath, type CredentialAnswer, type CredentialRequest } from "./protocol.ts";
 
 export interface ActiveCredential {
   readonly forge: Forge;
-  /** Repos the current task declared — the only ones that will be served. */
+  /**
+   * Repos the current task declared. A NARROWING filter, never the boundary: this list
+   * comes from the spec, which comes from a tracker item or a plan the agent wrote.
+   * `scope` is what the operator configured, and it is checked first.
+   */
   readonly repos: readonly RepoRef[];
+  /** The configured bound this task's workspace cannot reach past. */
+  readonly scope: WorkspaceScope;
 }
 
 export class CredentialService {
@@ -110,6 +116,21 @@ export class CredentialService {
 
     const host = request.host;
     if (host === undefined) throw new Error("credential request carried no host");
+
+    // git tells us the protocol it is about to authenticate over. `useHttpPath=true` is
+    // set on repo config the agent can add remotes to, so an `http://` remote for a repo
+    // that IS in scope would otherwise get the token sent as cleartext Basic auth.
+    if (request.protocol !== undefined && request.protocol !== "https") {
+      throw new Error(
+        `refusing to serve a credential over '${request.protocol}' — the token would ` +
+          `travel in clear; use an https remote`,
+      );
+    }
+
+    // FIRST, against what the operator configured. Doing this before the `repos` lookup
+    // matters: the lookup below compares the request with the task's own declared list,
+    // and a task that declared a hostile host would match itself.
+    assertWorkspaceScope({ host, owner: parsed.owner, name: parsed.name }, active.scope);
 
     const repo = active.repos.find(
       (candidate) =>

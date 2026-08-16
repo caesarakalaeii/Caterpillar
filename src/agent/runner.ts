@@ -23,6 +23,7 @@ import {
   type AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core/node";
 import type { Static, TSchema } from "@earendil-works/pi-ai";
+import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
 import type {
@@ -110,8 +111,15 @@ export class AgentSessionRunner {
     const repo = spec.repos[0];
     if (repo === undefined) throw new Error(`task ${spec.id} declares no repos`);
 
+    const profile = this.options.config.workspaces.get(spec.workspace);
+    if (profile === undefined) throw new WorkspaceNotConfiguredError(spec.workspace);
+
     const forge = await forgeFactory.forTask(spec);
-    credentials.setActive({ forge, repos: spec.repos });
+    credentials.setActive({
+      forge,
+      repos: spec.repos,
+      scope: workspaceScopeOf(profile, stateRepoRef(this.options.config.stateRepo)),
+    });
 
     try {
       // repos[0] is the workspace repo and becomes cwd; the rest land under repos/.

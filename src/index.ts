@@ -8,10 +8,11 @@
 import { createServer } from "node:http";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
+import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
-import type { ForgeFactory } from "./forge/types.ts";
+import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { createLlmRuntime } from "./llm/models.ts";
@@ -115,15 +116,21 @@ const main = async (): Promise<void> => {
   const store = new StateStore(config.stateRepo.path, git);
   const metrics = new AgentMetrics();
 
+  // Parsed once: every workspace's scope excludes the same state repo, and a task
+  // credential that could reach it would make the audit trail agent-writable (§9.3).
+  const stateRepo = stateRepoRef(config.stateRepo);
+
   const forges = new Map<WorkspaceName, ForgeFactory>();
   const trackers = new Map<WorkspaceName, Tracker>();
   const reviewers = new Map<WorkspaceName, ForgeFactory>();
+  const scopes = new Map<WorkspaceName, WorkspaceScope>();
   for (const [name, profile] of config.workspaces) {
-    forges.set(name, await loadForgeFactory(profile, config.secretsDir));
+    scopes.set(name, workspaceScopeOf(profile, stateRepo));
+    forges.set(name, await loadForgeFactory(profile, config.secretsDir, stateRepo));
 
     // The second identity (§12.1). Absent is normal and supported: the council still
     // reviews, and merging stays a human act.
-    const reviewer = await loadReviewerFactory(profile, config.secretsDir);
+    const reviewer = await loadReviewerFactory(profile, config.secretsDir, stateRepo);
     if (reviewer !== undefined) reviewers.set(name, reviewer);
     logger.info("reviewer.identity", { workspace: name, configured: reviewer !== undefined });
 
@@ -215,6 +222,7 @@ const main = async (): Promise<void> => {
     intake: new Ingester({
       store,
       trackers,
+      scopes,
       logger,
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
     }),

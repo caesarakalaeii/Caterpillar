@@ -25,6 +25,7 @@ import {
 } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
 import type { StateStore } from "../state/store.ts";
+import type { WorkspaceScope } from "../forge/types.ts";
 import type { Tracker, TrackerItem } from "../tracker/types.ts";
 import { renderSpec, taskIdFor } from "./spec.ts";
 
@@ -63,6 +64,11 @@ export interface IngesterDeps {
   readonly store: StateStore;
   /** Trackers to ingest from, by workspace. A workspace without one is supported. */
   readonly trackers: ReadonlyMap<WorkspaceName, Tracker>;
+  /**
+   * The configured repo bound per workspace (§9.1). An item naming a repo outside it is
+   * refused at intake, where the refusal reaches the human who wrote it.
+   */
+  readonly scopes: ReadonlyMap<WorkspaceName, WorkspaceScope>;
   readonly logger: Logger;
   /** Session cap stamped into each new task's `state.json`. */
   readonly maxSessionsPerTask: number;
@@ -163,8 +169,17 @@ export class Ingester {
     }
 
     const self = selfRepo(item.ref);
+    const scope = this.deps.scopes.get(workspace);
+    if (scope === undefined) {
+      // Refusing beats guessing. A workspace with a tracker but no forge profile is a
+      // misconfiguration, and inventing a permissive scope would turn it into a leak.
+      logger.warn("intake.no-scope", { task: id, workspace, tracker: tracker.kind });
+      return "skipped";
+    }
+
     const rendered = renderSpec(item, {
       workspace,
+      scope,
       ...(self !== undefined ? { defaultRepo: self } : {}),
     });
 

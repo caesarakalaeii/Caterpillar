@@ -21,6 +21,7 @@ import { createSign } from "node:crypto";
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
 import {
   assertInScope,
+  assertWorkspaceScope,
   type CheckConclusion,
   type CheckStatus,
   type Forge,
@@ -29,6 +30,7 @@ import {
   type MergeOptions,
   type PrRequest,
   type PrResult,
+  type WorkspaceScope,
 } from "./types.ts";
 
 /** Re-mint this long before expiry so a slow push never straddles the boundary. */
@@ -156,13 +158,19 @@ class GitHubAppForge implements Forge {
 
   private readonly options: GitHubAppOptions;
   private readonly allowed: readonly RepoRef[];
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: GitHubAppOptions, allowed: readonly RepoRef[]) {
+  constructor(options: GitHubAppOptions, allowed: readonly RepoRef[], scope: WorkspaceScope) {
     this.options = options;
     this.allowed = allowed;
+    this.scope = scope;
   }
 
   async credential(repo: RepoRef): Promise<GitCredential> {
+    // Both, in this order. `allowed` narrows to what the task asked for; `scope` is the
+    // bound the task did not get to choose. The factory checked the same thing, but a
+    // token is what leaves this method, so it is re-checked where it is minted.
+    assertWorkspaceScope(repo, this.scope);
     assertInScope(repo, this.allowed);
 
     const cached = this.cached;
@@ -426,13 +434,19 @@ export const summarise = (
 
 export class GitHubAppForgeFactory implements ForgeFactory {
   private readonly options: GitHubAppOptions;
+  private readonly scope: WorkspaceScope;
 
-  constructor(options: GitHubAppOptions) {
+  constructor(options: GitHubAppOptions, scope: WorkspaceScope) {
     this.options = options;
+    this.scope = scope;
   }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
-    return new GitHubAppForge(this.options, spec.repos);
+    // Refuse the whole task rather than the individual request. A spec naming a repo
+    // this workspace cannot reach is a spec that will fail somewhere later anyway, and
+    // failing here names the offending repo while nothing has been cloned yet.
+    for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
+    return new GitHubAppForge(this.options, spec.repos, this.scope);
   }
 }
 
@@ -445,4 +459,6 @@ export class GitHubAppForgeFactory implements ForgeFactory {
  */
 export const reviewerForgeFactory = (
   options: Omit<GitHubAppOptions, "permissions">,
-): ForgeFactory => new GitHubAppForgeFactory({ ...options, permissions: REVIEWER_PERMISSIONS });
+  scope: WorkspaceScope,
+): ForgeFactory =>
+  new GitHubAppForgeFactory({ ...options, permissions: REVIEWER_PERMISSIONS }, scope);

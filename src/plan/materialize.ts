@@ -17,6 +17,7 @@
  */
 import {
   asTaskId,
+  parseRepoRef,
   type Capability,
   type PlanMembership,
   type ProposedPlan,
@@ -26,6 +27,7 @@ import {
   type TaskSpec,
   type WorkspaceName,
 } from "../domain/task.ts";
+import { assertWorkspaceScope, type WorkspaceScope } from "../forge/types.ts";
 
 const KNOWN_CAPABILITIES: readonly string[] = [
   "linux",
@@ -50,21 +52,16 @@ export interface MaterialiseOptions {
   readonly workspace: WorkspaceName;
   /** Repos the brainstorm itself was scoped to — the fallback for a task that names none. */
   readonly defaultRepos: readonly RepoRef[];
+  /**
+   * The bound the workspace's credential cannot reach past (§9.1).
+   *
+   * A plan is written by the AGENT. `submit_plan` exposes a free-text `repos` field per
+   * child, and the only gate between it and a `ready` task is a council of LLM lenses
+   * that review feasibility and decomposition, not scope. Without this, a session could
+   * widen its successor's credential to any repo it liked.
+   */
+  readonly scope: WorkspaceScope;
 }
-
-/** `host/owner/name` or `owner/name`, matching intake and the store. */
-const parseRepo = (raw: string): RepoRef | undefined => {
-  const parts = raw.split("/").filter((p) => p.length > 0);
-  if (parts.length === 3) {
-    const [host, owner, name] = parts as [string, string, string];
-    return { host, owner, name };
-  }
-  if (parts.length === 2) {
-    const [owner, name] = parts as [string, string];
-    return { host: "github.com", owner, name };
-  }
-  return undefined;
-};
 
 /**
  * Child ids are positional: `<parent>-01`, `-02`, …
@@ -135,7 +132,7 @@ export const materialise = (
 
   const tasks: MaterialisedTask[] = [];
   for (const [index, task] of plan.tasks.entries()) {
-    const repos = resolveRepos(task, options.defaultRepos);
+    const repos = resolveRepos(task, options.defaultRepos, options.scope);
     if (repos === undefined) {
       return reject(
         `Task \`${task.localId}\` names a repo that is not \`owner/name\` or ` +
@@ -168,13 +165,22 @@ export const materialise = (
 const resolveRepos = (
   task: ProposedTask,
   fallback: readonly RepoRef[],
+  scope: WorkspaceScope,
 ): readonly RepoRef[] | undefined => {
   if (task.repos.length === 0) return fallback.length > 0 ? fallback : undefined;
 
   const parsed: RepoRef[] = [];
   for (const raw of task.repos) {
-    const repo = parseRepo(raw);
+    const repo = parseRepoRef(raw);
     if (repo === undefined) return undefined;
+    // Undefined, not a throw: the caller already turns this into a refusal naming the
+    // child, and a plan proposing an unreachable repo is the same class of mistake as
+    // one proposing an unparseable string.
+    try {
+      assertWorkspaceScope(repo, scope);
+    } catch {
+      return undefined;
+    }
     parsed.push(repo);
   }
   return parsed;

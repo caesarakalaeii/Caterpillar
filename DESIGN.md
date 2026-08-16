@@ -754,13 +754,41 @@ Minted per task, scoped **narrower than the App itself**:
 ```jsonc
 POST /app/installations/{id}/access_tokens
 {
-  "repositories": ["all-chat"],            // only repos named in spec.md
+  "repositories": ["all-chat"],            // repos named in spec.md, ∩ the workspace scope
   "permissions": { "contents": "write", "pull_requests": "write" }
 }
 ```
 
-No admin, no workflow. `TASK-123` cannot touch `caesar-deployment` unless its spec
-says so.
+No admin, no workflow.
+
+> **`spec.repos` is a narrowing filter, not the boundary.** It reads like one, and it
+> was treated as one for a while, and that was wrong: `spec.md` is rendered from a
+> GitHub issue body, a Vikunja description, or a plan the previous session wrote. All
+> three are outside the operator's control, and an outside contributor can edit their
+> own issue body after a maintainer has labelled it. Checking a credential request
+> against `spec.repos` — which is what `assertInScope` does on its own — compares an
+> attacker-chosen value against an attacker-chosen list. It always succeeds.
+>
+> The real bound is the **`WorkspaceScope`** (`src/config/scope.ts`), built from the
+> ConfigMap and nothing else:
+>
+> - `repo.host` must equal the workspace's own `forge.host`. Without this, a spec
+>   naming `evil.example.com/<owner>/<repo>` gets cloned from that host with the
+>   credential helper attached; the server answers `401`, git offers the credential,
+>   and the helper hands over a live token. On Codeberg that token is owner-wide and
+>   never expires.
+> - the **state repo is excluded**, compared case-insensitively because GitHub
+>   resolves `Caterpillar-State` and `caterpillar-state` to the same repository. This
+>   is what makes §9.3 true in code rather than by convention.
+>
+> Enforced in four places, deliberately redundantly: at `renderSpec` and `materialise`
+> so a human or an agent gets a refusal naming the repo, in `ForgeFactory.forTask` so
+> nothing is cloned, and in `CredentialService.answer` plus `Forge.credential` because
+> that is where a token actually leaves the supervisor. Only the last two are the
+> boundary; the first two exist so the failure is legible.
+
+With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec says so
+**and** `caesar-deployment` is on the workspace's forge and is not the state repo.
 
 > **Correction — "no merging" is not a token property.** GitHub has no separate merge
 > scope: `PUT /pulls/{n}/merge` is authorised by `pull_requests: write`, the same
@@ -839,9 +867,13 @@ interface ForgeCredentials {
 }
 ```
 
-Two implementations, `GitHubAppForge` and `ForgejoForge`, selected by the repo's host. The
-agent's `open_pr()` tool and the credential helper are **identical either way** — the agent
-never learns which forge it is on, let alone the token.
+Two implementations, `GitHubAppForge` and `ForgejoForge`, selected by the task's
+**workspace** — `spec.workspace` picks the profile, and the profile names the forge. NOT
+by the repo's host, which is the reading this sentence used to invite: one task binds one
+forge to one credential bundle, so a repo whose host disagrees with its workspace's
+`forge.host` has no credential that could serve it and is refused rather than routed
+(§9.1). The agent's `open_pr()` tool and the credential helper are **identical either
+way** — the agent never learns which forge it is on, let alone the token.
 
 **Codeberg specifics.** Codeberg runs Forgejo `16.0.0-dev` (checked 2026-08-13), which is
 past v15.0, so **repository-scoped access tokens are available**:
@@ -1020,7 +1052,7 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 | `Deployment` | supervisor, 1 replica, `Recreate` strategy |
 | `PVC` | git mirrors + worktrees |
 | `Secret` (SOPS) | GitHub App PEM, Discord webhook, proxy token |
-| `ConfigMap` | capabilities, thresholds, repo allowlist |
+| `ConfigMap` | capabilities, thresholds, workspace forge host (the repo scope, §9.1) |
 | `Deployment` | llm-proxy |
 | `Deployment` | discord-bridge |
 | `ServiceMonitor` | scrape supervisor `/metrics` |
