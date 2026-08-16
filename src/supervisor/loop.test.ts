@@ -1311,11 +1311,24 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   const inbox = new ChatInbox();
 
   // A session that runs until something aborts it — a hung `bash` call, in effect.
+  //
+  // `keepalive` is load-bearing, not decoration. A real hung session holds a live child
+  // process, and that handle keeps the event loop alive; a promise waiting on an abort
+  // event holds NOTHING. Every timer the supervisor arms for the duration of a session
+  // is deliberately unref'd — `watchCancels`, the wall clock, the heartbeat — so that a
+  // process with nothing left to do is never held up by one. In production that is safe
+  // because `index.ts` is always listening on a metrics port and a credential socket.
+  // A bare Supervisor has neither, so without this the loop drains mid-session and node
+  // ends the test with "Promise resolution is still pending" before the cancel is ever
+  // answered. That is the stub being unfaithful to a hang, not the supervisor misbehaving
+  // — it failed on node 22 and passed on 26.
   let sawAbort = false;
   const runner: SessionRunner = {
     run: (_spec, _state, signal) =>
       new Promise<SessionOutcome>((resolve) => {
+        const keepalive = setInterval(() => {}, 1_000);
         signal.addEventListener("abort", () => {
+          clearInterval(keepalive);
           sawAbort = true;
           resolve({
             reason: "interrupted",
