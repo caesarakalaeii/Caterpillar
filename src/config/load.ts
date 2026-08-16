@@ -14,7 +14,7 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
-import type { LlmConfig, RunnerConfig, WorkspaceProfile } from "./types.ts";
+import type { LlmConfig, RunnerConfig, WebConfig, WorkspaceProfile } from "./types.ts";
 
 export class ConfigError extends Error {
   constructor(detail: string) {
@@ -53,6 +53,7 @@ interface RawConfig {
   readonly secretsDir?: unknown;
   readonly log?: { readonly level?: unknown };
   readonly intake?: { readonly intervalSeconds?: unknown };
+  readonly web?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -67,6 +68,27 @@ const num = (value: unknown, field: string, fallback?: number): number => {
   if (value === undefined && fallback !== undefined) return fallback;
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new ConfigError(`${field} must be a finite number`);
+  }
+  return value;
+};
+
+/**
+ * A boolean is never coerced.
+ *
+ * `"false"` is truthy in JavaScript and false in intent, and the field this most matters
+ * for decides whether unauthenticated requests are answered. Refusing the string is the
+ * only reading that cannot silently mean the opposite of what was written.
+ */
+const bool = (value: unknown, field: string, fallback: boolean): boolean => {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") throw new ConfigError(`${field} must be true or false`);
+  return value;
+};
+
+const port = (value: unknown, field: string, fallback: number): number => {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new ConfigError(`${field} must be an integer port between 1 and 65535`);
   }
   return value;
 };
@@ -195,6 +217,20 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
   };
 };
 
+/** See `WebConfig` for why `enabled` and `requireForwardedUser` default the way they do. */
+const webConfig = (web: Record<string, unknown>): WebConfig => ({
+  enabled: bool(web["enabled"], "web.enabled", false),
+  port: port(web["port"], "web.port", 8080),
+  logCapacity: num(web["logCapacity"], "web.logCapacity", 500),
+  refreshSeconds: num(web["refreshSeconds"], "web.refreshSeconds", 10),
+  requireForwardedUser: bool(web["requireForwardedUser"], "web.requireForwardedUser", false),
+  forwardedUserHeader: str(
+    web["forwardedUserHeader"],
+    "web.forwardedUserHeader",
+    "remote-user",
+  ).toLowerCase(),
+});
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -264,5 +300,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     intake: {
       intervalSeconds: num(raw.intake?.intervalSeconds, "intake.intervalSeconds", 300),
     },
+    web: webConfig(raw.web ?? {}),
   };
 };

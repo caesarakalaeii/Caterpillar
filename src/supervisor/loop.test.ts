@@ -132,6 +132,16 @@ const config: RunnerConfig = {
   workspaces: new Map(),
   pollSeconds: 1,
   secretsDir: join(root, "secrets"),
+  // No web view in the loop's tests: these exercise the supervisor, and a listening
+  // socket per fixture is a port collision waiting for a parallel run.
+  web: {
+    enabled: false,
+    port: 8080,
+    logCapacity: 500,
+    refreshSeconds: 10,
+    requireForwardedUser: false,
+    forwardedUserHeader: "remote-user",
+  },
 };
 
 /**

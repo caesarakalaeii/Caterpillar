@@ -26,7 +26,13 @@ export const asWorkspaceName = (value: string): WorkspaceName => value as Worksp
  */
 const TASK_ID = /^[A-Za-z0-9._-]+$/;
 
-export const isTaskId = (value: string): value is TaskId => TASK_ID.test(value);
+/**
+ * The character class alone is not enough: it admits `.` and `..`, which are legal
+ * directory names and resolve to the task tree's PARENT — the state repo root. A dot
+ * inside an id is ordinary, so the rule is "not made only of dots" rather than "no dots".
+ */
+export const isTaskId = (value: string): value is TaskId =>
+  TASK_ID.test(value) && !/^\.+$/.test(value);
 
 /**
  * A capability a runner advertises and a task may require. Claiming requires

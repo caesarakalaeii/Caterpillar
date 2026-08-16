@@ -50,6 +50,13 @@ export interface SessionOptions {
   /** Prior transcript when resuming rather than starting fresh. */
   readonly messages?: readonly AgentMessage[];
   /**
+   * Called as each message settles, so something outside can watch a session that will
+   * not write its transcript for another half hour (DESIGN.md §18).
+   *
+   * Observation only: it must not throw, and nothing here waits on it.
+   */
+  readonly onMessage?: (message: AgentMessage) => void;
+  /**
    * Stops the session from outside: pod shutdown, a lost lease, a human `/cancel`, or
    * the wall clock. Declared here for a long time and read nowhere, which meant none of
    * those could actually stop anything — a hung `bash` call with no timeout wedged the
@@ -105,8 +112,16 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
   let handoffTriggered = false;
 
   agent.subscribe((event) => {
-    if (event.type === "message_end" && event.message.role === "assistant") {
+    if (event.type !== "message_end") return;
+    if (event.message.role === "assistant") {
       sessionUsage = sumTotals(sessionUsage, toTotals(event.message.usage));
+    }
+    // An observer that throws would tear down pi's event dispatch mid-session, which is
+    // a live view costing the task it was watching.
+    try {
+      options.onMessage?.(event.message);
+    } catch {
+      /* watching is never worth a session */
     }
   });
 

@@ -25,6 +25,9 @@ import { DiscordGateway } from "./notify/gateway.ts";
 import { ChatInbox } from "./supervisor/inbox.ts";
 import { TaskSnapshot } from "./supervisor/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
+import { LiveSession } from "./obs/live.ts";
+import { LogRing } from "./obs/ring.ts";
+import { createWebServer } from "./web/server.ts";
 import { PlanMaintainer } from "./plan/maintain.ts";
 import { ReviewCouncil } from "./review/council.ts";
 import {
@@ -76,7 +79,21 @@ const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) =
 
 const main = async (): Promise<void> => {
   const loaded = await loadConfig(CONFIG_PATH);
-  const logger = new JsonLogger({ level: loaded.log.level });
+
+  // The ring is the logger's SINK, not a second Logger: it therefore holds exactly the
+  // records that reached stdout, and there is no threshold implemented twice (obs/ring.ts).
+  const ring = new LogRing(loaded.web.enabled ? loaded.web.logCapacity : 0);
+  const logger = new JsonLogger({
+    level: loaded.log.level,
+    write: (line) => {
+      process.stdout.write(line);
+      ring.push(line);
+    },
+  });
+
+  // What this runner is executing right now. Written by the session runner, read by the
+  // web view, and empty at every other moment (DESIGN.md §18).
+  const live = new LiveSession();
 
   // ONE resolver for the whole process. The agent's shell, the council's, the plan
   // maintainer's and the acceptance gate's must be the same environment or the gate grades
@@ -196,6 +213,7 @@ const main = async (): Promise<void> => {
       bindings,
       metrics,
       toolchain,
+      live,
     }),
     toolchain,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
@@ -230,6 +248,7 @@ const main = async (): Promise<void> => {
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
+  const stopWeb = startWebView({ config, store, live, ring, logger });
 
   const controller = new AbortController();
   const shutdown = (signal: string): void => {
@@ -267,9 +286,45 @@ const main = async (): Promise<void> => {
     // loop alive, so the process never exited, and `Restart=always` never fired.
     controller.abort();
     stopMetrics();
+    stopWeb();
     await credentials.stop();
     await bridge;
   }
+};
+
+/**
+ * Start the read-only web view, if this runner was told to serve one (DESIGN.md §18).
+ *
+ * Its own port. The metrics port stays exactly what it was — one Service port for the
+ * ServiceMonitor and one for the Ingress means "what is published" is answerable by
+ * reading a Service rather than by reading this file.
+ */
+const startWebView = (options: {
+  readonly config: RunnerConfig;
+  readonly store: StateStore;
+  readonly live: LiveSession;
+  readonly ring: LogRing;
+  readonly logger: Logger;
+}): (() => void) => {
+  const { web } = options.config;
+  if (!web.enabled) {
+    options.logger.info("web.disabled", { reason: "web.enabled is false" });
+    return () => undefined;
+  }
+  if (web.port === METRICS_PORT) {
+    // Bind order would decide which of the two exists, and the loser fails with an
+    // EADDRINUSE that names neither. Say which two ports collided instead.
+    throw new Error(`web.port (${web.port}) must differ from METRICS_PORT (${METRICS_PORT})`);
+  }
+
+  const server = createWebServer(options);
+  server.listen(web.port);
+  options.logger.info("web.listening", {
+    port: web.port,
+    requireForwardedUser: web.requireForwardedUser,
+  });
+
+  return () => server.close();
 };
 
 /**
