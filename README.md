@@ -370,8 +370,10 @@ council reads it with plan-specific lenses, and on a pass the tasks are created 
 `wave` and a `blockedBy` (§14.3).
 
 To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
-so, then archived. The task is never claimed again; the thread keeps its history and
-un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
+so, then archived. It works on a task that is *running*, not only on an idle one: the
+session stops at the next turn boundary, nothing from it is recorded, and the park lands
+on the following poll (the reply says `cancelling` until then). The task is never claimed
+again; the thread keeps its history and un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
 `journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
 repo by hand, once no lease is held.
 

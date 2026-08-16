@@ -212,6 +212,7 @@ const main = async (): Promise<void> => {
           closer: new BotThreadCloser(discord.bot, threads),
         }),
     notifier: discord.notifier,
+    credentials,
     inbox,
     snapshot,
     metrics,

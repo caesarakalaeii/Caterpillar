@@ -312,7 +312,17 @@ export type SessionExitReason =
    * credential. NOT attributable to the task, which is the whole reason it is not
    * `error`: the task is released untouched and the RUNNER backs off (DESIGN.md §6.3).
    */
-  | "provider-unavailable";
+  | "provider-unavailable"
+  /**
+   * Something outside the session stopped it: the pod is shutting down, the lease was
+   * lost, a human cancelled, or the session ran past its wall clock.
+   *
+   * Not attributable to the task either, and deliberately distinct from
+   * `provider-unavailable` because it says nothing about the provider and must not
+   * start a cooldown. The task is left claimable; whoever caused the interruption is
+   * responsible for whatever happens next.
+   */
+  | "interrupted";
 
 /** Why the provider stopped answering, as far as its own error message admits. */
 export type OutageKind =

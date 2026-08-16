@@ -488,6 +488,43 @@ do by default (`maxRetries: 0`). A single 500 used to cost a whole session.
 
 ---
 
+### 6.4 A session can be stopped
+
+Four things may stop a session in flight, and they arrive as one `AbortSignal` threaded
+into `agent.prompt()` via pi's `abort()`:
+
+1. **Pod shutdown.** SIGTERM aborted the loop *between* tasks only, so a graceful stop
+   waited for the whole session.
+2. **A lost lease.** The heartbeat's failure callback used to set a flag read at the top
+   of the session loop, so a lease lost at t=60s let the session run out the rest of its
+   budget — still minting a fresh token for every push, via a `CredentialService.active`
+   that outlived the lease justifying it — while another runner worked the same branch.
+   The callback now aborts and clears the credential at that moment.
+3. **`/cancel`.** See below.
+4. **The wall clock** (`limits.maxSessionSeconds`, four hours). Not a budget: pi's bash
+   tool documents `timeout` as optional with **no default**, so the model decides whether
+   a command may block forever. `npm run dev`, a test runner waiting on stdin, a
+   `nix build` against a dead cache — the promise never settles, and everything in the
+   supervisor is single-threaded, so the poll loop, the chat drain and intake stop with
+   it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
+   indicator stays on: a runner that looks healthier the longer it is wedged.
+
+An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
+session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and
+deliberately distinct from it: no provider misbehaved, so no cooldown starts. Charging a
+task a session for a deploy would also count it against the no-progress streak, which is
+how a pod restart could park a task that was doing fine.
+
+**`/cancel` needs the queue read while the session runs.** `ChatInbox` is drained in the
+poll loop, which is blocked for the entire duration of a session — so a cancel sat in the
+queue until the session it was meant to stop had already finished, and the operator's
+Discord reply hung until then. `workTask` therefore watches for park requests naming its
+own task and takes only those (`takeWhere`), leaving everything else queued: the rest
+write the state repo, and this session holds the lease those writes would have to fence
+against. The cancel itself writes nothing — it aborts, the lease is released, and the
+park lands on the following poll. The reply says `cancelling`, not `parked`, because for
+a second or two that is the truth.
+
 ## 7. Human interaction
 
 The agent calls `ask_human(question, options?)`. The supervisor then:

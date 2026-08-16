@@ -115,7 +115,7 @@ const config: RunnerConfig = {
   // renewal landing mid-park would muddy which CAS was under test.
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
-  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3 },
+  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 3600 },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
   llm: {
@@ -1297,4 +1297,77 @@ test("a git failure in the poll loop is logged and retried, not fatal", async ()
     pulls >= 3,
     `the loop must survive a failing pull and try again — it stopped after ${pulls}`,
   );
+});
+
+test("/cancel stops a session running on this runner instead of refusing it", async () => {
+  // `applyPark` used to refuse a running task outright, so the only way to stop a
+  // session was deleting the pod — which then stranded the task, because an interrupted
+  // task is pushed as `running` and nothing moved it back (§6.2). The two bugs made
+  // each other unfixable from the operator's side.
+  const CANCELLED = asTaskId("SMOKE-CANCEL");
+  await seedTask(CANCELLED);
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new ChatInbox();
+
+  // A session that runs until something aborts it — a hung `bash` call, in effect.
+  let sawAbort = false;
+  const runner: SessionRunner = {
+    run: (_spec, _state, signal) =>
+      new Promise<SessionOutcome>((resolve) => {
+        signal.addEventListener("abort", () => {
+          sawAbort = true;
+          resolve({
+            reason: "interrupted",
+            usage: EMPTY_USAGE,
+            contextTokens: 0,
+            summary: "stopped from outside",
+          });
+        });
+      }),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Wait until the session is actually in flight, or the cancel would find nothing.
+  const started = Date.now() + 30_000;
+  while (Date.now() < started) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "running") break;
+    await sleep(50);
+  }
+
+  const outcome = await inbox.submit({ kind: "park", task: CANCELLED });
+  assert.equal(outcome.kind, "cancelling", "a running session must be stoppable");
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !sawAbort) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(sawAbort, "the abort must reach the session, not just the reply");
 });

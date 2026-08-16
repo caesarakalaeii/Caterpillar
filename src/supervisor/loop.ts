@@ -62,6 +62,14 @@ import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise, type TaskSnapshot } from "./snapshot.ts";
 
+/**
+ * How often a running session checks for a `/cancel`.
+ *
+ * A human is waiting on the reply, so this is seconds rather than a poll interval; it
+ * costs one array filter over a queue that is almost always empty.
+ */
+const CANCEL_POLL_MS = 2000;
+
 /** One task's state as read by a single sweep of the task tree. */
 interface TaskRecord {
   readonly id: TaskId;
@@ -69,8 +77,15 @@ interface TaskRecord {
 }
 
 export interface SessionRunner {
-  /** Runs one session and returns why it stopped. Never mutates task state. */
-  run(spec: TaskSpec, state: TaskState): Promise<SessionOutcome>;
+  /**
+   * Runs one session and returns why it stopped. Never mutates task state.
+   *
+   * `signal` aborts the session in flight — pod shutdown, a lost lease, a human
+   * `/cancel`, or the wall clock. Honouring it is what stops a hung tool call from
+   * wedging the whole runner: everything here is single-threaded, so a `bash` call that
+   * never returns used to stop the poll, the chat drain and intake along with it.
+   */
+  run(spec: TaskSpec, state: TaskState, signal: AbortSignal): Promise<SessionOutcome>;
 }
 
 export interface Verifier {
@@ -110,6 +125,12 @@ export interface SupervisorDeps {
    * runner has no task in flight.
    */
   readonly toolchain: ToolchainResolver;
+  /**
+   * The credential service, so a lost lease can revoke the task's credential at the
+   * moment it is lost rather than when the session eventually returns. Optional because
+   * nothing else in the loop needs it and the tests do not build one.
+   */
+  readonly credentials?: { clearActive(): void };
   /**
    * Tracker → task ingestion. Optional: a runner with no trackers configured, or one
    * fed only by hand-committed specs (§14.4), does not need it.
@@ -417,11 +438,37 @@ export class Supervisor {
   /**
    * Drive one task through as many sessions as it needs, until it parks or completes.
    *
-   * The heartbeat runs for the whole duration; if it fails, `abortOnLeaseLoss` fires
-   * and the next lease check throws, unwinding without writing anything.
+   * The heartbeat runs for the whole duration; if it fails the session is aborted at
+   * once and the next lease check throws, unwinding without writing anything.
    */
   private async workTask(lease: Lease, spec: TaskSpec, signal: AbortSignal): Promise<void> {
     const { store, leases, config, metrics, logger } = this.deps;
+
+    // Everything that may stop a session in flight, as one signal. Losing the lease used
+    // to set a flag that was only read at the TOP of the loop, so a lease lost at t=60s
+    // let the session run out the rest of its budget — still minting tokens for every
+    // push — while another runner worked the same branch.
+    const interrupt = new AbortController();
+    const stopOnShutdown = (): void => interrupt.abort();
+    signal.addEventListener("abort", stopOnShutdown, { once: true });
+
+    // The poll loop — and with it the inbox drain — is blocked for the whole duration of
+    // a session, so a `/cancel` submitted while the agent is working would otherwise sit
+    // in the queue until the session it was meant to stop had already ended, with the
+    // operator's Discord reply hanging until then. This watches for that ONE request and
+    // leaves everything else queued: the rest write the state repo, and this session
+    // holds the lease those writes would have to fence against.
+    const watchCancels = setInterval(() => {
+      const requests = this.deps.inbox?.takeWhere(
+        (request) => request.kind === "park" && request.task === spec.id,
+      );
+      if (requests === undefined || requests.length === 0) return;
+
+      logger.info("task.cancel-requested", { task: spec.id });
+      interrupt.abort();
+      for (const request of requests) request.settle({ kind: "cancelling" });
+    }, CANCEL_POLL_MS);
+    watchCancels.unref();
 
     let lost: LeaseLostError | undefined;
     const heartbeat = startHeartbeat(
@@ -430,6 +477,12 @@ export class Supervisor {
       config.lease.heartbeatSeconds,
       (error) => {
         lost = error;
+        // Immediately, not at the next loop iteration. The credential goes with it:
+        // `CredentialService.active` outlived the lease that justified it, so a session
+        // that had already lost its claim kept getting fresh tokens minted on demand.
+        logger.warn("lease.lost-mid-session", { task: spec.id, ...errorFields(error) });
+        this.deps.credentials?.clearActive();
+        interrupt.abort();
       },
     );
 
@@ -459,10 +512,27 @@ export class Supervisor {
         // Held for exactly the session, and stopped in a `finally` — an indicator left
         // running after a crash would be a lie that outlives the thing it described.
         const stopTyping = this.showWorking(state);
+        // The wall clock. pi's bash tool documents `timeout` as optional with no
+        // default, so the MODEL chooses whether a command can hang — `npm run dev`, a
+        // test runner waiting on stdin, or a nix build against a dead cache never
+        // settles, and everything here is single-threaded, so the poll, the chat drain
+        // and intake stop with it. The ceiling is generous: it exists to bound a hang,
+        // not to bound honest work.
+        const deadline = setTimeout(() => {
+          logger.error("session.timeout", {
+            task: spec.id,
+            session: state.sessions + 1,
+            maxSeconds: config.limits.maxSessionSeconds,
+          });
+          interrupt.abort();
+        }, config.limits.maxSessionSeconds * 1000);
+        deadline.unref();
+
         let outcome: SessionOutcome;
         try {
-          outcome = await this.deps.runner.run(spec, state);
+          outcome = await this.deps.runner.run(spec, state, interrupt.signal);
         } finally {
+          clearTimeout(deadline);
           stopTyping();
         }
 
@@ -481,6 +551,20 @@ export class Supervisor {
         metrics.tokens.inc({ task: spec.id, kind: "input" }, outcome.usage.inputTokens);
         metrics.tokens.inc({ task: spec.id, kind: "output" }, outcome.usage.outputTokens);
         metrics.cost.inc({ task: spec.id }, outcome.usage.costUsd);
+
+        if (outcome.reason === "interrupted") {
+          // Nothing is recorded. The session did not reach a decision, and writing a
+          // session count and a journal entry for a pod restart would charge the task
+          // for an interruption that says nothing about it — the same reasoning as
+          // `releaseAfterOutage`, minus the cooldown, because no provider misbehaved.
+          logger.info("session.interrupted", {
+            task: spec.id,
+            session: state.sessions + 1,
+            leaseLost: lost !== undefined,
+            shuttingDown: signal.aborted,
+          });
+          return;
+        }
 
         if (outcome.reason === "provider-unavailable") {
           // `outage` is set by `buildOutcome` for every one of these; the fallback is
@@ -524,6 +608,8 @@ export class Supervisor {
       await this.parkFailed(heartbeat, spec, error);
     } finally {
       heartbeat.stop();
+      clearInterval(watchCancels);
+      signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
   }
@@ -716,6 +802,13 @@ export class Supervisor {
         // not recording it is the entire point (see `releaseAfterOutage`). Kept so the
         // switch stays exhaustive — a new exit reason with no home here should be a
         // compile error — and harmless if it is ever reached: the task stays claimable.
+        await this.transition(lease, state, "ready");
+        return true;
+
+      case "interrupted":
+        // Also unreachable for the same reason — `workTask` returns on this before
+        // recording. Left claimable rather than parked: an interruption says nothing
+        // about the task, and parking it would demand a human for a pod restart.
         await this.transition(lease, state, "ready");
         return true;
 
@@ -1434,11 +1527,15 @@ export class Supervisor {
   /**
    * Park a task on request — `/cancel`.
    *
-   * A RUNNING task is refused rather than interrupted. Its lease is held by whichever
-   * runner is working it, possibly on another machine, and the drain happens between
-   * tasks rather than during one: there is no point at which this could stop a session
-   * mid-turn. Refusing says so; pretending to cancel would leave the task running and
-   * the human believing it was not.
+   * A task running ON THIS RUNNER never reaches here: `workTask` intercepts its own
+   * task's park requests while the session is in flight and aborts it, because the poll
+   * loop — and with it this drain — is blocked for the whole duration of a session. That
+   * path used to refuse outright, which left deleting the pod as the only way to stop a
+   * session, and that in turn stranded the task (§6.2).
+   *
+   * A task running on ANOTHER runner IS refused here. Nothing in this process can reach
+   * into that one, and pretending to cancel would leave the task running with the human
+   * believing it was not.
    *
    * The lease is taken for the write and released immediately, because every push
    * verifies ownership first (§5.1) and this one is no exception.

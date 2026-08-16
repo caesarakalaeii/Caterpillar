@@ -49,6 +49,13 @@ export interface SessionOptions {
   readonly control: ControlSink;
   /** Prior transcript when resuming rather than starting fresh. */
   readonly messages?: readonly AgentMessage[];
+  /**
+   * Stops the session from outside: pod shutdown, a lost lease, a human `/cancel`, or
+   * the wall clock. Declared here for a long time and read nowhere, which meant none of
+   * those could actually stop anything — a hung `bash` call with no timeout wedged the
+   * whole single-threaded runner while the heartbeat kept renewing the lease and
+   * /healthz kept answering 200.
+   */
   readonly signal?: AbortSignal;
 }
 
@@ -119,11 +126,22 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
     return false;
   };
 
+  // pi exposes `abort()` rather than taking a signal, so the bridge is explicit. The
+  // listener is removed in the `finally` below: `options.signal` outlives this session —
+  // it belongs to the task, which may run many — and an accumulating listener per session
+  // is a leak that ends in a MaxListenersExceededWarning on a long-lived task.
+  const abort = (): void => agent.abort();
+  const signal = options.signal;
+  signal?.addEventListener("abort", abort, { once: true });
+
   let error: string | undefined;
   try {
-    await agent.prompt(options.initialPrompt);
+    // Already aborted before we started: do not spend a request to find out.
+    if (signal?.aborted !== true) await agent.prompt(options.initialPrompt);
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    signal?.removeEventListener("abort", abort);
   }
 
   // The failure pi swallowed, if the throw did not happen. `errorMessage` is cleared at
@@ -140,6 +158,7 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
       handoffTriggered,
       sessionUsage,
       contextTokens,
+      interrupted: signal?.aborted === true,
     }),
     messages,
     contextOverrun: budget.wouldCompact(messages),
@@ -152,10 +171,22 @@ interface OutcomeInput {
   readonly handoffTriggered: boolean;
   readonly sessionUsage: UsageTotals;
   readonly contextTokens: number;
+  readonly interrupted: boolean;
 }
 
 const buildOutcome = (input: OutcomeInput): SessionOutcome => {
   const base = { usage: input.sessionUsage, contextTokens: input.contextTokens };
+
+  // FIRST, ahead of the error branch. Aborting the agent surfaces as a thrown
+  // AbortError, and classifying that as a session failure would park a task for a pod
+  // restart — and, worse, count it against the no-progress streak.
+  if (input.interrupted) {
+    return {
+      ...base,
+      reason: "interrupted",
+      summary: "the session was stopped from outside — shutdown, lost lease, or cancel",
+    };
+  }
 
   if (input.error !== undefined) {
     // An outage is reported ahead of any control signal for the same reason an error

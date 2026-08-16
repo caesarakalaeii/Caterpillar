@@ -23,7 +23,10 @@ const SPEND_LIMIT =
   'would exceed your account\'s monthly spend limit. Please try again later."},' +
   '"request_id":"req_011Ce4QadMncfV9FFP8Rt7Pf"}';
 
-const run = async (responses: readonly ReturnType<typeof fauxAssistantMessage>[]) => {
+const run = async (
+  responses: readonly ReturnType<typeof fauxAssistantMessage>[],
+  signal?: AbortSignal,
+) => {
   const faux = fauxProvider({ models: [{ id: "faux-model", contextWindow: 200_000, maxTokens: 4096 }] });
   const models = createModels();
   models.setProvider(faux.provider);
@@ -41,6 +44,7 @@ const run = async (responses: readonly ReturnType<typeof fauxAssistantMessage>[]
     tools: [],
     budget: new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 }),
     control: {},
+    ...(signal === undefined ? {} : { signal }),
   });
 };
 
@@ -74,4 +78,27 @@ test("a session that simply stops talking is still a handoff", async () => {
   const result = await run([fauxAssistantMessage("I have nothing else to add.")]);
 
   assert.equal(result.outcome.reason, "handoff");
+});
+
+test("a signal aborted before the session starts spends no request", async () => {
+  // `SessionOptions.signal` was declared and read nowhere, so nothing could stop a
+  // session: not a pod shutdown, not a lost lease, not `/cancel`, not a wall clock.
+  const result = await run([fauxAssistantMessage("hello")], AbortSignal.abort());
+
+  assert.equal(result.outcome.reason, "interrupted");
+  assert.equal(result.messages.length, 0, "the provider must not have been called");
+});
+
+test("an interruption is not recorded as a session failure", async () => {
+  // The distinction that matters: `error` is terminal and `/resume` refuses it, so
+  // classifying a pod restart as an error would demand a human for a deploy — and count
+  // it against the no-progress streak on the way.
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await run([fauxAssistantMessage("hello")], controller.signal);
+
+  assert.equal(result.outcome.reason, "interrupted");
+  assert.equal(result.outcome.error, undefined);
+  assert.match(result.outcome.summary, /stopped from outside/);
 });

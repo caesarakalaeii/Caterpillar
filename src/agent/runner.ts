@@ -102,7 +102,7 @@ export class AgentSessionRunner {
     this.options = options;
   }
 
-  async run(spec: TaskSpec, state: TaskState): Promise<SessionOutcome> {
+  async run(spec: TaskSpec, state: TaskState, signal?: AbortSignal): Promise<SessionOutcome> {
     const { credentials, worktrees, store, llm, metrics } = this.options;
 
     const forgeFactory = this.options.bindings.forges.get(spec.workspace);
@@ -209,6 +209,7 @@ export class AgentSessionRunner {
         tools,
         budget,
         control,
+        ...(signal === undefined ? {} : { signal }),
       });
 
       await store.writeSessionTranscript(
