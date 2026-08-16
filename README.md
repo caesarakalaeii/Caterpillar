@@ -227,8 +227,9 @@ writing either.
 
 It does **not** fetch secrets or log in to the model. Copy the secret directories yourself
 (`<root>/secrets/<secretRef>/<key>`, the same layout Kubernetes mounts) and run
-`npm run llm:login` on the machine. A script that could pull private keys onto a
-workstation would be a worse problem than a manual copy.
+`npm run llm:login -- --out <root>/credentials/anthropic.json` on the machine — the `--out`
+is required, and the `--` is what stops npm from eating the flag. A script that could pull
+private keys onto a workstation would be a worse problem than a manual copy.
 
 Then work reaches it by capability, never by address (§8): an agent already running
 elsewhere calls `handoff(requires: ["usb"])`, the task returns to `ready`, this runner
