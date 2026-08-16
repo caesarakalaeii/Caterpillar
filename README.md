@@ -170,6 +170,12 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/web/transcript.ts` | A pi transcript → renderable turns. Pure, no IO (§18). |
 | `src/web/pages.ts` | The pages. Given a view model, returns HTML (§18). |
 | `src/web/server.ts` | Routing, security headers, and the `GET`/`HEAD`-only gate (§18). |
+| `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
+| `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
+| `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
+| `src/digest/render.ts` | The one document Discord, git and the web view all get (§19). |
+| `src/digest/summarise.ts` | The prose paragraph. No tools, and never fails a digest (§19). |
+| `src/digest/publish.ts` | Claim the day, publish it, release the claim if that failed (§19). |
 
 ## Invariants worth not breaking
 
@@ -224,6 +230,12 @@ awkward, the change is probably wrong.
     subtract `^refs/heads/agent/*` and one exclusion per branch `git worktree list` reports
     as held, because deriving it from the worktrees survives an agent renaming its own
     branch and a naming convention does not (§3, DESIGN.md).
+11. **A day is claimed before it is published, and the claim is released if publishing
+    failed.** `refs/digests/<date>` is won by one runner in the fleet with the same
+    compare-and-swap that claims a task, and a failed CAS is never read as "someone else
+    did it" without checking the ref — a rejected push is also what a dead network looks
+    like. The asymmetry is the point: publishing twice is visible, while a day marked
+    published and never published is silent, and nothing would ever revisit it (§19).
 
 ## The web view
 
@@ -246,6 +258,44 @@ header — it is a fail-closed check on an Ingress whose forward-auth annotation
 dropped, which would otherwise publish every transcript and look like a working deployment.
 
 Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
+
+## The daily digest
+
+One document a day — what moved, what it cost, what it changed in the code, and what is
+still waiting on you — posted to Discord, committed to `digests/<date>.md` in the state
+repo, and served at `/digests` in the web view. Same text in all three places (§19).
+
+It is off unless a runner is told otherwise:
+
+```json
+"digest": { "enabled": true, "hour": 18, "timezone": "Europe/Berlin", "summarise": true }
+```
+
+- **`hour` + `timezone`** — when a day is considered over, on a local wall clock. The
+  digest for the 16th covers 18:00 on the 15th to 18:00 on the 16th, so nothing falls
+  between two days. A named IANA zone, never a fixed offset: `+02:00` is an hour wrong for
+  seven months a year and says nothing about it.
+- **`summarise`** — whether a model writes the opening paragraph. Everything else is
+  measured from the state repo's git history and costs nothing; this is the only part that
+  spends tokens. Turn it off and the report stays, minus the prose.
+
+**Exactly one runner in a fleet publishes each day.** The first to reach the hour creates
+`refs/digests/<date>` with the same compare-and-swap that claims a task (§5), and the
+others find it taken. A pod that was rolled through the cutoff still publishes when it
+comes back — catch-up reaches back one day, so a runner returning after a week does not
+post seven digests at once.
+
+Two things it will tell you about itself rather than fake:
+
+- **a missing paragraph says why** — a provider outage prints a line where the prose would
+  have been, because a digest that silently lost it looks exactly like one that never had
+  a summariser;
+- **a diff it cannot see says so** — a task branch lives in the mirror of the runner that
+  worked it, so on another runner the digest names the repo it cannot read instead of
+  printing `0 files changed` about a merged pull request.
+
+Enabling it needs nothing else: no new secret, no port, no Deployment. It runs on the
+existing poll loop and uses the notifier that is already configured.
 
 ## Passing work between machines
 

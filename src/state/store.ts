@@ -52,6 +52,16 @@ const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const isArtifactName = (name: string): boolean =>
   ARTIFACT_NAME.test(name) && !name.includes("..");
 
+/**
+ * A digest is filed under a calendar date, and that date becomes a file name.
+ *
+ * Fully anchored: the value arrives from a URL and from a ref name, and a path segment
+ * built from an unchecked one climbs out of `digests/` exactly as a task id would.
+ */
+const DIGEST_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+export const isDigestDate = (date: string): boolean => DIGEST_DATE.test(date);
+
 export class SpecParseError extends Error {
   constructor(task: TaskId, detail: string) {
     super(`spec.md for ${task} is invalid: ${detail}`);
@@ -576,6 +586,52 @@ export class StateStore {
     return readFile(path);
   }
 
+  /**
+   * The published copy of one day's digest (DESIGN.md §19).
+   *
+   * Kept because Discord is a view and this is the record: a day that scrolled out of the
+   * channel, or that a Discord outage swallowed, still exists here — and it is what the
+   * web view renders, so there is one document rather than two that can disagree.
+   *
+   * Overwriting is allowed and never happens: `refs/digests/<date>` is won once, fleet
+   * wide, so the second write for a date would be a bug elsewhere. Refusing it here would
+   * turn that bug into a released claim and a day published by nobody.
+   */
+  async writeDigest(date: string, body: string): Promise<void> {
+    if (!isDigestDate(date)) throw new Error(`'${date}' is not a date this can be filed under`);
+
+    const dir = join(this.root, "digests");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${date}.md`), `${body.trimEnd()}\n`, "utf8");
+  }
+
+  /**
+   * One digest, or nothing.
+   *
+   * The date reaches this from a URL, so it is checked rather than trusted — `..` is a
+   * legal directory name that resolves to the state repo root, the same trap task ids are
+   * guarded against.
+   */
+  async readDigest(date: string): Promise<string | undefined> {
+    if (!isDigestDate(date)) return undefined;
+
+    const path = join(this.root, "digests", `${date}.md`);
+    if (!existsSync(path)) return undefined;
+    return readFile(path, "utf8");
+  }
+
+  /** Published digests, newest first. */
+  async listDigests(): Promise<readonly string[]> {
+    const dir = join(this.root, "digests");
+    if (!existsSync(dir)) return [];
+
+    return (await readdir(dir))
+      .map((name) => (name.endsWith(".md") ? name.slice(0, -3) : ""))
+      .filter(isDigestDate)
+      // ISO dates sort lexically, which is the one thing that format is for.
+      .sort((a, b) => b.localeCompare(a));
+  }
+
   async readAnswer(task: TaskId, index: number): Promise<string | undefined> {
     const name = `${String(index).padStart(3, "0")}-answer.md`;
     const path = join(this.taskDir(task), "questions", name);
@@ -587,11 +643,11 @@ export class StateStore {
   async commitAndPush(message: string, remote: string, branch: string): Promise<void> {
     // Each path is staged only when it exists: `git add` fails the WHOLE command on a
     // pathspec that matches nothing (`fatal: pathspec 'tasks' did not match any files`),
-    // and neither directory is guaranteed. A freshly bootstrapped state repo has no
-    // `tasks/` at all, and a repo that has never refused an intake item has no `intake/`
-    // — so the first rejection on a new runner would otherwise throw here rather than
-    // record anything.
-    for (const path of ["tasks", "intake"]) {
+    // and none of these directories is guaranteed. A freshly bootstrapped state repo has
+    // no `tasks/` at all, a repo that has never refused an intake item has no `intake/`,
+    // and one whose first digest is not yet due has no `digests/` — so the first rejection
+    // on a new runner would otherwise throw here rather than record anything.
+    for (const path of ["tasks", "intake", "digests"]) {
       if (existsSync(join(this.root, path))) await this.git.run("add", "-A", path);
     }
     if (await this.git.hasUncommittedChanges()) {
@@ -692,7 +748,9 @@ export class StateStore {
 
     // Untracked leftovers are removed only where a task can be invented from one. The
     // rest of the checkout is left alone: this runs every poll, and a clean sweep of the
-    // whole repo would delete whatever an operator was in the middle of.
+    // whole repo would delete whatever an operator was in the middle of. `digests/` is
+    // deliberately NOT swept for the same reason it is staged: an unpushed digest is a
+    // day's record waiting for the next commit, not a phantom anything (§19).
     for (const path of ["tasks", "intake"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }

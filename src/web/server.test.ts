@@ -67,6 +67,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
   ]),
   pollSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
+  digest: { enabled: true, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   web: {
     enabled: true,
     port: 0,
@@ -366,4 +367,43 @@ test("a forwarded user is clipped before it is rendered", async () => {
   const body = await response.text();
   assert.equal(response.status, 200);
   assert.ok(!body.includes("a".repeat(100)), "the name must not be rendered at full length");
+});
+
+test("a published digest is served as it was published", async () => {
+  // The page serves the stored document rather than re-deriving the day. It is the record
+  // of what Discord was sent, and a page that recomputed it would disagree with the
+  // message the moment either renderer changed.
+  const harness = await serve();
+  await harness.store.writeDigest("2026-08-16", "# Daily digest — 2026-08-16\n\n2 done · $7.40\n");
+  await harness.store.writeDigest("2026-08-15", "# Daily digest — 2026-08-15\n\nNothing moved.\n");
+
+  const list = await (await fetch(`${harness.url}/digests`)).text();
+  assert.match(list, /2026-08-16/);
+  assert.match(list, /2026-08-15/);
+
+  const page = await (await fetch(`${harness.url}/digests/2026-08-16`)).text();
+  assert.match(page, /2 done · \$7\.40/);
+
+  const api = (await (await fetch(`${harness.url}/api/digests`)).json()) as {
+    readonly dates: readonly string[];
+  };
+  assert.deepEqual(api.dates, ["2026-08-16", "2026-08-15"], "newest first");
+});
+
+test("a date that is not a date never reaches the file system", async () => {
+  // Same rule as a task id, same reason: `digests/<date>.md` is a path built from a URL
+  // segment, and `..` is a legal directory name that resolves to the state repo root.
+  const harness = await serve();
+
+  for (const attempt of ["..", "%2e%2e", "..%2f..%2f.git%2fconfig", "2026-8-1", "2026-08-16x"]) {
+    const response = await raw(harness.url, `GET /digests/${attempt} HTTP/1.1`);
+    assert.match(response, /^HTTP\/1\.1 404 /, `${attempt} must be refused`);
+  }
+});
+
+test("the digests page is there before any digest is", async () => {
+  const harness = await serve();
+  const list = await (await fetch(`${harness.url}/digests`)).text();
+
+  assert.match(list, /No digest has been published yet/);
 });

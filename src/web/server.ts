@@ -28,6 +28,8 @@ import { isArtifactName, type StateStore } from "../state/store.ts";
 import { SCRIPT, STYLESHEET } from "./assets.ts";
 import type { Html } from "./html.ts";
 import {
+  digestPage,
+  digestsPage,
   errorPage,
   fleetPage,
   layout,
@@ -39,7 +41,7 @@ import {
   type Page,
 } from "./pages.ts";
 import { parseTranscript } from "./transcript.ts";
-import { fleet, runnerExport, taskDetail } from "./view.ts";
+import { digests, digestView, fleet, runnerExport, taskDetail } from "./view.ts";
 
 export interface WebServerOptions {
   readonly config: RunnerConfig;
@@ -157,7 +159,25 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return page(options, "runner", config.runnerId, runnerPage(runnerExport(config)), 200, user);
   }
 
+  // `/digests` and `/digests/<date>`. The date is validated by the store before it ever
+  // becomes a path (`isDigestDate`), so anything else simply has no digest and 404s.
+  if (path === "/digests") {
+    return page(options, "digests", "digests", digestsPage(await digests(store)), 200, user);
+  }
+  if (path.startsWith("/digests/")) {
+    const view = await digestView(store, path.slice("/digests/".length));
+    if (view === undefined) return notFound(options, user);
+    return page(options, "digests", `digest ${view.date}`, digestPage(view), 200, user);
+  }
+
   if (path === "/api/fleet") return json(200, await fleet({ store, live, runnerId: config.runnerId }));
+  if (path === "/api/digests") return json(200, { dates: await digests(store) });
+  if (path.startsWith("/api/digests/")) {
+    const view = await digestView(store, path.slice("/api/digests/".length));
+    return view === undefined
+      ? notFound(options, user)
+      : json(200, { date: view.date, body: view.body });
+  }
   if (path === "/api/runner") return json(200, runnerExport(config));
   if (path === "/api/logs") return json(200, { records: ring.records() });
 

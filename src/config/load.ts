@@ -6,6 +6,7 @@
  * mounted secret directory, so a config dump can never leak a credential.
  */
 import { readFile } from "node:fs/promises";
+import { isTimeZone } from "../digest/day.ts";
 import {
   asWorkspaceName,
   KNOWN_CAPABILITIES,
@@ -14,7 +15,13 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
-import type { LlmConfig, RunnerConfig, WebConfig, WorkspaceProfile } from "./types.ts";
+import type {
+  DigestConfig,
+  LlmConfig,
+  RunnerConfig,
+  WebConfig,
+  WorkspaceProfile,
+} from "./types.ts";
 
 export class ConfigError extends Error {
   constructor(detail: string) {
@@ -54,6 +61,7 @@ interface RawConfig {
   readonly log?: { readonly level?: unknown };
   readonly intake?: { readonly intervalSeconds?: unknown };
   readonly web?: Record<string, unknown>;
+  readonly digest?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -217,6 +225,37 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
   };
 };
 
+/**
+ * Validate the `digest` block (DESIGN.md §19).
+ *
+ * The hour and the zone are checked even when the digest is disabled. A runner that has a
+ * typo in a zone it is not currently using finds out the day someone enables it — in the
+ * cluster, at 18:00, when the thing that was supposed to report the day instead throws
+ * inside the poll loop.
+ */
+const digestConfig = (digest: Record<string, unknown>): DigestConfig => {
+  const hour = num(digest["hour"], "digest.hour", 18);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+    throw new ConfigError("digest.hour must be an integer hour between 0 and 23");
+  }
+
+  const timeZone = str(digest["timezone"], "digest.timezone", "Europe/Berlin");
+  if (!isTimeZone(timeZone)) {
+    throw new ConfigError(
+      `digest.timezone '${timeZone}' is not an IANA zone name — it must be something like ` +
+        `'Europe/Berlin' or 'UTC'. An unrecognised zone would otherwise fall back to UTC ` +
+        `and publish at the wrong hour forever without saying so`,
+    );
+  }
+
+  return {
+    enabled: bool(digest["enabled"], "digest.enabled", false),
+    hour,
+    timeZone,
+    summarise: bool(digest["summarise"], "digest.summarise", true),
+  };
+};
+
 /** See `WebConfig` for why `enabled` and `requireForwardedUser` default the way they do. */
 const webConfig = (web: Record<string, unknown>): WebConfig => ({
   enabled: bool(web["enabled"], "web.enabled", false),
@@ -301,5 +340,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       intervalSeconds: num(raw.intake?.intervalSeconds, "intake.intervalSeconds", 300),
     },
     web: webConfig(raw.web ?? {}),
+    digest: digestConfig(raw.digest ?? {}),
   };
 };

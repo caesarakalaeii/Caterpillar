@@ -181,6 +181,37 @@ export interface ToolchainConfig {
   readonly gcKeepDays: number;
 }
 
+/**
+ * The daily digest (DESIGN.md §19).
+ *
+ * `enabled` defaults to FALSE, for the same reason the web view's does: a digest is
+ * published to the shared Discord channel and committed to the shared state repo, and a
+ * runner someone started on a workstation must not begin doing either because it was
+ * upgraded. The claim protocol makes double-posting impossible, not unwanted.
+ */
+export interface DigestConfig {
+  readonly enabled: boolean;
+  /**
+   * Local hour at which a day is considered over, 0–23. The digest covers the 24 hours
+   * ending here — see `digest/day.ts` for why it is not midnight-to-now.
+   */
+  readonly hour: number;
+  /**
+   * IANA zone, e.g. `Europe/Berlin`. Named rather than an offset so DST is the zone
+   * database's problem: a fixed `+02:00` publishes an hour late for five months a year.
+   */
+  readonly timeZone: string;
+  /**
+   * Whether a model writes the prose paragraph over the day's work.
+   *
+   * The facts are free and come from git; this is the only part of a digest that costs
+   * tokens. Turning it off leaves a complete document with a section missing, which is
+   * why it is a separate switch from `enabled` — a runner minding its spend should not
+   * have to choose between prose and no digest at all.
+   */
+  readonly summarise: boolean;
+}
+
 export interface RunnerConfig {
   readonly runnerId: string;
   readonly capabilities: readonly Capability[];
@@ -199,6 +230,7 @@ export interface RunnerConfig {
   readonly log: LogConfig;
   readonly intake: IntakeConfig;
   readonly web: WebConfig;
+  readonly digest: DigestConfig;
 }
 
 export interface IntakeConfig {

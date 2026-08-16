@@ -453,3 +453,18 @@ export const isTerminal = (status: TaskStatus): boolean =>
 /** Claim order: earlier waves first, then by id so it is deterministic across runners. */
 export const claimOrder = (a: TaskState, b: TaskState): number =>
   (a.plan?.wave ?? 0) - (b.plan?.wave ?? 0) || a.id.localeCompare(b.id);
+
+/**
+ * A goal's first heading or first non-blank line, as a one-line name.
+ *
+ * Here rather than beside either caller because both the web view and the daily digest
+ * name tasks this way, and two implementations would eventually disagree about what a
+ * task is called depending on where you read it.
+ */
+export const goalHeadline = (goal: string): string | undefined => {
+  for (const line of goal.split("\n")) {
+    const trimmed = line.replace(/^#+\s*/, "").trim();
+    if (trimmed !== "") return trimmed;
+  }
+  return undefined;
+};

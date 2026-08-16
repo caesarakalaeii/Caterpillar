@@ -12,9 +12,9 @@
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, safeUrl, type Html } from "./html.ts";
 import type { TranscriptEntry } from "./transcript.ts";
-import type { FleetView, RunnerExport, TaskDetail, TaskRow } from "./view.ts";
+import type { DigestView, FleetView, RunnerExport, TaskDetail, TaskRow } from "./view.ts";
 
-export type Page = "fleet" | "logs" | "runner";
+export type Page = "fleet" | "digests" | "logs" | "runner";
 
 export interface Chrome {
   readonly runnerId: string;
@@ -48,6 +48,7 @@ export const layout = (chrome: Chrome, body: Html): string => {
     </div>
     <nav>
       <a href="/"${chrome.current === "fleet" ? raw(' aria-current="page"') : raw("")}>fleet</a>
+      <a href="/digests"${chrome.current === "digests" ? raw(' aria-current="page"') : raw("")}>digests</a>
       <a href="/logs"${chrome.current === "logs" ? raw(' aria-current="page"') : raw("")}>logs</a>
       <a href="/runner"${chrome.current === "runner" ? raw(' aria-current="page"') : raw("")}>runner</a>
     </nav>
@@ -606,6 +607,63 @@ export const runnerPage = (exported: RunnerExport): Html => html`<main>
       <a href="/api/fleet">/api/fleet</a>, one task at <code>/api/tasks/&lt;id&gt;</code>, and
       Prometheus scrapes <code>/metrics</code> on the metrics port, not this one.
     </p>
+  </section>
+</main>`;
+
+/* ------------------------------------------------------------------ digests */
+
+export const digestsPage = (dates: readonly string[]): Html => html`<main>
+  <div class="page-head">
+    <div class="eyebrow">state repo · digests/</div>
+    <h1>Daily digests</h1>
+    <p class="sub">
+      One document per day, published at the configured hour by whichever runner won the
+      claim for it. The same text went to Discord.
+    </p>
+  </div>
+
+  <section>
+    ${
+      dates.length === 0
+        ? html`<p class="empty">
+            No digest has been published yet. One appears after the first cutoff hour with
+            the digest enabled.
+          </p>`
+        : html`<div class="chips">
+            ${dates.map((date) => html`<a class="chip" href="/digests/${date}">${date}</a>`)}
+          </div>`
+    }
+  </section>
+</main>`;
+
+/**
+ * One day, exactly as it was published.
+ *
+ * Rendered as prose rather than parsed as markdown, like every other document this view
+ * shows. It is generated text quoting agent-authored prose, and `html.ts` escaping it is
+ * the whole defence — a markdown renderer here would be a second thing to get right.
+ */
+export const digestPage = (view: DigestView): Html => html`<main>
+  <div class="page-head">
+    <div class="crumb"><a href="/digests">digests</a> / ${view.date}</div>
+    <h1>${view.date}</h1>
+    <p class="sub">As published. Discord got this text; the state repo keeps it.</p>
+  </div>
+
+  <section>
+    <div class="panel"><div class="prose">${view.body}</div></div>
+  </section>
+
+  <section>
+    <h2>Other days</h2>
+    <div class="chips">
+      ${view.dates.map(
+        (date) =>
+          html`<a class="chip${date === view.date ? " on" : ""}" href="/digests/${date}"
+            >${date}</a
+          >`,
+      )}
+    </div>
   </section>
 </main>`;
 

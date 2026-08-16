@@ -95,7 +95,23 @@ export type Notification =
       readonly retryInSeconds: number;
     }
   /** ...and once when it answers again, so the silence has an end a human can see. */
-  | { readonly kind: "provider-recovered"; readonly task: TaskId };
+  | { readonly kind: "provider-recovered"; readonly task: TaskId }
+  /**
+   * The day's digest (DESIGN.md §19). The only notification about the FLEET rather than
+   * about one task, which is why it is the only one with no `task`.
+   *
+   * `body` is a whole document and routinely exceeds Discord's limit, so it is split
+   * exactly as a question is: a digest cut off mid-task is a digest that is silent about
+   * whatever came after the cut, and the reader cannot tell that anything was.
+   */
+  | {
+      readonly kind: "digest";
+      /** `YYYY-MM-DD` of the day it covers. */
+      readonly date: string;
+      /** The one-line count. Repeated as the header of every part after the first. */
+      readonly summary: string;
+      readonly body: string;
+    };
 
 /** Where a notification goes. A task with a thread talks in it rather than the channel. */
 export interface NotifyTarget {
@@ -223,6 +239,8 @@ export const renderParts = (
     : undefined;
   const hint = components === undefined;
 
+  if (notification.kind === "digest") return digestParts(notification);
+
   if (notification.kind !== "question") {
     const content = frame(notification, hint);
     return [{ content, ...(components === undefined ? {} : { components }) }];
@@ -269,6 +287,41 @@ export const renderParts = (
     };
   });
 };
+
+/**
+ * A digest, split across as many messages as it takes.
+ *
+ * The document already opens with its own heading, so only the continuation parts carry
+ * one — and they carry the day and the counts, because a reader scrolling into part three
+ * of a message that arrived while they were away has no other way to tell what it belongs
+ * to. Past the cap it stops and says where the whole thing is: a digest is a summary of a
+ * record that is in git either way, so pointing at the record beats posting fifteen
+ * messages into a channel.
+ */
+const digestParts = (
+  notification: Notification & { readonly kind: "digest" },
+): readonly Rendered[] => {
+  const { date, summary, body } = notification;
+
+  const header = `**Daily digest — ${date}** · ${summary}\n`;
+  const overhead = size(header) + size(DIGEST_TAIL(date));
+  const chunks = chunkProse(body, Math.max(CONTENT_LIMIT - overhead, MIN_CHUNK));
+  const kept = chunks.slice(0, MAX_DIGEST_PARTS);
+  const clipped = chunks.length > MAX_DIGEST_PARTS ? DIGEST_TAIL(date) : "";
+
+  return kept.map((chunk, index) => {
+    const prefix = index === 0 ? "" : `${header}(${index + 1}/${kept.length})\n\n`;
+    const suffix = index === kept.length - 1 ? clipped : "";
+    const room = Math.max(CONTENT_LIMIT - size(prefix) - size(suffix), 0);
+    return { content: `${prefix}${take(chunk, room)}${suffix}` };
+  });
+};
+
+const DIGEST_TAIL = (date: string): string =>
+  `\n\n… the rest is in \`digests/${date}.md\` in the state repo.`;
+
+/** Messages one digest may occupy. Four is a scroll; fifteen is a channel nobody reads. */
+const MAX_DIGEST_PARTS = 4;
 
 /** Most parts a question is ever split into, before it points at the state repo instead. */
 const MAX_PARTS = 6;
@@ -471,11 +524,20 @@ export const componentsFor = (
     case "plan-revised":
     case "provider-unavailable":
     case "provider-recovered":
+    // Nothing to press. Everything a digest offers is a link inside its own prose, and a
+    // row of buttons on a four-part message would arrive attached to one arbitrary part.
+    case "digest":
       return undefined;
   }
 };
 
 const frame = (notification: Notification, hint: boolean): string => {
+  // Before `task` is read at all: the digest is the one notification about the fleet
+  // rather than about a task, so it is the one that does not have one.
+  if (notification.kind === "digest") {
+    return fit(notification.body, (text) => text);
+  }
+
   const task = notification.task;
 
   switch (notification.kind) {

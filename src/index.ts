@@ -11,11 +11,14 @@ import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
+import { MirrorChangeReader } from "./digest/changes.ts";
+import { DailyDigest } from "./digest/publish.ts";
+import { LlmSummariser } from "./digest/summarise.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
-import { createLlmRuntime } from "./llm/models.ts";
+import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
@@ -38,6 +41,7 @@ import {
   SecretBundle,
 } from "./secrets/load.ts";
 import { ensureStateCheckout } from "./state/bootstrap.ts";
+import type { Git } from "./state/git.ts";
 import { LeaseManager } from "./state/lease.ts";
 import { StateStore } from "./state/store.ts";
 import { Supervisor } from "./supervisor/loop.ts";
@@ -200,10 +204,23 @@ const main = async (): Promise<void> => {
       : {}),
   });
 
+  const digester = createDigest({
+    config,
+    git,
+    store,
+    leases,
+    worktrees,
+    llm,
+    notifier: discord.notifier,
+    metrics,
+    logger,
+  });
+
   const supervisor = new Supervisor({
     config,
     store,
     leases,
+    ...(digester === undefined ? {} : { digest: digester }),
     runner: new AgentSessionRunner({
       config,
       store,
@@ -290,6 +307,69 @@ const main = async (): Promise<void> => {
     await credentials.stop();
     await bridge;
   }
+};
+
+/**
+ * Build the daily digest, if this runner was told to publish one (DESIGN.md §19).
+ *
+ * Off by default, like the web view and for a related reason: publishing writes to the
+ * shared state repo and posts to the shared Discord channel, and a runner someone starts
+ * on a workstation must not begin doing either because it was upgraded. The claim protocol
+ * makes a second publisher harmless, not welcome.
+ *
+ * The summariser is a separate switch. Everything else in a digest is measured from git
+ * and costs nothing; the prose is the only part that spends tokens, so a runner minding
+ * its spend can drop the paragraph without losing the report.
+ */
+const createDigest = (options: {
+  readonly config: RunnerConfig;
+  readonly git: Git;
+  readonly store: StateStore;
+  readonly leases: LeaseManager;
+  readonly worktrees: WorktreeManager;
+  readonly llm: LlmRuntime;
+  readonly notifier: Notifier;
+  readonly metrics: AgentMetrics;
+  readonly logger: Logger;
+}): DailyDigest | undefined => {
+  const { config, logger } = options;
+  const { digest } = config;
+
+  if (!digest.enabled) {
+    logger.info("digest.disabled", { reason: "digest.enabled is false" });
+    return undefined;
+  }
+
+  logger.info("digest.configured", {
+    hour: digest.hour,
+    timeZone: digest.timeZone,
+    summarise: digest.summarise,
+  });
+
+  return new DailyDigest({
+    git: options.git,
+    store: options.store,
+    leases: options.leases,
+    notifier: options.notifier,
+    logger,
+    boundary: { hour: digest.hour, timeZone: digest.timeZone },
+    runner: config.runnerId,
+    branch: config.stateRepo.branch,
+    // Read-only, and strictly local: the digest reports on mirrors this runner already
+    // has and never fetches one to do it.
+    changes: new MirrorChangeReader(options.worktrees),
+    ...(digest.summarise
+      ? {
+          summariser: new LlmSummariser({
+            llm: options.llm,
+            timeZone: digest.timeZone,
+            thresholdFraction: config.handoff.thresholdFraction,
+          }),
+        }
+      : {}),
+    onPublished: (_date, quiet) =>
+      options.metrics.digests.inc({ runner: config.runnerId, quiet: String(quiet) }),
+  });
 };
 
 /**

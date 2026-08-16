@@ -85,6 +85,7 @@ const CONFIG: RunnerConfig = {
   ]),
   pollSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
+  digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   web: {
     enabled: true,
     port: 8080,

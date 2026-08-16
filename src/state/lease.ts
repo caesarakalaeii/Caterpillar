@@ -119,12 +119,39 @@ export class LeaseManager {
 
   /** Release voluntarily. Best-effort: a failure just means it will expire instead. */
   async release(lease: Lease): Promise<void> {
+    await this.releaseRef(leaseRef(lease.task), lease.oid);
+  }
+
+  /**
+   * Claim a ref that must be won exactly once across the whole fleet, ever.
+   *
+   * The same compare-and-swap as a task claim, with two differences that matter: the
+   * expected value is always empty, so this succeeds only if nobody has ever created the
+   * ref; and nothing renews or steals it, so winning is permanent. That is what a marker
+   * wants — "the digest for 2026-08-16 has been published" is not a fact that expires
+   * (DESIGN.md §19), and a stealable one would let a restarted runner republish a day.
+   *
+   * Returns the oid this runner wrote, or undefined when it did not win. Undefined is NOT
+   * proof that someone else did: a dead network fails the same push. Callers that must
+   * tell the two apart ask `hasRef` afterwards.
+   */
+  async claimOnce(ref: string, message: string): Promise<string | undefined> {
+    return this.casRef(ref, message, "");
+  }
+
+  /** Whether the remote has `ref` at all. */
+  async hasRef(ref: string): Promise<boolean> {
+    return (await this.git.lsRemote(this.remote, ref)) !== undefined;
+  }
+
+  /** Delete a ref this runner holds. Best-effort, and never deletes someone else's. */
+  async releaseRef(ref: string, oid: string): Promise<void> {
     await this.git.tryRun(
       "push",
       this.remote,
       "--delete",
-      leaseRef(lease.task),
-      `--force-with-lease=${leaseRef(lease.task)}:${lease.oid}`,
+      ref,
+      `--force-with-lease=${ref}:${oid}`,
     );
   }
 
@@ -135,11 +162,30 @@ export class LeaseManager {
    * carries no working-tree content and cannot conflict with repo history.
    */
   private async push(task: TaskId, expectedOid: string): Promise<Lease | undefined> {
+    const oid = await this.casRef(
+      leaseRef(task),
+      `lease ${task} runner=${this.runner}`,
+      expectedOid,
+    );
+    return oid === undefined ? undefined : { task, runner: this.runner, oid };
+  }
+
+  /**
+   * The compare-and-swap itself, shared by every ref this manager owns.
+   *
+   * ONE implementation on purpose: `--force-with-lease` semantics are the whole of the
+   * mutual exclusion (DESIGN.md §5), and a second copy written for a second kind of ref
+   * is a second chance to get an empty expected value subtly wrong. An empty `expectedOid`
+   * means "must not already exist"; anything else means "must be exactly this".
+   */
+  private async casRef(
+    ref: string,
+    message: string,
+    expectedOid: string,
+  ): Promise<string | undefined> {
     const emptyTree = await this.git.run("hash-object", "-t", "tree", "/dev/null");
-    const message = `lease ${task} runner=${this.runner}`;
     const oid = await this.git.run("commit-tree", emptyTree, "-m", message);
 
-    const ref = leaseRef(task);
     const result = await this.git.tryRun(
       "push",
       this.remote,
@@ -147,8 +193,7 @@ export class LeaseManager {
       `--force-with-lease=${ref}:${expectedOid}`,
     );
 
-    if (result.code !== 0) return undefined;
-    return { task, runner: this.runner, oid };
+    return result.code === 0 ? oid : undefined;
   }
 
   /**
