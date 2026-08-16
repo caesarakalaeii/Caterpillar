@@ -550,6 +550,11 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
 
 - **Release the lease LAST.** Anything recording *why* a task failed must write while the
   lease is held, using the heartbeat's current lease.
+- **`checkLimits` runs BEFORE a claim's first session.** So any limit still met when a
+  task returns to `ready` parks it again having run nothing, and any command that puts a
+  task back must clear whatever limit parked it or say plainly that it did not. `/resume`
+  and `/answer` both clear `noProgressStreak`; neither clears `sessions`, and the reply
+  says so.
 - **A first-session commit needs a baseline that exists.** The fallback is the branch's fork
   point, resolved locally — but do **not** use the fork point always, or every session after
   the first commit looks productive and thrashing never parks.

@@ -1146,3 +1146,94 @@ test("the runner says when the provider came back, once", async () => {
     "one message when it broke and one when it came back — not one per attempt",
   );
 });
+
+test("/resume clears the no-progress streak, or the task parks again without running", async () => {
+  // 2026-08-16, in the state repo, five seconds apart:
+  //
+  //   09:41:20  chore(BS-…-01): resumed from chat
+  //   09:41:25  chore(BS-…-01): parked
+  //
+  // `/resume` sets the task `ready` but left `noProgressStreak` at 3, and `workTask`
+  // runs `checkLimits` BEFORE the first session — so the task parked itself on the very
+  // next claim, having run nothing. The command reported success and did nothing.
+  //
+  // `applyAnswer` already solved this and says why: the streak that made a task park is
+  // not the next session's fault. Answering is progress; so is a human looking at a
+  // parked task and saying keep going. The SESSION limit is deliberately not forgiven —
+  // that is a budget, and raising it is a decision, not a side effect of resuming.
+  const STUCK = asTaskId("RESUME-4");
+  await seedTask(STUCK, {
+    status: "parked",
+    sessions: 5,
+    progress: { lastProgressSession: 2, noProgressStreak: 3 },
+  });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: STUCK });
+  assert.equal(outcome.kind, "resumed");
+
+  const pushed = await pushedState(STUCK);
+  assert.equal(pushed?.status, "ready");
+  assert.equal(pushed?.progress.noProgressStreak, 0, "resuming into an exhausted limit is a no-op");
+  assert.equal(
+    pushed?.progress.lastProgressSession,
+    2,
+    "the high-water mark is history and stays; only the streak is forgiven",
+  );
+
+  // ...and prove it end to end: the next claim must run a SESSION, not re-park.
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "ask-human",
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "Still stuck on the same thing — which way?",
+          summary: "needs a decision",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Polled rather than slept: this supervisor claims every `ready` task in the shared
+  // state repo, so how many claims come before this one is not this test's business.
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(STUCK);
+    if (state !== undefined && state.status !== "ready") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(
+    settled?.status,
+    "awaiting-human",
+    "a resumed task must reach a session — parking again without running is the bug",
+  );
+});
