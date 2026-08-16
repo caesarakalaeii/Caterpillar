@@ -217,6 +217,13 @@ awkward, the change is probably wrong.
    commit the mirror last fetched. `configure` unsets it and pins
    `remote.origin.push = HEAD`, so no incantation an agent types can move a branch other
    than its own (§3, DESIGN.md).
+10. **A mirror refresh never writes a branch a worktree holds.** One bare mirror serves
+    every task on a repo, and `clone --mirror` fetches `+refs/*:refs/*` — so once any task
+    pushed, the fetch tried to write a local head that task's worktree had checked out and
+    git refused the *whole* fetch, parking every later task on that repo. The refspecs
+    subtract `^refs/heads/agent/*` and one exclusion per branch `git worktree list` reports
+    as held, because deriving it from the worktrees survives an agent renaming its own
+    branch and a naming convention does not (§3, DESIGN.md).
 
 ## The web view
 

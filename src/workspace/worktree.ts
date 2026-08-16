@@ -42,8 +42,7 @@ const cloneUrl = (repo: RepoRef): string =>
   `https://${repo.host}/${repo.owner}/${repo.name}.git`;
 
 /**
- * What a mirror refresh is allowed to touch: everything EXCEPT the branches this runner's
- * own worktrees have checked out.
+ * Everything the mirror refresh always wants, and the branches it must never write.
  *
  * `clone --mirror` configures `+refs/*:refs/*`, so a plain `fetch --prune` tries to write
  * every remote ref onto the identically-named local ref — including `refs/heads/agent/<task>`
@@ -56,11 +55,12 @@ const cloneUrl = (repo: RepoRef): string =>
  * permanently — the second task on a repo parked two seconds after being claimed, which
  * reads as a scheduler fault rather than a git one.
  *
- * A negative refspec is the surgical fix: the mirror exists to supply upstream history to
- * create worktrees from, and it never needs to fetch back the agent branches it pushed
- * itself. Excluding them from the refspec also excludes them from `--prune`, so a local
- * branch whose remote counterpart was deleted by a merge survives rather than being
- * yanked out from under a live worktree.
+ * `^refs/heads/agent/*` is the standing half of the answer, and it is about ownership
+ * rather than about the refusal: the mirror exists to supply upstream history to create
+ * worktrees from, and it never needs to fetch back a branch it pushed itself. Excluding
+ * those refs from the refspec also excludes them from `--prune`, so an agent branch whose
+ * remote counterpart a merge deleted survives instead of being pruned out from under a
+ * worktree that may still be resumed. The rest of the answer is `checkedOutBranches`.
  *
  * Passed per invocation rather than written into the mirror's config, because `configure`
  * runs only on first clone and every mirror already on a PVC would keep the old refspec.
@@ -135,8 +135,54 @@ export class WorktreeManager {
     }
 
     const mirror = this.git.at(path);
-    await mirror.run("fetch", "--prune", "origin", ...MIRROR_REFSPECS);
+    await mirror.run("fetch", "--prune", "origin", ...(await this.refspecs(mirror)));
     return path;
+  }
+
+  /**
+   * The refspecs for one refresh: the standing set, plus an exclusion per branch a
+   * worktree currently holds.
+   *
+   * `^refs/heads/agent/*` alone assumed the agent stays on the branch we created for it.
+   * Nothing holds it there — the session drives git through its bash tool, and the PR tool
+   * takes whatever `head` it is handed — so an agent that renamed its work re-created the
+   * original failure under a name the exclusion could not match:
+   *
+   *   fatal: refusing to fetch into branch 'refs/heads/ci/govulncheck-go-1.25.13'
+   *          checked out at '/work/tasks/<other task>/<repo>'
+   *
+   * Same shape, same blast radius: two later tasks on that repo parked seconds after being
+   * claimed, naming a branch neither had ever touched. So the exclusion is derived from the
+   * worktrees rather than from a naming convention the agent never agreed to.
+   */
+  private async refspecs(mirror: Git): Promise<readonly string[]> {
+    const held = await this.checkedOutBranches(mirror);
+    return [...new Set([...MIRROR_REFSPECS, ...held.map((ref) => `^${ref}`)])];
+  }
+
+  /**
+   * Every branch a worktree of this mirror has checked out, as full ref names.
+   *
+   * `worktree list` is deliberately the source: it and the fetch's refusal both read
+   * git's own worktree list, so this cannot disagree with the check it exists to satisfy
+   * — including about worktrees whose directory has since been deleted, which still hold
+   * their branch until they are pruned. Porcelain emits `branch <fullref>` for a worktree
+   * on a branch, `detached` for one that is not, and neither for the bare mirror itself;
+   * only a branch a worktree HOLDS can refuse a fetch, so the other two contribute nothing.
+   *
+   * The cost is that such a branch stops tracking upstream until its worktree goes away.
+   * For `agent/<task>` that is the point. For the default branch — an agent that ran
+   * `git checkout main` in its worktree — it means later tasks fork from a mirror that is
+   * behind, which they resolve on their own PR. A stale base beats a repo whose every
+   * later task parks.
+   */
+  private async checkedOutBranches(mirror: Git): Promise<readonly string[]> {
+    const listed = await mirror.run("worktree", "list", "--porcelain");
+    return listed
+      .split("\n")
+      .filter((line) => line.startsWith("branch "))
+      .map((line) => line.slice("branch ".length).trim())
+      .filter((ref) => ref.length > 0);
   }
 
   /**

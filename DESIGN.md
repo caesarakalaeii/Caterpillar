@@ -128,7 +128,7 @@ declares which one it belongs to.
 credentials from the profile; **a task in one workspace can never obtain another
 workspace's credentials.** This is the same containment property as §9.1, one level up.
 
-#### A mirror refresh never touches `refs/heads/agent/*`
+#### A mirror refresh never touches a branch a worktree holds
 
 One bare mirror per repo serves every task on it, and each task's worktree checks out
 `agent/<task>` — a local branch in that shared mirror. `clone --mirror` configures
@@ -145,13 +145,38 @@ on that repo, permanently. Worktrees persist on the PVC after a session ends, so
 not limited to tasks running concurrently — and it surfaced as `task.parked` two seconds
 after a claim, which reads as a scheduler fault rather than a git one.
 
-Rule: **the mirror fetches `+refs/*:refs/*` minus `^refs/heads/agent/*`.** The mirror exists
-to supply upstream history to create worktrees from; it never needs to fetch back branches
-it pushed itself. Excluding them from the refspec also excludes them from `--prune`, so a
-branch whose remote counterpart a merge deleted is not yanked out from under a live
-worktree. The refspec is passed per invocation, not written into the mirror's config,
-because that config is only written on first clone and every mirror already on a PVC would
-keep the old one.
+`^refs/heads/agent/*` was the first answer, and it is still half of it — but only the half
+about *ownership*, not the half about the refusal. The mirror exists to supply upstream
+history to create worktrees from; it never needs to fetch back a branch it pushed itself,
+and excluding those refs also excludes them from `--prune`, so an agent branch whose remote
+counterpart a merge deleted is not pruned out from under a worktree that may still be
+resumed.
+
+What that exclusion assumed is that the agent stays on the branch we created for it.
+Nothing holds it there: the session drives git through its bash tool, and the PR tool takes
+whatever `head` it is handed. An agent that renamed its work reproduced the failure exactly,
+under a name the pattern could not match —
+
+```
+fatal: refusing to fetch into branch 'refs/heads/ci/govulncheck-go-1.25.13'
+       checked out at '/work/tasks/<other task>/<repo>'
+```
+
+— and again it was the *next* two tasks on that repo that parked, naming a branch neither
+had ever touched.
+
+Rule: **the mirror fetches `+refs/*:refs/*`, minus `^refs/heads/agent/*`, minus one
+exclusion per branch a worktree currently holds.** The held set comes from `git worktree
+list --porcelain`, because that and the fetch's refusal read git's own worktree list, so the
+exclusion cannot disagree with the check it exists to satisfy — a naming convention the
+agent never agreed to can. The cost is that a held branch stops tracking upstream until its
+worktree goes away; for `agent/<task>` that is the point, and for the default branch (an
+agent that ran `git checkout main`) it means later tasks fork from a mirror that is behind,
+which they resolve on their own PR. A stale base beats a repo whose every later task parks.
+
+The refspecs are passed per invocation, not written into the mirror's config — that config
+is only written on first clone, so every mirror already on a PVC would keep the old one, and
+the held set changes with every worktree anyway.
 
 #### An agent push can only ever move `agent/<task>`
 
