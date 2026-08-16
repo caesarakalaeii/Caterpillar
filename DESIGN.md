@@ -521,9 +521,15 @@ queue until the session it was meant to stop had already finished, and the opera
 Discord reply hung until then. `workTask` therefore watches for park requests naming its
 own task and takes only those (`takeWhere`), leaving everything else queued: the rest
 write the state repo, and this session holds the lease those writes would have to fence
-against. The cancel itself writes nothing — it aborts, the lease is released, and the
-park lands on the following poll. The reply says `cancelling`, not `parked`, because for
-a second or two that is the truth.
+against. The reply says `cancelling`, not `parked`, because the session may take a turn
+boundary to unwind and the human is waiting on a Discord interaction.
+
+Stopping the session is **not** cancelling the task, and the difference is easy to miss:
+an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
+means the next poll re-claims it and starts over while the operator watches the thing
+they cancelled carry on working. `workTask` therefore parks it under the lease it still
+holds, before releasing. A cancel that raced a lost lease does not — it has no standing
+to write, and `park` fences anyway.
 
 ## 7. Human interaction
 

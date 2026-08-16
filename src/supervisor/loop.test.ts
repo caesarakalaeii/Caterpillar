@@ -1366,8 +1366,23 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline && !sawAbort) await sleep(50);
 
+  // ...and the task must actually END UP parked. Aborting the session is only half of
+  // a cancel: an interrupted task is left `running`, which is claimable again, so
+  // without the park the very next poll would start the session over.
+  let parked: TaskState | undefined;
+  const settled = Date.now() + 30_000;
+  while (Date.now() < settled) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "parked") {
+      parked = state;
+      break;
+    }
+    await sleep(50);
+  }
+
   controller.abort();
   await running.catch(() => undefined);
 
   assert.ok(sawAbort, "the abort must reach the session, not just the reply");
+  assert.ok(parked !== undefined, "a cancelled task must end up parked, not re-claimed");
 });

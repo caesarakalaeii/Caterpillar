@@ -458,6 +458,7 @@ export class Supervisor {
     // operator's Discord reply hanging until then. This watches for that ONE request and
     // leaves everything else queued: the rest write the state repo, and this session
     // holds the lease those writes would have to fence against.
+    let cancelled = false;
     const watchCancels = setInterval(() => {
       const requests = this.deps.inbox?.takeWhere(
         (request) => request.kind === "park" && request.task === spec.id,
@@ -465,7 +466,11 @@ export class Supervisor {
       if (requests === undefined || requests.length === 0) return;
 
       logger.info("task.cancel-requested", { task: spec.id });
+      cancelled = true;
       interrupt.abort();
+      // Settled now rather than after the park, because the human is waiting on a
+      // Discord interaction and the session may take a turn boundary to unwind.
+      // `cancelling` says exactly that, and the park follows below.
       for (const request of requests) request.settle({ kind: "cancelling" });
     }, CANCEL_POLL_MS);
     watchCancels.unref();
@@ -553,16 +558,29 @@ export class Supervisor {
         metrics.cost.inc({ task: spec.id }, outcome.usage.costUsd);
 
         if (outcome.reason === "interrupted") {
-          // Nothing is recorded. The session did not reach a decision, and writing a
-          // session count and a journal entry for a pod restart would charge the task
-          // for an interruption that says nothing about it — the same reasoning as
-          // `releaseAfterOutage`, minus the cooldown, because no provider misbehaved.
+          // Nothing about the SESSION is recorded. It did not reach a decision, and
+          // writing a session count and a journal entry for a pod restart would charge
+          // the task for an interruption that says nothing about it — the same reasoning
+          // as `releaseAfterOutage`, minus the cooldown, because no provider misbehaved.
           logger.info("session.interrupted", {
             task: spec.id,
             session: state.sessions + 1,
+            cancelled,
             leaseLost: lost !== undefined,
             shuttingDown: signal.aborted,
           });
+
+          // A CANCEL is different from the other three, and this is the half that is easy
+          // to miss: stopping the session is not cancelling the task. An interrupted task
+          // is left `running`, which is claimable (§6.2) — so without this the very next
+          // poll would re-claim it and start the session over, and the operator would
+          // watch the thing they cancelled carry on working.
+          //
+          // Only when the lease is still ours: a cancel that raced a lost lease has no
+          // standing to write, and `park` fences anyway.
+          if (cancelled && lost === undefined) {
+            await this.park(heartbeat, spec, state, "cancelled from chat");
+          }
           return;
         }
 
