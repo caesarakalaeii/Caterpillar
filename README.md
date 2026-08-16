@@ -186,6 +186,12 @@ awkward, the change is probably wrong.
    cooldown instead of claiming the next task and failing identically. An account limit
    reached at 10:00 otherwise takes the whole queue with it in under a minute, which is
    exactly what happened on 2026-08-15 (§6.3).
+8. **An agent can only push the branch it is standing on.** Task worktrees share their
+   mirror's config, and `clone --mirror` sets `remote.origin.mirror`, which silently made
+   every agent `git push` a force-push of *every* ref — including `main`, at whatever
+   commit the mirror last fetched. `configure` unsets it and pins
+   `remote.origin.push = HEAD`, so no incantation an agent types can move a branch other
+   than its own (§3, DESIGN.md).
 
 ## Passing work between machines
 

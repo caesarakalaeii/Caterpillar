@@ -316,7 +316,7 @@ export class WorktreeManager {
   }
 
   /**
-   * Point this checkout at the credential helper.
+   * Point this checkout at the credential helper, and make its pushes narrow.
    *
    * `credential.useHttpPath` is REQUIRED: without it git omits `path` from the
    * credential request, every repo on a host looks identical to the helper, and
@@ -325,6 +325,8 @@ export class WorktreeManager {
   private async configure(path: string): Promise<void> {
     const git = this.git.at(path);
     const helper = `!${this.options.helperPath} --socket ${this.options.socketPath}`;
+
+    await this.disarmMirrorPush(git, path);
 
     // NOTE: `git config` inside a worktree writes to the repository's COMMON config,
     // shared by the mirror and every other worktree of it. That is fine — and wanted —
@@ -342,5 +344,41 @@ export class WorktreeManager {
     // those inherit the operator's global `commit.gpgsign`. The bot identity has no
     // signing key, and signing agent work with the operator's key would be a lie.
     await git.run("config", "commit.gpgsign", "false");
+  }
+
+  /**
+   * Stop the agent's own `git push` from being a MIRROR push.
+   *
+   * `clone --mirror` writes `remote.origin.mirror = true`, and a linked worktree shares
+   * the mirror's config — so a bare `git push` from a task worktree pushed every ref the
+   * mirror held, force, including `main`. The mirror's `main` is only as fresh as its last
+   * fetch, so when a sibling task had pushed in the meantime the agent silently rewound
+   * shared history over a commit no clone on the box had ever seen:
+   *
+   *   + 6a889c2...b0b1f47 main -> main (forced update)
+   *
+   * It also blocked the safe incantation: `git push -u origin <branch>` fails outright with
+   * "--mirror can't be combined with refspecs", so an agent that tries to be careful is
+   * pushed back towards the bare `git push` that does the damage.
+   *
+   * Unsetting the flag is necessary but not sufficient — a bare `git push` would then fall
+   * through to `push.default`, which on an unconfigured branch is a usage error, and on the
+   * operator's own global config could be anything. `remote.origin.push = HEAD` pins it:
+   * push the CURRENT branch to its own name upstream, and nothing else. An agent physically
+   * cannot move a branch it is not standing on, whatever it types.
+   *
+   * Both live in the mirror's shared config, which is what we want: the rule is a property
+   * of every task on the repo, not of one task. And because `configure` runs on every
+   * worktree create AND reuse — unlike the fetch refspec, which is why THAT one is passed
+   * per invocation — mirrors already on a PVC are healed the next time a task touches them.
+   */
+  private async disarmMirrorPush(git: Git, path: string): Promise<void> {
+    // `--unset-all` exits 5 when the key is absent, which is the steady state after the
+    // first call. Only a real failure should surface.
+    const unset = await git.tryRun("config", "--unset-all", "remote.origin.mirror");
+    if (unset.code !== 0 && unset.code !== 5) {
+      throw new Error(`could not unset remote.origin.mirror in ${path}: ${unset.stderr}`);
+    }
+    await git.run("config", "remote.origin.push", "HEAD");
   }
 }
