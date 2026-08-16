@@ -359,6 +359,26 @@ export class Supervisor {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
+      // The CAS is what established this was safe to take, so by here the previous
+      // holder is gone. Say so: a reclaim is a pod that died mid-task, and the whole
+      // failure used to be invisible — the task simply stopped, with no line anywhere
+      // connecting it to the deploy that killed it.
+      if (state.status === "running") {
+        this.deps.logger.warn("task.reclaimed", {
+          task: id,
+          runner: lease.runner,
+          sessions: state.sessions,
+        });
+        await store.appendJournal(
+          id,
+          state.sessions,
+          "The runner holding this task stopped without parking or finishing it — a " +
+            "restart, a lost lease, or a killed pod. The lease has since gone stale, so " +
+            `${lease.runner} has taken it over. Work already pushed to the task branch ` +
+            "is intact; anything the previous session had not committed is not.",
+        );
+      }
+
       this.deps.logger.info("task.claimed", {
         task: id,
         runner: lease.runner,

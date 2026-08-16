@@ -397,16 +397,31 @@ export const capabilitiesSatisfy = (
 /**
  * True when a task may be claimed right now (DESIGN.md §14.3).
  *
- * `ready` is necessary and no longer sufficient: a task cut from a plan waits on its
- * blockers. A blocker that is missing from the state repo entirely counts as unsatisfied
- * — a dangling dependency should stall its dependent visibly rather than be treated as
- * already met, which is what silently ignoring it would do.
+ * A task cut from a plan waits on its blockers. A blocker that is missing from the state
+ * repo entirely counts as unsatisfied — a dangling dependency should stall its dependent
+ * visibly rather than be treated as already met, which is what silently ignoring it
+ * would do.
+ *
+ * `running` IS claimable, and that is not a loophole — it is what makes crash recovery
+ * work at all. From the end of session 1 onward the pushed `state.json` says `running`,
+ * because `recordSession` writes the same status object it was handed. So every task
+ * past its first session that ends by any route other than a clean terminal transition
+ * — a killed pod, a Keel roll on every push to main, even a graceful SIGTERM — is left
+ * `running` on the remote with nothing that ever moves it back. Excluding it here made
+ * the stale-lease steal in `LeaseManager.claim` unreachable for exactly the tasks that
+ * needed it, which stranded one task per deploy, silently, forever.
+ *
+ * What decides whether a `running` task may actually be taken is the lease CAS, not this
+ * predicate: a successful claim means the lease was absent or stale, i.e. the previous
+ * holder is gone. Only that is an exclusion test, because only that is atomic. This
+ * function is a filter over a snapshot read seconds earlier, and a filter over stale
+ * data cannot establish exclusivity no matter which statuses it admits.
  */
 export const isClaimable = (
   state: TaskState,
   statusOf: (id: TaskId) => TaskStatus | undefined,
 ): boolean =>
-  state.status === "ready" &&
+  (state.status === "ready" || state.status === "running") &&
   (state.plan?.blockedBy ?? []).every((id) => statusOf(id) === "done");
 
 /**

@@ -375,6 +375,27 @@ On reclaim, the new session:
 2. Appends a journal entry recording the interruption.
 3. Replays context from `spec.md` + `journal.md` + `handoff.md`.
 
+**A reclaim requires `running` to be claimable, and for a long time it was not.** From
+the end of session 1 the pushed `state.json` says `running` — `recordSession` writes the
+status object it was handed — so this is the state EVERY interrupted task is in, not an
+edge case. `isClaimable` accepted only `ready`, and `claimNext` filters on it *before*
+calling `LeaseManager.claim`, which meant the stale-lease steal below could never run for
+the tasks it exists to serve. Every route out of a session other than a clean terminal
+transition stranded the task permanently: a killed pod, a lost lease, and a graceful
+SIGTERM alike — and Keel rolls the pod on every push to main, so this fired on each
+deploy, with no notification.
+
+Nothing was lost when it happened (branch commits and the journal survive, and `/cancel`
+then `/resume` recovers it), which is precisely why it went unnoticed: the symptom is a
+task that is simply never worked again.
+
+The predicate now admits `running` and lets the CAS adjudicate. That is the correct
+division: `isClaimable` filters a snapshot read seconds earlier, and a filter over stale
+data cannot establish exclusivity whatever statuses it admits — only the atomic
+compare-and-swap on the lease ref can, and a successful one already means the lease was
+absent or stale. Terminal and parked statuses stay excluded, because those are decisions
+rather than interruptions.
+
 The last session's transcript may be missing or truncated — that is acceptable, because
 the journal, not the transcript, is the source of truth.
 
