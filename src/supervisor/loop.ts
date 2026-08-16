@@ -189,7 +189,7 @@ export class Supervisor {
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
   async run(signal: AbortSignal): Promise<void> {
-    const { config, store, logger } = this.deps;
+    const { config, logger } = this.deps;
 
     logger.info("supervisor.start", {
       runner: config.runnerId,
@@ -198,56 +198,77 @@ export class Supervisor {
     });
 
     while (!signal.aborted) {
-      await store.pull("origin", config.stateRepo.branch);
+      // The whole iteration, for the same reason `workTask` below is wrapped: a failure
+      // here belongs to one poll, not to the process. `store.pull` throws on any non-zero
+      // git exit, `resolveEnv` awaits a token mint over an untimed fetch roughly hourly,
+      // and `claimNext` reaches the network through `ls-remote` — so a blip in any of
+      // them used to unwind out of `run()` into main's `finally`, which closes /healthz
+      // and the credential socket and then blocks forever on `await bridge`. The result
+      // was a live process, still answering Discord from a frozen snapshot, that polled
+      // nothing and that systemd would never restart because it never exited.
+      try {
+        await this.pollOnce(signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        logger.error("poll.failed", errorFields(error));
+        await sleep(config.pollSeconds * 1000);
+      }
+    }
+  }
 
-      // Both before claiming, so a task unparked by either is claimable on this same
-      // iteration rather than sitting idle until the next poll. Both also run DURING a
-      // provider cooldown: answering a question and ingesting an issue cost no tokens,
-      // and a queue that keeps filling while the provider is down is the correct
-      // behaviour — it is only starting sessions that has to stop.
-      await this.applyChatRequests();
-      await this.maybeIngest();
+  /** One iteration of the poll loop. Throws only what the caller should log and retry. */
+  private async pollOnce(signal: AbortSignal): Promise<void> {
+    const { config, store, logger } = this.deps;
 
-      if (await this.coolingDown()) continue;
+    await store.pull("origin", config.stateRepo.branch);
 
-      const claimed = await this.claimNext(await this.survey());
-      if (claimed === undefined) {
+    // Both before claiming, so a task unparked by either is claimable on this same
+    // iteration rather than sitting idle until the next poll. Both also run DURING a
+    // provider cooldown: answering a question and ingesting an issue cost no tokens,
+    // and a queue that keeps filling while the provider is down is the correct
+    // behaviour — it is only starting sessions that has to stop.
+    await this.applyChatRequests();
+    await this.maybeIngest();
+
+    if (await this.coolingDown()) return;
+
+    const claimed = await this.claimNext(await this.survey());
+    if (claimed === undefined) {
         // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
         // volume so collecting is a requirement rather than hygiene, but a collection
         // racing a session on this same runner is a risk with no upside — there is always
         // another idle poll.
         await this.deps.toolchain.maybeCollectGarbage();
 
-        // Debug, not info: at the default poll interval this is the single noisiest
-        // line the supervisor could emit, and an idle runner is not news.
-        logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
-        await sleep(config.pollSeconds * 1000);
-        continue;
-      }
+      // Debug, not info: at the default poll interval this is the single noisiest
+      // line the supervisor could emit, and an idle runner is not news.
+      logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
+      await sleep(config.pollSeconds * 1000);
+      return;
+    }
 
-      try {
-        await this.workTask(claimed.lease, claimed.spec, signal);
-      } catch (error) {
-        if (error instanceof LeaseLostError) {
-          // Another runner owns this task now. Drop everything without writing.
-          logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
-          continue;
-        }
-        if (signal.aborted) throw error;
-
-        // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
-        // exits the process, and because the claim is durable the restarted
-        // supervisor re-claims the same task and dies again — one malformed task
-        // wedges the whole runner permanently.
-        //
-        // `workTask` parks anything attributable to the task while it still holds the
-        // lease, so reaching this point means the failure escaped that path. Log it
-        // and keep polling rather than exiting.
-        logger.error("supervisor.unhandled", {
-          task: claimed.spec.id,
-          ...errorFields(error),
-        });
+    try {
+      await this.workTask(claimed.lease, claimed.spec, signal);
+    } catch (error) {
+      if (error instanceof LeaseLostError) {
+        // Another runner owns this task now. Drop everything without writing.
+        logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
+        return;
       }
+      if (signal.aborted) throw error;
+
+      // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
+      // exits the process, and because the claim is durable the restarted
+      // supervisor re-claims the same task and dies again — one malformed task
+      // wedges the whole runner permanently.
+      //
+      // `workTask` parks anything attributable to the task while it still holds the
+      // lease, so reaching this point means the failure escaped that path. Log it
+      // and keep polling rather than exiting.
+      logger.error("supervisor.unhandled", {
+        task: claimed.spec.id,
+        ...errorFields(error),
+      });
     }
   }
 

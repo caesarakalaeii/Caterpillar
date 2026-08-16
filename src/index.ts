@@ -259,6 +259,12 @@ const main = async (): Promise<void> => {
   try {
     await supervisor.run(controller.signal);
   } finally {
+    // FIRST, and unconditionally. `runBridge`'s loop only exits when this signal aborts,
+    // and only the SIGTERM/SIGINT handlers used to abort it — so a throw out of
+    // `supervisor.run` reached `await bridge` and blocked there forever, having already
+    // closed /healthz and the credential socket. The Discord websocket kept the event
+    // loop alive, so the process never exited, and `Restart=always` never fired.
+    controller.abort();
     stopMetrics();
     await credentials.stop();
     await bridge;
@@ -355,10 +361,35 @@ const runBridge = (
   }).run(signal);
 };
 
-main().catch((error: unknown) => {
-  // A failure here can predate `loadConfig`, so this logger takes the default level
-  // rather than the configured one — a boot failure must never be the thing that gets
-  // filtered out.
-  new JsonLogger().error("supervisor.boot-failed", errorFields(error));
-  process.exitCode = 1;
-});
+/**
+ * Die loudly rather than linger.
+ *
+ * Every failure path here has the same shape: something the supervisor cannot recover
+ * from happens, and the process stays alive because a websocket or a listening socket is
+ * still holding the event loop open. A runner that is up but not working is the worst of
+ * the three states — Kubernetes will not restart it, systemd will not restart it, and
+ * `/healthz` says 200 — so each of these exits on purpose.
+ *
+ * `process.exit` rather than `exitCode`: setting the code only takes effect once the loop
+ * drains, which is exactly what is not going to happen.
+ */
+const die = (event: string, error: unknown): never => {
+  new JsonLogger().error(event, errorFields(error));
+  process.exit(1);
+};
+
+process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
+process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
+
+main().then(
+  () => {
+    // A clean return means the signal aborted and shutdown completed.
+    process.exit(0);
+  },
+  (error: unknown) => {
+    // A failure here can predate `loadConfig`, so this logger takes the default level
+    // rather than the configured one — a boot failure must never be the thing that gets
+    // filtered out.
+    die("supervisor.boot-failed", error);
+  },
+);
