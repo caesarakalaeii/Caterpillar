@@ -75,6 +75,7 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | Credential service + git helper | implemented, integration-tested through **real git** |
 | Workspace mirror clone (private repos) | fixed, deployed, exercised in-cluster |
 | **Mirror refresh vs worktrees** | **fixed (#33)** — verified in-cluster on a poisoned mirror |
+| **Agent push was a mirror push** | **fixed** — `main` can no longer be moved by a task (§B2) |
 | GitHub App forge (mint, PR, checks) | implemented, verified against live GitHub |
 | Forgejo/Codeberg forge | implemented, endpoints verified against live Codeberg |
 | Session runner | implemented, **many real tasks to merged PRs** |
@@ -182,6 +183,33 @@ parked two seconds after being claimed, reading as a scheduler fault.
 
 Fixed with a negative refspec, `^refs/heads/agent/*`, passed per invocation because
 `configure` only runs on first clone and every mirror already on a PVC keeps the old refspec.
+
+### B2. The same shared config made every agent push a force-push of `main` — FIXED
+
+The push-side twin of B, and the one that did real damage. `clone --mirror` also sets
+`remote.origin.mirror = true`; a worktree reads the mirror's config, so the agent's plain
+`git push` mirror-pushed **every** ref, forced. The mirror's `main` is as stale as its last
+fetch, so on `caesarakalaeii/sub2_random` a task rewound shared `main` over `6a889c2` — a
+commit a sibling task had pushed and no clone on the box had ever fetched:
+
+```
++ 6a889c2...b0b1f47 main -> main (forced update)
+```
+
+The flag also made `git push -u origin <branch>` fail outright
+(`--mirror can't be combined with refspecs`), which is what drove agents to the bare `git
+push` in the first place.
+
+Fixed in `configure`: unset `remote.origin.mirror`, set `remote.origin.push = HEAD`. Written
+into the shared config *deliberately* — unlike B's refspec — because `configure` runs on every
+worktree create and reuse, so PVC mirrors already carrying the flag are healed on next touch.
+Regression test drives a real `git push` from a worktree against a stale mirror and asserts
+`main` did not move.
+
+**Recovery note:** the destroyed commit was recoverable server-side. `b0b1f47` was `6a889c2`'s
+*parent*, so restoring was a plain fast-forward — GitHub keeps unreferenced commits reachable
+via the API (`gh api repos/<o>/<r>/commits/<sha>`) long after a forced update. Check there
+before concluding a commit is gone; the local reflog will not show it.
 
 ### C. The acceptance toolchain is missing from the runner — NOT fixed here, owned elsewhere
 
@@ -543,6 +571,13 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
   post-session code (probe, verifier) must not need the network.
 - **Never set `remote.origin.url` from a worktree** — worktrees share the mirror's config.
   Use **`--git-common-dir`, not `--git-dir`**, for `info/exclude` and shared refs.
+- **A worktree of a `--mirror` clone inherits `remote.origin.mirror`**, so a bare `git push`
+  there force-pushes *every* ref. Sharing the mirror's config cuts both ways: it is the
+  delivery mechanism for the credential helper AND for a footgun. Pin
+  `remote.origin.push = HEAD` (§B2).
+- **A force-pushed-away commit is usually still on the forge.** GitHub answers
+  `gh api repos/<o>/<r>/commits/<sha>` for unreferenced objects; check there before trusting
+  a local reflog that never saw the commit.
 - **"No merging" is not expressible as a GitHub permission.** `pull_requests: write`
   authorises merge; branch protection requiring an approving review is what enforces it.
 

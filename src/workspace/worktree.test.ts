@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { Git } from "../state/git.ts";
-import type { RepoRef } from "../domain/task.ts";
+import { asTaskId, type RepoRef } from "../domain/task.ts";
 import { WorktreeManager } from "./worktree.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
@@ -246,5 +246,91 @@ test("refreshing a mirror does not fail because a task branch is checked out", a
     (await new Git(join(root, "wt"), hermetic).run("rev-parse", "--abbrev-ref", "HEAD")).trim(),
     "agent/T-1",
     "the live worktree must survive the refresh",
+  );
+});
+
+test("an agent's plain `git push` cannot move any branch but its own", async () => {
+  // The bug that rewound shared `main` by a commit nobody had fetched.
+  //
+  // `clone --mirror` writes `remote.origin.mirror = true`, and a linked worktree shares
+  // the mirror's config — so the agent's own `git push`, run through the bash tool from
+  // its worktree, was a MIRROR push. It force-updated every ref the mirror held onto the
+  // remote, and the mirror's `main` is whatever the last fetch saw:
+  //
+  //   + 6a889c2...b0b1f47 main -> main (forced update)
+  //
+  // A sibling task on the same repo had pushed a commit that this mirror had never
+  // fetched, so the push silently reset upstream `main` backwards. It also made the
+  // correct incantation impossible — `git push -u origin <branch>` died with
+  // "--mirror can't be combined with refspecs", which pushes the agent towards the bare
+  // `git push` that does the damage.
+  const root = await scratch();
+  const origin = join(root, "origin.git");
+  const hermetic = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "caterpillar",
+    GIT_AUTHOR_EMAIL: "caterpillar@example.invalid",
+    GIT_COMMITTER_NAME: "caterpillar",
+    GIT_COMMITTER_EMAIL: "caterpillar@example.invalid",
+  };
+  const plain = new Git(root, hermetic);
+
+  await plain.run("init", "--bare", "--initial-branch=main", origin);
+  const seed = join(root, "seed");
+  await plain.run("clone", origin, seed);
+  const seedGit = new Git(seed, hermetic);
+  await writeFile(join(seed, "f"), "one\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "one");
+  await seedGit.run("push", "origin", "HEAD:main");
+
+  // A mirror as `syncMirror` would have left it, pointed at the local origin so the rest
+  // runs without a network or a credential.
+  const mirror = mirrorDir(root);
+  await mkdir(join(mirror, ".."), { recursive: true });
+  await plain.run("clone", "--mirror", origin, mirror);
+
+  // `ensureWorktree` takes the fetch path and, crucially, runs `configure`.
+  const worktree = await manager(root).ensureWorktree(REPO, asTaskId("T-1"));
+  const agent = new Git(worktree, hermetic);
+
+  // A SIBLING task pushes to main after this mirror last fetched, so the mirror's idea
+  // of `main` is now stale — exactly the state that made the mirror push destructive.
+  await writeFile(join(seed, "g"), "sibling\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "sibling agent commit");
+  await seedGit.run("push", "origin", "HEAD:main");
+  const siblingMain = (await seedGit.run("rev-parse", "HEAD")).trim();
+
+  await writeFile(join(worktree, "w"), "task work\n");
+  await agent.run("add", "-A");
+  await agent.run("commit", "-m", "task work");
+
+  // What the agent actually types. It must succeed — a task that cannot push is broken
+  // too — but it must only ever carry the task's own branch.
+  await agent.run("push");
+
+  const originGit = new Git(origin, hermetic);
+  assert.equal(
+    (await originGit.revParse("refs/heads/main"))?.trim(),
+    siblingMain,
+    "an agent push must never move `main`, least of all backwards over a commit the " +
+      "mirror never fetched",
+  );
+  assert.equal(
+    (await originGit.revParse("refs/heads/agent/T-1"))?.trim(),
+    (await agent.run("rev-parse", "HEAD")).trim(),
+    "the agent's own branch must still reach the remote",
+  );
+
+  // The form the agent reaches for when a bare push looks unsafe must also work, so it is
+  // never pushed back towards the destructive one.
+  const explicit = await agent.tryRun("push", "-u", "origin", "agent/T-1");
+  assert.equal(
+    explicit.code,
+    0,
+    `\`git push -u origin <branch>\` must work, got: ${explicit.stderr}`,
   );
 });

@@ -153,6 +153,36 @@ worktree. The refspec is passed per invocation, not written into the mirror's co
 because that config is only written on first clone and every mirror already on a PVC would
 keep the old one.
 
+#### An agent push can only ever move `agent/<task>`
+
+The same shared config cuts the other way on push. `clone --mirror` also writes
+`remote.origin.mirror = true`, and a linked worktree reads the mirror's config — so the
+agent's own `git push`, typed into the bash tool from its worktree, was a **mirror push**:
+every ref the mirror holds, forced, onto the remote. The mirror's `main` is only as fresh
+as its last fetch, so with a sibling task pushing to the same repo the agent silently
+rewound shared history:
+
+```
++ 6a889c2...b0b1f47 main -> main (forced update)
+```
+
+The destroyed commit had never been fetched into any clone on the box, so no local reflog
+could restore it. Worse, the flag also blocks the careful form — `git push -u origin
+<branch>` fails with `--mirror can't be combined with refspecs` — so an agent trying to be
+precise is pushed back towards the bare `git push` that does the damage.
+
+Rule: **`configure` unsets `remote.origin.mirror` and sets `remote.origin.push = HEAD`.**
+Unsetting alone is not enough — a bare `git push` would then fall through to `push.default`,
+which is a usage error on an unconfigured branch and on a machine runner inherits whatever
+the operator's global config says. `HEAD` pins it to *the current branch, to its own name
+upstream, and nothing else*: an agent cannot move a branch it is not standing on, whatever
+it types. Delivery to the default branch goes through the PR path (§12), never a push.
+
+Unlike the fetch refspec above, this **is** written into the shared config — the rule is a
+property of every task on the repo, not of one invocation — and because `configure` runs on
+every worktree create *and* reuse, mirrors already on a PVC are healed the next time a task
+touches them.
+
 ## 4. State model
 
 ### 4.1 Layout
