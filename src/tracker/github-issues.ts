@@ -85,7 +85,25 @@ interface GitHubIssue {
   readonly labels?: readonly GitHubLabel[];
   /** Present only on pull requests. Its presence is the only reliable discriminator. */
   readonly pull_request?: unknown;
+  /**
+   * The author's relationship to the repository, as GitHub computes it. Comes back on
+   * the list response, so gating on it costs no extra request.
+   *
+   * Absent on very old GHES versions; treated as untrusted when missing, because the
+   * alternative is a silent downgrade to "anyone" on exactly the deployments least
+   * likely to be watched.
+   */
+  readonly author_association?: string;
 }
+
+/**
+ * Associations whose holders may have an issue body executed by this runner.
+ *
+ * `CONTRIBUTOR` is deliberately absent: GitHub gives it to anyone with a merged commit,
+ * which on a public repo is close to "anyone who has ever been helpful once". The bar
+ * here is push access, not history.
+ */
+const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 export class GitHubIssuesApiError extends Error {
   readonly status: number;
@@ -177,6 +195,7 @@ export class GitHubIssuesTracker implements Tracker {
           title: issue.title ?? `issue ${issue.number}`,
           body: issue.body ?? "",
           url: issue.html_url ?? `https://github.com/${slug}/issues/${issue.number}`,
+          authorTrusted: TRUSTED_ASSOCIATIONS.has(issue.author_association ?? ""),
         });
       }
     }

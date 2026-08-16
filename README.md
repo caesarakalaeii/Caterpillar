@@ -39,6 +39,17 @@ acceptance:
 
 An item without one is refused, and commented on **once** explaining what to write.
 
+**On GitHub the author must have push access** — `OWNER`, `MEMBER` or `COLLABORATOR`.
+Labelling someone else's issue is not enough to run it, because the author can edit their
+own body after the label is applied and `acceptance` is executed as shell on the runner.
+To hand an outside contributor's request to the agent, open your own issue referencing
+theirs. Vikunja has no such check and needs none — writing to a project already requires
+an account someone provisioned (§14.1).
+
+Repos are bounded too: an item may only name repos on its workspace's own forge, and
+never the state repo (§9.1). A `codeberg.org/...` sibling in a GitHub workspace is
+refused rather than half-working.
+
 In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
 *inside* a code block instead — intake accepts either position.
 

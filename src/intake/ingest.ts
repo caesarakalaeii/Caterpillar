@@ -27,7 +27,7 @@ import type { Logger } from "../obs/log.ts";
 import type { StateStore } from "../state/store.ts";
 import type { WorkspaceScope } from "../forge/types.ts";
 import type { Tracker, TrackerItem } from "../tracker/types.ts";
-import { renderSpec, taskIdFor } from "./spec.ts";
+import { renderSpec, taskIdFor, type IngestResult } from "./spec.ts";
 
 /**
  * Whether an intake pass is due.
@@ -177,11 +177,26 @@ export class Ingester {
       return "skipped";
     }
 
-    const rendered = renderSpec(item, {
-      workspace,
-      scope,
-      ...(self !== undefined ? { defaultRepo: self } : {}),
-    });
+    const rendered: IngestResult = item.authorTrusted
+      ? renderSpec(item, {
+          workspace,
+          scope,
+          ...(self !== undefined ? { defaultRepo: self } : {}),
+        })
+      : {
+          kind: "rejected",
+          // Deliberately NOT the `agent` block template. The template is instructions for
+          // making this body executable, and handing them to an author we have just
+          // declined to trust is the one comment that turns a refusal into a tutorial.
+          // The person who needs to act is the maintainer who applied the label.
+          reason:
+            "The author of this item does not have write access to this repository, so " +
+            "its body is not run as a task. An `agent` block's `acceptance` list is " +
+            "executed as shell on the runner, and the body can be edited by its author " +
+            "after the label is applied — so the label alone cannot authorise it.\n\n" +
+            "If this work should go to the agent, a maintainer should open it as their " +
+            "own item, referencing this one.",
+        };
 
     if (rendered.kind === "rejected") {
       const digest = digestOf(item);

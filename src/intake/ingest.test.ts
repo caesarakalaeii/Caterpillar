@@ -86,10 +86,11 @@ class FakeTracker implements Tracker {
   }
 }
 
-const item = (body: string, number = "12"): TrackerItem => ({
+const item = (body: string, number = "12", authorTrusted = true): TrackerItem => ({
   ref: { kind: "github-issues", id: number, container: "acme/widget" },
   title: "Fix the widget",
   body,
+  authorTrusted,
   url: `https://github.com/acme/widget/issues/${number}`,
 });
 
@@ -172,6 +173,51 @@ test("an item that cannot become a task is commented on exactly once", async () 
     assert.equal((await subject.ingest("origin", "main")).created, 0);
   }
   assert.equal(tracker.comments.length, 1, "one comment, however many passes run");
+});
+
+test("an item from an author without write access never becomes a task", async () => {
+  // The attack this closes: `listAgentItems` filters on the label alone, and the body is
+  // re-read from the tracker on every pass. An outside contributor opens an issue, a
+  // maintainer labels it, and the author — who can edit their own body forever — then
+  // pastes in an `agent` block whose `acceptance` list runs as shell on the runner.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID, "12", false)]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
+
+  const pass = await subject.ingest("origin", "main");
+  assert.equal(pass.created, 0);
+  assert.equal(pass.rejected, 1);
+  assert.deepEqual(await store.listTasks(), []);
+});
+
+test("the refusal to an untrusted author does not hand them the template", async () => {
+  // Posting "here is how to write an agent block" to someone we just declined to trust
+  // is what turned the first refusal into a working set of instructions.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item("Please just fix it.", "12", false)]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
+
+  await subject.ingest("origin", "main");
+
+  const text = tracker.comments[0]?.text ?? "";
+  assert.equal(tracker.comments.length, 1);
+  assert.doesNotMatch(text, /```agent/, "the template must not be quoted back");
+  assert.match(text, /write access/);
+});
+
+test("an untrusted author cannot re-open the item by editing it", async () => {
+  // The digest re-opens a refusal when the human-authored content changes, which is
+  // correct for a maintainer fixing their own block and is exactly the wrong behaviour
+  // for an author who is not allowed to supply one at all.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item("Please just fix it.", "12", false)]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
+
+  await subject.ingest("origin", "main");
+  tracker.setItems([item(VALID, "12", false)]);
+
+  assert.equal((await subject.ingest("origin", "main")).created, 0);
+  assert.deepEqual(await store.listTasks(), []);
 });
 
 test("editing a refused item makes intake look again", async () => {

@@ -1378,6 +1378,29 @@ cycle is discarded whole rather than partially.
 
 ### 14.1 The `agent` block
 
+**Who wrote it is checked before what it says.** On GitHub the item's author must hold
+`OWNER`, `MEMBER` or `COLLABORATOR` — push access, in other words. `CONTRIBUTOR` is
+deliberately not enough: GitHub grants it for one merged commit, which on a public repo
+is close to "anyone who has ever been helpful once".
+
+The label cannot carry this on its own, and the reason is a sequencing property rather
+than a trust one. A maintainer applies `agent` to an item; the AUTHOR keeps the right to
+edit the body afterwards, forever. Intake re-reads the body on every pass, so the text
+that gets executed is not the text anyone approved. Since `acceptance` runs as shell in
+the supervisor's own process, before the CI gate, the gap between "labelled" and
+"executed" is a gap between two different documents.
+
+The refusal for an untrusted author deliberately does **not** quote the template back.
+Everywhere else a refusal explains exactly what to write, which is right when the reader
+is allowed to write it; here it would be a set of instructions for making the body
+executable, handed to the one person who must not have them. The comment says a
+maintainer should open their own item instead.
+
+Vikunja has no equivalent check and needs none: writing to a project requires an account
+someone provisioned, and the agent's token only sees projects that account was granted.
+There is no arm's-length contributor. `VikunjaTracker` says so at the line that sets
+`authorTrusted`, so a future public instance has one place to change.
+
 What a human writes in the tracker item:
 
 ````

@@ -17,6 +17,7 @@ const item = (body: string, title = "Make the thing work"): TrackerItem => ({
   title,
   body,
   url: "https://github.com/acme/widget/issues/12",
+  authorTrusted: true,
 });
 
 const block = (yaml: string): string => ["```agent", yaml, "```"].join("\n");
@@ -159,6 +160,7 @@ test("an item with no repo to fall back on must declare one", async () => {
       title: "Do the thing",
       body: block(["acceptance:", '  - "npm test"'].join("\n")),
       url: "https://tasks.example.invalid/tasks/42",
+      authorTrusted: true,
     },
     { workspace: WORKSPACE, scope: SCOPE },
   );
@@ -390,6 +392,7 @@ test("a Vikunja description survives the HTML round-trip into a spec", async () 
       title: "Widget drops frames",
       body: stripHtml(description),
       url: "https://tasks.example.invalid/tasks/42",
+      authorTrusted: true,
     },
     { workspace: WORKSPACE, scope: SCOPE },
   );
