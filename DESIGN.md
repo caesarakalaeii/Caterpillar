@@ -1683,3 +1683,137 @@ never holds it — uploads and downloads are supervisor-mediated exactly like th
 None of §17.1 is implemented. It is written down because the pointer format is the part that
 has to be decided before anything depends on it, and because the honest answer to "where do
 the game dumps go" is currently "nowhere, and they should not need to".
+
+---
+
+## 18. The web view
+
+Discord is a signal channel and Grafana is an aggregate. Neither answers the question an
+operator actually asks first — *what is this thing doing right now, and why* — because
+answering it means reading a task's spec, its journal, the questions it asked, and the
+messages of the session currently in flight, all at once. Every one of those already
+exists; none of them was reachable without `kubectl exec` and a `git log`.
+
+So: a read-only web view, one page per thing, behind the cluster's existing SSO.
+
+### It runs inside the supervisor
+
+The obvious shape is a second Deployment that clones the state repo. It was rejected.
+
+Such a process needs its own copy of the state-repo credential and its own clone to keep
+fresh, which is a second thing that can fall behind and a second place a token lives. And
+it still could not show the two things the view exists for: **the log this process is
+writing** and **the session it is running**. Both are in this process's memory, and
+neither is in git until later — a transcript is written when a session ENDS, and pushed
+after that.
+
+So the view runs in the supervisor, next to the outbound notifier and the gateway
+websocket, for the same reason those do (§11.2, §7).
+
+The consequence is stated rather than hidden: **fleet-wide task data comes from git and is
+complete; logs and in-flight messages are this runner's only.** Another runner's tasks are
+visible here — the state repo is the fleet's shared surface — but its logs are in Loki and
+its live session is in its own process.
+
+### Its own port
+
+`web.port`, default 8080, never the metrics port. One Service port is scraped by the
+ServiceMonitor and one is published by the Ingress, so "what is exposed" is answerable by
+reading a Service rather than by reading the router. The web view is the only thing behind
+the Ingress; `/metrics` is not on it.
+
+### Read-only, and provably so
+
+The guarantee rests on three independent things, because one mechanism is one edit away
+from being wrong:
+
+1. anything that is not `GET` or `HEAD` is refused with 405 **before routing**, so there
+   is no handler a write could reach even if one were added by accident;
+2. every handler goes through `web/view.ts`, which reads and does nothing else — no
+   commit, no push, no ref update, no forge call. The property is checkable by reading one
+   file;
+3. the process holds no forge token while serving. The credential service refuses to
+   answer outside a session by design (§9.2), so even a bug here has nothing to spend.
+
+### Everything on these pages is untrusted input
+
+This is the part that decides the implementation. A goal, a journal entry, a question, the
+text of a bash result — all of it is written by a model, and quotes whatever that model
+read in a repository. It is the §11.2 rule about Discord mentions, one layer down.
+
+- **Escaping is the default and `raw` is the exception.** `web/html.ts` is a tagged
+  template that escapes every interpolation; there is no sanitiser and there should never
+  be one, because sanitising is a guessing game and escaping is not.
+- **CSP `default-src 'none'`,** with no `unsafe-inline`. That is why the stylesheet and
+  the script are routes rather than inline blocks.
+- **An artifact is served as `application/octet-stream`, as an attachment.** Agent-authored
+  bytes rendered as a document on the origin that serves every transcript would be script.
+- **A URL reaching an `href` is scheme-checked** (`safeUrl`): `javascript:` and `data:` are
+  script on this origin, and a PR url arrives from a forge.
+- **Task ids and artifact names are validated with the same guards the chat commands use.**
+  Writing this view is what found that `isTaskId` accepted `..` — a directory name that
+  resolves to the state repo root, reachable from a slash command since the day it shipped.
+
+### Authentication is the Ingress's job, and `requireForwardedUser` is the seatbelt
+
+Authelia forward-auth at the Ingress, exactly as `plot-spot.caes.ar` does it. The app
+implements no login and stores no session.
+
+`web.requireForwardedUser` makes the supervisor refuse any request that did not arrive with
+the proxy's identity header. **This is not a second authentication system** — anything
+already inside the cluster can set a header. It is a fail-closed check on the one realistic
+failure: an Ingress whose forward-auth annotations are typo'd or dropped, which otherwise
+publishes the whole state repo to the internet and looks exactly like a working deployment.
+`/healthz` is answered before the check, because the kubelet does not come through the
+Ingress and a probe that gets 401 restarts a healthy pod forever.
+
+`web.enabled` defaults to **false**. A runner on a workstation must not begin serving every
+transcript the fleet has produced because it was upgraded; in the cluster it is turned on in
+the same ConfigMap as the Ingress that authenticates it.
+
+### The two in-memory sources
+
+**`obs/ring.ts`** holds the last N log lines. It is wired as `JsonLogger`'s `write` SINK
+rather than as a second `Logger`, which is the whole trick: the sink runs only for records
+that already survived the configured level, so the ring and the container's stdout cannot
+disagree, and the threshold is not implemented twice. It carries nothing stdout does not,
+so §11's "never log a credential" rule covers both.
+
+**`obs/live.ts`** holds the session in flight. pi already keeps these messages in
+`agent.state.messages` for the length of the session, so this keeps references to objects
+that are alive anyway; clearing at session end is what stops it becoming a second,
+unbounded copy of every transcript. The tap is `SessionOptions.onMessage`, called from the
+`message_end` subscription that was already there for usage accounting — and wrapped in a
+`try`, because an observer that throws would tear down pi's event dispatch mid-session,
+which is a live view costing the task it was watching.
+
+### There is no runner registry
+
+`runners/<runner-id>.json` has been in the §4.1 layout since the beginning and is still not
+written. It was reconsidered here and rejected again: a heartbeat file committed to the
+state repo every poll is a commit per runner per interval, forever, in a repo every runner
+clones and pulls constantly — the same objection §17 makes to large artifacts.
+
+Who is running what is derived from task ownership instead, which costs nothing and is
+already true. The price is that an **idle** runner other than this one is invisible: it owns
+nothing, so nothing names it. That is the correct trade for a question ("where is this task
+running") that is only ever asked about tasks that are running.
+
+`state.owner` is a mirror of the lease and is never cleared (`transition` in
+`supervisor/loop.ts` stamps it and nothing unstamps it), so on a task that is not `running`
+it names the runner that worked it LAST. The view says "last run by" there rather than
+"held by", and counts only running tasks when it reports who is busy — otherwise a runner
+that finished a task in March is reported as holding it in August.
+
+### Rendered on the server
+
+No build step, no framework, no dependency: the stylesheet and the script are strings in
+`web/assets.ts` that `tsc` emits, because the image copies `dist/` and nothing else and a
+`.css` file on disk would work in development and 404 in the cluster. The live pages
+re-fetch themselves and swap `<main>`; the server already knows how to draw every one of
+these, and a second renderer in the browser is a second thing to keep in step with the
+first.
+
+Spec and journal prose is shown as the markdown SOURCE it is. A markdown renderer is either
+a dependency or a hand-rolled parser, and both are a new place for agent-authored text to
+become markup.

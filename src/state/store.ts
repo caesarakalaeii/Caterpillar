@@ -20,7 +20,7 @@
 import { mkdir, readFile, readdir, rm, writeFile, appendFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { GitError, type Git } from "./git.ts";
 import {
@@ -368,6 +368,39 @@ export class StateStore {
     await writeFile(join(dir, name), gzipSync(Buffer.from(jsonl, "utf8")));
   }
 
+  /**
+   * Session ordinals this task has a stored transcript for, ascending.
+   *
+   * Sorted NUMERICALLY rather than by file name. The names are zero-padded to three
+   * digits, so a lexical sort is right up to session 999 and silently wrong after it —
+   * the kind of bug that appears once, on the longest-running task, years in.
+   */
+  async listSessions(task: TaskId): Promise<readonly number[]> {
+    const dir = join(this.taskDir(task), "sessions");
+    if (!existsSync(dir)) return [];
+
+    return (await readdir(dir))
+      .map((name) => /^(\d+)\.jsonl\.gz$/.exec(name)?.[1])
+      .flatMap((digits) => (digits === undefined ? [] : [Number.parseInt(digits, 10)]))
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * One stored transcript, decompressed. Undefined when there is none.
+   *
+   * The ordinal reaches this from a URL, so it is checked rather than trusted: anything
+   * that is not a positive integer never becomes part of a path.
+   */
+  async readSessionTranscript(task: TaskId, session: number): Promise<string | undefined> {
+    if (!Number.isSafeInteger(session) || session < 1) return undefined;
+
+    const name = `${String(session).padStart(3, "0")}.jsonl.gz`;
+    const path = join(this.taskDir(task), "sessions", name);
+    if (!existsSync(path)) return undefined;
+
+    return gunzipSync(await readFile(path)).toString("utf8");
+  }
+
   /** Unanswered question, if the task is parked waiting on one. */
   async pendingQuestion(task: TaskId): Promise<{ readonly index: number; readonly question: string } | undefined> {
     const dir = join(this.taskDir(task), "questions");
@@ -382,6 +415,64 @@ export class StateStore {
     if (files.includes(answer)) return undefined;
 
     return { index, question: await readFile(join(dir, last), "utf8") };
+  }
+
+  /**
+   * Every question this task has asked, with its answer where one was given.
+   *
+   * `pendingQuestion` answers "is this task blocked right now"; this answers "what has
+   * this task needed a human for", which is a different question and the one the web
+   * view (DESIGN.md §18) is for. Read-only — the numbering rule stays with the writers.
+   */
+  async listQuestions(
+    task: TaskId,
+  ): Promise<readonly { readonly index: number; readonly question: string; readonly answer?: string }[]> {
+    const dir = join(this.taskDir(task), "questions");
+    if (!existsSync(dir)) return [];
+
+    const files = await readdir(dir);
+    const indices = files
+      .map((name) => /^(\d+)-question\.md$/.exec(name)?.[1])
+      .flatMap((digits) => (digits === undefined ? [] : [Number.parseInt(digits, 10)]))
+      .sort((a, b) => a - b);
+
+    return Promise.all(
+      indices.map(async (index) => {
+        const pad = String(index).padStart(3, "0");
+        const question = await readFile(join(dir, `${pad}-question.md`), "utf8");
+        const answer = await this.readAnswer(task, index);
+        return {
+          index,
+          question: question.trimEnd(),
+          ...(answer === undefined ? {} : { answer: answer.trimEnd() }),
+        };
+      }),
+    );
+  }
+
+  /**
+   * Every council verdict, oldest first (DESIGN.md §12.1).
+   *
+   * `latestVerdict` is what the next session reads; this is what a human reads to see
+   * whether the council keeps objecting to the same thing.
+   */
+  async listVerdicts(
+    task: TaskId,
+  ): Promise<readonly { readonly index: number; readonly body: string }[]> {
+    const dir = join(this.taskDir(task), "reviews");
+    if (!existsSync(dir)) return [];
+
+    const files = (await readdir(dir))
+      .map((name) => /^(\d+)-verdict\.md$/.exec(name)?.[1])
+      .flatMap((digits) => (digits === undefined ? [] : [Number.parseInt(digits, 10)]))
+      .sort((a, b) => a - b);
+
+    return Promise.all(
+      files.map(async (index) => ({
+        index,
+        body: (await readFile(join(dir, `${String(index).padStart(3, "0")}-verdict.md`), "utf8")).trimEnd(),
+      })),
+    );
   }
 
   async writeQuestion(task: TaskId, index: number, question: string): Promise<void> {

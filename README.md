@@ -163,6 +163,13 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/supervisor/snapshot.ts` | In-memory task view, so a listing answers inside Discord's 3s budget. |
 | `src/metrics/registry.ts` | Prometheus exposition (§11). |
 | `src/obs/log.ts` | Structured JSON-line logging to stdout (§11). |
+| `src/obs/ring.ts` | The last N log lines, in memory, as the logger's own sink (§18). |
+| `src/obs/live.ts` | The session in flight, so it is visible before its transcript exists (§18). |
+| `src/web/html.ts` | Tagged template that escapes by default. Every string here is agent-authored (§18). |
+| `src/web/view.ts` | Read models. Reads only — the whole security argument for the view (§18). |
+| `src/web/transcript.ts` | A pi transcript → renderable turns. Pure, no IO (§18). |
+| `src/web/pages.ts` | The pages. Given a view model, returns HTML (§18). |
+| `src/web/server.ts` | Routing, security headers, and the `GET`/`HEAD`-only gate (§18). |
 
 ## Invariants worth not breaking
 
@@ -198,12 +205,40 @@ awkward, the change is probably wrong.
    cooldown instead of claiming the next task and failing identically. An account limit
    reached at 10:00 otherwise takes the whole queue with it in under a minute, which is
    exactly what happened on 2026-08-15 (§6.3).
-8. **An agent can only push the branch it is standing on.** Task worktrees share their
+8. **The web view cannot write, and everything on it is untrusted.** Anything but `GET`
+   or `HEAD` is 405 before routing; every handler goes through `web/view.ts`, which only
+   reads. Prose on those pages is model-authored and quotes whatever the agent read, so
+   the template escapes by default, the CSP is `default-src 'none'` with no
+   `unsafe-inline`, and an artifact is served as an attachment rather than as a document
+   on the origin that also serves the transcripts (§18).
+9. **An agent can only push the branch it is standing on.** Task worktrees share their
    mirror's config, and `clone --mirror` sets `remote.origin.mirror`, which silently made
    every agent `git push` a force-push of *every* ref — including `main`, at whatever
    commit the mirror last fetched. `configure` unsets it and pins
    `remote.origin.push = HEAD`, so no incantation an agent types can move a branch other
    than its own (§3, DESIGN.md).
+
+## The web view
+
+A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Authelia —
+what is running where, the runner's own log, the messages of the session in flight, every
+stored transcript, and each task's spec, journal, questions, council verdicts and
+artifacts. It runs inside the supervisor process, on its own port, because the two things
+it exists for — this process's log and this process's live session — are in memory and not
+in git until later (§18).
+
+It is off unless a runner is told otherwise:
+
+```json
+"web": { "enabled": true, "port": 8080, "requireForwardedUser": true }
+```
+
+`requireForwardedUser` refuses any request that did not arrive with Authelia's
+`Remote-User` header. That is not a second login — anything inside the cluster can set a
+header — it is a fail-closed check on an Ingress whose forward-auth annotations get
+dropped, which would otherwise publish every transcript and look like a working deployment.
+
+Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
 
 ## Passing work between machines
 

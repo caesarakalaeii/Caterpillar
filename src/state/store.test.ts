@@ -360,3 +360,73 @@ test("a dirty working tree does not livelock the rebase path", async () => {
   const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
   assert.match(listed, /^intake\/GH-acme-widget-5\.json$/m);
 });
+
+test("a written transcript lists and reads back decompressed", async () => {
+  // The web view reads what the agent runner wrote (DESIGN.md §18). If the two halves
+  // disagree about the file name or the gzip, a finished session renders as a task that
+  // never ran one.
+  const subject = await store();
+  const task = asTaskId("TASK-sessions");
+  await subject.writeSessionTranscript(task, 1, '{"role":"user","content":"one"}');
+  await subject.writeSessionTranscript(task, 12, '{"role":"user","content":"twelve"}');
+
+  assert.deepEqual(await subject.listSessions(task), [1, 12]);
+  assert.equal(await subject.readSessionTranscript(task, 12), '{"role":"user","content":"twelve"}');
+});
+
+test("sessions are ordered numerically, not by their zero-padded name", async () => {
+  const subject = await store();
+  const task = asTaskId("TASK-order");
+  for (const n of [2, 10, 1]) await subject.writeSessionTranscript(task, n, "{}");
+
+  assert.deepEqual(await subject.listSessions(task), [1, 2, 10]);
+});
+
+test("a task with no sessions lists none rather than throwing", async () => {
+  const subject = await store();
+  assert.deepEqual(await subject.listSessions(asTaskId("TASK-none")), []);
+  assert.equal(await subject.readSessionTranscript(asTaskId("TASK-none"), 1), undefined);
+});
+
+test("a session ordinal that is not a positive integer is refused, never joined into a path", async () => {
+  // The ordinal arrives from a URL. `../../etc/passwd` must not become a file name.
+  const subject = await store();
+  const task = asTaskId("TASK-path");
+  await subject.writeSessionTranscript(task, 1, "{}");
+
+  for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(await subject.readSessionTranscript(task, bad), undefined, `${bad} must be refused`);
+  }
+});
+
+test("the question history reads back paired with its answers", async () => {
+  // The web view shows every round trip, not just the open one: "why is this task slow"
+  // is usually answered by the three questions a human took a day each to answer.
+  const subject = await store();
+  const task = asTaskId("TASK-questions");
+  await subject.writeQuestion(task, 1, "which database?");
+  await subject.writeAnswer(task, 1, "postgres");
+  await subject.writeQuestion(task, 2, "which schema?");
+
+  assert.deepEqual(await subject.listQuestions(task), [
+    { index: 1, question: "which database?", answer: "postgres" },
+    { index: 2, question: "which schema?" },
+  ]);
+});
+
+test("a task that was never asked anything has no question history", async () => {
+  const subject = await store();
+  assert.deepEqual(await subject.listQuestions(asTaskId("TASK-quiet")), []);
+});
+
+test("every council verdict is kept, not just the last", async () => {
+  const subject = await store();
+  const task = asTaskId("TASK-verdicts");
+  await subject.writeVerdict(task, 1, "changes requested: no tests");
+  await subject.writeVerdict(task, 4, "pass");
+
+  assert.deepEqual(await subject.listVerdicts(task), [
+    { index: 1, body: "changes requested: no tests" },
+    { index: 4, body: "pass" },
+  ]);
+});

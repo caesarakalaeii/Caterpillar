@@ -36,6 +36,7 @@ import type {
 import type { ForgeFactory } from "../forge/types.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
+import type { LiveSession } from "../obs/live.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
@@ -86,6 +87,12 @@ export interface AgentSessionRunnerOptions {
   readonly bindings: WorkspaceBindings;
   readonly metrics: AgentMetrics;
   readonly toolchain: ToolchainResolver;
+  /**
+   * Where the in-flight session is published for the web view (DESIGN.md §18). Optional:
+   * a runner with no web view has nothing to publish to, and the session runs identically
+   * either way.
+   */
+  readonly live?: LiveSession;
 }
 
 export class WorkspaceNotConfiguredError extends Error {
@@ -103,7 +110,7 @@ export class AgentSessionRunner {
   }
 
   async run(spec: TaskSpec, state: TaskState, signal?: AbortSignal): Promise<SessionOutcome> {
-    const { credentials, worktrees, store, llm, metrics } = this.options;
+    const { credentials, worktrees, store, llm, metrics, live } = this.options;
 
     const forgeFactory = this.options.bindings.forges.get(spec.workspace);
     if (forgeFactory === undefined) throw new WorkspaceNotConfiguredError(spec.workspace);
@@ -201,6 +208,16 @@ export class AgentSessionRunner {
       const environmentNote =
         toolchain.note === undefined ? "" : `\n\n${toolchain.note}`;
 
+      // The session is announced BEFORE the first request, not after the first message:
+      // model resolution and the opening request can take a while, and a runner that has
+      // started work must not read as idle for any of it.
+      live?.begin({
+        task: spec.id,
+        session: state.sessions + 1,
+        model: llm.model.id,
+        startedAt: new Date().toISOString(),
+      });
+
       const result = await runSession({
         models: llm.models,
         model: llm.model,
@@ -210,6 +227,7 @@ export class AgentSessionRunner {
         budget,
         control,
         ...(signal === undefined ? {} : { signal }),
+        ...(live === undefined ? {} : { onMessage: (message) => live.record(message) }),
       });
 
       await store.writeSessionTranscript(
@@ -232,6 +250,10 @@ export class AgentSessionRunner {
         ...(pr !== undefined ? { pr: { number: pr.number, url: pr.url } } : {}),
       };
     } finally {
+      // Cleared on every exit, including a throw: the transcript is on disk by now, and a
+      // live view that outlived its session would show the last thing that ran as the
+      // thing running.
+      live?.end();
       credentials.clearActive();
       await forge.revoke().catch(() => undefined);
     }

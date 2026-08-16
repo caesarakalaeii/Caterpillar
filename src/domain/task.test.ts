@@ -7,6 +7,7 @@ import {
   capabilitiesSatisfy,
   EMPTY_USAGE,
   isClaimable,
+  isTaskId,
   KNOWN_CAPABILITIES,
   type Capability,
   type TaskState,
@@ -93,4 +94,17 @@ test("an interrupted task still waits for its plan blockers", () => {
 
   assert.equal(isClaimable(blocked, () => "running"), false);
   assert.equal(isClaimable(blocked, () => "done"), true);
+});
+
+test("a task id may not be a relative path segment", async () => {
+  // An id becomes a directory name under `tasks/`, and it arrives from outside the state
+  // repo — a slash command, a button's custom_id, a URL. The character class alone admits
+  // `.` and `..`, which resolve to the task tree's parent: the state repo root.
+  assert.equal(isTaskId("."), false);
+  assert.equal(isTaskId(".."), false);
+  assert.equal(isTaskId("..."), false);
+
+  assert.equal(isTaskId("TASK-1"), true);
+  assert.equal(isTaskId("GH-acme-widget-12"), true);
+  assert.equal(isTaskId("v1.2.3-fix"), true, "a dot inside an id is still ordinary");
 });

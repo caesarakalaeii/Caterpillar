@@ -198,6 +198,7 @@ export interface RunnerConfig {
   readonly secretsDir: string;
   readonly log: LogConfig;
   readonly intake: IntakeConfig;
+  readonly web: WebConfig;
 }
 
 export interface IntakeConfig {
@@ -212,4 +213,34 @@ export interface IntakeConfig {
 export interface LogConfig {
   /** Records below this severity are dropped. Defaults to `info`. */
   readonly level: LogLevel;
+}
+
+/**
+ * The read-only web view (DESIGN.md §18).
+ *
+ * `enabled` defaults to FALSE. The view serves every session transcript the fleet has
+ * produced, and a transcript quotes whatever the agent read; a runner on a workstation
+ * must not begin answering for that because it was upgraded. In the cluster it is turned
+ * on in the ConfigMap, where the Ingress that authenticates it is turned on too.
+ */
+export interface WebConfig {
+  readonly enabled: boolean;
+  /** Separate from the metrics port: the Ingress publishes this one and only this one. */
+  readonly port: number;
+  /** Log records held in memory for the view. Loki keeps the history. */
+  readonly logCapacity: number;
+  /** How often a live page re-fetches itself. */
+  readonly refreshSeconds: number;
+  /**
+   * Refuse any request that did not arrive with an identity header from the
+   * authenticating proxy.
+   *
+   * This is NOT authentication — anything already inside the cluster can set a header.
+   * It is a fail-closed check on the one realistic failure: an Ingress whose forward-auth
+   * annotations are dropped or misspelt, which otherwise publishes the whole state repo
+   * to the internet and looks exactly like a working deployment.
+   */
+  readonly requireForwardedUser: boolean;
+  /** Header carrying that identity. Lowercased — node lowercases what it receives. */
+  readonly forwardedUserHeader: string;
 }
