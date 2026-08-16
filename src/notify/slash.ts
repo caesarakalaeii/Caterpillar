@@ -164,6 +164,29 @@ export const parseInteraction = (interaction: Interaction): Intent => {
 
 const malformed = (reason: string): Intent => ({ kind: "run", command: { kind: "malformed", reason } });
 
+/** The decoration `bridge.ts` puts on an autocomplete suggestion: `<id> — <status>`. */
+const SUGGESTION_LABEL = / — ([^ ]+)$/;
+
+/**
+ * Undo our own autocomplete label when a client submits it in place of the choice value.
+ *
+ * The suggestion carries `value: task.id` and only renders `<id> — <status>` for the
+ * human, but some Discord clients commit the LABEL when the choice is taken by keyboard
+ * rather than clicked. `/resume` felt all of it: every task it can suggest is parked, so
+ * the suffix was always present and the command refused its own autocompletion.
+ *
+ * Deliberately narrow. Only a suffix that is a real status is removed, so this cannot
+ * decay into "take everything before a dash" and start accepting a pasted sentence — and
+ * a task id can never contain a space anyway (`TASK_ID`), so nothing legal is lost.
+ */
+const unlabelled = (value: string): string => {
+  const match = SUGGESTION_LABEL.exec(value);
+  const status = match?.[1];
+  return match !== null && status !== undefined && isStatus(status)
+    ? value.slice(0, match.index)
+    : value;
+};
+
 /**
  * Read a task id from a command option.
  *
@@ -174,7 +197,7 @@ const malformed = (reason: string): Intent => ({ kind: "run", command: { kind: "
 const taskOption = (interaction: Interaction, name: string): TaskId | string => {
   const raw = optionValue(interaction, name);
   if (raw === undefined || raw.trim().length === 0) return `\`${name}\` is required.`;
-  const trimmed = raw.trim();
+  const trimmed = unlabelled(raw.trim());
   return isTaskId(trimmed) ? asTaskId(trimmed) : `\`${trimmed}\` is not a task id.`;
 };
 

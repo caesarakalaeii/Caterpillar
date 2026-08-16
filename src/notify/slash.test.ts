@@ -113,6 +113,34 @@ test("/cancel parks", () => {
   );
 });
 
+test("a client that submits the suggestion's LABEL still names the task", () => {
+  // `bridge.ts` renders every suggestion as `<id> — <status>` and sets `value` to the
+  // bare id, but some Discord clients commit the LABEL when the choice is taken by
+  // keyboard rather than clicked. `/resume` felt the whole of that: every task it can
+  // suggest is parked, so the suffix was always there and the command answered "not a
+  // task id" to its own autocompletion.
+  for (const status of ["parked", "awaiting-human", "done"]) {
+    assert.deepEqual(
+      parseInteraction(
+        interaction({ data: { name: "resume", options: [{ name: "task", value: `${TASK} — ${status}` }] } }),
+      ),
+      { kind: "run", command: { kind: "resume", task: TASK } },
+      status,
+    );
+  }
+});
+
+test("only OUR label is unwrapped — a suffix that is not a status stays refused", () => {
+  // The unwrap must not become a general "take everything before a dash": that would
+  // silently accept a pasted sentence and run the task it happened to start with.
+  for (const value of [`${TASK} — ../../etc`, `${TASK} — `, `../../etc — parked`]) {
+    const intent = parseInteraction(
+      interaction({ data: { name: "resume", options: [{ name: "task", value }] } }),
+    );
+    assert.equal(intent.kind === "run" ? intent.command.kind : undefined, "malformed", value);
+  }
+});
+
 test("autocomplete reports what is being typed", () => {
   assert.deepEqual(
     parseInteraction(
