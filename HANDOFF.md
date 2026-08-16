@@ -682,7 +682,8 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
   tool classifier — even listing variable *names* is blocked. The user seals those tokens
   themselves with `../caesar-deployment/scripts/seal-caterpillar-secrets.sh eb`.
 - Conventional Commits, **no** `Co-Authored-By` trailer, no gitmoji. The repo's history has
-  **no trailers at all** — match it. PR bodies *do* carry the Claude Code footer.
+  **no trailers at all** — match it. **PR bodies carry no generated-with footer either**
+  (changed 2026-08-16); the earlier note here said the opposite.
 - Never use the type `any`.
 - Prefer open-source, provider-agnostic tooling — this is why the project is built on `pi`.
   The user asked to be argued with rather than deferred to.
