@@ -220,7 +220,10 @@ Before it can claim anything, two things this script deliberately does not do:
 
 2. THE MODEL CREDENTIAL. On a subscription this runner needs its own:
 
-     npm run llm:login        # writes $ROOT/credentials/anthropic.json
+     npm run llm:login -- --out $ROOT/credentials/anthropic.json
+
+   The \`--\` is required, or npm eats \`--out\` as one of its own flags; the flag
+   itself is required too, and the CLI exits 1 without it.
 
    It must be writable and durable — refreshing rotates the refresh token and pi
    writes the new one back.
