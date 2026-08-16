@@ -249,6 +249,84 @@ test("refreshing a mirror does not fail because a task branch is checked out", a
   );
 });
 
+test("refreshing a mirror survives a branch the agent named itself", async () => {
+  // The same bug again, under a name the `agent/*` exclusion does not match:
+  //
+  //   BS-…-02 parked — session failed: git fetch --prune origin +refs/*:refs/*
+  //   ^refs/heads/agent/* failed (128): fatal: refusing to fetch into branch
+  //   'refs/heads/ci/govulncheck-go-1.25.13' checked out at '/work/tasks/BS-…-01/ci-fix'
+  //
+  // Excluding `refs/heads/agent/*` assumed the agent stays on the branch we created for
+  // it. Nothing holds it there — the session drives git through its bash tool, and the
+  // PR tool takes whatever `head` it is told — so `git checkout -b ci/<something>`
+  // followed by a push re-creates the original failure exactly. And again the task that
+  // dies is the NEXT one on that repo, over a branch it has never heard of.
+  const root = await scratch();
+  const origin = join(root, "origin.git");
+  const hermetic = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "caterpillar",
+    GIT_AUTHOR_EMAIL: "caterpillar@example.invalid",
+    GIT_COMMITTER_NAME: "caterpillar",
+    GIT_COMMITTER_EMAIL: "caterpillar@example.invalid",
+  };
+  const plain = new Git(root, hermetic);
+
+  await plain.run("init", "--bare", "--initial-branch=main", origin);
+  const seed = join(root, "seed");
+  await plain.run("clone", origin, seed);
+  const seedGit = new Git(seed, hermetic);
+  await writeFile(join(seed, "f"), "one\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "one");
+  await seedGit.run("push", "origin", "HEAD:main");
+
+  const mirror = mirrorDir(root);
+  await mkdir(join(mirror, ".."), { recursive: true });
+  await plain.run("clone", "--mirror", origin, mirror);
+
+  // Task -01 works exactly as the reported one did: it renames its branch to something
+  // meaningful and pushes that. The worktree persists on the PVC afterwards.
+  const worktree = await manager(root).ensureWorktree(REPO, asTaskId("T-1"));
+  const agent = new Git(worktree, hermetic);
+  await agent.run("checkout", "-b", "ci/govulncheck-go-1.25.13");
+  await writeFile(join(worktree, "w"), "task work\n");
+  await agent.run("add", "-A");
+  await agent.run("commit", "-m", "task work");
+  await agent.run("push");
+
+  // Upstream moves on, which is the only reason a later task fetches at all.
+  await writeFile(join(seed, "g"), "later\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "later");
+  await seedGit.run("push", "origin", "HEAD:main");
+  const upstreamMain = (await seedGit.run("rev-parse", "HEAD")).trim();
+
+  const mirrorGit = new Git(mirror, hermetic);
+  const agentBefore = await mirrorGit.revParse("refs/heads/ci/govulncheck-go-1.25.13");
+
+  // Task -02 claiming the same repo. This is the call that parked it.
+  await manager(root).syncMirror(REPO);
+
+  assert.equal(
+    (await mirrorGit.revParse("refs/heads/main"))?.trim(),
+    upstreamMain,
+    "the mirror must still pick up upstream history",
+  );
+  assert.equal(
+    await mirrorGit.revParse("refs/heads/ci/govulncheck-go-1.25.13"),
+    agentBefore,
+    "a branch a live worktree holds must not be written by a mirror refresh",
+  );
+  assert.equal(
+    (await agent.run("rev-parse", "--abbrev-ref", "HEAD")).trim(),
+    "ci/govulncheck-go-1.25.13",
+    "the live worktree must survive the refresh",
+  );
+});
+
 test("an agent's plain `git push` cannot move any branch but its own", async () => {
   // The bug that rewound shared `main` by a commit nobody had fetched.
   //
