@@ -306,6 +306,7 @@ supervisor loop:
       done      → run acceptance criteria, verify PR + CI, then status=done
       blocked   → update requires[], status=ready, release lease  ← machine handoff
       limit     → status=parked, notify Discord
+      provider  → status=ready, release lease, cool the RUNNER down  ← §6.3, not the task's fault
 ```
 
 ### 6.1 The handoff threshold vs the context window
@@ -346,6 +347,81 @@ On reclaim, the new session:
 
 The last session's transcript may be missing or truncated — that is acceptable, because
 the journal, not the transcript, is the source of truth.
+
+### 6.3 When the provider stops answering
+
+**Added after the incident of 2026-08-15.** The account's monthly spend limit was
+reached mid-session. Nine seconds later the task had run five sessions, three of them
+without receiving a single token, and had parked itself citing *"3 consecutive sessions
+made no measurable progress"* — a verdict about the agent, for something the agent never
+saw. Every other `ready` task was queued up for the same treatment.
+
+Three separate things were wrong, and each is now closed:
+
+**1. pi does not throw on a provider failure.** `Agent.prompt()` catches it, appends an
+assistant message with `stopReason: "error"` and an `errorMessage`, and returns
+normally. The `try/catch` in `agent/session.ts` therefore saw nothing, and the session
+fell through to *"ended without a control-plane decision"* — which is a **handoff**, and
+a handoff means *start another session immediately*. That is the retry storm. Both
+halves of the failure are read now: the throw, and `agent.state.errorMessage`.
+
+**2. An outage is not a session exit reason the task owns.** `provider-unavailable` is
+its own reason, distinct from `error`, and `llm/outage.ts` decides which one a failure
+is by reading the provider's message. The line it draws:
+
+| Reads as | Examples | Response |
+|---|---|---|
+| outage | 429 spend/usage limit, 429 burst, 5xx, 529 overloaded, 401/403, no response at all | release the task, back the runner off |
+| the task's own error | 400 `prompt is too long`, 404 unknown model | unchanged — `failed`, and a human looks |
+
+Sweeping the second row into a cooldown would hide a real bug behind an hour of silence
+and then reproduce it exactly. That is why the classifier reads prose rather than
+treating every failure as transient.
+
+**3. The response belongs to the runner, not the task.** On an outage:
+
+- the task goes back to **`ready`** — not `parked`, not `failed`. It did nothing wrong,
+  and a park needs a human to undo, so a limit that clears by itself would otherwise
+  leave a queue of tasks all needing hand-resumption.
+- the **progress probe does not run** and `progress` is untouched. The no-progress
+  detector (§11.1) answers *"is the agent going in circles"*. Feeding an outage into it
+  is precisely how a spend limit came to park a task for making no progress.
+- a session that never got a token back **is not recorded at all** — no journal entry,
+  no session count, no transcript commit. It cost nothing and proves nothing, and one
+  entry per attempt is the spam `agent/journal.ts` exists to bound. A session
+  interrupted *mid-work* is recorded in full, minus the probe: its tokens were spent and
+  its commits are on the branch.
+- the state is pushed as `ready` **even when nothing else changed**. Only `ready` is
+  claimable, and every task past its first session was last pushed as `running`.
+- the **runner** then stops claiming until a cooldown expires: 60s, doubling, capped at
+  30 minutes (`llm.cooldownSeconds` / `llm.maxCooldownSeconds`). A wait the provider
+  itself asked for wins when it is longer. A rejected credential goes straight to the
+  cap — no wait length fixes a 401.
+
+The cooldown is in memory and runner-scoped. In memory because it is a claim about right
+now, and a restarted pod should try again immediately — the likeliest reason anyone
+restarted it is that they just fixed the provider. Runner-scoped because the account is
+shared by every task, so a per-task schedule would multiply the request rate by the size
+of the queue.
+
+Chat and intake keep running throughout. Answering a question and ingesting an issue
+cost no tokens, and a queue that fills while the provider is down is correct — it is only
+*starting sessions* that has to stop.
+
+**The council was a fourth way to lose.** Its reviewers abstain rather than fail, so an
+outage made all three abstain — and `decide` excluded abstentions from the blocker count,
+leaving zero blocking objections, which read as a **pass**. An unreachable provider was a
+way to merge an unread change. A council whose every reviewer abstained is now the same
+as an empty one, and a council interrupted by an outage records no verdict at all: a
+verdict is a permanent document, and *"could not complete this review"* × 3 is not one
+worth keeping in the file the next session reads as its instructions.
+
+Visibility: `caterpillar_provider_outage_total{kind}`,
+`caterpillar_provider_cooldown_seconds`, a `provider.unavailable` log line, and exactly
+two Discord messages per incident — one when it breaks, one when it comes back.
+
+Sessions also retry transient provider errors twice before giving up, which pi does not
+do by default (`maxRetries: 0`). A single 500 used to cost a whole session.
 
 ---
 
@@ -871,6 +947,9 @@ billing. Consequences, all load-bearing:
   both read the same token and both write; the loser persists one the provider has
   already invalidated. `FileCredentialStore` takes a lock directory for this.
 - **Rate limits are per-account** and shared with the operator's own interactive usage.
+  So is the spend limit, and reaching either is a normal operating condition rather than
+  an exception: the supervisor treats a refusal as a runner-wide pause, never as a fact
+  about the task that happened to be running. See §6.3.
 
 **`proxy` (retained).** All runners point at an in-cluster proxy holding the provider
 credential. Its value is not "easy provider swap" (pi-ai already gives that) but:
@@ -961,12 +1040,17 @@ journal entry so the next session sees it at all.
 | `caterpillar_lease_age_seconds{task}` | gauge | detects wedged runners |
 | `caterpillar_no_progress_streak{task}` | gauge | thrash detector |
 | `caterpillar_context_overrun_total` | counter | **should always be 0** — see §6.1 |
+| `caterpillar_provider_outage_total{kind}` | counter | sessions the provider refused — §6.3 |
+| `caterpillar_provider_cooldown_seconds{runner}` | gauge | >0 means idle **on purpose** — §6.3 |
 
 **Alerts**
 
 - `caterpillar_context_overrun_total > 0` — handoff threshold fired too late
 - `caterpillar_no_progress_streak >= 3` — task is thrashing
 - `caterpillar_lease_age_seconds > 600` with no heartbeat — dead runner
+- `caterpillar_provider_cooldown_seconds > 0` for 15m — the provider is refusing and
+  nothing is being worked on. Without this a runner sitting out a spend limit looks
+  exactly like an idle one.
 - task in `awaiting-human` > 24h — you forgot
 - `caterpillar_cost_usd_total` over per-task budget
 
@@ -978,6 +1062,12 @@ sessions with none → park and notify.
 
 This is the limit that catches the failure the others miss: an agent burning tokens for
 hours while going in circles.
+
+**It judges the AGENT, so only the agent's sessions reach it.** A session the provider
+refused does not run the probe and does not touch the streak (§6.3). The detector was
+the thing that finally stopped the spend-limit retry storm on 2026-08-15, by parking the
+task — which is the right mechanism reaching the wrong conclusion about the wrong actor,
+and exactly the kind of evidence that makes a park unreadable.
 
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head

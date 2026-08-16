@@ -50,8 +50,13 @@ export const decide = (verdicts: readonly ReviewerVerdict[]): CouncilVerdict => 
 
   return {
     // An empty council is not unanimous approval. It means nothing reviewed this, which
-    // is the one outcome that must never merge silently.
-    decision: blockers.length > 0 || verdicts.length === 0 ? "changes" : "pass",
+    // is the one outcome that must never merge silently — and a council where every
+    // reviewer abstained is the same council, convened. That second half was missing:
+    // abstentions are excluded from `blockers` by design, so three of them left zero
+    // blocking objections and read as a pass. During a provider outage that is every
+    // reviewer, which made "the model is unreachable" a way to merge an unread change.
+    decision:
+      blockers.length > 0 || verdicts.length === abstentions.length ? "changes" : "pass",
     blockers,
     abstentions,
     verdicts,

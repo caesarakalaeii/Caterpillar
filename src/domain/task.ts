@@ -265,7 +265,36 @@ export type SessionExitReason =
   | "plan-proposed"
   | "blocked"
   | "limit"
-  | "error";
+  | "error"
+  /**
+   * The model provider stopped answering — spend limit, rate limit, outage, expired
+   * credential. NOT attributable to the task, which is the whole reason it is not
+   * `error`: the task is released untouched and the RUNNER backs off (DESIGN.md §6.3).
+   */
+  | "provider-unavailable";
+
+/** Why the provider stopped answering, as far as its own error message admits. */
+export type OutageKind =
+  /** The account is out of budget. Clears when the window rolls over or a human pays. */
+  | "exhausted"
+  /** Going too fast. Clears by itself, usually in under a minute. */
+  | "rate-limited"
+  /** The provider is down or overloaded. */
+  | "unavailable"
+  /** The credential was rejected. Waiting does not fix this one; a human must. */
+  | "unauthorised"
+  /** No response arrived at all. */
+  | "network";
+
+export interface ProviderOutage {
+  readonly kind: OutageKind;
+  /** HTTP status, when there was a response to read one from. */
+  readonly status?: number;
+  /** The provider's own sentence, for the log and for Discord. Never a credential. */
+  readonly detail: string;
+  /** How long the provider asked us to wait, when it said. */
+  readonly retryAfterMs?: number;
+}
 
 export interface SessionOutcome {
   readonly reason: SessionExitReason;
@@ -277,8 +306,10 @@ export interface SessionOutcome {
   readonly question?: string;
   /** Set when reason is `blocked` — the capabilities the task now needs. */
   readonly requires?: readonly Capability[];
-  /** Set when reason is `error`. */
+  /** Set when reason is `error` or `provider-unavailable`. */
   readonly error?: string;
+  /** Set when reason is `provider-unavailable`. */
+  readonly outage?: ProviderOutage;
   /** Set when the agent opened a PR during this session. */
   readonly pr?: PullRequestRef;
   /** Set when reason is `plan-proposed` — the decomposition awaiting the council. */

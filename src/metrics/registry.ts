@@ -104,6 +104,28 @@ export class AgentMetrics {
     "sessions ending past the safe context point — must stay 0",
   );
 
+  /**
+   * Sessions cut short because the model provider stopped answering (§6.3), by kind.
+   *
+   * Labelled by kind rather than by task deliberately: an outage is a property of the
+   * account, and a per-task series would suggest the task had something to do with it.
+   */
+  readonly providerOutages = this.registry.counter(
+    "caterpillar_provider_outage_total",
+    "sessions ended by a provider outage, by kind",
+  );
+
+  /**
+   * Seconds this runner is still refusing to start a session. 0 when healthy.
+   *
+   * The one series that says "nothing is being worked on, and that is on purpose" —
+   * without it a runner sitting out a spend limit is indistinguishable from an idle one.
+   */
+  readonly providerCooldown = this.registry.gauge(
+    "caterpillar_provider_cooldown_seconds",
+    "seconds until this runner will start a session again — 0 when healthy",
+  );
+
   render(): string {
     return this.registry.render();
   }

@@ -9,13 +9,34 @@
  * In every case the caller gets a SessionOutcome and the state repo is updated
  * before the process is allowed to exit. Sessions never mutate task state directly;
  * that is the supervisor's job, so a crashed session cannot leave half-written state.
+ *
+ * (3) is subtler than it looks and is the reason this file was amended. pi does NOT
+ * throw when a provider request fails: `Agent` catches it, appends an assistant message
+ * carrying `stopReason: "error"` and an `errorMessage`, and returns. A `try/catch`
+ * around `prompt()` sees a perfectly ordinary return, so an errored session used to be
+ * reported as "ended without a control-plane decision" — a handoff. Both halves of the
+ * failure are read here now.
  */
 import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { calculateContextTokens } from "@earendil-works/pi-agent-core";
-import type { Api, Model, MutableModels, Usage } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, MutableModels, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai";
 import { EMPTY_USAGE, type SessionOutcome, type UsageTotals } from "../domain/task.ts";
+import { classifyProviderFailure } from "../llm/outage.ts";
 import { ContextBudget } from "./limits.ts";
 import type { ControlSink } from "./tools.ts";
+
+/**
+ * Attempts after the first, for the errors an immediate retry can actually fix.
+ *
+ * pi's default is zero, so a single 500 or a one-second burst limit ended a whole
+ * session and cost a fresh context to resume from. The policy underneath is pi's
+ * (`retryProviderRequest`): 408/409/429/5xx only, exponential backoff, and — the part
+ * that matters here — a refusal to sit out a wait longer than `maxRetryDelayMs`. A
+ * spend limit therefore still fails fast rather than parking the runner on a socket
+ * for an hour, and `classifyProviderFailure` reads the delay the server asked for out
+ * of the resulting message.
+ */
+const MAX_PROVIDER_RETRIES = 2;
 
 export interface SessionOptions {
   readonly models: MutableModels;
@@ -64,7 +85,13 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
       tools: [...options.tools],
       ...(options.messages !== undefined ? { messages: [...options.messages] } : {}),
     },
-    streamFn: options.models.streamSimple.bind(options.models),
+    // Wrapped rather than bound, only to add the retry budget. The caller's options win
+    // if they ever carry one, so this is a default and not an override.
+    streamFn: (model: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions) =>
+      options.models.streamSimple(model, context, {
+        ...streamOptions,
+        maxRetries: streamOptions?.maxRetries ?? MAX_PROVIDER_RETRIES,
+      }),
   });
 
   let sessionUsage: UsageTotals = EMPTY_USAGE;
@@ -99,6 +126,10 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
     error = cause instanceof Error ? cause.message : String(cause);
   }
 
+  // The failure pi swallowed, if the throw did not happen. `errorMessage` is cleared at
+  // the start of every run and set from the last turn, so it describes THIS session.
+  error ??= agent.state.errorMessage;
+
   const messages = agent.state.messages;
   const contextTokens = budget.tokensUsed(messages);
 
@@ -127,6 +158,19 @@ const buildOutcome = (input: OutcomeInput): SessionOutcome => {
   const base = { usage: input.sessionUsage, contextTokens: input.contextTokens };
 
   if (input.error !== undefined) {
+    // An outage is reported ahead of any control signal for the same reason an error
+    // is: whatever the agent had decided, this session did not finish deciding it.
+    const outage = classifyProviderFailure(input.error);
+    if (outage !== undefined) {
+      return {
+        ...base,
+        reason: "provider-unavailable",
+        error: input.error,
+        outage,
+        summary: `the model provider stopped answering: ${outage.detail}`,
+      };
+    }
+
     return {
       ...base,
       reason: "error",

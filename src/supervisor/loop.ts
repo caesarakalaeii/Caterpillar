@@ -22,11 +22,13 @@ import {
   isTerminal,
   repoSlug,
   type ProposedPlan,
+  type ProviderOutage,
   type SessionOutcome,
   type TaskId,
   type TaskSpec,
   type TaskState,
   type TaskStatus,
+  type UsageTotals,
   type WorkspaceName,
 } from "../domain/task.ts";
 import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "../plan/brainstorm.ts";
@@ -52,6 +54,7 @@ import type { ForgeFactory } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
+import { ProviderCooldown } from "./cooldown.ts";
 import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise, type TaskSnapshot } from "./snapshot.ts";
@@ -167,8 +170,18 @@ export class Supervisor {
 
   private readonly deps: SupervisorDeps;
 
+  /**
+   * How long this runner is sitting out a provider outage (DESIGN.md §6.3).
+   *
+   * Runner-scoped and in memory only. In memory because it is a statement about right
+   * now — a restarted pod SHOULD try again immediately, since the most likely reason
+   * anyone restarted it is that they just fixed the provider.
+   */
+  private readonly cooldown: ProviderCooldown;
+
   constructor(deps: SupervisorDeps) {
     this.deps = deps;
+    this.cooldown = new ProviderCooldown(deps.config.llm.cooldown);
   }
 
   /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
@@ -185,9 +198,14 @@ export class Supervisor {
       await store.pull("origin", config.stateRepo.branch);
 
       // Both before claiming, so a task unparked by either is claimable on this same
-      // iteration rather than sitting idle until the next poll.
+      // iteration rather than sitting idle until the next poll. Both also run DURING a
+      // provider cooldown: answering a question and ingesting an issue cost no tokens,
+      // and a queue that keeps filling while the provider is down is the correct
+      // behaviour — it is only starting sessions that has to stop.
       await this.applyChatRequests();
       await this.maybeIngest();
+
+      if (await this.coolingDown()) continue;
 
       const claimed = await this.claimNext(await this.survey());
       if (claimed === undefined) {
@@ -228,6 +246,26 @@ export class Supervisor {
         });
       }
     }
+  }
+
+  /**
+   * Sit out a provider outage, if one is in progress. See DESIGN.md §6.3.
+   *
+   * Returns true when this poll must not claim anything. The wait is capped at ONE poll
+   * interval per iteration rather than slept through in one go, so the loop keeps
+   * pulling, answering chat and ingesting while it waits, and an abort is honoured
+   * within a poll rather than within the cooldown.
+   */
+  private async coolingDown(): Promise<boolean> {
+    const { config, metrics, logger } = this.deps;
+
+    const remaining = this.cooldown.remainingMs(Date.now());
+    metrics.providerCooldown.set({ runner: config.runnerId }, Math.ceil(remaining / 1000));
+    if (remaining === 0) return false;
+
+    logger.info("provider.cooling", { remainingSeconds: Math.ceil(remaining / 1000) });
+    await sleep(Math.min(remaining, config.pollSeconds * 1000));
+    return true;
   }
 
   /**
@@ -400,6 +438,26 @@ export class Supervisor {
         metrics.tokens.inc({ task: spec.id, kind: "output" }, outcome.usage.outputTokens);
         metrics.cost.inc({ task: spec.id }, outcome.usage.costUsd);
 
+        if (outcome.reason === "provider-unavailable") {
+          // `outage` is set by `buildOutcome` for every one of these; the fallback is
+          // here so a future caller cannot turn a missing field into an uncooled runner.
+          await this.releaseAfterOutage(
+            heartbeat,
+            spec,
+            state,
+            outcome.outage ?? { kind: "unavailable", detail: outcome.summary },
+            outcome.usage,
+            "session",
+          );
+          return;
+        }
+
+        // The provider answered, so whatever this runner was sitting out is over.
+        if (this.cooldown.clear()) {
+          logger.info("provider.recovered", { task: spec.id });
+          await this.notifyTask(state, { kind: "provider-recovered", task: spec.id });
+        }
+
         state = await this.recordSession(heartbeat, spec, state, outcome);
 
         const done = await this.applyOutcome(heartbeat, spec, state, outcome);
@@ -554,7 +612,9 @@ export class Supervisor {
         // never asked to re-litigate whether the tests pass — it reads the change.
         const reviewed = await this.convene(lease, spec, state);
         if (reviewed.decision === "changes") return false;
-        if (reviewed.decision === "stalled") return true;
+        // Both finish with this task for now. `stalled` waits for a human; `outage`
+        // waits for the provider, with the task already released and the runner cooling.
+        if (reviewed.decision === "stalled" || reviewed.decision === "outage") return true;
 
         const merge = await this.mergeReviewed(spec, reviewed.state);
         await this.transition(lease, reviewed.state, "done");
@@ -597,6 +657,14 @@ export class Supervisor {
         await this.park(lease, spec, state, outcome.summary);
         return true;
 
+      case "provider-unavailable":
+        // Unreachable: `workTask` acts on this BEFORE the session is recorded, because
+        // not recording it is the entire point (see `releaseAfterOutage`). Kept so the
+        // switch stays exhaustive — a new exit reason with no home here should be a
+        // compile error — and harmless if it is ever reached: the task stays claimable.
+        await this.transition(lease, state, "ready");
+        return true;
+
       case "error":
         logger.error("task.failed", {
           task: spec.id,
@@ -635,8 +703,18 @@ export class Supervisor {
 
     const reviewed =
       council === undefined
-        ? { verdict: undefined, usage: EMPTY_USAGE }
+        ? { verdict: undefined, usage: EMPTY_USAGE, outage: undefined }
         : await council.reviewPlan(spec, state, plan);
+
+    // Reviewers that never reached the provider have not rejected this plan. Cutting it
+    // into tasks on their silence, or recording a rejection they did not make, would
+    // both be verdicts nobody reached. The brainstorm is released instead and proposes
+    // again once the provider answers — one session's cost, against a permanent record
+    // of a decision nobody made (§6.3).
+    if (reviewed.outage !== undefined) {
+      await this.releaseAfterOutage(lease, spec, state, reviewed.outage, reviewed.usage, "council");
+      return true;
+    }
 
     let rejection: string | undefined;
     if (reviewed.verdict !== undefined) {
@@ -746,12 +824,22 @@ export class Supervisor {
     state: TaskState,
   ): Promise<{
     readonly state: TaskState;
-    readonly decision: "pass" | "changes" | "stalled";
+    readonly decision: "pass" | "changes" | "stalled" | "outage";
   }> {
     const { council, store, config, metrics, logger } = this.deps;
     if (council === undefined) return { state, decision: "pass" };
 
-    const { verdict, usage } = await council.review(spec, state);
+    const { verdict, usage, outage } = await council.review(spec, state);
+
+    // Reviewers that could not reach the provider have not reviewed anything, and a
+    // verdict is a permanent document. Written now it would say "could not complete
+    // this review" three times over, in the file the next session reads as its
+    // instructions. So nothing is recorded and the council is convened again later.
+    if (outage !== undefined) {
+      await this.releaseAfterOutage(lease, spec, state, outage, usage, "council");
+      return { state, decision: "outage" };
+    }
+
     const text = renderVerdict(verdict);
     const rounds = (state.review?.rounds ?? 0) + (verdict.decision === "changes" ? 1 : 0);
 
@@ -986,6 +1074,99 @@ export class Supervisor {
       };
     } finally {
       await forge.revoke().catch(() => undefined);
+    }
+  }
+
+  /**
+   * The model provider stopped answering. See DESIGN.md §6.3.
+   *
+   * Everything here is about NOT holding the task responsible for it:
+   *
+   *   - the task goes back to `ready`, not `parked` and not `failed`. It did nothing
+   *     wrong, and a park needs a human to undo — an account limit that clears by
+   *     itself would otherwise leave a queue of tasks needing hand-resumption.
+   *   - the progress probe does not run and `progress` is not touched. The no-progress
+   *     detector answers "is the AGENT going in circles", and feeding an outage into it
+   *     is how a spend limit came to park a task for "no measurable progress".
+   *   - a session that never got a token back writes no history: no journal entry, no
+   *     session count. It cost nothing and proves nothing, and one entry per attempt is
+   *     precisely the retry-storm spam `agent/journal.ts` exists to bound.
+   *   - a session that DID work before the wall is recorded in full, minus the probe.
+   *     Its tokens were spent and its commits are on the branch; pretending otherwise
+   *     would lose the accounting and re-run the work.
+   *   - the release itself is always pushed, even when there is nothing else to say.
+   *     Only `ready` is claimable, and every task past its first session was last
+   *     pushed as `running`.
+   *
+   * The runner then stops claiming until the cooldown expires, which is the part that
+   * turns one refused request into a pause instead of a sweep through the whole queue.
+   */
+  private async releaseAfterOutage(
+    lease: LeaseHandle,
+    spec: TaskSpec,
+    state: TaskState,
+    outage: ProviderOutage,
+    /** Tokens already spent before the wall. Charged to the task either way. */
+    spent: UsageTotals,
+    /** Which LLM caller met the wall — a session has a journal, the council does not. */
+    origin: "session" | "council",
+  ): Promise<void> {
+    const { store, config, metrics, logger } = this.deps;
+
+    const entry = this.cooldown.record(Date.now(), outage);
+    const waitSeconds = Math.ceil(entry.waitMs / 1000);
+
+    metrics.providerOutages.inc({ kind: outage.kind });
+    metrics.providerCooldown.set({ runner: config.runnerId }, waitSeconds);
+    logger.warn("provider.unavailable", {
+      task: spec.id,
+      during: origin,
+      kind: outage.kind,
+      status: outage.status,
+      detail: outage.detail,
+      waitSeconds,
+      // Distinguishes a session cut off mid-work from one that never started — the
+      // difference between a session worth recording and one that did not happen.
+      outputTokens: spent.outputTokens,
+    });
+
+    // A session that got a token back happened; one that did not, did not.
+    const counts = origin === "session" && spent.outputTokens > 0;
+    if (counts) {
+      await store.appendJournal(
+        spec.id,
+        state.sessions + 1,
+        [
+          `**Interrupted:** ${outage.detail}`,
+          "",
+          "The model provider stopped answering mid-session. Nothing about this task " +
+            "caused it and nothing here is a verdict on the work; the next session " +
+            "picks up from the branch as usual.",
+        ].join("\n"),
+      );
+    }
+
+    const released: TaskState = {
+      ...state,
+      ...(counts ? { sessions: state.sessions + 1 } : {}),
+      usage: addUsage(state.usage, spent),
+    };
+
+    // ALWAYS pushed, even when nothing else changed. Only `ready` is claimable, and a
+    // task last pushed as `running` — which is every task past its first session — would
+    // otherwise be stranded there by an outage no human is going to hear about in time.
+    await this.transition(lease, released, "ready");
+    await this.push(lease, `chore(${spec.id}): released — the provider stopped answering`);
+
+    // Once per incident. The runner re-checks on a back-off, and a message per attempt
+    // would be this failure mode wearing a different hat.
+    if (entry.first) {
+      await this.notifyTask(state, {
+        kind: "provider-unavailable",
+        task: spec.id,
+        detail: outage.detail,
+        retryInSeconds: waitSeconds,
+      });
     }
   }
 

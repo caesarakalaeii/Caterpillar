@@ -554,6 +554,17 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
   point, resolved locally — but do **not** use the fork point always, or every session after
   the first commit looks productive and thrashing never parks.
 - **pi does not auto-compact.** The hazard is a provider context-length error.
+- **pi does not THROW on a provider failure either.** `Agent.prompt()` catches it, appends
+  an assistant message with `stopReason: "error"` + `errorMessage`, and returns normally.
+  A `try/catch` around it sees nothing. Read `agent.state.errorMessage` as well, or a 429
+  reads as "the model stopped talking" — which is a handoff, which means *start another
+  session now*. That is how the 2026-08-15 spend limit produced five sessions in nine
+  seconds and a task parked for "no progress" (DESIGN.md §6.3).
+- **An outage is the RUNNER's problem, never the task's.** Release the task as `ready`,
+  do not run the progress probe, do not record a session that got no tokens back — and
+  back the runner off, or the next task in the queue meets the same wall immediately.
+  `llm/outage.ts` is deliberately narrow: a 400 `prompt is too long` is still the task's
+  own failure and must keep failing loudly.
 - **Context size must include `cacheRead` + `cacheWrite`.**
 - **An OAuth refresh ROTATES the refresh token**, inside `CredentialStore.modify`.
 - **Intake must not ride the poll interval.** A GitHub pass costs 1 request + 1 per repo

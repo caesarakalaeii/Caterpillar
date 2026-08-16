@@ -112,8 +112,22 @@ export interface WorkspacePathsConfig {
  */
 export type LlmAuthMode = "proxy" | "subscription";
 
+/**
+ * How long the runner stops starting sessions after the provider refuses (§6.3).
+ *
+ * Not per task: the account is shared by every task on this runner, so the first
+ * refusal is the answer for all of them.
+ */
+export interface CooldownConfig {
+  /** Wait after the first refusal. Doubles per consecutive one. */
+  readonly initialSeconds: number;
+  /** Ceiling on one wait — also how often a long outage is re-checked. */
+  readonly maxSeconds: number;
+}
+
 export interface LlmConfig {
   readonly auth: LlmAuthMode;
+  readonly cooldown: CooldownConfig;
   /** Proxy base URL. Ignored for `subscription`, which uses pi's own provider. */
   readonly baseUrl: string;
   readonly modelId: string;

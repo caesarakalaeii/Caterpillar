@@ -79,7 +79,23 @@ export type Notification =
       readonly changed: number;
       readonly note: string;
     }
-  | { readonly kind: "failed"; readonly task: TaskId; readonly error: string };
+  | { readonly kind: "failed"; readonly task: TaskId; readonly error: string }
+  /**
+   * The model provider stopped answering and this runner is sitting it out (§6.3).
+   *
+   * Sent ONCE per incident, not once per attempt: the runner keeps re-checking on a
+   * back-off, and a message each time would be the notification equivalent of the retry
+   * storm this whole path exists to stop. The task named is the one that met the wall —
+   * it is not at fault and is left claimable.
+   */
+  | {
+      readonly kind: "provider-unavailable";
+      readonly task: TaskId;
+      readonly detail: string;
+      readonly retryInSeconds: number;
+    }
+  /** ...and once when it answers again, so the silence has an end a human can see. */
+  | { readonly kind: "provider-recovered"; readonly task: TaskId };
 
 /** Where a notification goes. A task with a thread talks in it rather than the channel. */
 export interface NotifyTarget {
@@ -453,6 +469,8 @@ export const componentsFor = (
     case "failed":
     case "plan-ready":
     case "plan-revised":
+    case "provider-unavailable":
+    case "provider-recovered":
       return undefined;
   }
 };
@@ -528,7 +546,28 @@ const frame = (notification: Notification, hint: boolean): string => {
       );
     case "failed":
       return fit(notification.error, (text) => `**${task}** failed — ${text}`);
+    case "provider-unavailable":
+      return fit(notification.detail, (text) =>
+        [
+          `⏸️ **Paused — the model provider stopped answering.**`,
+          "",
+          text,
+          "",
+          `\`${task}\` was released untouched and nothing is at fault. Retrying in ` +
+            `${minutes(notification.retryInSeconds)}, and every ${minutes(notification.retryInSeconds)} ` +
+            `after that until it answers.`,
+        ].join("\n"),
+      );
+    case "provider-recovered":
+      return `▶️ **The model provider is answering again.** Resumed on \`${task}\`.`;
   }
+};
+
+/** A wait, said the way a human reads one. */
+const minutes = (seconds: number): string => {
+  if (seconds < 90) return `${Math.max(1, Math.round(seconds))}s`;
+  const value = Math.round(seconds / 60);
+  return `${value} minute${value === 1 ? "" : "s"}`;
 };
 
 /**
