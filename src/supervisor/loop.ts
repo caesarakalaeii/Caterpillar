@@ -1423,16 +1423,28 @@ export class Supervisor {
    * human reading the journal invites the same failure on a loop. `done` is not
    * re-openable at all — a new task is the honest way to ask for more work.
    *
-   * What it deliberately does NOT do is reset `sessions`, `noProgressStreak` or the
-   * review rounds. A task parked for exhausting a limit will park again on its next
-   * session, and that is correct: the fix for "it used its twenty sessions" is a human
-   * deciding to raise the limit, not a command that quietly forgives it. The reply says
-   * so rather than letting the human discover it thirty seconds later.
+   * It DOES clear `noProgressStreak`, and only that. **Corrected on 2026-08-16**, when a
+   * resume and the re-park that undid it landed in the state repo five seconds apart:
+   *
+   *     09:41:20  chore(BS-…-01): resumed from chat
+   *     09:41:25  chore(BS-…-01): parked
+   *
+   * `workTask` evaluates `checkLimits` BEFORE the first session, so a task resumed at the
+   * no-progress limit parked itself on the very next claim having run nothing at all. The
+   * command reported success and did nothing, which is worse than refusing. `applyAnswer`
+   * had already met this and says why: the streak that made a task park is not the next
+   * session's fault. Answering is progress; so is a human reading a parked task and
+   * saying keep going.
+   *
+   * `sessions` and the review rounds are still NOT reset. Those are budgets, and the fix
+   * for "it used its twenty sessions" is a human deciding to raise the limit, not a
+   * command that quietly forgives it — so the reply says so rather than letting the human
+   * discover it on the next claim.
    */
   private async applyResume(
     request: ChatRequest & { readonly kind: "resume" },
   ): Promise<ChatOutcome> {
-    const { store, leases, logger, config } = this.deps;
+    const { store, leases, logger } = this.deps;
 
     const state = await store.tryReadState(request.task);
     if (state === undefined) return { kind: "unknown-task" };
@@ -1447,23 +1459,29 @@ export class Supervisor {
     try {
       const handle = heldLease(lease);
       await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
-      await this.transition(handle, state, "ready");
+      // `lastProgressSession` is history and stays put; only the streak is forgiven, so
+      // the journal can still show how long the task has actually been stalled.
+      await this.transition(
+        handle,
+        { ...state, progress: { ...state.progress, noProgressStreak: 0 } },
+        "ready",
+      );
       await this.push(handle, `chore(${request.task}): resumed from chat`);
       logger.info("task.resumed", {
         task: request.task,
         sessions: state.sessions,
         maxSessions: state.limits.maxSessions,
+        // What it WAS, since that is the thing being forgiven.
         noProgressStreak: state.progress.noProgressStreak,
       });
 
-      // The limits it will meet again, so the human hears it now rather than after the
-      // next session parks it for the same reason it was parked the first time.
+      // The one limit resuming does not forgive, said now rather than discovered on the
+      // next claim — which is where it is discovered, not after a session: `checkLimits`
+      // runs before the first one.
       const exhausted =
         state.sessions >= state.limits.maxSessions
           ? `it has used ${state.sessions} of ${state.limits.maxSessions} sessions`
-          : state.progress.noProgressStreak >= config.limits.noProgressLimit
-            ? `its no-progress streak is ${state.progress.noProgressStreak}`
-            : undefined;
+          : undefined;
 
       return { kind: "resumed", from: "parked", ...(exhausted === undefined ? {} : { exhausted }) };
     } finally {

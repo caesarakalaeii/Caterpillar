@@ -23,7 +23,10 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
     case "resumed":
       return outcome.exhausted === undefined
         ? `Resumed **${task}**. It is \`ready\` and will be claimed on the next poll.`
-        : `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again after its next session unless the limit is raised.`;
+        : // "on the next claim", NOT "after its next session": `checkLimits` runs before
+          // the first session, so a task resumed at its session limit parks again having
+          // run nothing. Saying otherwise sends the human away expecting work to happen.
+          `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again on the next claim, without running, unless the limit is raised.`;
     case "not-resumable":
       return `**${task}** is \`${outcome.status}\`, not \`parked\` — nothing was written.`;
     case "merged":

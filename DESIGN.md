@@ -556,6 +556,17 @@ can share a thread (a plan's children inherit their brainstorm's), so a parent g
 live the task AWAITING an answer owns it. Nothing is deleted: parking stops the work, and
 the journal is the audit trail.
 
+**`/resume` forgives the no-progress streak, and nothing else.** `checkLimits` runs
+*before* a claim's first session, so any limit still met at resume time parks the task
+again having run nothing — on 2026-08-16 a resume and the re-park that undid it landed in
+the state repo five seconds apart, and the command had reported success. The streak is
+cleared for the reason `/answer` already clears it: it is a measurement of the agent's
+last few sessions, and a human reading a parked task and saying *keep going* is new
+information about the next one. `sessions` and the review rounds are budgets rather than
+measurements, so resuming does not forgive those — the reply names the one that still
+stands and says the task will park again on the next claim, without running, until a
+human raises it.
+
 **The typing indicator is what says the agent is alive.** Handoffs are deliberately not
 notified (§11), so between a question and its answer the channel is silent and a task
 thinking for forty minutes looks exactly like one that has died. While a session runs for
