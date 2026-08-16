@@ -22,7 +22,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import type { Git } from "./git.ts";
+import { GitError, type Git } from "./git.ts";
 import {
   asTaskId,
   asWorkspaceName,
@@ -503,16 +503,112 @@ export class StateStore {
     for (const path of ["tasks", "intake"]) {
       if (existsSync(join(this.root, path))) await this.git.run("add", "-A", path);
     }
-    if (!(await this.git.hasUncommittedChanges())) return;
-    await this.git.run("commit", "-m", message);
-    await this.git.run("push", remote, `HEAD:${branch}`);
+    if (await this.git.hasUncommittedChanges()) {
+      await this.git.run("commit", "-m", message);
+    }
+    // NOT `else return`. A clean tree does not mean there is nothing to push: after a
+    // rejected push the tree is clean and the commit is still local. Returning here made
+    // that loss permanent in principle — every subsequent call returned before pushing,
+    // so the orphaned commit was never re-sent, and the next `pull()` destroyed it.
+    await this.push(remote, branch);
   }
 
+  /**
+   * Push, rebasing onto the remote if someone else got there first.
+   *
+   * The state branch is ONE shared resource. Leases are per task, so they say nothing
+   * about this: two runners finishing different tasks push to the same branch, and so
+   * does a human hand-committing a spec (§14.4), which HANDOFF.md documents as a
+   * supported workflow. `Git.run` throws on any non-zero exit, so a non-fast-forward
+   * rejection used to propagate out of `recordSession` into `parkFailed`, which pushes
+   * too and was rejected identically — costing a session's journal, its usage
+   * accounting, and leaving the task stranded.
+   *
+   * Rebase rather than merge: runners touch disjoint `tasks/<id>/` paths, so the histories
+   * commute, and a linear state history is the one that reads as a sequence of events.
+   */
+  private async push(remote: string, branch: string): Promise<void> {
+    for (let attempt = 0; attempt < PUSH_ATTEMPTS; attempt += 1) {
+      const ahead = await this.git.tryRun(
+        "rev-list", "--count", `${remote}/${branch}..HEAD`,
+      );
+      // A missing remote-tracking ref means we have never fetched; push and find out.
+      if (ahead.code === 0 && ahead.stdout.trim() === "0") return;
+
+      const pushed = await this.git.tryRun("push", remote, `HEAD:${branch}`);
+      if (pushed.code === 0) return;
+
+      // Anything other than a rejection — no network, no credential, a hook refusing the
+      // content — will not be fixed by rebasing onto it, and retrying would just repeat
+      // it three times before reporting the same thing.
+      if (!isPushRejection(pushed.stderr)) {
+        throw new GitError(["push", remote, `HEAD:${branch}`], pushed);
+      }
+
+      await this.git.run("fetch", remote, branch);
+      const rebased = await this.git.tryRun("rebase", `${remote}/${branch}`);
+      if (rebased.code !== 0) {
+        // Two runners wrote the same file. Leave the repo usable rather than mid-rebase:
+        // the caller's changes are still in the local commit, and the next poll's pull
+        // will report the divergence rather than silently discarding one side.
+        await this.git.tryRun("rebase", "--abort");
+        throw new GitError(["rebase", `${remote}/${branch}`], rebased);
+      }
+    }
+    throw new Error(
+      `state push to ${remote}/${branch} was rejected ${PUSH_ATTEMPTS} times running — ` +
+        `something else is writing the state branch faster than this runner can rebase`,
+    );
+  }
+
+  /**
+   * Refresh the checkout from the remote, keeping anything not yet pushed.
+   *
+   * This used to be `fetch` + `reset --hard`, which destroyed local commits that a
+   * failed push had left behind, and — because `reset` reverts tracked files and leaves
+   * untracked ones — left the task directories of a rejected `applyPlan` on disk.
+   * `listTasks` enumerates the filesystem, so those became tasks the runner claimed and
+   * worked while they existed nowhere in git. That happened: five of them, and the money
+   * spent on them is in HANDOFF.md.
+   */
   async pull(remote: string, branch: string): Promise<void> {
     await this.git.run("fetch", remote, branch);
-    await this.git.run("reset", "--hard", `${remote}/${branch}`);
+
+    const ahead = await this.git.tryRun("rev-list", "--count", `${remote}/${branch}..HEAD`);
+    const unpushed = ahead.code === 0 && ahead.stdout.trim() !== "0";
+
+    if (unpushed) {
+      const rebased = await this.git.tryRun("rebase", `${remote}/${branch}`);
+      if (rebased.code !== 0) {
+        await this.git.tryRun("rebase", "--abort");
+        throw new GitError(["rebase", `${remote}/${branch}`], rebased);
+      }
+    } else {
+      await this.git.run("reset", "--hard", `${remote}/${branch}`);
+    }
+
+    // Untracked leftovers are removed only where a task can be invented from one. The
+    // rest of the checkout is left alone: this runs every poll, and a clean sweep of the
+    // whole repo would delete whatever an operator was in the middle of.
+    for (const path of ["tasks", "intake"]) {
+      if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
+    }
   }
 }
+
+/** Rebase-and-retry ceiling. Three losses in a row is contention, not a race. */
+const PUSH_ATTEMPTS = 3;
+
+/**
+ * Whether git refused the push because the remote moved, as opposed to anything else.
+ *
+ * Matched on stderr because git exits 1 for every push failure alike — a rejection, a
+ * dead network, a missing credential and a rejecting hook are indistinguishable by code.
+ * Treating them all as rejections would turn "no network" into three rebase attempts
+ * against a ref we could not fetch either.
+ */
+const isPushRejection = (stderr: string): boolean =>
+  /\[rejected\]|non-fast-forward|fetch first|Updates were rejected/i.test(stderr);
 
 const isTrackerRef = (value: unknown): value is TrackerRef => {
   if (value === null || typeof value !== "object") return false;

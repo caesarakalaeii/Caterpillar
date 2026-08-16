@@ -7,7 +7,8 @@
  * can claim and nothing can explain, which is strictly worse than never creating it.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -212,4 +213,121 @@ test("commitAndPush stages intake records, not only tasks", async () => {
   // push carried the file.
   const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
   assert.match(listed, /^intake\/GH-acme-widget-97\.json$/m);
+});
+
+/** A state repo with a real origin, plus a second clone standing in for another runner. */
+const sharedStateRepo = async (): Promise<{
+  store: StateStore;
+  git: Git;
+  bare: Git;
+  other: Git;
+  root: string;
+  otherRoot: string;
+}> => {
+  const hermetic: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  };
+  const origin = await mkdtemp(join(tmpdir(), "caterpillar-share-origin-"));
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-share-"));
+  const otherRoot = await mkdtemp(join(tmpdir(), "caterpillar-share-other-"));
+  roots.push(origin, root, otherRoot);
+
+  const bare = new Git(origin, hermetic);
+  await bare.run("init", "--quiet", "--bare", "--initial-branch=main", ".");
+
+  const git = new Git(root, hermetic);
+  await git.run("init", "--quiet", "--initial-branch=main", ".");
+  await git.run("config", "user.email", "supervisor@example.invalid");
+  await git.run("config", "user.name", "supervisor");
+  await git.run("remote", "add", "origin", origin);
+  await writeFile(join(root, "README.md"), "state\n", "utf8");
+  await git.run("add", "-A");
+  await git.run("commit", "--quiet", "-m", "seed");
+  await git.run("push", "--quiet", "origin", "HEAD:main");
+
+  const other = new Git(otherRoot, hermetic);
+  await other.run("clone", "--quiet", origin, ".");
+  await other.run("config", "user.email", "other@example.invalid");
+  await other.run("config", "user.name", "other");
+
+  return { store: new StateStore(root, git), git, bare, other, root, otherRoot };
+};
+
+test("a push rejected by a concurrent writer is rebased and retried, not lost", async () => {
+  // The failure this reproduces cost a real session and $10.28. `commitAndPush` had no
+  // fetch, no rebase and no retry, so a non-fast-forward rejection propagated out
+  // through `parkFailed` — which pushes too, and was rejected identically — and the next
+  // poll's `reset --hard` then destroyed the commit.
+  const { store, bare, other, otherRoot } = await sharedStateRepo();
+
+  // Another runner lands a commit on main first. Runner A never saw it.
+  await writeFile(join(otherRoot, "OTHER.md"), "other runner\n", "utf8");
+  await other.run("add", "-A");
+  await other.run("commit", "--quiet", "-m", "other runner's work");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-1"), {
+    digest: "abc",
+    reason: "no acceptance",
+  });
+  await store.commitAndPush("chore(intake): record refusals", "origin", "main");
+
+  // BOTH commits are on the remote: ours rebased on top rather than replacing theirs.
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^intake\/GH-acme-widget-1\.json$/m);
+  assert.match(listed, /^OTHER\.md$/m, "the other runner's commit must survive");
+});
+
+test("a commit stranded by an earlier failed push is still sent", async () => {
+  // The early return on a clean tree made the loss unrecoverable in principle: after a
+  // failed push the tree is clean, so every later commitAndPush returned before pushing
+  // and the orphaned commit was never re-sent.
+  const { store, git, bare } = await sharedStateRepo();
+
+  // A local commit that never reached the remote — the state after a rejected push.
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-2"), { digest: "d", reason: "r" });
+  await git.run("add", "-A");
+  await git.run("commit", "--quiet", "-m", "orphaned by a failed push");
+
+  // Nothing new to stage: the tree is clean.
+  await store.commitAndPush("chore(intake): nothing new", "origin", "main");
+
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^intake\/GH-acme-widget-2\.json$/m, "the stranded commit must land");
+});
+
+test("pull rebases unpushed commits instead of destroying them", async () => {
+  const { store, git, bare, other, root } = await sharedStateRepo();
+
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-3"), { digest: "d", reason: "r" });
+  await git.run("add", "-A");
+  await git.run("commit", "--quiet", "-m", "local work not yet pushed");
+
+  await store.pull("origin", "main");
+
+  // Survived the pull, and a later push carries it.
+  assert.ok(existsSync(join(root, "intake", "GH-acme-widget-3.json")));
+  await store.commitAndPush("chore: after pull", "origin", "main");
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^intake\/GH-acme-widget-3\.json$/m);
+});
+
+test("pull removes untracked task directories a failed push left behind", async () => {
+  // `reset --hard` reverts tracked files and leaves untracked ones. `applyPlan` writes
+  // every child's spec BEFORE pushing, so a rejected push left the children on disk —
+  // and `listTasks` enumerates the filesystem, so the runner claimed and worked five
+  // tasks that existed nowhere in git. That is the HANDOFF.md:469 incident.
+  const { store, root } = await sharedStateRepo();
+
+  await mkdir(join(root, "tasks", "PHANTOM-01"), { recursive: true });
+  await writeFile(join(root, "tasks", "PHANTOM-01", "spec.md"), "# phantom\n", "utf8");
+
+  await store.pull("origin", "main");
+
+  assert.deepEqual(await store.listTasks(), [], "a task that is not in git is not a task");
 });

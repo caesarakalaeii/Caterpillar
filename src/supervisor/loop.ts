@@ -1,8 +1,10 @@
 /**
  * The supervisor loop. See DESIGN.md §6.
  *
- * One task at a time per runner. Scale by adding replicas — the git-ref leasing
- * already makes that safe (DESIGN.md §2, Concurrency).
+ * One task at a time per runner. Scale by adding replicas — the git-ref leasing makes
+ * the TASKS safe (DESIGN.md §2, Concurrency). Note what it does not make safe: leases are
+ * per task, and the state branch is one shared resource that every runner pushes to, so
+ * that half rests on `StateStore.push` rebasing rather than on the lease.
  *
  * Invariants this loop is responsible for:
  *   - never run a session without a held lease
