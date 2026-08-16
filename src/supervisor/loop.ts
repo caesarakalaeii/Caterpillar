@@ -660,6 +660,16 @@ export class Supervisor {
         // waits for the provider, with the task already released and the runner cooling.
         if (reviewed.decision === "stalled" || reviewed.decision === "outage") return true;
 
+        // BEFORE the merge, not after. `push` fences, but a merge is irreversible and
+        // crosses a system boundary, so fencing it afterwards fences nothing: `convene`
+        // takes minutes (§5.1 records 207s), and in that window a lease can go stale, an
+        // operator can `/cancel`, and another runner can park the task and push. The
+        // council would then return `pass` and this runner would merge a PR for a task
+        // the human had already cancelled — with `assertHeld` throwing afterwards, and
+        // the throw logged at warn and discarded. §5.1 says every push verifies lease
+        // ownership first; a merge deserves the same, first.
+        await this.deps.leases.assertHeld(await lease.current());
+
         const merge = await this.mergeReviewed(spec, reviewed.state);
         await this.transition(lease, reviewed.state, "done");
         await this.push(lease, `chore(${spec.id}): done`);
@@ -1576,27 +1586,42 @@ export class Supervisor {
       };
     }
 
-    const merge = await this.mergeReviewed(spec, state);
-    if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
-
-    // Merging a parked task settles it: the work is on the default branch, and leaving
-    // it parked would invite a human to pick up something already shipped.
+    // The lease FIRST, then the merge. This ran the other way round, which meant a task
+    // being actively worked by another runner could have its PR merged out from under
+    // the session still writing to that branch — the claim below would then fail, and
+    // the only trace was a `merge.unrecorded` warning about an irreversible act that had
+    // already happened. Refusing is the safe direction: nothing has been merged, and the
+    // human gets told why.
     const lease = await leases.claim(request.task);
-    if (lease !== undefined) {
+    if (lease === undefined) {
+      return {
+        kind: "not-mergeable",
+        reason:
+          "another runner holds this task right now — it is still being worked, so " +
+          "merging would land a branch that is still moving. Try again once it parks.",
+      };
+    }
+
+    try {
+      const merge = await this.mergeReviewed(spec, state);
+      if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
+
+      // Merging a parked task settles it: the work is on the default branch, and leaving
+      // it parked would invite a human to pick up something already shipped.
+      const handle = heldLease(lease);
       try {
-        const handle = heldLease(lease);
         await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
         await this.transition(handle, state, "done");
         await this.push(handle, `chore(${request.task}): merged from chat`);
-      } finally {
-        await leases.release(lease).catch(() => undefined);
+      } catch (error) {
+        // The merge already happened; failing to record it is worth a log, not a retry.
+        logger.warn("merge.unrecorded", { task: request.task, ...errorFields(error) });
       }
-    } else {
-      // The merge already happened; failing to record it is worth a log, not a retry.
-      logger.warn("merge.unrecorded", { task: request.task, reason: "task is leased elsewhere" });
-    }
 
-    return { kind: "merged", prUrl: state.pr.url };
+      return { kind: "merged", prUrl: state.pr.url };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
   }
 
   /**

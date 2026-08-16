@@ -116,3 +116,46 @@ test("a failing legacy combined status is respected even with no check runs", ()
   const status = summarise({ check_runs: [] }, { state: "failure", total_count: 2 });
   assert.equal(status.conclusion, "failure");
 });
+
+test("a partial check-run list is pending, never success", () => {
+  // The §12 CI gate used to run on one unpaginated request, which returns GitHub's
+  // default of 30. A matrix build whose failing job landed on page 2 came back as
+  // success and was squash-merged red. `total_count` was not even declared on the
+  // response type, so the truncation was undetectable.
+  const status = summarise(
+    {
+      total_count: 42,
+      check_runs: [{ status: "completed", conclusion: "success", name: "test (1)" }],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "pending");
+  assert.match(status.summary, /1 of 42/);
+});
+
+test("a complete check-run list is judged normally", () => {
+  const status = summarise(
+    {
+      total_count: 2,
+      check_runs: [
+        { status: "completed", conclusion: "success", name: "test" },
+        { status: "completed", conclusion: "success", name: "lint" },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "success");
+});
+
+test("a response without total_count is trusted as complete", () => {
+  // GHES and the test fixtures predating pagination omit it. Treating absence as
+  // truncation would make every such ref permanently pending.
+  const status = summarise(
+    { check_runs: [{ status: "completed", conclusion: "failure", name: "test" }] },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+});

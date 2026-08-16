@@ -278,6 +278,18 @@ it must **abort immediately** — no pushes to the task branch, no state writes.
 Rule: **every push verifies lease ownership first.** Mutual exclusion on claiming is not
 enough; a runner that lost the network but kept working must not resurrect stale work.
 
+**And every IRREVERSIBLE act, not only every push.** A push is cheap to fence because it
+is cheap to lose — a rejected one costs a retry. A merge is not: it lands on the default
+branch, it crosses a system boundary, and no later check can take it back. Fencing it
+afterwards fences nothing. The gap that made this concrete: `convene` takes minutes (207s
+observed), and in that window the lease can go stale, an operator can `/cancel`, and
+another runner can park the task and push — after which the council returns `pass` and
+the original runner merges the PR for a task the human already cancelled. `assertHeld`
+then threw, and the throw was logged at warn and discarded, because by then there was
+nothing left to protect. So `assertHeld` runs immediately *before* the merge, and the
+`Merge anyway` button claims the lease before merging rather than after, refusing when
+another runner holds it.
+
 > **Clock skew matters.** Steal-on-stale compares commit timestamps across machines.
 > Runners must run NTP. The 5-minute threshold is deliberately far larger than plausible
 > skew.
