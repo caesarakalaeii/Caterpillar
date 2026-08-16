@@ -450,9 +450,43 @@ export const isClaimable = (
 export const isTerminal = (status: TaskStatus): boolean =>
   status === "done" || status === "failed" || status === "parked";
 
-/** Claim order: earlier waves first, then by id so it is deterministic across runners. */
-export const claimOrder = (a: TaskState, b: TaskState): number =>
-  (a.plan?.wave ?? 0) - (b.plan?.wave ?? 0) || a.id.localeCompare(b.id);
+/** A task the runner could take, and the one thing about its spec claiming depends on. */
+export interface ClaimCandidate {
+  readonly state: TaskState;
+  readonly kind: TaskKind;
+}
+
+/**
+ * A brainstorm outranks batch work, because someone is waiting on it.
+ *
+ * The two kinds are not the same sort of job. An implementation task is throughput — it
+ * runs for as many sessions as it needs and nobody is watching any single one. A
+ * brainstorm is a conversation: a human typed `/brainstorm`, a thread opened under it,
+ * and they are looking at that thread now. It also costs almost nothing to let in,
+ * because `ask_human` parks the task and releases the lease at the first question, so a
+ * brainstorm holds the runner for one short session and gives it straight back.
+ *
+ * Without this a brainstorm could not start at all while the queue was non-empty, and
+ * the reason was an accident of the id scheme rather than anything anyone decided: a
+ * brainstorm's id is its Discord thread id, thread ids are snowflakes, and snowflakes
+ * increase — so the NEWEST brainstorm always sorted LAST behind every task already
+ * there, including the children of previous brainstorms. What that looked like from
+ * Discord was a thread that opened and then stayed silent indefinitely.
+ */
+const claimRank = (candidate: ClaimCandidate): number =>
+  candidate.kind === "brainstorm" ? 0 : 1;
+
+/**
+ * Claim order: a waiting human first, then earlier waves, then by id.
+ *
+ * The id remains the final tie-break, and every field before it is derived from state
+ * both runners can read — so two runners sorting the same queue reach the same answer
+ * rather than racing for the same task.
+ */
+export const claimOrder = (a: ClaimCandidate, b: ClaimCandidate): number =>
+  claimRank(a) - claimRank(b) ||
+  (a.state.plan?.wave ?? 0) - (b.state.plan?.wave ?? 0) ||
+  a.state.id.localeCompare(b.state.id);
 
 /**
  * A goal's first heading or first non-blank line, as a one-line name.

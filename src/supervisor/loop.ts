@@ -428,18 +428,39 @@ export class Supervisor {
     const statusOf = (id: TaskId): TaskStatus | undefined =>
       records.find((record) => record.id === id)?.state.status;
 
-    // Earlier waves first, then by id. Without the sort this is `readdir` order, which
-    // is alphabetical and would run a plan's wave-3 task before its wave-1 sibling
-    // whenever the ids happened to fall that way.
-    const ordered = [...records].sort((a, b) => claimOrder(a.state, b.state));
-
-    for (const { id, state } of ordered) {
+    // The spec is read BEFORE the sort, not inside the loop, because the order now
+    // depends on the task's kind and `state.json` does not carry it. Only for tasks that
+    // survive the cheap filters — a state repo holds every task the fleet has ever run,
+    // and reading all of their specs on every poll to order the two that are claimable
+    // would be a sweep of the whole tree once a minute forever.
+    //
+    // A spec that cannot be read drops out here rather than being claimed and failing
+    // later, which is what the old `continue` did one step further down.
+    // `id` is carried alongside rather than taken from `state.id`: the directory name is
+    // what `listTasks` walked and what the lease ref keys on, and nothing validates that
+    // the two agree.
+    const candidates: { readonly id: TaskId; readonly spec: TaskSpec; readonly state: TaskState }[] =
+      [];
+    for (const { id, state } of records) {
       if (!isClaimable(state, statusOf)) continue;
       if (!capabilitiesSatisfy(config.capabilities, state.requires)) continue;
 
       const spec = await store.readSpec(id).catch(() => undefined);
       if (spec === undefined) continue;
+      candidates.push({ id, spec, state });
+    }
 
+    // A waiting human first, then earlier waves, then by id. Without the sort this is
+    // `readdir` order, which is alphabetical and would run a plan's wave-3 task before
+    // its wave-1 sibling whenever the ids happened to fall that way.
+    candidates.sort((a, b) =>
+      claimOrder(
+        { state: { ...a.state, id: a.id }, kind: a.spec.kind ?? "implement" },
+        { state: { ...b.state, id: b.id }, kind: b.spec.kind ?? "implement" },
+      ),
+    );
+
+    for (const { id, spec, state } of candidates) {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
@@ -648,6 +669,8 @@ export class Supervisor {
 
         const done = await this.applyOutcome(heartbeat, spec, state, outcome);
         if (done) return;
+
+        if (await this.yieldToBrainstorm(heartbeat, spec, state)) return;
       }
     } catch (error) {
       // Parking happens HERE rather than in the caller, because the `finally` below
@@ -670,6 +693,44 @@ export class Supervisor {
       signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
+  }
+
+  /**
+   * Hand the runner back when someone is waiting on a brainstorm (DESIGN.md §14.3).
+   *
+   * `workTask` drives ONE task through as many sessions as it needs, and the poll loop —
+   * and with it the chat drain and the next claim — is blocked for all of them. A task
+   * that keeps handing off therefore owns the runner indefinitely, which is how a human
+   * typing `/brainstorm` got a thread that opened and then said nothing: twenty minutes
+   * and six sessions, in the run this was written from.
+   *
+   * Deliberately NOT an interrupt. `/cancel` aborts a session because the human's whole
+   * intent is to stop it; here the session is doing legitimate work, and an interrupted
+   * session records nothing at all (§6.4) — so cutting one short to start a conversation
+   * would throw away everything it had done since the last boundary. Waiting for the
+   * boundary costs the human the tail of one session and costs the task nothing.
+   *
+   * The task is put back to `ready` rather than left `running`. Both are claimable, but
+   * `running` is the crash-recovery path: re-claiming one logs `task.reclaimed` and
+   * writes a journal entry about a runner that "stopped without parking or finishing it",
+   * which would be a lie told once per brainstorm, in the task's permanent record.
+   *
+   * The request itself is left in the queue. This code cannot serve it — creating the
+   * task writes the state repo, and that is the loop's to do — so it only gets out of
+   * the way, and `applyChatRequests` drains it on the very next poll.
+   */
+  private async yieldToBrainstorm(
+    lease: LeaseHandle,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<boolean> {
+    const { inbox, logger } = this.deps;
+    if (inbox?.some((request) => request.kind === "brainstorm") !== true) return false;
+
+    logger.info("task.yielded", { task: spec.id, sessions: state.sessions, to: "brainstorm" });
+    await this.transition(lease, state, "ready");
+    await this.push(lease, `chore(${spec.id}): released for a waiting brainstorm`);
+    return true;
   }
 
   /** Persist the journal and usage for a finished session. */

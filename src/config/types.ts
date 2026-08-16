@@ -8,6 +8,22 @@
 import type { Capability, ForgeKind, TrackerKind, WorkspaceName } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 
+/**
+ * Who the runner authors as (DESIGN.md §9.7).
+ *
+ * One identity for both writers: the supervisor committing the state repo and the agent
+ * committing in a task worktree. They are the same actor, and two identities would make
+ * the audit trail read as though the fleet had a second author nobody configured.
+ *
+ * Deployment-specific by nature — it names the App installed for THIS deployment — which
+ * is why it is configuration and not a constant. See `identity` in `load.ts` for the one
+ * address shape that is refused, and why.
+ */
+export interface CommitIdentity {
+  readonly name: string;
+  readonly email: string;
+}
+
 export interface ForgeConfig {
   readonly kind: ForgeKind;
   readonly host: string;
@@ -215,6 +231,8 @@ export interface DigestConfig {
 export interface RunnerConfig {
   readonly runnerId: string;
   readonly capabilities: readonly Capability[];
+  /** Author and committer of everything this runner writes. */
+  readonly identity: CommitIdentity;
   readonly toolchain: ToolchainConfig;
   readonly stateRepo: StateRepoConfig;
   readonly paths: WorkspacePathsConfig;

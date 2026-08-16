@@ -9,6 +9,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Git } from "../state/git.ts";
+import type { CommitIdentity } from "../config/types.ts";
 import type { RepoRef, TaskId } from "../domain/task.ts";
 
 /** Where a task's repos landed. `root` is the agent's working directory. */
@@ -16,12 +17,6 @@ export interface TaskCheckout {
   readonly root: string;
   /** Sibling repos, keyed `owner/name`, checked out under `root/repos/<name>`. */
   readonly siblings: ReadonlyMap<string, string>;
-}
-
-/** Bot identity for commits the agent makes. */
-export interface CommitIdentity {
-  readonly name: string;
-  readonly email: string;
 }
 
 export interface WorktreeOptions {

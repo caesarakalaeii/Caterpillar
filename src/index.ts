@@ -54,11 +54,6 @@ import { ToolchainResolver } from "./workspace/toolchain.ts";
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
 /** Where state-repo installation tokens are minted. Not a workspace forge. */
 const GITHUB_API_BASE = process.env["GITHUB_API_BASE"] ?? "https://api.github.com";
-/** Authors both the state repo's commits and the agent's. */
-const BOT_IDENTITY = {
-  name: "caterpillar",
-  email: "caterpillar@users.noreply.github.com",
-} as const;
 const METRICS_PORT = Number.parseInt(process.env["METRICS_PORT"] ?? "9090", 10);
 const CRED_SOCKET = process.env["CRED_SOCKET"] ?? "/run/caterpillar/cred.sock";
 const CRED_HELPER = process.env["CRED_HELPER"] ?? "/usr/local/bin/caterpillar-cred";
@@ -131,7 +126,7 @@ const main = async (): Promise<void> => {
     path: config.stateRepo.path,
     url: config.stateRepo.url,
     branch: config.stateRepo.branch,
-    identity: BOT_IDENTITY,
+    identity: config.identity,
     ...(stateCredentials !== undefined ? { envProvider: stateCredentials.gitEnv } : {}),
   });
   const store = new StateStore(config.stateRepo.path, git);
@@ -175,7 +170,7 @@ const main = async (): Promise<void> => {
     tasksDir: config.paths.tasks,
     helperPath: CRED_HELPER,
     socketPath: CRED_SOCKET,
-    identity: BOT_IDENTITY,
+    identity: config.identity,
   });
 
   const credentials = new CredentialService();

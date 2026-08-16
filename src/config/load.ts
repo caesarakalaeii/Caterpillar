@@ -16,6 +16,7 @@ import {
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
 import type {
+  CommitIdentity,
   DigestConfig,
   LlmConfig,
   RunnerConfig,
@@ -33,6 +34,7 @@ export class ConfigError extends Error {
 /** Shape of the on-disk config file. Validated into RunnerConfig. */
 interface RawConfig {
   readonly capabilities?: unknown;
+  readonly identity?: unknown;
   readonly stateRepo?: {
     readonly url?: unknown;
     readonly branch?: unknown;
@@ -123,6 +125,56 @@ const capabilities = (value: unknown): readonly Capability[] => {
     }
     return entry as Capability;
   });
+};
+
+/**
+ * GitHub's noreply domain. An address here is not decoration — it RESOLVES to an account.
+ */
+const GITHUB_NOREPLY = "@users.noreply.github.com";
+
+/** The unambiguous form: `<id>+<login>@users.noreply.github.com`. */
+const ID_PREFIXED = /^\d+\+/;
+
+/**
+ * Validate who this runner authors as (DESIGN.md §9.7).
+ *
+ * Required, with no default. Every default would be a claim about who wrote an audit
+ * trail, and after the fact a wrong claim is indistinguishable from a right one — so a
+ * runner that has not been told refuses to start rather than guess.
+ *
+ * The one shape refused outright is a github noreply address WITHOUT the numeric id
+ * prefix. This is not pedantry, it is the defect that produced this function.
+ * `caterpillar@users.noreply.github.com` reads like a reserved, inert address for a
+ * project called caterpillar; it is in fact the pre-2017 personal noreply form, and
+ * GitHub resolves it to the account holding that login. An unrelated person spent a
+ * hundred and twenty-nine commits as the author of this fleet's work, on their
+ * contribution graph, with their avatar, in a repository they have never seen. The
+ * id-prefixed form cannot do that: a numeric id names exactly one account, so it is
+ * either yours or it does not exist.
+ *
+ * Only that domain is checked. A runner pushing to Codeberg has no github noreply
+ * address to get wrong and must not be made to invent an id prefix that means nothing
+ * there.
+ */
+const identity = (value: unknown): CommitIdentity => {
+  const raw = (value === null || typeof value !== "object" ? {} : value) as Record<string, unknown>;
+  const name = str(raw["name"], "identity.name");
+  const email = str(raw["email"], "identity.email");
+
+  if (!email.includes("@")) {
+    throw new ConfigError(`identity.email must be an email address (got '${email}')`);
+  }
+
+  if (email.endsWith(GITHUB_NOREPLY) && !ID_PREFIXED.test(email)) {
+    throw new ConfigError(
+      `identity.email '${email}' is a bare users.noreply.github.com address, which GitHub ` +
+        `resolves to the account with that login — it would attribute this runner's commits ` +
+        `to whoever owns it. Use the id-prefixed form '<id>+<login>@users.noreply.github.com'; ` +
+        `for a GitHub App the id is that of '<slug>[bot]' (GET /users/<slug>%5Bbot%5D)`,
+    );
+  }
+
+  return { name, email };
 };
 
 const workspace = (name: string, value: unknown): WorkspaceProfile => {
@@ -289,6 +341,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
+    identity: identity(raw.identity),
     toolchain: {
       nixpkgs: str(raw.toolchain?.nixpkgs, "toolchain.nixpkgs", DEFAULTS.nixpkgs),
       timeoutSeconds: num(

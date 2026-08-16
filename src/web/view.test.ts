@@ -49,6 +49,7 @@ const state = (id: string, over: Partial<TaskState> = {}): TaskState => ({
 const CONFIG: RunnerConfig = {
   runnerId: "pod-7f3a",
   capabilities: ["linux", "nix"],
+  identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: { nixpkgs: "github:NixOS/nixpkgs/abc", timeoutSeconds: 900, gcIntervalHours: 24, gcKeepDays: 7 },
   stateRepo: {
     url: "https://github.com/acme/state.git",

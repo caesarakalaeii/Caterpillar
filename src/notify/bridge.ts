@@ -18,8 +18,8 @@
  * snapshot, inside the acknowledgement budget, because going through the loop for a
  * listing would mean waiting on a session to end before finding out what it is doing.
  */
-import { asTaskId } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
+import { brainstormId } from "../plan/brainstorm.ts";
 import type { ChatInbox } from "../supervisor/inbox.ts";
 import type { TaskSnapshot } from "../supervisor/snapshot.ts";
 import type { DiscordBot } from "./bot.ts";
@@ -294,12 +294,34 @@ export class DiscordBridge {
     const threadId = await bot.createThread(opening.id, threadName(topic));
     logger.info("bridge.brainstorm", { thread: threadId, repo, author });
 
+    // Both BEFORE the loop is awaited, and both are free — a brainstorm's id is its
+    // thread id (§14.3), so neither the greeting nor the binding needs anything written
+    // first. Waiting for the write is what made a `/brainstorm` land in an empty thread
+    // and stay there: the loop is blocked for the whole of a session, and the human had
+    // nothing to look at and nowhere their typing would be kept.
+    //
+    // Binding early is safe because ordering makes it safe. The creation is queued ahead
+    // of anything typed afterwards and `drain` preserves that order, so by the time an
+    // answer is applied its task exists. Until the agent asks something the answer is
+    // `not-waiting`, which the message path already treats as ordinary.
+    const task = brainstormId(threadId);
+    threads?.bind(threadId, task);
+    await this.say(
+      `Starting \`${task}\` here. Talk to me in this thread — I will pick it up as soon ` +
+        `as the runner reaches a session boundary.`,
+      threadId,
+    );
+
     const outcome = await inbox.submit({ kind: "brainstorm", topic, repo, threadId, author });
-    if (outcome.kind === "started") threads?.bind(threadId, outcome.task);
+
+    // A thread no task owns must not stay bound. `threadBindings` unbinds terminal tasks
+    // for exactly this reason: a message in a bound thread is an ANSWER, so a binding
+    // with nothing behind it swallows everything typed into it in silence.
+    if (outcome.kind !== "started") threads?.unbind(threadId);
 
     // Answered in the THREAD rather than where the command was typed, so the whole
-    // conversation starts in one place.
-    await this.say(describeOutcome(asTaskId(threadId), outcome), threadId);
+    // conversation stays in one place.
+    await this.say(describeOutcome(task, outcome), threadId);
     return `Brainstorming in <#${threadId}>.`;
   }
 
