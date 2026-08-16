@@ -77,6 +77,20 @@ test("a council where nobody reviewed does not merge", () => {
   assert.equal(decide([]).decision, "changes");
 });
 
+test("a council where EVERY reviewer abstained does not merge either", () => {
+  // The same outcome as an empty council, arrived at differently: three reviewers were
+  // convened and none of them reviewed anything. Counting zero blocking objections as
+  // consensus is how a provider outage would have merged an unread change.
+  const result = decide([
+    verdict({ lens: "correctness", abstained: true, decision: "changes" }),
+    verdict({ lens: "design", abstained: true, decision: "changes" }),
+    verdict({ lens: "fit", abstained: true, decision: "changes" }),
+  ]);
+
+  assert.equal(result.decision, "changes");
+  assert.equal(result.abstentions.length, 3);
+});
+
 test("a rejected verdict reads as instructions, not as a score", () => {
   // This text goes into the journal, which is what the next session actually reads. If
   // it does not say WHERE and WHAT, the next session re-derives the objection or ignores it.

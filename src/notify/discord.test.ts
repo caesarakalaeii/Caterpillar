@@ -229,6 +229,13 @@ test("every notification kind renders with the task id and its payload", async (
     { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
     { kind: "done", task: TASK, prUrl: "https://example.invalid/pr/1" },
     { kind: "failed", task: TASK, error: "mirror clone failed" },
+    {
+      kind: "provider-unavailable",
+      task: TASK,
+      detail: "This request would exceed your account's monthly spend limit.",
+      retryInSeconds: 1800,
+    },
+    { kind: "provider-recovered", task: TASK },
   ];
 
   for (const notification of cases) {
@@ -236,4 +243,19 @@ test("every notification kind renders with the task id and its payload", async (
     assert.match(content, /SMOKE-1/, notification.kind);
     assert.ok(size(content) > 0 && size(content) <= CONTENT_LIMIT, notification.kind);
   }
+});
+
+test("a pause says what broke, that no task is at fault, and when it retries", () => {
+  // The message a human wakes up to. It has to answer all three questions at once, or
+  // the obvious reading of "paused" is "a task did something wrong".
+  const content = render({
+    kind: "provider-unavailable",
+    task: TASK,
+    detail: "This request would exceed your account's monthly spend limit.",
+    retryInSeconds: 1800,
+  });
+
+  assert.match(content, /monthly spend limit/);
+  assert.match(content, /nothing is at fault/);
+  assert.match(content, /30 minutes/);
 });

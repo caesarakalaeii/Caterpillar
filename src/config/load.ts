@@ -182,6 +182,12 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
     providerId: str(llm["providerId"], "llm.providerId"),
     contextWindow: num(llm["contextWindow"], "llm.contextWindow"),
     maxTokens: num(llm["maxTokens"], "llm.maxTokens"),
+    // Defaulted, never required: this exists to survive an incident, and an incident
+    // must not be the moment a runner discovers its ConfigMap is a field short.
+    cooldown: {
+      initialSeconds: num(llm["cooldownSeconds"], "llm.cooldownSeconds", 60),
+      maxSeconds: num(llm["maxCooldownSeconds"], "llm.maxCooldownSeconds", 1800),
+    },
     ...(credentialsPath === undefined
       ? {}
       : { credentialsPath: str(credentialsPath, "llm.credentialsPath") }),

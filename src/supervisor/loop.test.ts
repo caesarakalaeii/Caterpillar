@@ -125,6 +125,9 @@ const config: RunnerConfig = {
     providerId: "test",
     contextWindow: 100_000,
     maxTokens: 4096,
+    // Longer than the outage test's observation window, so "did it claim again" is a
+    // question about the cooldown rather than a race with it.
+    cooldown: { initialSeconds: 30, maxSeconds: 60 },
   },
   workspaces: new Map(),
   pollSeconds: 1,
@@ -143,6 +146,15 @@ const TEST_TOOLCHAIN = new ToolchainResolver({
   config: DEFAULT_TOOLCHAIN_CONFIG,
   tasksDir: join(root, "tasks"),
 });
+
+/**
+ * Take a task out of circulation once a test is done with it.
+ *
+ * Only the outage tests need this, and they need it for the reason they exist: an outage
+ * deliberately leaves the task `ready`, and every supervisor in this file claims whatever
+ * is `ready`. Without it, one test's released task becomes the next test's first claim.
+ */
+const retire = (id: TaskId): Promise<void> => seedTask(id, { status: "done" });
 
 /** What the state repo's REMOTE says — the only evidence a push actually landed. */
 const pushedState = async (task: TaskId = TASK): Promise<TaskState | undefined> => {
@@ -894,4 +906,243 @@ test("/resume warns when the task will meet the same limit again", async () => {
   if (outcome.kind !== "resumed") return;
   assert.match(outcome.exhausted ?? "", /20 of 20 sessions/);
   assert.equal((await pushedState(SPENT))?.status, "ready", "it is still resumed, just warned about");
+});
+
+test("a provider outage releases the task and stops the runner claiming the next one", async () => {
+  // 2026-08-15: the account's monthly spend limit was reached mid-session. pi does not
+  // throw on a provider refusal — it ends the turn — so the supervisor read a 429 as
+  // "session ended without a control-plane decision", started a fresh session two
+  // seconds later, and did it again. Five sessions in nine seconds, three of them
+  // without a single token, and the task parked citing "no measurable progress": a
+  // verdict about the agent, for something the agent never saw. Every other ready task
+  // was next in line for the same treatment.
+  //
+  // What must be true instead: the task is released untouched, and the RUNNER waits.
+  const OUTAGE = asTaskId("OUTAGE-1");
+  await seedTask(OUTAGE, { sessions: 1 });
+
+  let sessions = 0;
+  const runner: SessionRunner = {
+    run: () => {
+      sessions += 1;
+      return Promise.resolve({
+        reason: "provider-unavailable",
+        usage: EMPTY_USAGE,
+        contextTokens: 0,
+        error: '429 {"type":"error","error":{"type":"rate_limit_error","message":"..."}}',
+        outage: { kind: "exhausted", status: 429, detail: "monthly spend limit" },
+        summary: "the model provider stopped answering",
+      } satisfies SessionOutcome);
+    },
+  };
+  const verifier: Verifier = {
+    verify: () => Promise.resolve({ passed: false, detail: "unused" }),
+  };
+  const progress: ProgressProbe = {
+    probe: () =>
+      assert.fail("the progress probe must not run for a session the provider refused"),
+  };
+
+  const notifications: string[] = [];
+  const notifier: Notifier = {
+    notify: (notification) => {
+      notifications.push(notification.kind);
+      return Promise.resolve();
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier,
+    progress,
+    notifier,
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Long enough for several polls at `pollSeconds: 1`. Without the cooldown this is a
+  // session per poll; with it, one session and then silence.
+  await sleep(3_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(sessions, 1, "the runner must not start a session per poll during an outage");
+
+  const pushed = await pushedState(OUTAGE);
+  assert.equal(pushed?.status, "ready", "an outage is not the task's fault — it stays claimable");
+  assert.equal(pushed?.sessions, 1, "a session that got no tokens back did not happen");
+  assert.equal(
+    pushed?.progress.noProgressStreak,
+    0,
+    "the no-progress detector judges the agent, and the agent never ran",
+  );
+  assert.deepEqual(
+    notifications,
+    ["provider-unavailable"],
+    "one message per incident, not one per attempt",
+  );
+
+  const journal = await new Git(origin).tryRun("show", `main:tasks/${OUTAGE}/journal.md`);
+  assert.doesNotMatch(
+    journal.stdout,
+    /Interrupted|Exit:/,
+    "a session that never ran writes no history",
+  );
+
+  await retire(OUTAGE);
+});
+
+test("a session interrupted mid-work keeps its tokens and its history", async () => {
+  // The other half of an outage: session 2 of the real incident had already run
+  // twenty-three tool-using turns when the limit hit. Its tokens were spent and its
+  // commits are on the branch, so pretending it never happened would lose the
+  // accounting and re-run the work. It counts — the PROBE is what must not run, because
+  // "did the agent make progress" is not a question about a truncated session.
+  const WORKED = asTaskId("OUTAGE-2");
+  await seedTask(WORKED, { sessions: 3 });
+
+  const runner: SessionRunner = {
+    run: () =>
+      Promise.resolve({
+        reason: "provider-unavailable",
+        usage: { inputTokens: 40_000, outputTokens: 900, costUsd: 1.25 },
+        contextTokens: 38_854,
+        outage: { kind: "exhausted", status: 429, detail: "monthly spend limit" },
+        summary: "the model provider stopped answering",
+      } satisfies SessionOutcome),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: { probe: () => assert.fail("the probe must not run for an interrupted session") },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await sleep(2_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const pushed = await pushedState(WORKED);
+  assert.equal(pushed?.status, "ready");
+  assert.equal(pushed?.sessions, 4, "a session that got tokens back happened");
+  assert.equal(pushed?.usage.costUsd, 1.25, "spend is charged to the task that spent it");
+  assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is the agent's, not the provider's");
+
+  const journal = await new Git(origin).tryRun("show", `main:tasks/${WORKED}/journal.md`);
+  assert.match(journal.stdout, /Interrupted/);
+  assert.doesNotMatch(
+    journal.stdout,
+    /Parked/,
+    "an outage never parks a task — a park needs a human to undo",
+  );
+
+  await retire(WORKED);
+});
+
+test("the runner says when the provider came back, once", async () => {
+  const BACK = asTaskId("OUTAGE-3");
+  await seedTask(BACK);
+
+  // The only test that waits a cooldown out, so it gets its own short one.
+  const quick: RunnerConfig = {
+    ...config,
+    llm: { ...config.llm, cooldown: { initialSeconds: 1, maxSeconds: 2 } },
+  };
+
+  let calls = 0;
+  const runner: SessionRunner = {
+    run: () => {
+      calls += 1;
+      return Promise.resolve(
+        calls === 1
+          ? ({
+              reason: "provider-unavailable",
+              usage: EMPTY_USAGE,
+              contextTokens: 0,
+              outage: { kind: "exhausted", status: 429, detail: "monthly spend limit" },
+              summary: "the model provider stopped answering",
+            } satisfies SessionOutcome)
+          : ({
+              reason: "ask-human",
+              usage: EMPTY_USAGE,
+              contextTokens: 100,
+              question: "Which database?",
+              summary: "needs a decision",
+            } satisfies SessionOutcome),
+      );
+    },
+  };
+
+  const notifications: string[] = [];
+  const supervisor = new Supervisor({
+    config: quick,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(quick.runnerId),
+      staleAfterSeconds: quick.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: {
+      notify: (notification) => {
+        notifications.push(notification.kind);
+        return Promise.resolve();
+      },
+    },
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await sleep(5_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  // Paused, then resumed: an incident with a beginning and an end, rather than a
+  // silence someone has to go and interpret. Asserted as a PREFIX because the state
+  // repo is shared with every other test in this file, so whatever the supervisor does
+  // with the leftovers afterwards is not this test's business.
+  assert.deepEqual(
+    notifications.slice(0, 2),
+    ["provider-unavailable", "provider-recovered"],
+  );
+  assert.equal(
+    notifications.filter((kind) => kind.startsWith("provider-")).length,
+    2,
+    "one message when it broke and one when it came back — not one per attempt",
+  );
 });

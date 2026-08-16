@@ -118,6 +118,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
+| `src/llm/outage.ts` | Provider outage vs. the task's own error. Pure, no IO (§6.3). |
+| `src/supervisor/cooldown.ts` | The runner's back-off after a refusal. Pure, clock injected (§6.3). |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
@@ -178,6 +180,12 @@ awkward, the change is probably wrong.
    the state repo is written and pushed, and a mirroring failure only logs — an
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
    failed notification logs `notify.failed` and never rewrites the state it announces.
+7. **A task is never blamed for the provider.** When the model provider refuses — spend
+   limit, rate limit, outage, expired credential — the task returns to `ready` untouched,
+   its progress record is not written, and the **runner** backs off on a doubling
+   cooldown instead of claiming the next task and failing identically. An account limit
+   reached at 10:00 otherwise takes the whole queue with it in under a minute, which is
+   exactly what happened on 2026-08-15 (§6.3).
 
 ## Passing work between machines
 

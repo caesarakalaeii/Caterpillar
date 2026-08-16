@@ -30,6 +30,7 @@ import {
   addUsage,
   EMPTY_USAGE,
   type ProposedPlan,
+  type ProviderOutage,
   type TaskSpec,
   type TaskState,
   type UsageTotals,
@@ -38,6 +39,7 @@ import { ContextBudget } from "../agent/limits.ts";
 import { runSession } from "../agent/session.ts";
 import type { ControlSink } from "../agent/tools.ts";
 import type { LlmRuntime } from "../llm/models.ts";
+import { classifyProviderFailure } from "../llm/outage.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
@@ -68,6 +70,15 @@ export interface CouncilResult {
   readonly verdict: CouncilVerdict;
   /** Tokens and cost the council itself spent. Added to the task's totals. */
   readonly usage: UsageTotals;
+  /**
+   * Set when a reviewer abstained because the PROVIDER stopped answering (§6.3).
+   *
+   * Carried out rather than folded into the verdict because it is not a review outcome
+   * at all: the supervisor must back off and convene again later, not record that the
+   * council had reservations. A verdict written from three unreachable reviewers would
+   * be a permanent document about a temporary condition.
+   */
+  readonly outage?: ProviderOutage;
 }
 
 export interface Council {
@@ -145,16 +156,20 @@ export class ReviewCouncil implements Council {
 
     const verdict = decide(results.map((r) => r.verdict));
     const usage = results.reduce<UsageTotals>((total, r) => addUsage(total, r.usage), EMPTY_USAGE);
+    // Any of them is enough: the three reviewers share one account, so one that could
+    // not reach the provider is a statement about all three.
+    const outage = results.find((r) => r.outage !== undefined)?.outage;
 
     logger.info("council.verdict", {
       task: spec.id,
       decision: verdict.decision,
       blockers: verdict.blockers.map((b) => b.lens).join(",") || undefined,
       abstentions: verdict.abstentions.length,
+      outage: outage?.kind,
       costUsd: usage.costUsd,
     });
 
-    return { verdict, usage };
+    return { verdict, usage, ...(outage === undefined ? {} : { outage }) };
   }
 
   /**
@@ -171,13 +186,17 @@ export class ReviewCouncil implements Council {
     prompt: string,
     spec: TaskSpec,
     toolchain: ResolvedEnv,
-  ): Promise<{ readonly verdict: ReviewerVerdict; readonly usage: UsageTotals }> {
+  ): Promise<{
+    readonly verdict: ReviewerVerdict;
+    readonly usage: UsageTotals;
+    readonly outage?: ProviderOutage;
+  }> {
     const { llm, config, logger } = this.options;
 
     const sink: VerdictSink = {};
-    // The session's own exit reason is discarded — the council reads the sink, not the
-    // outcome. This exists only to reuse `shouldStopAfterTurn`, so a reviewer that has
-    // submitted its verdict stops immediately instead of continuing to read the repo.
+    // The session's exit reason is read for one thing only — whether the provider was
+    // reachable. Everything else about the review comes from the sink, so a reviewer
+    // that stopped for its own reasons still speaks through its verdict.
     const control: ControlSink = {};
 
     const execContext: ExecContext = {
@@ -208,16 +227,20 @@ export class ReviewCouncil implements Council {
       });
 
       if (sink.decision === undefined) {
-        // Ran to a stop without deciding: out of context, or it simply narrated a review
-        // and never called the tool. Either way nothing was approved.
+        // Ran to a stop without deciding: the provider refused, it ran out of context,
+        // or it simply narrated a review and never called the tool. Nothing was approved
+        // in any of those cases; only the first is worth backing the runner off for.
+        const outage = result.outcome.outage;
         logger.warn("council.abstained", {
           task: spec.id,
           lens: lens.key,
+          outage: outage?.kind,
           reason: result.outcome.error ?? "no verdict submitted",
         });
         return {
           verdict: abstention(lens, result.outcome.error ?? "the reviewer ended without submitting a verdict"),
           usage: result.outcome.usage,
+          ...(outage === undefined ? {} : { outage }),
         };
       }
 
@@ -233,10 +256,16 @@ export class ReviewCouncil implements Council {
         usage: result.outcome.usage,
       };
     } catch (error) {
+      // Reachable for a failure OUTSIDE the session — a worktree that would not check
+      // out, say. Classified all the same: whatever threw, if the provider is the reason
+      // then the next two reviewers and the next task will meet it too.
+      const message = error instanceof Error ? error.message : String(error);
+      const outage = classifyProviderFailure(message);
       logger.error("council.failed", { task: spec.id, lens: lens.key, ...errorFields(error) });
       return {
-        verdict: abstention(lens, error instanceof Error ? error.message : String(error)),
+        verdict: abstention(lens, message),
         usage: EMPTY_USAGE,
+        ...(outage === undefined ? {} : { outage }),
       };
     }
   }
