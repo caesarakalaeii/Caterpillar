@@ -287,6 +287,34 @@ export interface DigestConfig {
   readonly summarise: boolean;
 }
 
+/**
+ * Supervisor-mediated cluster reads (DESIGN.md §20).
+ *
+ * Two switches, and they are not the same switch. `enabled` says this runner may perform
+ * cluster reads at all; `namespaces` says which ones. An EMPTY list denies everything — see
+ * `cluster/guard.ts` for why that reading is the only safe one — so `enabled: true` with the
+ * list forgotten produces a runner that refuses every read and says so in its metrics,
+ * rather than one that reads the whole cluster.
+ *
+ * This is the ONLY place the namespace bound is set. There is deliberately no per-task and
+ * no per-alert list (§20): a bound an alert payload could widen for itself is not a bound.
+ */
+export interface ClusterConfig {
+  readonly enabled: boolean;
+  /** Namespaces a `remediation` session may read. Empty — the default — denies all. */
+  readonly namespaces: readonly string[];
+  /**
+   * Loki's query API. Plain HTTP in-cluster: the deployment is `SingleBinary` with
+   * `gateway.enabled: false`, so there is no nginx front door and no TLS to terminate.
+   * Configurable so a Grafana datasource proxy can be substituted later.
+   */
+  readonly lokiUrl: string;
+  /** The kube API. In-cluster this is the only value that works. */
+  readonly kubeApiUrl: string;
+  /** Ceiling on lines one `cluster_logs` call may return. Lowers the built-in cap, never raises it. */
+  readonly maxLogLines: number;
+}
+
 export interface RunnerConfig {
   readonly runnerId: string;
   readonly capabilities: readonly Capability[];
@@ -308,6 +336,7 @@ export interface RunnerConfig {
   readonly intake: IntakeConfig;
   readonly web: WebConfig;
   readonly digest: DigestConfig;
+  readonly cluster: ClusterConfig;
 }
 
 export interface IntakeConfig {

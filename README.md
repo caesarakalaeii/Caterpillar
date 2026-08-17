@@ -180,6 +180,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/digest/render.ts` | The one document Discord, git and the web view all get (§19). |
 | `src/digest/summarise.ts` | The prose paragraph. No tools, and never fails a digest (§19). |
 | `src/digest/publish.ts` | Claim the day, publish it, release the claim if that failed (§19). |
+| `src/cluster/guard.ts` | The namespace allowlist. Empty denies everything (§20). |
+| `src/cluster/names.ts` | The only path from a model string to a URL or a LogQL selector (§20). |
+| `src/cluster/redact.ts` | Kind allowlist and Secret redaction. Pure, and the whole boundary (§20). |
+| `src/cluster/client.ts` | Logs, events and describe. `node:https` with the cluster CA (§20). |
 
 ## Invariants worth not breaking
 
@@ -250,6 +254,16 @@ awkward, the change is probably wrong.
     the review council's — it was the council's that wedged, for 2h42m, on an `npm test`
     whose subprocess never exited. `limits.maxSessionSeconds` is the backstop, not the
     fix: four hours is an outage, not a hang detector (§6.4).
+13. **Cluster access is read-only, supervisor-held, and bound to one task kind.** The
+    ServiceAccount token never leaves the supervisor — `kubectl` in the agent's shell was
+    rejected precisely because the credential would then belong to the pod and every task
+    on the runner would inherit it. `cluster_logs`, `cluster_events` and `cluster_describe`
+    bind only for `kind: remediation`, every one of them checks the namespace against
+    `cluster.namespaces` before any IO, an empty allowlist denies everything, and no model
+    string reaches a URL path or a LogQL selector without passing the Kubernetes name
+    grammar. `cluster_describe` reads eleven kinds and returns a Secret as key names and
+    byte lengths: RBAC cannot express "keys but not values", so `cluster/redact.ts` is the
+    entire boundary and is tested as one (§20).
 
 ## The web view
 
@@ -310,6 +324,62 @@ Two things it will tell you about itself rather than fake:
 
 Enabling it needs nothing else: no new secret, no port, no Deployment. It runs on the
 existing poll loop and uses the notifier that is already configured.
+
+## Reading the cluster
+
+A session created by a firing alert (`kind: remediation`, §20) needs evidence: what the pod
+logged, what Kubernetes said about it, what the object actually looks like. It gets three
+tools — `cluster_logs`, `cluster_events`, `cluster_describe` — and **no way to write
+anything**.
+
+Off unless a runner is told otherwise, and the namespace list is the whole bound:
+
+```json
+"cluster": { "enabled": true, "namespaces": ["caterpillar", "monitoring"], "maxLogLines": 2000 }
+```
+
+- **`namespaces`** — which namespaces are readable, and nothing else widens it. There is no
+  per-task and no per-alert list: a bound an alert payload could extend for itself is not a
+  bound. **Empty denies everything**, so `enabled: true` with the list forgotten produces a
+  runner that refuses every read, warns at startup and counts the denials — not one that
+  reads the cluster.
+- **`lokiUrl`, `kubeApiUrl`** — defaulted to the in-cluster addresses. Loki is plain HTTP
+  (`SingleBinary`, `gateway.enabled: false`, so there is no nginx in front); the kube API is
+  HTTPS verified against the cluster CA the ServiceAccount volume projects. There is no
+  option to skip that verification and no fallback that quietly does.
+
+The supervisor performs every call, so **the agent never holds the token**. That is the same
+rule as everywhere else (§9.2), and it is why these are tools rather than `kubectl` in the
+agent's shell: an ambient pod credential would belong to the pod, and every task that ever
+ran on the runner would inherit cluster access with no allowlist between it and the API.
+
+Two bounds are in code rather than configuration, deliberately, because widening them should
+be a review:
+
+- `cluster_describe` reads **eleven kinds** and no others — the workload kinds, `ConfigMap`,
+  `Secret`, `Service`, `Ingress`, `PersistentVolumeClaim`. No nodes, no namespaces, nothing
+  cluster-scoped.
+- a **Secret comes back as key names and byte lengths.** Kubernetes RBAC cannot express
+  "read a Secret's keys but not its values", so the supervisor's ServiceAccount does hold
+  `get secrets` and `cluster/redact.ts` is the entire boundary — which is why it is a pure
+  function with an adversarial test file that asserts on the serialized output, including
+  the `last-applied-configuration` annotation where an earlier `kubectl apply` leaves a
+  verbatim copy of the values. ConfigMaps are returned in full, on purpose: most
+  misconfigurations live there.
+
+Denials are visible: `caterpillar_cluster_reads_total{tool,outcome}` counts `ok`, `denied`
+and `error` separately, because an allowlist that is wrong otherwise looks exactly like a
+session that failed to diagnose anything.
+
+Unlike the digest, this one does need something outside the ConfigMap: the supervisor's
+ServiceAccount needs `get`/`list` on those kinds in those namespaces, granted by a Role per
+namespace in the deployment repo. Nothing here creates or requests that permission — a runner
+whose Role is missing gets a 403 and reports it as a failed read, which is the right shape of
+failure for a permission an operator has not granted.
+
+Without `cluster.enabled` a remediation task still runs — it gets the ordinary control verbs
+and diagnoses from the repository. It does not crash, and it does not quietly acquire the
+reads either.
 
 ## Passing work between machines
 

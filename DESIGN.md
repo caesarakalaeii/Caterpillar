@@ -1717,10 +1717,25 @@ reads, so a rejection has to arrive there as instructions rather than as a score
 | `open_pr`, `ask_human`, `handoff`, `done` | supervisor | control-plane verbs, typed |
 | web search / fetch | supervisor | fewer human round-trips on unfamiliar libs |
 | Grafana / Jira / Atlassian | MCP | verify impact, pull requirements |
-| `kubectl` (read-only) | supervisor | logs, pods, events — no writes |
+| `cluster_logs`, `cluster_events`, `cluster_describe` | supervisor | read-only cluster evidence — no writes of any kind |
 
 The control-plane verbs being *tools* rather than parsed prose is load-bearing: every
 state transition is typed and auditable.
+
+The three `cluster_*` reads bind **only for `kind: remediation`** (§20), and only on a
+runner where an operator has set `cluster.enabled`. An `implement` or `brainstorm` task
+never receives them, even on a runner where the reader is configured — the binding is by
+task kind, in `agent/tools.ts:toolsForKind`, and that is the security boundary of the whole
+feature rather than an implementation detail of it.
+
+They are tools instead of `kubectl` in the agent's shell for the reason §9.2 gives for every
+other credential: the ServiceAccount token stays with the supervisor. Were it the pod's
+ambient credential, every task that ever ran on the runner would inherit cluster read access
+and the bound would be whatever the model chose to type. Instead each call is checked against
+a namespace allowlist that is supervisor configuration, `cluster_describe` can read eleven
+kinds and no others, and a Secret comes back as key names and byte lengths — the values never
+leave the supervisor, because Kubernetes RBAC cannot express "keys but not values" and
+`cluster/redact.ts` is therefore the entire boundary.
 
 ---
 

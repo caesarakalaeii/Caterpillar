@@ -23,6 +23,7 @@ import {
   type AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core/node";
 import type { Static, TSchema } from "@earendil-works/pi-ai";
+import type { ClusterReader } from "../cluster/client.ts";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
@@ -47,7 +48,7 @@ import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { buildPrompt, systemPromptFor } from "./prompt.ts";
 import { runSession } from "./session.ts";
-import { brainstormTools, controlTools, type ControlSink, type ToolContext } from "./tools.ts";
+import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
 
 void _gzipSync;
 
@@ -102,6 +103,15 @@ export interface AgentSessionRunnerOptions {
    * either way.
    */
   readonly live?: LiveSession;
+  /**
+   * Read-only cluster access, offered to `remediation` sessions only (DESIGN.md §20).
+   *
+   * Optional, and absent is the ordinary case — a runner outside the cluster, or one whose
+   * operator has not turned `cluster.enabled` on, has nothing to hand over. A remediation
+   * task then runs with the ordinary bundle: it does not crash, and it does not quietly
+   * acquire privileges either.
+   */
+  readonly cluster?: ClusterReader;
 }
 
 export class WorkspaceNotConfiguredError extends Error {
@@ -145,6 +155,11 @@ export class AgentSessionRunner {
 
       const control: ControlSink = {};
       const tracker = this.options.bindings.trackers.get(spec.workspace);
+      // The cluster reader is offered to the tool context for a REMEDIATION task and no
+      // other kind (§20). By kind, not by capability and not by config alone: a runner with
+      // `k8s` in its capabilities and a configured reader still gives an `implement` task no
+      // way to read the cluster, because the binding is decided here and nowhere else.
+      const cluster = spec.kind === "remediation" ? this.options.cluster : undefined;
       const toolContext: ToolContext = {
         forge,
         repo,
@@ -152,6 +167,16 @@ export class AgentSessionRunner {
         publish: (name, path, note) => this.publishArtifact(spec, worktree, name, path, note),
         ...(tracker !== undefined ? { tracker } : {}),
         ...(spec.tracker !== undefined ? { trackerRef: spec.tracker } : {}),
+        ...(cluster === undefined
+          ? {}
+          : {
+              cluster,
+              recordClusterRead: (tool, outcome, seconds) => {
+                const labels = { tool, outcome };
+                metrics.clusterReads.inc(labels);
+                metrics.clusterReadSeconds.inc(labels, seconds);
+              },
+            }),
       };
 
       // The agent's shell, the review council's, the plan maintainer's and the acceptance
@@ -191,7 +216,9 @@ export class AgentSessionRunner {
               bindTool(createEditTool<ExecContext>(), execContext) as AgentTool,
             ]),
         bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,
-        ...(brainstorm ? brainstormTools(toolContext) : controlTools(toolContext)),
+        // Which control verbs a kind gets is decided in `tools.ts`, so the binding can be
+        // tested without running a session (§20).
+        ...toolsForKind(spec.kind, toolContext),
       ];
 
       const budget = new ContextBudget({

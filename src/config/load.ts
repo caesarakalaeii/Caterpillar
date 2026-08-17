@@ -15,7 +15,9 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
+import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
 import type {
+  ClusterConfig,
   CommitIdentity,
   DigestConfig,
   LlmConfig,
@@ -67,6 +69,7 @@ interface RawConfig {
   readonly intake?: { readonly intervalSeconds?: unknown };
   readonly web?: Record<string, unknown>;
   readonly digest?: Record<string, unknown>;
+  readonly cluster?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -346,6 +349,35 @@ const webConfig = (web: Record<string, unknown>): WebConfig => ({
   ).toLowerCase(),
 });
 
+/**
+ * Validate the `cluster` block (DESIGN.md §20).
+ *
+ * Everything defaults, and the defaults are the closed ones: disabled, no namespaces. The
+ * namespace list is validated per entry by `strings`, so a `null` in it is a config error
+ * rather than an allowlist containing the string "null".
+ *
+ * `enabled: true` with an empty list is NOT an error here. It is a runner that will refuse
+ * every read and increment `outcome="denied"` when it does, which is a state an operator can
+ * see and fix — whereas throwing at startup would take the whole supervisor down over a
+ * feature nothing may even be using yet.
+ */
+const clusterConfig = (cluster: Record<string, unknown>): ClusterConfig => {
+  const maxLogLines = num(cluster["maxLogLines"], "cluster.maxLogLines", MAX_LOG_LINES);
+  if (!Number.isInteger(maxLogLines) || maxLogLines < 1) {
+    throw new ConfigError("cluster.maxLogLines must be a positive integer");
+  }
+
+  return {
+    enabled: bool(cluster["enabled"], "cluster.enabled", false),
+    namespaces: strings(cluster["namespaces"], "cluster.namespaces"),
+    lokiUrl: str(cluster["lokiUrl"], "cluster.lokiUrl", DEFAULT_LOKI_URL),
+    kubeApiUrl: str(cluster["kubeApiUrl"], "cluster.kubeApiUrl", DEFAULT_KUBE_API_URL),
+    // Clamped rather than refused: the client caps it too, and an operator who wrote a
+    // larger number wanted more logs, not a runner that will not start.
+    maxLogLines: Math.min(maxLogLines, MAX_LOG_LINES),
+  };
+};
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -431,5 +463,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     },
     web: webConfig(raw.web ?? {}),
     digest: digestConfig(raw.digest ?? {}),
+    cluster: clusterConfig(raw.cluster ?? {}),
   };
 };

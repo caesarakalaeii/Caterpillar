@@ -1,12 +1,14 @@
 /**
- * Tests for the sections whose DEFAULTS are load-bearing — `web` (DESIGN.md §18) and
- * `digest` (§19).
+ * Tests for the sections whose DEFAULTS are load-bearing — `web` (DESIGN.md §18), `digest`
+ * (§19) and `cluster` (§20).
  *
- * Both default to off, and both do something outward-facing when they are on: one opens a
- * port that answers with agent transcripts, the other posts to a shared channel and
- * commits to a shared repo. A runner someone started on a laptop must not begin doing
- * either because it was upgraded, and one that HAS been told to must not silently do it
- * wrongly — unauthenticated, or at an hour a misspelt zone quietly turned into UTC.
+ * All three default to off, and all three do something outward-facing when they are on: one
+ * opens a port that answers with agent transcripts, one posts to a shared channel and
+ * commits to a shared repo, one reads a live cluster with the supervisor's own
+ * ServiceAccount. A runner someone started on a laptop must not begin doing any of it
+ * because it was upgraded, and one that HAS been told to must not silently do it wrongly —
+ * unauthenticated, at an hour a misspelt zone quietly turned into UTC, or against a
+ * namespace nobody allowed.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -142,4 +144,67 @@ test("the prose can be turned off without losing the digest", async () => {
   assert.equal(config.digest.enabled, true);
   assert.equal(config.digest.summarise, false);
   await assert.rejects(() => load({ digest: { summarise: "no" } }), ConfigError);
+});
+
+test("a config that says nothing about the cluster reads none of it", async () => {
+  // Two closed defaults rather than one: not enabled, and — should someone enable it
+  // without saying more — no namespace either. See `cluster/guard.ts` for why an empty
+  // allowlist has to mean deny-all.
+  const config = await load({});
+
+  assert.equal(config.cluster.enabled, false);
+  assert.deepEqual(config.cluster.namespaces, []);
+  assert.equal(config.cluster.lokiUrl, "http://loki.monitoring.svc.cluster.local:3100");
+  assert.equal(config.cluster.kubeApiUrl, "https://kubernetes.default.svc");
+  assert.equal(config.cluster.maxLogLines, 2000);
+});
+
+test("enabling cluster reads without a namespace list is allowed and reads nothing", async () => {
+  // Deliberately not a startup failure. A half-finished ConfigMap should produce a runner
+  // that refuses every read, says so in its log and counts the denials — not a supervisor
+  // that will not start because of a feature nothing may be using yet.
+  const config = await load({ cluster: { enabled: true } });
+
+  assert.equal(config.cluster.enabled, true);
+  assert.deepEqual(config.cluster.namespaces, []);
+});
+
+test("every cluster field can be set", async () => {
+  const config = await load({
+    cluster: {
+      enabled: true,
+      namespaces: ["caterpillar", "monitoring"],
+      lokiUrl: "http://grafana.monitoring.svc/api/datasources/proxy/1",
+      kubeApiUrl: "https://kubernetes.default.svc:443",
+      maxLogLines: 500,
+    },
+  });
+
+  assert.deepEqual(config.cluster.namespaces, ["caterpillar", "monitoring"]);
+  assert.equal(config.cluster.lokiUrl, "http://grafana.monitoring.svc/api/datasources/proxy/1");
+  assert.equal(config.cluster.kubeApiUrl, "https://kubernetes.default.svc:443");
+  assert.equal(config.cluster.maxLogLines, 500);
+});
+
+test("cluster.enabled is a boolean and nothing else", async () => {
+  await assert.rejects(() => load({ cluster: { enabled: "true" } }), ConfigError);
+});
+
+test("a namespace list with a non-string entry is refused, not stringified", async () => {
+  // Otherwise a `null` becomes the allowlist entry "null", which matches nothing and is
+  // reported as a denial rather than as the config error it is.
+  await assert.rejects(
+    () => load({ cluster: { enabled: true, namespaces: ["caterpillar", null] } }),
+    ConfigError,
+  );
+  await assert.rejects(() => load({ cluster: { enabled: true, namespaces: "caterpillar" } }), ConfigError);
+});
+
+test("maxLogLines is clamped down to the built-in ceiling, and nonsense is refused", async () => {
+  const generous = await load({ cluster: { enabled: true, maxLogLines: 100000 } });
+  assert.equal(generous.cluster.maxLogLines, 2000, "a config cannot raise the built-in cap");
+
+  await assert.rejects(() => load({ cluster: { maxLogLines: 0 } }), ConfigError);
+  await assert.rejects(() => load({ cluster: { maxLogLines: 12.5 } }), ConfigError);
+  await assert.rejects(() => load({ cluster: { maxLogLines: "many" } }), ConfigError);
 });

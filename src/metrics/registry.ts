@@ -139,6 +139,34 @@ export class AgentMetrics {
     "daily digests published by this runner",
   );
 
+  /**
+   * Supervisor-mediated cluster reads, by tool and outcome (DESIGN.md §20).
+   *
+   * `outcome="denied"` is the series that earns this metric its place. A namespace
+   * allowlist that is wrong looks, from every other angle, like a session that simply did
+   * not diagnose anything: the agent is told no, writes something else, and nothing
+   * anywhere records that the fleet is being refused. A denial is a configuration bug and
+   * has to be visible as one.
+   */
+  readonly clusterReads = this.registry.counter(
+    "caterpillar_cluster_reads_total",
+    "supervisor-mediated cluster reads by tool and outcome",
+  );
+
+  /**
+   * Cumulative seconds spent in those reads, same labels.
+   *
+   * A counter of seconds rather than a histogram, because this registry has counters and
+   * gauges and nothing else (see `MetricKind`), and buckets are not worth a new metric type
+   * for a call that either answers in milliseconds or has already failed. Divided by
+   * `caterpillar_cluster_reads_total` it gives the mean, which is the only question anyone
+   * has asked of it: whether Loki is answering at all.
+   */
+  readonly clusterReadSeconds = this.registry.counter(
+    "caterpillar_cluster_read_seconds",
+    "cumulative seconds spent in supervisor-mediated cluster reads",
+  );
+
   render(): string {
     return this.registry.render();
   }

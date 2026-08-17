@@ -8,6 +8,7 @@
 import { createServer } from "node:http";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
+import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
 import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
 import type { RunnerConfig } from "./config/types.ts";
@@ -265,6 +266,10 @@ const main = async (): Promise<void> => {
     logger,
   });
 
+  // Read-only cluster access for remediation sessions (DESIGN.md §20). Built here so the
+  // ServiceAccount token stays with the supervisor and is never handed to a session.
+  const cluster = createClusterReader(config, logger);
+
   // Built before both users: the supervisor refreshes it on every poll, the bridge reads
   // it on every inbound event (DESIGN.md §7). One replica of a fleet acts on Discord.
   const chat = new ChatLeadership({
@@ -290,6 +295,7 @@ const main = async (): Promise<void> => {
       metrics,
       toolchain,
       live,
+      ...(cluster === undefined ? {} : { cluster }),
     }),
     toolchain,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
@@ -429,6 +435,52 @@ const createDigest = (options: {
       : {}),
     onPublished: (_date, quiet) =>
       options.metrics.digests.inc({ runner: config.runnerId, quiet: String(quiet) }),
+  });
+};
+
+/**
+ * Build the cluster reader, if this runner was told it may read the cluster (DESIGN.md §20).
+ *
+ * Off by default, like the web view and the digest, and for a sharper reason than either: a
+ * runner someone starts on a workstation has no ServiceAccount token, and one running in a
+ * cluster it was not deployed to has the wrong one. `enabled` is the operator saying "this
+ * replica is in the cluster it is allowed to look at".
+ *
+ * The allowlist is LOGGED at startup, including when it is empty. An operator debugging a
+ * refused read should find the answer in the log rather than inferring it from a denial
+ * message inside a session transcript — and an empty list denies everything, which is the
+ * one case where that log line is the whole diagnosis.
+ */
+const createClusterReader = (config: RunnerConfig, logger: Logger): ClusterReader | undefined => {
+  const { cluster } = config;
+  if (!cluster.enabled) {
+    logger.info("cluster.disabled", { reason: "cluster.enabled is false" });
+    return undefined;
+  }
+
+  logger.info("cluster.configured", {
+    // Joined rather than nested: log fields are scalars, and the whole point of this line
+    // is that the allowlist can be read out of it.
+    namespaces: cluster.namespaces.join(","),
+    kubeApiUrl: cluster.kubeApiUrl,
+    lokiUrl: cluster.lokiUrl,
+    maxLogLines: cluster.maxLogLines,
+  });
+  if (cluster.namespaces.length === 0) {
+    // Not fatal, and not silent either: the feature is on and can read nothing, which is a
+    // half-finished ConfigMap rather than a decision anyone would make on purpose.
+    logger.warn("cluster.namespaces.empty", {
+      detail:
+        "cluster.enabled is true but cluster.namespaces is empty, so every cluster read " +
+        "will be denied",
+    });
+  }
+
+  return new ClusterClient({
+    namespaces: cluster.namespaces,
+    kubeApiUrl: cluster.kubeApiUrl,
+    lokiUrl: cluster.lokiUrl,
+    maxLogLines: cluster.maxLogLines,
   });
 };
 
