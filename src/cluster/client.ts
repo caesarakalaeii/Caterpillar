@@ -108,8 +108,13 @@ export class ClusterUnavailableError extends Error {
 export class ClusterRequestError extends Error {
   readonly status: number;
 
+  /** `status` 0 means the request completed and the BODY was the problem. */
   constructor(what: string, status: number, body: string) {
-    super(`${what} failed with HTTP ${status}: ${body.slice(0, 400)}`);
+    super(
+      status === 0
+        ? `${what}: ${body.slice(0, 400)}`
+        : `${what} failed with HTTP ${status}: ${body.slice(0, 400)}`,
+    );
     this.name = "ClusterRequestError";
     this.status = status;
   }
@@ -324,8 +329,9 @@ export class ClusterClient implements ClusterReader {
       // millisecond value is silently read as 1970, which returns nothing at all.
       start: String((end - sinceMinutes * 60_000) * 1_000_000),
       end: String(end * 1_000_000),
-      // Newest first from Loki so the CAP keeps the most recent lines; the render below
-      // reverses them, because a log an operator reads runs oldest to newest.
+      // Newest first from Loki, so when the limit bites it is the OLDEST lines that are
+      // lost rather than the ones nearest the incident. The render below sorts back to
+      // oldest-first, because a log is read as a narrative.
       direction: "BACKWARD",
     });
 
@@ -342,14 +348,19 @@ export class ClusterClient implements ClusterReader {
       throw new ClusterRequestError("Loki query", response.status, await response.text());
     }
 
-    const payload = JSON.parse(await response.text()) as {
-      readonly data?: { readonly result?: readonly LokiStream[] };
-    };
+    const payload = parseJson<{ readonly data?: { readonly result?: readonly LokiStream[] } }>(
+      await response.text(),
+      "Loki query",
+    );
     const lines: { readonly at: bigint; readonly text: string }[] = [];
     for (const stream of payload.data?.result ?? []) {
       const pod = stream.stream?.["pod"] ?? "";
       for (const [ns, line] of stream.values ?? []) {
-        lines.push({ at: BigInt(ns), text: `${isoFromNanos(ns)}  ${pod}  ${line.trimEnd()}` });
+        // A timestamp that is not a number would otherwise throw out of `BigInt` and end the
+        // tool call with a message about syntax. Sorted to the front instead: an unreadable
+        // timestamp is still a log line, and the line is what the session came for.
+        const at = nanosOrZero(ns);
+        lines.push({ at, text: `${at === 0n ? ns : isoFromNanos(ns)}  ${pod}  ${line.trimEnd()}` });
       }
     }
     if (lines.length === 0) {
@@ -472,7 +483,7 @@ export class ClusterClient implements ClusterReader {
     if (response.status < 200 || response.status >= 300) {
       throw new ClusterRequestError(what, response.status, response.body);
     }
-    return JSON.parse(response.body) as T;
+    return parseJson<T>(response.body, what);
   }
 
   /** Read-once-per-session credentials. The promise is cached so concurrent calls share one read. */
@@ -489,6 +500,30 @@ export class ClusterClient implements ClusterReader {
     }
   }
 }
+
+/**
+ * JSON, or a typed error that says which call produced the unparseable body.
+ *
+ * A bare `SyntaxError` would reach the session as "Unexpected token < in JSON at position
+ * 0", which is the signature of an HTML error page from something that is not the API
+ * server at all — and the one detail that would help is which endpoint answered.
+ */
+const parseJson = <T>(body: string, what: string): T => {
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new ClusterRequestError(`${what} returned a body that is not JSON`, 0, body);
+  }
+};
+
+/** Nanoseconds, or 0 for anything Loki sent that is not a number. */
+const nanosOrZero = (value: string): bigint => {
+  try {
+    return BigInt(value);
+  } catch {
+    return 0n;
+  }
+};
 
 /** Best available timestamp on an event. `lastTimestamp` is empty on the events.k8s.io shape. */
 const eventTime = (event: KubeEvent): string =>

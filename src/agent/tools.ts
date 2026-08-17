@@ -396,6 +396,11 @@ const clusterRead = async (
     // outside the bound, and both are answerable in prose. An HTTP failure is not: it means
     // the supervisor could not read what it was allowed to read, and the message is the
     // only place that distinction is visible.
+    //
+    // A 403 from the API server therefore counts as `error`, not `denied`. It is the same
+    // word from a human's point of view and a different problem: `denied` is this runner's
+    // allowlist, which an operator fixes in the ConfigMap, and a 403 is a missing Role,
+    // which they fix in the deployment. Collapsing them would send them to the wrong file.
     const denied = error instanceof NamespaceNotAllowedError || isRefusal(error);
     finish(denied ? "denied" : "error");
     const detail = error instanceof Error ? error.message : String(error);

@@ -295,6 +295,51 @@ test("a Loki failure is a typed error carrying the status", async () => {
   });
 });
 
+test("a body that is not JSON is reported as such, naming the call", async () => {
+  // The signature of something other than the API server answering — a proxy's HTML error
+  // page. A bare SyntaxError would tell the session about a token at position 0 and nothing
+  // about which endpoint produced it.
+  const html = (input: string): Promise<Response> => {
+    void input;
+    return Promise.resolve(new Response("<html>502 Bad Gateway</html>", { status: 200 }));
+  };
+  await assert.rejects(
+    () => client({ fetch: html }).logs({ namespace: "caterpillar" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ClusterRequestError);
+      assert.match(error.message, /Loki query returned a body that is not JSON/);
+      assert.ok(!error.message.includes("HTTP 0"));
+      return true;
+    },
+  );
+
+  const kube = recordingGet([{ status: 200, body: "not json either" }]);
+  await assert.rejects(
+    () => client({ httpsGet: kube.get }).events({ namespace: "caterpillar" }),
+    ClusterRequestError,
+  );
+});
+
+test("an unreadable log timestamp keeps the line instead of ending the call", async () => {
+  const loki = recordingFetch({
+    data: {
+      result: [
+        {
+          stream: { pod: "caterpillar-0" },
+          values: [
+            ["not-a-number", "the line that matters"],
+            [nanos("2026-01-01T10:00:00Z"), "an ordinary line"],
+          ],
+        },
+      ],
+    },
+  });
+
+  const text = await client({ fetch: loki.fetch }).logs({ namespace: "caterpillar" });
+  assert.match(text, /the line that matters/);
+  assert.match(text, /an ordinary line/);
+});
+
 test("the Loki base URL is configurable, for a datasource proxy later", async () => {
   const loki = recordingFetch({ data: { result: [] } });
   await client({ fetch: loki.fetch, lokiUrl: "http://grafana.monitoring.svc/api/datasources/proxy/1/" }).logs({
