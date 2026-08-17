@@ -86,6 +86,8 @@ export interface LlmSummariserOptions {
   readonly llm: LlmRuntime;
   readonly timeZone: string;
   readonly thresholdFraction: number;
+  /** Wall-clock ceiling on the one session this runs. See `SessionOptions`. */
+  readonly maxSessionSeconds: number;
 }
 
 export class LlmSummariser implements Summariser {
@@ -103,6 +105,7 @@ export class LlmSummariser implements Summariser {
 
     try {
       const result = await runSession({
+        timeoutSeconds: this.options.maxSessionSeconds,
         // So a pod shutting down is not held open by a paragraph. Everything that matters
         // about the day is already measured; this is the one call that waits on a network.
         ...(signal === undefined ? {} : { signal }),

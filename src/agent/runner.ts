@@ -224,6 +224,11 @@ export class AgentSessionRunner {
       });
 
       const result = await runSession({
+        // Also armed by the supervisor around this whole call (`maxSessionSeconds`).
+        // Both, deliberately: the outer one covers the worktree setup and the prompt
+        // assembly either side of this, the inner one is what makes an unbounded
+        // session impossible to write at all.
+        timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
         systemPrompt: `${systemPromptFor(spec.kind)}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,

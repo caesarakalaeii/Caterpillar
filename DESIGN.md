@@ -529,11 +529,29 @@ into `agent.prompt()` via pi's `abort()`:
 3. **`/cancel`.** See below.
 4. **The wall clock** (`limits.maxSessionSeconds`, four hours). Not a budget: pi's bash
    tool documents `timeout` as optional with **no default**, so the model decides whether
-   a command may block forever. `npm run dev`, a test runner waiting on stdin, a
+   a command may block forever — and a provider request can hang just as well as a
+   command can. `npm run dev`, a test runner waiting on stdin, a
    `nix build` against a dead cache — the promise never settles, and everything in the
    supervisor is single-threaded, so the poll loop, the chat drain and intake stop with
    it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
    indicator stays on: a runner that looks healthier the longer it is wedged.
+
+**The ceiling belongs to `runSession`, not to whoever calls it.** It was the supervisor's,
+armed around the agent's session and nowhere else — and the agent's session is not the
+only one. `ReviewCouncil` runs three, `PlanMaintainer` one, the digest summariser one, and
+every one of them called `runSession` with no signal at all. So the four stop conditions
+above protected the one call site that already had a second layer and none of the four
+that had nothing. A provider request that never returned wedged the runner exactly as a
+hung `bash` call would, and in the cluster one did: **7h20m inside `council.start`, zero
+restarts**, the poll loop and the chat drain frozen behind three reviewers under a
+`Promise.all`, `/healthz` answering 200 throughout. It also made §14.3's brainstorm
+priority moot — a queue cannot be re-ordered by a loop that never gets a turn.
+
+`SessionOptions.timeoutSeconds` is therefore **required**. A caller may add a signal of
+its own and the two are combined, but it cannot take the ceiling away, and the next call
+site cannot quietly omit it — the compiler names it instead. All five share
+`limits.maxSessionSeconds`: it is a hang detector rather than a budget, and nothing that
+runs a session has a claim to run unbounded.
 
 An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
 session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and

@@ -64,6 +64,22 @@ export interface SessionOptions {
    * /healthz kept answering 200.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Wall-clock ceiling on THIS session. A hang detector, not a budget.
+   *
+   * Required, and that is the point. It was the supervisor's job, applied around the
+   * agent's session and nowhere else — but the council, the plan maintainer and the
+   * digest summariser all run sessions too, and all three ran them with no signal
+   * whatsoever. A provider request that never returned therefore wedged the whole
+   * single-threaded runner: the poll loop, the chat drain, intake and claiming all sit
+   * behind it, the heartbeat keeps renewing the lease, and /healthz keeps answering 200.
+   * One did exactly that for 7h20m inside `council.start`, with zero restarts.
+   *
+   * Making it a required field rather than an optional one is the whole fix. A caller
+   * may add a signal of its own — shutdown, a lost lease, a `/cancel` — but it cannot
+   * take this away, and the next call site cannot quietly omit it.
+   */
+  readonly timeoutSeconds: number;
 }
 
 export interface SessionResult {
@@ -146,17 +162,24 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
   // it belongs to the task, which may run many — and an accumulating listener per session
   // is a leak that ends in a MaxListenersExceededWarning on a long-lived task.
   const abort = (): void => agent.abort();
-  const signal = options.signal;
-  signal?.addEventListener("abort", abort, { once: true });
+  // The caller's reasons to stop and this session's own ceiling, as one signal. `any`
+  // rather than a second listener so that everything downstream — the pre-flight check
+  // below, `interrupted` in the outcome, the tools' own `signal` — sees both alike, and
+  // a timeout is indistinguishable from a `/cancel` to code that has no business
+  // telling them apart.
+  const deadline = AbortSignal.timeout(options.timeoutSeconds * 1000);
+  const signal =
+    options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline]);
+  signal.addEventListener("abort", abort, { once: true });
 
   let error: string | undefined;
   try {
     // Already aborted before we started: do not spend a request to find out.
-    if (signal?.aborted !== true) await agent.prompt(options.initialPrompt);
+    if (!signal.aborted) await agent.prompt(options.initialPrompt);
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause);
   } finally {
-    signal?.removeEventListener("abort", abort);
+    signal.removeEventListener("abort", abort);
   }
 
   // The failure pi swallowed, if the throw did not happen. `errorMessage` is cleared at
@@ -173,7 +196,7 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
       handoffTriggered,
       sessionUsage,
       contextTokens,
-      interrupted: signal?.aborted === true,
+      interrupted: signal.aborted,
     }),
     messages,
     contextOverrun: budget.wouldCompact(messages),
