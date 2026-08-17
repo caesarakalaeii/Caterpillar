@@ -15,6 +15,7 @@ import { test } from "node:test";
 import {
   fencedBlock,
   handleAlertRequest,
+  MAX_ALERTS_PER_DELIVERY,
   MAX_BODY_BYTES,
   parseAlert,
   sanitizeLabels,
@@ -290,6 +291,22 @@ test("a firing alert survives the round trip with the fields the queue needs", (
   assert.match(alert.generatorURL ?? "", /^https:\/\/prometheus/);
   assert.equal(alert.labels.find((pair) => pair.key === "task")?.value, "GH-1");
   assert.equal(alert.annotations.find((pair) => pair.key === "summary")?.value, "a task is thrashing");
+});
+
+test("a delivery carrying hundreds of alerts is capped and says how many it left", () => {
+  const target = sink();
+  const many = Array.from({ length: MAX_ALERTS_PER_DELIVERY + 25 }, (_unused, index) =>
+    firing({ fingerprint: index.toString(16).padStart(8, "0") }),
+  );
+
+  const out = handleAlertRequest(post(payload(...many)), { token: TOKEN, sink: target });
+
+  assert.equal(out.reply.status, 202);
+  assert.equal(target.taken.length, MAX_ALERTS_PER_DELIVERY);
+  // The members past the cap are still firing and will be re-delivered, but a delivery that
+  // silently examined a fraction of what it was sent would be indistinguishable from one
+  // that handled it all.
+  assert.ok(out.skipped.some((reason) => reason.includes("25 member(s) past")));
 });
 
 test("a member with no explicit `firing` status is skipped rather than assumed", () => {

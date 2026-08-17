@@ -17,7 +17,7 @@ import { asWorkspaceName, type TaskId, type TaskSpec, type TaskState } from "../
 import type { Notification, Notifier, NotifyTarget } from "../notify/discord.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import type { AlertRefusal } from "../state/store.ts";
-import { parsePolicy, type AlertPolicy } from "./policy.ts";
+import { parsePolicy, PolicyParseError, type AlertPolicy } from "./policy.ts";
 import { AlertProcessor, AlertQueue, renderAlertSpec, type AlertStore } from "./queue.ts";
 import type { FiringAlert } from "./receiver.ts";
 
@@ -368,6 +368,39 @@ test("one alert that throws does not cost the rest of the batch", async () => {
 
   assert.equal(pass.created, 1);
   assert.equal(store.specs[0]?.id, "ALERT-00ff00ff");
+});
+
+test("a policy that does not parse refuses nothing and records nothing", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  // What `readAlertPolicy` does with a file that exists and is wrong: it throws
+  // `PolicyParseError`, and the alert path must not read that as "no entry". A refusal
+  // record here would suppress an alert the operator believes is covered, and the commit
+  // that fixed the file would be met with silence.
+  const broken: AlertStore = {
+    ...store,
+    readAlertPolicy: () => Promise.reject(new PolicyParseError("`alerts` must be a list")),
+    readAlertRefusal: (fingerprint) => store.readAlertRefusal(fingerprint),
+    writeAlertRefusal: (fingerprint, record) => store.writeAlertRefusal(fingerprint, record),
+    countOpenAlertTasks: (alertname) => store.countOpenAlertTasks(alertname),
+    hasTask: (task) => store.hasTask(task),
+    writeState: (state) => store.writeState(state),
+    writeSpec: (spec) => store.writeSpec(spec),
+    commitAndPush: (message) => store.commitAndPush(message),
+  };
+
+  const pass = await new AlertProcessor({
+    store: broken,
+    notifier,
+    logger: SILENT_LOGGER,
+    maxSessionsPerTask: 20,
+  }).process([alert()], "origin", "main");
+
+  assert.deepEqual(pass, { seen: 1, created: 0, duplicate: 0, refused: 0 });
+  assert.equal(store.refusals.size, 0);
+  assert.equal(store.specs.length, 0);
+  assert.equal(store.commits.length, 0);
+  assert.equal(notifier.sent.length, 0);
 });
 
 test("an empty drain reads no policy and pushes nothing", async () => {

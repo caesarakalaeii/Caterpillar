@@ -26,7 +26,12 @@ import { EMPTY_USAGE, type TaskId, type TaskSpec, type TaskState } from "../doma
 import type { Notifier } from "../notify/discord.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { AlertRefusal, StateStore } from "../state/store.ts";
-import { alertTaskId, lookupPolicy, type AlertPolicyEntry } from "./policy.ts";
+import {
+  alertTaskId,
+  lookupPolicy,
+  type AlertPolicy,
+  type AlertPolicyEntry,
+} from "./policy.ts";
 import { fencedBlock, type AlertObserver, type AlertOutcome, type FiringAlert } from "./receiver.ts";
 
 /**
@@ -134,7 +139,21 @@ export class AlertProcessor {
     const { store, logger } = this.deps;
     if (alerts.length === 0) return { seen: 0, created: 0, duplicate: 0, refused: 0 };
 
-    const policy = await store.readAlertPolicy();
+    let policy: AlertPolicy;
+    try {
+      policy = await store.readAlertPolicy();
+    } catch (error) {
+      // A document that does not parse is an operator mistake and gets one clear message,
+      // never a refusal record: writing one would suppress the alert on a policy the
+      // operator believes says otherwise, and the next fix to the file would be met with
+      // silence. Nothing is written and the alerts are dropped — they are still firing, so
+      // Alertmanager re-delivers them once the file is right (§20).
+      logger.error("alert.policy-invalid", {
+        alerts: alerts.length,
+        ...errorFields(error),
+      });
+      return { seen: alerts.length, created: 0, duplicate: 0, refused: 0 };
+    }
 
     let created = 0;
     let duplicate = 0;

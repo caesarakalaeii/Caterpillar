@@ -91,6 +91,15 @@ export interface ReceiverOptions {
  */
 export const MAX_BODY_BYTES = 1024 * 1024;
 
+/**
+ * Members of `alerts[]` examined in one delivery.
+ *
+ * Alertmanager groups, so a delivery is legitimately several alerts — but not two hundred,
+ * and the queue behind this only holds a hundred anyway. The rest are still firing and are
+ * re-delivered on the next interval.
+ */
+export const MAX_ALERTS_PER_DELIVERY = 100;
+
 /** Labels or annotations kept per alert. Beyond this the payload is not describing one. */
 const MAX_PAIRS = 50;
 
@@ -307,7 +316,6 @@ export const handleAlertRequest = (
     return {
       ...nothing,
       reply: text(401, "a bearer token is required", { "www-authenticate": "Bearer" }),
-      skipped: ["unauthorized"],
     };
   }
 
@@ -334,7 +342,12 @@ export const handleAlertRequest = (
   const accepted: FiringAlert[] = [];
   const dropped: FiringAlert[] = [];
   const skipped: string[] = [];
-  for (const member of alerts) {
+  // Capped. A megabyte of body holds thousands of minimal alert objects, and each one that
+  // is skipped costs a log line; a grouping this large is a misconfigured Alertmanager
+  // rather than an incident, and the members past the cap are still firing and still
+  // re-delivered. The cap is on MEMBERS EXAMINED rather than on accepted ones so the work
+  // one delivery can ask for is bounded whatever the payload says.
+  for (const member of alerts.slice(0, MAX_ALERTS_PER_DELIVERY)) {
     const parsed = parseAlert(member);
     if ("skipped" in parsed) {
       skipped.push(parsed.skipped);
@@ -342,6 +355,13 @@ export const handleAlertRequest = (
     }
     if (options.sink.submit(parsed.alert)) accepted.push(parsed.alert);
     else dropped.push(parsed.alert);
+  }
+
+  if (alerts.length > MAX_ALERTS_PER_DELIVERY) {
+    skipped.push(
+      `${alerts.length - MAX_ALERTS_PER_DELIVERY} member(s) past the ` +
+        `${MAX_ALERTS_PER_DELIVERY}-per-delivery cap`,
+    );
   }
 
   // 202 for everything that parsed, including a batch of nothing but resolved alerts: the
