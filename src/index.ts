@@ -29,6 +29,8 @@ import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.
 import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
+import { AlertProcessor, AlertQueue } from "./remediation/queue.ts";
+import { startRemediationReceiver, type AlertObserver } from "./remediation/receiver.ts";
 import { ChatInbox } from "./supervisor/inbox.ts";
 import { TaskSnapshot } from "./supervisor/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
@@ -243,6 +245,10 @@ const main = async (): Promise<void> => {
   });
 
   const inbox = new ChatInbox();
+  // Filled by the webhook receiver when one is running, drained by the loop (§20). Built
+  // unconditionally and cheap: an empty queue costs one array swap a poll, and building it
+  // here keeps the receiver's own startup a single decision about the port and the secret.
+  const alertQueue = new AlertQueue();
   const snapshot = new TaskSnapshot();
   const threads = new ThreadIndex();
   const discord = await loadDiscord(config.secretsDir, logger);
@@ -327,10 +333,29 @@ const main = async (): Promise<void> => {
       logger,
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
     }),
+    // The fifth intake path (§20). Present whether or not the receiver is listening: the
+    // drain is a no-op on an empty queue, and wiring it conditionally would mean an alert
+    // accepted by a receiver started later had nowhere to go.
+    alerts: {
+      queue: alertQueue,
+      ingester: new AlertProcessor({
+        store,
+        notifier: discord.notifier,
+        logger,
+        metrics: alertObserver(metrics),
+        maxSessionsPerTask: config.limits.maxSessionsPerTask,
+      }),
+    },
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
   const stopWeb = startWebView({ config, store, live, ring, logger });
+  const stopReceiver = await startAlertReceiver({
+    config,
+    sink: alertQueue,
+    metrics,
+    logger,
+  });
 
   const controller = new AbortController();
   const shutdown = (signal: string): void => {
@@ -369,6 +394,7 @@ const main = async (): Promise<void> => {
     controller.abort();
     stopMetrics();
     stopWeb();
+    stopReceiver();
     await credentials.stop();
     await bridge;
   }
@@ -503,11 +529,7 @@ const startWebView = (options: {
     options.logger.info("web.disabled", { reason: "web.enabled is false" });
     return () => undefined;
   }
-  if (web.port === METRICS_PORT) {
-    // Bind order would decide which of the two exists, and the loser fails with an
-    // EADDRINUSE that names neither. Say which two ports collided instead.
-    throw new Error(`web.port (${web.port}) must differ from METRICS_PORT (${METRICS_PORT})`);
-  }
+  assertPortsDiffer(options.config);
 
   const server = createWebServer(options);
   server.listen(web.port);
@@ -518,6 +540,89 @@ const startWebView = (options: {
 
   return () => server.close();
 };
+
+/**
+ * Every port this process listens on must be a different port.
+ *
+ * Checked in one place for all three rather than pairwise as each was added: bind order
+ * would otherwise decide which listener exists, and the loser fails with an EADDRINUSE that
+ * names neither of the two things that collided.
+ */
+const assertPortsDiffer = (config: RunnerConfig): void => {
+  const ports: readonly (readonly [string, number])[] = [
+    ["METRICS_PORT", METRICS_PORT],
+    ["web.port", config.web.port],
+    ["remediation.port", config.remediation.port],
+  ];
+
+  for (const [i, [name, value]] of ports.entries()) {
+    for (const [otherName, otherValue] of ports.slice(i + 1)) {
+      if (value === otherValue) {
+        throw new Error(`${name} (${value}) must differ from ${otherName} (${otherValue})`);
+      }
+    }
+  }
+};
+
+/**
+ * Start the Alertmanager webhook receiver, if this runner was told to (DESIGN.md §20).
+ *
+ * Two ways not to start, and they are different events:
+ *
+ *   `remediation.enabled` is false — the ordinary case, logged at info like the web view's.
+ *
+ *   the secret is missing — a MISCONFIGURATION, logged at error, and the receiver does not
+ *   start. It does not fall back to an open port: this listener is the only one that can
+ *   cause a task to exist, and a task is a session with a shell and a forge credential, so
+ *   an unauthenticated one is a remote code execution path. Failing closed leaves the alert
+ *   path dark and everything else working, which is the failure an operator can see and fix
+ *   with one commit.
+ */
+const startAlertReceiver = async (options: {
+  readonly config: RunnerConfig;
+  readonly sink: AlertQueue;
+  readonly metrics: AgentMetrics;
+  readonly logger: Logger;
+}): Promise<() => void> => {
+  const { config, logger } = options;
+  if (!config.remediation.enabled) {
+    logger.info("remediation.disabled", { reason: "remediation.enabled is false" });
+    return () => undefined;
+  }
+  assertPortsDiffer(config);
+
+  const bundle = new SecretBundle(config.secretsDir, "caterpillar-remediation");
+  const token = await bundle.readOptional("webhook-token").catch(() => undefined);
+  if (token === undefined || token.length === 0) {
+    logger.error("remediation.no-token", {
+      secret: "caterpillar-remediation",
+      key: "webhook-token",
+      reason:
+        "the receiver refuses to start unauthenticated — a webhook that creates tasks is a " +
+        "remote code execution path",
+    });
+    return () => undefined;
+  }
+
+  return startRemediationReceiver({
+    port: config.remediation.port,
+    token,
+    sink: options.sink,
+    logger,
+    metrics: alertObserver(options.metrics),
+  });
+};
+
+/**
+ * The alert counter, as the two halves of the alert path see it.
+ *
+ * One adapter rather than each of them reaching into `AgentMetrics`, so `outcome` is the
+ * label the receiver and the queue agree on and neither has to know how a counter is
+ * incremented.
+ */
+const alertObserver = (metrics: AgentMetrics): AlertObserver => ({
+  observe: (alertname, outcome) => metrics.alerts.inc({ alertname, outcome }),
+});
 
 /**
  * Rebuild the thread index from the state repo.

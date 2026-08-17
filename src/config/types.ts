@@ -337,6 +337,30 @@ export interface RunnerConfig {
   readonly web: WebConfig;
   readonly digest: DigestConfig;
   readonly cluster: ClusterConfig;
+  readonly remediation: RemediationConfig;
+}
+
+/**
+ * The Alertmanager webhook receiver (DESIGN.md §20).
+ *
+ * `enabled` defaults to FALSE, and here that is more than the caution the web view and the
+ * digest exercise: this listener is the only one in the process that can cause a task to
+ * exist, and a task is a session with a shell and a forge credential. A runner someone
+ * started on a workstation must not open that port because it was upgraded.
+ *
+ * There is no token field. The token is a credential and lives in the mounted secret
+ * `caterpillar-remediation` under `webhook-token`, like every other credential (§9) — and
+ * the receiver refuses to start without it, because an unauthenticated webhook that creates
+ * tasks is a remote code execution path.
+ */
+export interface RemediationConfig {
+  readonly enabled: boolean;
+  /**
+   * Its own port, separate from the metrics port and the web view's. All three are checked
+   * against each other at startup: bind order would otherwise decide which one exists, and
+   * the loser fails with an EADDRINUSE that names neither.
+   */
+  readonly port: number;
 }
 
 export interface IntakeConfig {

@@ -143,6 +143,7 @@ const config: RunnerConfig = {
     kubeApiUrl: "https://kube.invalid",
     maxLogLines: 2000,
   },
+  remediation: { enabled: false, port: 8081 },
   web: {
     enabled: false,
     port: 8080,

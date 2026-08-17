@@ -83,6 +83,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     kubeApiUrl: "https://kube.invalid",
     maxLogLines: 2000,
   },
+  remediation: { enabled: false, port: 8081 },
   web: {
     enabled: true,
     port: 0,
