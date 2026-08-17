@@ -26,6 +26,7 @@ import { GitError, type Git } from "./git.ts";
 import {
   asTaskId,
   asWorkspaceName,
+  isTerminal,
   parseRepoRef,
   type Capability,
   type RepoRef,
@@ -35,6 +36,32 @@ import {
   type ToolchainSpec,
   type TrackerRef,
 } from "../domain/task.ts";
+import {
+  EMPTY_POLICY,
+  isAlertFingerprint,
+  parsePolicy,
+  type AlertPolicy,
+} from "../remediation/policy.ts";
+
+/**
+ * What the supervisor remembers about one firing alert (DESIGN.md §20).
+ *
+ * Written on every decision the receiver makes about an alert — refused, rate-limited,
+ * or accepted — not only on a refusal, because the same record answers two questions:
+ * "have I already told someone about this?" and "which alertname does task
+ * `ALERT-<fingerprint>` belong to?". The second is not recoverable from a fingerprint,
+ * which is a hash.
+ */
+export interface AlertRefusal {
+  readonly fingerprint: string;
+  readonly alertname: string;
+  /** Why the receiver refused, or how it handled the alert. Human-facing. */
+  readonly reason: string;
+  /** The task this alert produced, when it produced one. */
+  readonly task?: TaskId;
+  /** Stamped by the writer, for an operator wondering how long this has been so. */
+  readonly at?: string;
+}
 
 const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
@@ -186,13 +213,18 @@ export class StateStore {
     }
 
     const kind = meta.kind === undefined ? "implement" : meta.kind;
-    if (kind !== "implement" && kind !== "brainstorm") {
-      throw new SpecParseError(task, "`kind` must be `implement` or `brainstorm`");
+    if (kind !== "implement" && kind !== "brainstorm" && kind !== "remediation") {
+      throw new SpecParseError(
+        task,
+        "`kind` must be `implement`, `brainstorm` or `remediation`",
+      );
     }
 
     // A brainstorm may declare none: its gate is the review council's verdict on the
     // plan it produces, not §12's acceptance commands (§14.3). It is the ONLY exception,
-    // and it exists because a refinement conversation has nothing to run.
+    // and it exists because a refinement conversation has nothing to run. `remediation`
+    // is deliberately NOT widened into it (§20): an alert-driven task ends in a pull
+    // request like any other, so it needs commands the supervisor can run.
     const acceptance =
       kind === "brainstorm" && meta.acceptance === undefined
         ? []
@@ -252,7 +284,10 @@ export class StateStore {
     const frontMatter = stringifyYaml({
       workspace: spec.workspace,
       // Omitted when it is the default, so an ordinary spec looks exactly as it did
-      // before this field existed and a hand-written one need not know about it.
+      // before this field existed and a hand-written one need not know about it. Every
+      // other kind — `brainstorm`, `remediation` — is written out, because losing it
+      // would silently turn the task back into an ordinary implementation task on the
+      // way back in through `readSpec`.
       ...(spec.kind !== undefined && spec.kind !== "implement" ? { kind: spec.kind } : {}),
       // Always fully qualified, so the host never has to be inferred on the way back in.
       repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
@@ -314,6 +349,114 @@ export class StateStore {
   /** Idempotent: the success path clears unconditionally. */
   async clearIntakeRejection(task: TaskId): Promise<void> {
     await rm(this.intakePath(task), { force: true });
+  }
+
+  /**
+   * The operator's alert policy (DESIGN.md §20).
+   *
+   * READ ONLY, and there is no `writeAlertPolicy` on purpose: `alerts/policy.yaml` is
+   * authored by a human and committed by a human, which is what makes adding an alert a
+   * reviewable change rather than something the supervisor can do to itself. The only
+   * thing under `alerts/` the supervisor writes is `alerts/refusals/`.
+   *
+   * A missing file is an EMPTY policy rather than an error. Most state repos have never
+   * heard of alerts, and the poll loop calls this every cycle — a throw there would turn
+   * "this cluster has not opted in" into a supervisor that logs a failure every 30
+   * seconds. A file that exists and does not parse still throws `PolicyParseError`: that
+   * one IS an operator mistake and must be visible.
+   */
+  async readAlertPolicy(): Promise<AlertPolicy> {
+    const path = join(this.root, "alerts", "policy.yaml");
+    if (!existsSync(path)) return EMPTY_POLICY;
+    return parsePolicy(await readFile(path, "utf8"));
+  }
+
+  private alertRefusalPath(fingerprint: string): string {
+    return join(this.root, "alerts", "refusals", `${fingerprint}.json`);
+  }
+
+  /**
+   * Why the alert receiver last refused this alert, if it did.
+   *
+   * The same reasoning as `readIntakeRejection`, verbatim: the record suppresses a repeat
+   * notification, and Keel rolls the pod on every push to main, so an in-memory set would
+   * re-notify for every refused alert on every deploy — and Alertmanager re-sends a
+   * firing alert every few minutes, which makes the fleet noisier than the alert.
+   *
+   * `alertname` is stored rather than derived. A fingerprint is a hash: the alertname is
+   * NOT recoverable from it, and `maxOpenTasks` needs to count the open tasks for an
+   * alertname (§20). Recording it here is what makes that a lookup instead of a guess.
+   */
+  async readAlertRefusal(fingerprint: string): Promise<AlertRefusal | undefined> {
+    if (!isAlertFingerprint(fingerprint)) return undefined;
+    const path = this.alertRefusalPath(fingerprint);
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(await readFile(path, "utf8")) as AlertRefusal;
+  }
+
+  async writeAlertRefusal(fingerprint: string, record: AlertRefusal): Promise<void> {
+    // The fingerprint becomes a file name, so it is checked rather than trusted: it
+    // arrives in an HTTP body from outside this process, and `..` is a legal directory
+    // name that resolves out of `alerts/` — the same trap a task id is guarded against.
+    if (!isAlertFingerprint(fingerprint)) {
+      throw new Error(`'${fingerprint}' is not an alert fingerprint this can be filed under`);
+    }
+    await mkdir(join(this.root, "alerts", "refusals"), { recursive: true });
+    await writeFile(
+      this.alertRefusalPath(fingerprint),
+      `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
+  /** Idempotent, like `clearIntakeRejection`: the success path clears unconditionally. */
+  async clearAlertRefusal(fingerprint: string): Promise<void> {
+    if (!isAlertFingerprint(fingerprint)) return;
+    await rm(this.alertRefusalPath(fingerprint), { force: true });
+  }
+
+  /**
+   * How many tasks this alertname has open right now (DESIGN.md §20).
+   *
+   * "Open" is `!isTerminal(status)` — the one notion of task status the whole supervisor
+   * uses, deliberately not a second one invented here. A `parked` remediation task counts
+   * as closed: it is waiting on a human, and a fresh firing of the same alert is exactly
+   * the nudge that should be allowed to create a new task rather than be suppressed by a
+   * task nobody is working on.
+   *
+   * Counted by joining `alerts/refusals/` to `tasks/` rather than by parsing ids, because
+   * a fingerprint is a hash and does not carry its alertname. A record naming a task that
+   * no longer exists contributes nothing, so a manually deleted task frees its slot.
+   */
+  async countOpenAlertTasks(alertname: string): Promise<number> {
+    const records = await this.listAlertRefusals();
+
+    let open = 0;
+    for (const record of records) {
+      if (record.alertname !== alertname || record.task === undefined) continue;
+      const state = await this.tryReadState(record.task).catch(() => undefined);
+      if (state !== undefined && !isTerminal(state.status)) open += 1;
+    }
+    return open;
+  }
+
+  /** Every alert record on disk, for counting open tasks per alertname (§20). */
+  async listAlertRefusals(): Promise<readonly AlertRefusal[]> {
+    const dir = join(this.root, "alerts", "refusals");
+    if (!existsSync(dir)) return [];
+
+    const out: AlertRefusal[] = [];
+    for (const name of (await readdir(dir)).sort()) {
+      if (!name.endsWith(".json")) continue;
+      // One unreadable record must not cost the whole listing: this feeds a rate limit,
+      // and a limit that throws is a limit that blocks every alert rather than one.
+      try {
+        out.push(JSON.parse(await readFile(join(dir, name), "utf8")) as AlertRefusal);
+      } catch {
+        continue;
+      }
+    }
+    return out;
   }
 
   async readState(task: TaskId): Promise<TaskState> {
@@ -647,7 +790,11 @@ export class StateStore {
     // no `tasks/` at all, a repo that has never refused an intake item has no `intake/`,
     // and one whose first digest is not yet due has no `digests/` — so the first rejection
     // on a new runner would otherwise throw here rather than record anything.
-    for (const path of ["tasks", "intake", "digests"]) {
+    //
+    // `alerts/` is in the list because it is the only thing that makes an alert refusal
+    // reach the remote at all (§20). It is also where the operator's `policy.yaml` lives,
+    // which the supervisor never writes — staging a path it does not write costs nothing.
+    for (const path of ["tasks", "intake", "digests", "alerts"]) {
       if (existsSync(join(this.root, path))) await this.git.run("add", "-A", path);
     }
     if (await this.git.hasUncommittedChanges()) {
@@ -751,7 +898,13 @@ export class StateStore {
     // whole repo would delete whatever an operator was in the middle of. `digests/` is
     // deliberately NOT swept for the same reason it is staged: an unpushed digest is a
     // day's record waiting for the next commit, not a phantom anything (§19).
-    for (const path of ["tasks", "intake"]) {
+    //
+    // `alerts/` IS swept. A refusal record whose commit never landed is a suppression
+    // that outlives the branch it was written on: the alert stays silenced on this runner
+    // while existing nowhere in git, so no other runner agrees and no operator can see
+    // why the notification stopped (§20). `policy.yaml` is tracked, so the sweep cannot
+    // touch it.
+    for (const path of ["tasks", "intake", "alerts"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }
   }

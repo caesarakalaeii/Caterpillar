@@ -99,8 +99,14 @@ export type TaskPhase = "planning" | "implementing" | "verifying" | "review";
  * conversation that produces a PLAN and never touches the code — its completion gate is
  * the review council's verdict on that plan, not §12's acceptance commands, which is why
  * it is the one task kind permitted to declare none (DESIGN.md §14.3).
+ *
+ * `remediation` is a task a firing alert created (DESIGN.md §20). It writes code and
+ * ends in a pull request exactly as `implement` does, and §12 applies to it unchanged —
+ * it is a separate kind only because its ORIGIN changes what the session should be told:
+ * that the evidence comes from a cluster it may read and must never write, and that
+ * "this needs a human, not a patch" is a legitimate outcome rather than a failure.
  */
-export type TaskKind = "implement" | "brainstorm";
+export type TaskKind = "implement" | "brainstorm" | "remediation";
 
 /** Which forge a repo lives on. Selects the ForgeCredentials implementation. */
 export type ForgeKind = "github" | "forgejo";
