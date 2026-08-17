@@ -489,3 +489,59 @@ test("a git that cannot answer degrades to silence, never to a failed session", 
   assert.equal(resolved.source, "inherited");
   assert.equal(resolved.note, undefined);
 });
+
+/** A resolver whose config names binary caches, with everything else at defaults. */
+const cached = (
+  over: Partial<ToolchainConfig>,
+  extra: NodeJS.ProcessEnv = {},
+): ToolchainResolver =>
+  new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: { ...TEST_CONFIG, ...over },
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: process.env["PATH"] ?? "", ...extra },
+  });
+
+test("configured substituters reach every spawned process via NIX_CONFIG", async () => {
+  const resolved = await cached({ substituters: ["http://cache.invalid/"] }).resolve(spec, "/tmp/wt");
+
+  assert.match(resolved.env["NIX_CONFIG"] ?? "", /^extra-substituters = http:\/\/cache\.invalid\/$/m);
+});
+
+test("NIX_CONFIG is APPENDED, so the image's experimental-features survive", async () => {
+  // The image ships NIX_CONFIG="experimental-features = nix-command flakes". Replacing it
+  // turns every flake reference into an error about an experimental feature, which reads
+  // as a broken flake rather than as a clobbered variable.
+  const resolved = await cached(
+    { substituters: ["http://cache.invalid/"] },
+    { NIX_CONFIG: "experimental-features = nix-command flakes" },
+  ).resolve(spec, "/tmp/wt");
+
+  const config = resolved.env["NIX_CONFIG"] ?? "";
+  assert.match(config, /experimental-features = nix-command flakes/);
+  assert.match(config, /extra-substituters = http:\/\/cache\.invalid\//);
+});
+
+test("trusted keys are emitted separately from the caches that need them", async () => {
+  const resolved = await cached({
+    substituters: ["http://cache.invalid/", "http://other.invalid/"],
+    trustedPublicKeys: ["cache.invalid:AAAA", "other.invalid:BBBB"],
+  }).resolve(spec, "/tmp/wt");
+
+  const config = resolved.env["NIX_CONFIG"] ?? "";
+  assert.match(config, /^extra-substituters = http:\/\/cache\.invalid\/ http:\/\/other\.invalid\/$/m);
+  assert.match(config, /^extra-trusted-public-keys = cache\.invalid:AAAA other\.invalid:BBBB$/m);
+});
+
+test("no configured cache leaves NIX_CONFIG exactly as the environment had it", async () => {
+  // A machine runner and a local `docker run` have no in-cluster cache to point at, and
+  // must behave precisely as they did before this existed.
+  const untouched = await cached({}, { NIX_CONFIG: "experimental-features = flakes" }).resolve(
+    spec,
+    "/tmp/wt",
+  );
+  assert.equal(untouched.env["NIX_CONFIG"], "experimental-features = flakes");
+
+  const absent = await cached({}).resolve(spec, "/tmp/wt");
+  assert.equal(absent.env["NIX_CONFIG"], undefined);
+});

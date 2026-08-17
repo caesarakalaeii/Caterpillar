@@ -33,7 +33,14 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
   runnerId: "pod-test",
   capabilities: ["linux"],
   identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
-  toolchain: { nixpkgs: "github:NixOS/nixpkgs/pin", timeoutSeconds: 900, gcIntervalHours: 24, gcKeepDays: 7 },
+  toolchain: {
+    nixpkgs: "github:NixOS/nixpkgs/pin",
+    timeoutSeconds: 900,
+    gcIntervalHours: 24,
+    gcKeepDays: 7,
+    substituters: [],
+    trustedPublicKeys: [],
+  },
   stateRepo: {
     url: "https://example.invalid/state.git",
     branch: "main",
@@ -43,7 +50,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
   paths: { mirrors: "/work/mirrors", tasks: "/work/tasks" },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
-  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 14_400 },
+  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 14_400, commandTimeoutSeconds: 900 },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
   llm: {

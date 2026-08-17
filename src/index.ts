@@ -6,6 +6,7 @@
  * repo, so recovery is "fetch and reclaim".
  */
 import { createServer } from "node:http";
+import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
@@ -18,6 +19,7 @@ import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester } from "./intake/ingest.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
+import { HOLDER_TOKEN_ENV, HttpCredentialStore } from "./llm/credential-client.ts";
 import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
@@ -74,6 +76,52 @@ const startMetricsServer = (metrics: AgentMetrics, port: number): (() => void) =
   });
   server.listen(port);
   return () => server.close();
+};
+
+/**
+ * Where this runner's rotating credential comes from (DESIGN.md §9.6).
+ *
+ * Three cases, and the ORDER is the whole decision:
+ *
+ *   `credentialsUrl` — a fleet. The credential holder owns the only copy and this runner
+ *   reads it over HTTP. Checked FIRST, and it wins over a path, because a fleet's
+ *   ConfigMap necessarily carries both: one object configures the runners and the holder,
+ *   and `credentialsPath` there is the HOLDER's field. A runner that preferred the path
+ *   would open its own copy on its own volume and start rotating a token three other
+ *   replicas are using — the exact failure the holder exists to prevent, arriving through
+ *   a config that looks correct.
+ *
+ *   `credentialsPath` — one replica, the original shape. A file on the PVC, locked across
+ *   processes. Still supported and still right for a machine runner or a `docker run`,
+ *   neither of which has a holder to talk to.
+ *
+ *   neither — proxy mode, which authenticates from the environment and stores nothing.
+ */
+const credentialStore = (
+  llm: RunnerConfig["llm"],
+  logger: Logger,
+): { credentials: CredentialStore } | undefined => {
+  if (llm.credentialsUrl !== undefined) {
+    logger.info("llm.credential-source", { source: "holder", url: llm.credentialsUrl });
+    return {
+      credentials: new HttpCredentialStore({
+        baseUrl: llm.credentialsUrl,
+        // Absent is legal and the holder decides whether that is acceptable — it warns
+        // at boot when it is running without one. Failing here instead would mean a
+        // runner refusing to start over a policy its peer is responsible for.
+        ...(process.env[HOLDER_TOKEN_ENV] === undefined
+          ? {}
+          : { token: process.env[HOLDER_TOKEN_ENV] }),
+      }),
+    };
+  }
+
+  if (llm.credentialsPath !== undefined) {
+    logger.info("llm.credential-source", { source: "file", path: llm.credentialsPath });
+    return { credentials: new FileCredentialStore(llm.credentialsPath) };
+  }
+
+  return undefined;
 };
 
 const main = async (): Promise<void> => {
@@ -192,11 +240,7 @@ const main = async (): Promise<void> => {
   // credential store, one place the model id is decided.
   const llm = createLlmRuntime({
     config: config.llm,
-    // Only subscription mode has a rotating credential to persist. Proxy mode
-    // authenticates from the environment and has nothing to store.
-    ...(config.llm.credentialsPath !== undefined
-      ? { credentials: new FileCredentialStore(config.llm.credentialsPath) }
-      : {}),
+    ...(credentialStore(config.llm, logger) ?? {}),
   });
 
   const digester = createDigest({
@@ -219,6 +263,7 @@ const main = async (): Promise<void> => {
     runner: new AgentSessionRunner({
       config,
       store,
+      logger,
       worktrees,
       credentials,
       llm,

@@ -98,6 +98,21 @@ export interface LimitsConfig {
    * legitimately needs longer than this is one nobody is watching.
    */
   readonly maxSessionSeconds: number;
+  /**
+   * Ceiling AND default for ONE command from the agent's shell (DESIGN.md §6.4).
+   *
+   * `maxSessionSeconds` above is the backstop; this is the actual fix. pi's bash tool
+   * documents `timeout` as *"Defaults to no timeout"* and passes through whatever the
+   * model asked for, so without this a single `npm test` whose subprocess never exits
+   * holds the lease until the session ceiling fires hours later — which is exactly what
+   * happened, for 2h42m, inside a review council reviewer.
+   *
+   * Defaults to 900 to match the per-command timeout the acceptance gate has always had
+   * (`COMMAND_TIMEOUT_MS` in `supervisor/verifier.ts`). The gate and the agent trying to
+   * satisfy it should tolerate the same command taking the same time; they disagreed, and
+   * only the gate was protected.
+   */
+  readonly commandTimeoutSeconds: number;
 }
 
 export interface StateRepoConfig {
@@ -168,8 +183,26 @@ export interface LlmConfig {
    * Must be on WRITABLE, durable storage — the PVC, never a mounted Secret.
    * Refreshing rotates the refresh token, so a read-only mount locks the
    * supervisor out as soon as the access token expires.
+   *
+   * In a FLEET this is the credential holder's field, not a runner's: the holder
+   * owns the single durable copy and runners read it over `credentialsUrl`.
+   * Both are present in a fleet's ConfigMap because one object configures both
+   * workloads — see `credentialsUrl` for which one wins where.
    */
   readonly credentialsPath?: string;
+  /**
+   * Base URL of the credential holder (DESIGN.md §9.6). Set this to scale past ONE
+   * replica.
+   *
+   * When present it WINS over `credentialsPath` in the supervisor: the runner reads
+   * the credential over HTTP and never writes one. That is the whole mechanism —
+   * a refresh rotates the refresh token, the cluster has no ReadWriteMany storage
+   * class, so N replicas would hold N copies and N-1 of them would be invalid
+   * within the hour.
+   *
+   * The holder itself ignores this field and uses `credentialsPath`.
+   */
+  readonly credentialsUrl?: string;
 }
 
 /** How this runner materialises a task's dev environment (DESIGN.md §8.1). */
@@ -195,6 +228,32 @@ export interface ToolchainConfig {
   readonly gcIntervalHours: number;
   /** Days a store path survives with no GC root. */
   readonly gcKeepDays: number;
+  /**
+   * Binary caches to consult BEFORE the defaults (DESIGN.md §8.1). Empty by default.
+   *
+   * This is what makes a fleet affordable. Every replica has its own store — the cluster
+   * has no ReadWriteMany storage class, so it cannot have anything else — and without a
+   * shared cache each one substitutes the same dotnet closure over the public internet,
+   * separately, every time the store is collected. One in-cluster pull-through cache
+   * turns that into a LAN copy for everyone after the first.
+   *
+   * These are `extra-substituters`, never `substituters`: appending leaves
+   * cache.nixos.org in place, so a cache that is down or empty costs a failed request and
+   * not a from-source build of a toolchain.
+   */
+  readonly substituters: readonly string[];
+  /**
+   * Public keys that make `substituters` trustworthy. Empty by default.
+   *
+   * A pull-through cache in front of cache.nixos.org needs NONE: it serves the upstream's
+   * own signatures, which nix already trusts. This is for a cache that signs its own
+   * paths, which is what a store that also holds locally-BUILT derivations has to do.
+   *
+   * Configured separately from the URL rather than parsed out of it, because a key is a
+   * trust decision and a URL is a location, and one operator changing the other's mind by
+   * editing a string is exactly the accident worth preventing.
+   */
+  readonly trustedPublicKeys: readonly string[];
 }
 
 /**

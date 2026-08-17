@@ -50,6 +50,37 @@ export const intakeDue = (
   intervalSeconds: number,
 ): boolean => lastAtMs === 0 || nowMs - lastAtMs >= intervalSeconds * 1000;
 
+/**
+ * The ref that makes exactly one runner in a fleet ingest per interval (DESIGN.md §14).
+ *
+ * `intakeDue` bounds how often ONE runner ingests. It says nothing about how often the
+ * FLEET does, and the arithmetic above is why that is not a detail: a pass is ~66 requests
+ * against an installation budget of ~83/minute, so four replicas at the 300s default sit
+ * at ~52/min and ten replicas exhaust the hourly budget — taking every forge call down
+ * with it, because the limit is per installation and not per endpoint.
+ *
+ * So the interval becomes a BUCKET and the bucket becomes a claim, won by the same
+ * compare-and-swap that claims a task (§5). The winner ingests; the losers skip the pass
+ * entirely and are not delayed by it. Nothing is released: the ref's existence IS the
+ * record that the bucket has been served, which is what makes this idempotent across a
+ * restart — a runner that dies mid-pass costs one skipped interval, and intake is
+ * already best-effort by design.
+ *
+ * Bucketing on wall-clock rather than on each runner's own `lastIntakeAt` is what makes
+ * the runners agree without talking: two pods that booted forty seconds apart compute the
+ * same bucket, so they contend for one ref instead of alternating two.
+ *
+ * The agreement is approximate at a boundary and that is accepted rather than fixed.
+ * Runners whose intervals fire either side of one land in ADJACENT buckets and both win,
+ * so a fleet can ingest twice in an interval — but only twice, however many replicas
+ * there are, because everyone before the boundary shares a ref and everyone after shares
+ * the other. Two passes the hourly budget absorbs; N passes is the problem being solved.
+ * A tighter scheme would need the runners to agree on a clock, which is a distributed
+ * clock to be wrong about in exchange for one saved request per five minutes.
+ */
+export const intakeRef = (nowMs: number, intervalSeconds: number): string =>
+  `refs/intake/${Math.floor(nowMs / (intervalSeconds * 1000))}`;
+
 /** What one pass did. Reported so an idle intake is distinguishable from a broken one. */
 export interface IntakePass {
   /** Items the trackers returned, before any were skipped or refused. */

@@ -49,12 +49,15 @@ interface RawConfig {
     readonly noProgressLimit?: unknown;
     readonly maxReviewRounds?: unknown;
     readonly maxSessionSeconds?: unknown;
+    readonly commandTimeoutSeconds?: unknown;
   };
   readonly toolchain?: {
     readonly nixpkgs?: unknown;
     readonly timeoutSeconds?: unknown;
     readonly gcIntervalHours?: unknown;
     readonly gcKeepDays?: unknown;
+    readonly substituters?: unknown;
+    readonly trustedPublicKeys?: unknown;
   };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
@@ -80,6 +83,19 @@ const num = (value: unknown, field: string, fallback?: number): number => {
     throw new ConfigError(`${field} must be a finite number`);
   }
   return value;
+};
+
+/**
+ * A list of non-empty strings, defaulting to empty.
+ *
+ * Every entry is checked rather than the array as a whole: a substituter list with one
+ * `null` in it would otherwise reach nix as the string "null" and be reported as an
+ * unreachable cache, which sends the operator looking at the network.
+ */
+const strings = (value: unknown, field: string): readonly string[] => {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new ConfigError(`${field} must be an array of strings`);
+  return value.map((entry, index) => str(entry, `${field}[${index}]`));
 };
 
 /**
@@ -248,11 +264,16 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
   }
 
   const credentialsPath = llm["credentialsPath"];
-  if (auth === "subscription" && credentialsPath === undefined) {
+  const credentialsUrl = llm["credentialsUrl"];
+  // Either is a complete answer to "where does this runner get its credential", and a
+  // fleet's ConfigMap carries BOTH because the same object configures the runners and
+  // the holder they read from. Only their joint absence is a misconfiguration.
+  if (auth === "subscription" && credentialsPath === undefined && credentialsUrl === undefined) {
     throw new ConfigError(
-      "llm.credentialsPath is required when llm.auth is 'subscription' — it must " +
-        "point at writable, durable storage (the PVC), because refreshing the token " +
-        "rotates it",
+      "llm.auth is 'subscription' but neither llm.credentialsPath nor llm.credentialsUrl " +
+        "is set — a single runner needs a path on writable, durable storage (the PVC), " +
+        "because refreshing the token rotates it; a fleet needs the URL of the credential " +
+        "holder that owns the only copy",
     );
   }
 
@@ -274,6 +295,9 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
     ...(credentialsPath === undefined
       ? {}
       : { credentialsPath: str(credentialsPath, "llm.credentialsPath") }),
+    ...(credentialsUrl === undefined
+      ? {}
+      : { credentialsUrl: str(credentialsUrl, "llm.credentialsUrl") }),
   };
 };
 
@@ -355,6 +379,11 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         DEFAULTS.gcIntervalHours,
       ),
       gcKeepDays: num(raw.toolchain?.gcKeepDays, "toolchain.gcKeepDays", DEFAULTS.gcKeepDays),
+      substituters: strings(raw.toolchain?.substituters, "toolchain.substituters"),
+      trustedPublicKeys: strings(
+        raw.toolchain?.trustedPublicKeys,
+        "toolchain.trustedPublicKeys",
+      ),
     },
     stateRepo: {
       url: str(raw.stateRepo?.url, "stateRepo.url"),
@@ -383,6 +412,14 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       // observed is well under one — and short enough that a hung tool call is caught
       // within a shift rather than discovered by someone wondering why the queue stopped.
       maxSessionSeconds: num(raw.limits?.maxSessionSeconds, "limits.maxSessionSeconds", 4 * 60 * 60),
+      // 15 minutes, matching the acceptance gate's own per-command timeout. This is the
+      // hang detector that actually catches things; maxSessionSeconds above is what
+      // catches whatever this misses.
+      commandTimeoutSeconds: num(
+        raw.limits?.commandTimeoutSeconds,
+        "limits.commandTimeoutSeconds",
+        15 * 60,
+      ),
     },
     llm: llmConfig(llm),
     workspaces,

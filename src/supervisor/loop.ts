@@ -48,7 +48,7 @@ import {
 import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
-import { intakeDue, type IntakePass } from "../intake/ingest.ts";
+import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -338,7 +338,7 @@ export class Supervisor {
    * so a tracker outage must not stop the supervisor from working tasks it already has.
    */
   private async maybeIngest(): Promise<void> {
-    const { intake, config, logger } = this.deps;
+    const { intake, config, logger, leases } = this.deps;
     if (intake === undefined) return;
     if (!intakeDue(this.lastIntakeAt, Date.now(), config.intake.intervalSeconds)) return;
 
@@ -346,6 +346,23 @@ export class Supervisor {
     // interval, or a tracker returning errors would be retried on every poll — the exact
     // request storm the interval exists to prevent.
     this.lastIntakeAt = Date.now();
+
+    // One runner in the fleet serves each interval — see `intakeRef` for why this is a
+    // rate-limit requirement and not tidiness. With one replica it is a single ls-remote
+    // that always wins, which is the same cost the digest claim already pays.
+    const ref = intakeRef(this.lastIntakeAt, config.intake.intervalSeconds);
+    const claimed = await leases.claimOnce(ref, `intake runner=${config.runnerId}`).catch(() => {
+      // A claim that ERRORS is not a claim another runner won, and skipping on it would
+      // let a state-repo blip stop intake fleet-wide and silently. Ingest anyway: a
+      // duplicated pass is idempotent (`hasTask`), a skipped one is work nobody sees.
+      logger.warn("intake.claim-failed", { ref });
+      return "claim-failed";
+    });
+
+    if (claimed === undefined) {
+      logger.debug("intake.claimed-elsewhere", { ref });
+      return;
+    }
 
     try {
       // Always info, never debug. At a 300s interval this is ~12 lines an hour, and it is

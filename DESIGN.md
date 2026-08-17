@@ -29,9 +29,9 @@ and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment
 | Context strategy | **Hard handoff** at a token threshold — new session, not compaction |
 | Mutual exclusion | **Atomic git ref CAS** on `refs/leases/<TASK>`, heartbeat + steal-on-stale |
 | Multi-machine | **Capability-matched runner daemons** that poll and claim |
-| K8s shape | **Deployment** running a supervisor loop, one task at a time per replica |
-| Workspace | **PVC** bare mirrors + one **git worktree** per task |
-| LLM access | All runners → **in-cluster proxy** that holds the credential |
+| K8s shape | **StatefulSet** of supervisor loops, one task at a time per replica (§10) |
+| Workspace | **Per-replica PVC** bare mirrors + one **git worktree** per task |
+| LLM access | All runners → **in-cluster credential holder**; the traffic is direct (§9.6) |
 | Git credentials | **GitHub App**, supervisor-minted, scoped per task; repo-scoped tokens on Codeberg |
 | Commit identity | The author App's **own bot account**, configured per deployment (§9.7) |
 | Autonomy | Push branches, open/update PRs. **No merging. No cluster writes.** |
@@ -68,14 +68,24 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 ```
 ┌─ k3s cluster ─────────────────────────────────────────────┐
 │                                                            │
-│  supervisor (Deployment, 1 replica)                        │
-│    ├─ claim loop (git ref CAS)                             │
-│    ├─ pi Agent instance  ← one task at a time              │
+│  supervisor (StatefulSet, N replicas)                      │
+│    ├─ claim loop (git ref CAS)   ← the only coordination   │
+│    ├─ pi Agent instance  ← one task at a time, per replica │
 │    ├─ GitHub App token minting                             │
+│    ├─ own /work + /nix volume    ← no RWX in this cluster  │
 │    └─ /metrics                                             │
+│         │                    │                             │
+│         │ credential         │ substituter                 │
+│         ▼                    ▼                             │
+│  credential-holder      nix-cache (pull-through)           │
+│    exactly 1 replica      exactly 1 replica                │
+│    owns the ONLY copy     caches cache.nixos.org so N      │
+│    of a token whose       stores are not N internet        │
+│    refresh rotates it     fetches of one closure           │
 │                                                            │
-│  llm-proxy ──────────────► provider (Anthropic today)      │
-│    holds the only credential, enforces global spend cap    │
+│  …runners talk to the provider DIRECTLY. An OAuth bearer   │
+│    cannot be forwarded by an x-api-key proxy (§9.6), so    │
+│    only the CREDENTIAL is centralised, never the traffic.  │
 │                                                            │
 │  discord-bridge                                            │
 │    outbound: questions, parks, outcomes                    │
@@ -85,13 +95,14 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 │    GitHub issues (label: agent) → task spec                │
 │    Discord /brainstorm          → plan → task specs        │
 └────────────────────────────────────────────────────────────┘
-             ▲                              ▲
-             │ git (state repo)             │ https (llm-proxy over wireguard)
-             ▼                              │
-┌─ dedicated machine ────────────────────────┴──────────────┐
+             ▲
+             │ git (state repo)
+             ▼
+┌─ dedicated machine ───────────────────────────────────────┐
 │  same supervisor binary                                    │
 │  capabilities: [linux, gpu, usb, human-present]            │
-│  holds NO LLM credential — proxied                         │
+│  its own credential file and its own nix store — it has    │
+│  no holder and no cache to reach, and must keep working    │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -535,6 +546,55 @@ into `agent.prompt()` via pi's `abort()`:
    it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
    indicator stays on: a runner that looks healthier the longer it is wedged.
 
+#### It happened, and the session ceiling was the wrong place to catch it
+
+The paragraph above was written as a prediction. The prediction was right and the
+mitigation was too weak, in two separate ways.
+
+A review council reviewer ran `npm test` in a task worktree. One test subprocess never
+exited, `tail` blocked on the pipe, and the reviewer sat in that single tool call for **two
+hours and forty-two minutes** — lease renewed on schedule, `/healthz` green, CPU at 15
+millicores, the last log line ninety minutes old. Exactly the runner-that-looks-healthy
+above.
+
+**The first failure: the ceiling was in the wrong place.** `maxSessionSeconds` wraps
+`runner.run` in the supervisor loop and is cleared in a `finally` before the council is
+convened. So the implementation session was bounded at four hours and the review *of* that
+session was bounded by nothing at all. The council now carries the same deadline, and a
+reviewer cut off by it is recorded as an **abstention** — the honest reading, since it did
+not decide — and deliberately not as an outage, so the runner does not back off from a
+provider that was answering fine.
+
+**The second failure: four hours is not a hang detector, it is an outage.** Even correctly
+placed, a ceiling that generous means a wedged runner is out of service for half a working
+day. The real fix belongs one level down, at the command:
+
+> **`limits.commandTimeoutSeconds`, default 900** — a ceiling *and* a default for one
+> command from the agent's shell, applied in `BoundedExecutionEnv`.
+
+Three things about it are load-bearing:
+
+- **It clamps as well as defaults.** Absent-becomes-900 fixes the common case; without the
+  clamp a model that passes `timeout: 86400` for a slow build reintroduces the hang, and it
+  would look like the protection was working. A clamp rather than a refusal, because the
+  model is not doing anything wrong by asking — it cannot know what this runner tolerates,
+  and an error it has to interpret costs a turn to learn something the harness can decide.
+- **It is applied in BOTH shells.** The council builds its own `ExecutionEnv`, separate
+  from the runner's, and *that* is the one that wedged. A fix in the agent's shell alone
+  would have left the exact failure untouched.
+- **900 matches the acceptance gate.** `verifier.ts` has always passed a 15-minute
+  `timeout` to `execFile`. That asymmetry was the whole bug: the gate could not wedge and
+  the agent trying to satisfy it could. They should tolerate the same command for the same
+  time.
+
+`maxSessionSeconds` stays, now genuinely as a backstop: it catches what a per-command
+ceiling cannot — a model looping over a thousand commands that each return in a second.
+
+**A note on where this did *not* get fixed.** The council's shared preamble already tells
+reviewers the suite has passed and not to run it again. The reviewer ran it anyway. That is
+the argument for the ceiling living in the harness rather than in a prompt: a prompt is a
+request, and an unattended fleet needs a limit.
+
 An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
 session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and
 deliberately distinct from it: no provider misbehaved, so no cooldown starts. Charging a
@@ -823,14 +883,58 @@ the one thing that is not an option — store paths carry their literal `/nix/st
 inside the binaries, so moving it invalidates every binary-cache substitution and forces
 builds from source.
 
-In the cluster a PVC is mounted at `/nix`, seeded from the image's own closure by an
+In the cluster a volume is mounted at `/nix`, seeded from the image's own closure by an
 initContainer (`caesar-deployment`, `apps/workloads/caterpillar`). Without it every deploy
-throws the store away, and since keel rolls the Deployment on every push to `main`, a task
-needing a dotnet SDK would re-download over a gigabyte each time. It is a *separate* volume
-from `caterpillar-work` deliberately: that one holds the rotating Anthropic credential, and
-purging a wedged nix store must never be one `kubectl delete` away from locking the
-supervisor out. Nothing in this repo changes for any of it — which is the point, because a
-machine runner and a local `docker run` have no such mount and must keep working.
+throws the store away, and since keel rolls the workload on every push to `main`, a task
+needing a dotnet SDK would re-download over a gigabyte each time. Nothing in this repo
+changes for any of it — which is the point, because a machine runner and a local
+`docker run` have no such mount and must keep working.
+
+**A fleet gets one store per replica, and there was never a choice about it.** The cluster
+offers exactly one storage class, `local-path`: node-local and `ReadWriteOnce`. There is no
+`ReadWriteMany` to be had at any price, so a shared `/nix` is not an option that was
+weighed and rejected — it does not exist. The volumes therefore come from a StatefulSet's
+`volumeClaimTemplates` rather than from a claim the manifests name, which is the entire
+reason the workload is a StatefulSet and not a Deployment (§10).
+
+Sharing the store between co-located pods via `hostPath` *would* be possible and is
+deliberately not done. Nix supports concurrent processes against one store — that is what
+`/nix/var/nix/db/big-lock` is for — but two containers writing one SQLite database through
+separate mount namespaces is not a configuration nix tests, and the failure mode is a store
+whose database has forgotten paths that are still on disk. It would also pin every replica
+to one node, which is the opposite of the goal.
+
+**So the cost of a fleet is N stores, and the fix is a shared binary cache rather than a
+shared store.** The distinction matters: a replica must *materialise* every closure it
+runs, so nothing can make the disk cost sublinear. What can be made sublinear is the
+*fetch*. Almost nothing here is built — a devShell of dotnet, go, node and python is
+substituted from `cache.nixos.org` byte for byte — so `toolchain.substituters` points every
+runner at an in-cluster pull-through cache first. One replica pulls a 3.8G closure over the
+internet; the rest, and the same replica after its next garbage collection, get it over the
+LAN.
+
+That shape needs **no signing key and no push path**, which is why it is a caching proxy
+and not harmonia or attic. The proxy passes the upstream's own `narinfo` through untouched,
+signature included, so nix verifies against the `cache.nixos.org-1` key it already trusts.
+Nothing has to trust the proxy — it is a cache, not an authority. A store that served
+*locally built* paths would have to sign them, and `toolchain.trustedPublicKeys` exists for
+that day without being needed today.
+
+Two properties of how it is applied are load-bearing:
+
+- **It is set through `NIX_CONFIG`, not through flags on the resolver's own `nix` call.**
+  That reaches every nix in the session — `nix-collect-garbage`, and the agent's own
+  `nix build` inside its bash tool — and it survives into the resolved devShell
+  environment, which a flag on one argv would not.
+- **It is `extra-substituters`, appended, never `substituters`.** `cache.nixos.org` stays
+  in the list, so the cache being down costs a failed request and a slower fetch rather
+  than building a compiler from source. The append also matters mechanically: the image
+  ships `NIX_CONFIG="experimental-features = nix-command flakes"`, and assigning over it
+  turns every flake reference into an error about an experimental feature.
+
+`extra-substituters` from an untrusted caller is silently ignored by a nix **daemon**. This
+image runs single-user nix with `node` owning `/nix`, so the caller is the trusted user and
+it is honoured — worth knowing before anyone introduces a daemon.
 - **nixpkgs is pinned** for generated environments. An unattended agent picking up a silent
   bump produces a red acceptance run with no diff to explain it.
 - **A toolchain that will not build parks the task**, naming nix's own error. Falling
@@ -1116,11 +1220,75 @@ billing. Consequences, all load-bearing:
 - **The credential must live on writable, durable storage.** Refreshing **rotates the
   refresh token**, and pi performs that inside `CredentialStore.modify`. A mounted
   Kubernetes Secret is read-only, so putting it there locks the runner out about an hour
-  after start. It lives on the PVC, seeded once from `npm run llm:login` on a machine
+  after start. It lives on a volume, seeded once from `npm run llm:login` on a machine
   with a browser — a pod has nowhere to open one.
 - **`modify` must serialize across processes.** Two sessions refreshing at once would
   both read the same token and both write; the loser persists one the provider has
   already invalidated. `FileCredentialStore` takes a lock directory for this.
+
+#### The credential holder — what a fleet needs instead
+
+`FileCredentialStore`'s lock is a directory, so its blast radius is the volume it sits on.
+That is exactly enough for one supervisor and exactly nothing for a fleet, because §8.1's
+constraint applies here too: no `ReadWriteMany`, so N replicas means N volumes means **N
+copies of the credential**.
+
+Copies are what make this fatal rather than wasteful. The first replica to refresh rotates
+the refresh token, and every other copy is instantly a token the provider has invalidated.
+The fleet locks itself out about an hour after it starts — and does it *silently*, because
+each replica keeps working right up until its own access token expires.
+
+So the credential stops being a file each runner owns and becomes a service exactly one pod
+owns. Runners get an `HttpCredentialStore` that **never writes and never refreshes**.
+
+This is §2's "in-cluster proxy that holds the credential", reduced to the part that was
+ever possible. The original proxy was meant to carry the model *traffic* and could not —
+an OAuth bearer cannot be forwarded by something authenticating with `x-api-key`, which is
+what deleted it. Carrying the *credential* was never the problem. Runners still talk to
+`api.anthropic.com` themselves; only the token comes from the holder, and the spend-cap
+choke point the original promised still does not exist.
+
+Three things about it are load-bearing:
+
+- **Nothing reimplements OAuth.** The holder calls `Models.getAuth`, which is pi's own
+  public entry into `resolveStoredOAuth` — the double-checked "is it expiring / refresh
+  once / persist the rotation" dance, run inside `CredentialStore.modify`. Handing it the
+  same `FileCredentialStore` the single-replica deployment used means the refresh path in
+  a fleet is character-for-character the refresh path that already worked.
+- **The runner's `modify` deliberately does not run pi's callback.** This is the one place
+  that departs from the letter of pi's `CredentialStore` contract, and it is the whole
+  point. That callback invokes `anthropicOAuth.refresh`, which mints a new access token and
+  invalidates the refresh token it was given. Running it on a replica would rotate the
+  fleet's credential from something that cannot persist it — the holder's copy dies on the
+  spot and every other replica dies at its next refresh. So the call is forwarded to the
+  holder, which runs the identical refresh under its own lock against the single durable
+  copy, and returns what the callback would have produced. pi's caller cannot tell.
+- **`delete` throws rather than being a no-op.** Logging out is a fleet-wide act and a
+  runner is not entitled to it. Nothing calls it today; it is a tripwire for the caller
+  that eventually does.
+
+The runner caches what it reads until the token is inside a ten-minute margin — larger than
+pi's own five-minute staleness check, so the cache cannot hand pi something pi immediately
+rejects, which would make every request take the refresh path. Rotation does not invalidate
+an *access* token, so caching by `expires` is safe.
+
+**Config precedence is the sharp edge.** A fleet's ConfigMap necessarily carries both
+`credentialsPath` and `credentialsUrl`, because one object configures the runners and the
+holder. `credentialsUrl` wins in a runner (`src/index.ts`), and it has to: a runner that
+preferred the path would open a private copy on its own volume and start rotating a token
+its peers are using — the exact failure the holder exists to prevent, arriving through a
+config that looks correct.
+
+`credentialsPath` alone remains fully supported and is right for a machine runner or a
+local `docker run`, neither of which has a holder to reach.
+
+**What the bearer token does and does not do.** It bounds reach to workloads that hold it,
+rather than to anything in the cluster that can resolve the Service. It is *not* a defence
+against the agent: the agent's bash tool runs inside a runner pod, which is a pod that
+legitimately holds the token — and the credential was equally readable from that pod's own
+volume before the holder existed. Its absence is a warning at boot, not a refusal, because
+bringing a fleet up before sealing a secret should produce a working cluster and a loud log
+line rather than a crash loop.
 - **Rate limits are per-account** and shared with the operator's own interactive usage.
   So is the spend limit, and reaching either is a normal operating condition rather than
   an exception: the supervisor treats a refusal as a runner-wide pause, never as a fact
@@ -1172,6 +1340,35 @@ history is self-consistent rather than carrying two names for one actor. Note th
 bot account's id is **not** the App id in the secret: the App id names the application,
 this names the account it commits as.
 
+#### Nothing the fleet writes carries a second name
+
+The identity above is stamped on every commit by the git layer. Everything the *agent*
+writes — commit message bodies, pull request titles and descriptions, review comments,
+journal entries, code comments — must carry no attribution at all.
+
+This needed saying explicitly, in the system prompts, because the default behaviour is the
+opposite. A model asked to commit reaches for a `Co-Authored-By` trailer and a "Generated
+with" footer without being asked, having learned them from a corpus full of both, and it
+had been doing exactly that: the fleet was signing its work with the name of the harness it
+resembles.
+
+Two reasons, and only the second is about taste:
+
+- **It contradicts the identity.** The configured author is already on the commit. A
+  different name in the message body means the history carries two authors for one actor,
+  which is precisely the failure §9.7 exists to prevent, arriving through prose instead of
+  through config.
+- **It is an advertisement nobody is being paid for**, for a product that is an
+  implementation detail. The model behind a runner is a config field (§9.6) and may be a
+  different one next month; the work is Caterpillar's either way.
+
+Enforced in three prompts rather than one, because they publish to different places:
+`SYSTEM_PROMPT` (which `REMEDIATION_SYSTEM_PROMPT` inherits) covers commits and pull
+requests, the review council's shared preamble covers verdicts posted verbatim to a PR, and
+the digest summariser covers the daily post to Discord and the state repo. A stripping pass
+over the output was considered and rejected: it would be a denylist of the phrasings
+somebody already thought of, and the model has more.
+
 ---
 
 ## 10. Kubernetes
@@ -1184,17 +1381,45 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 
 | Object | Purpose |
 |---|---|
-| `Deployment` | supervisor, 1 replica, `Recreate` strategy |
-| `PVC` | git mirrors + worktrees |
-| `Secret` (SOPS) | GitHub App PEM, Discord webhook, proxy token |
+| `StatefulSet` | the supervisor fleet, N replicas, `RollingUpdate` |
+| `volumeClaimTemplates` | git mirrors + worktrees, and the nix store — **one pair per replica** |
+| `Deployment` | credential holder, **exactly 1** (§9.6) + its own claim + `Service` |
+| `Deployment` | nix pull-through cache, **exactly 1** (§8.1) + its own claim + `Service` |
+| `Secret` (SOPS) | GitHub App PEM, Discord webhook, credential-holder token |
 | `ConfigMap` | capabilities, thresholds, workspace forge host (the repo scope, §9.1) |
-| `Deployment` | llm-proxy |
-| `Deployment` | discord-bridge |
+| `Service` | load-balanced `metrics` + `web`, and a headless one for stable per-pod DNS |
 | `ServiceMonitor` | scrape supervisor `/metrics` |
 | `PrometheusRule` | alerts below |
 
-`Recreate` rather than `RollingUpdate`: two supervisors briefly overlapping is safe
-(leases handle it) but pointless, and it avoids PVC `ReadWriteOnce` contention.
+**A StatefulSet for one reason: `volumeClaimTemplates`.** Not ordering, not identity. The
+cluster's only storage class is node-local and `ReadWriteOnce`, so each replica needs its
+own `/nix` and `/work` (§8.1), and a Deployment can only name claims that already exist —
+which is one set for every replica. The stable pod name is a genuine second prize:
+`RUNNER_ID` is the pod name, so a lease in the state repo now names `caterpillar-0`, an
+identity that survives a restart, rather than a ReplicaSet's random suffix that never
+appears again.
+
+`RollingUpdate` is safe here and was not before. The single-replica Deployment used
+`Recreate` to avoid two pods contending for one `ReadWriteOnce` claim; with a claim per
+replica there is nothing to contend for, and overlapping supervisors were always safe on
+their own — leases handle it. `podManagementPolicy: Parallel`, because these pods do not
+form a quorum: `OrderedReady` would let a wedged `caterpillar-0` stop `caterpillar-1` from
+ever booting, which is the opposite of what a fleet is for.
+
+**What actually bounds the replica count** — none of it is this repo:
+
+- **Node disk.** Each replica takes its `work` + `nix` claims from `local-path` on
+  whichever node it lands on. `topologySpreadConstraints` exist to stop four replicas
+  piling onto one node and filling it while two others sit empty; that is a storage
+  constraint wearing scheduling clothes, and it is `ScheduleAnyway` because a fleet that
+  refuses to grow over an uneven spread is worse than an uneven fleet.
+- **The subscription's rate limit**, which is per *account* and shared with the operator's
+  own interactive usage (§6.3). This is the ceiling reached first. The fleet degrades
+  rather than failing tasks — a refusal is a runner-wide pause, not a fact about the task —
+  but many replicas contending for one subscription mostly produces many runners in
+  cooldown.
+- **Scaling down leaves claims behind.** Kubernetes never deletes a StatefulSet's volumes.
+  Reclaiming that space is a deliberate `kubectl delete pvc`.
 
 ---
 
@@ -1534,9 +1759,10 @@ path would put it in 1, alongside a dependency that has not run. Claiming filter
 hint and a readable label, never the constraint itself.
 
 **Waves describe what MAY run concurrently, not what does.** One runner still works one
-task at a time (§6). Actual parallelism comes from scaling the Deployment, which git-ref
+task at a time (§6). Actual parallelism comes from scaling the StatefulSet, which git-ref
 leasing already makes safe (§5). A wave of four on a single replica is four sequential
-tasks in a defined order — worth having, but not parallel until there are replicas.
+tasks in a defined order — worth having, and genuinely parallel once the fleet is wider
+than one.
 
 **A plan is a prediction, so it is re-checked.** When a task from a plan reaches `done`, a
 short maintenance pass reads what it actually did and may move the edges between its
@@ -1631,6 +1857,30 @@ installation limit of 5000/hour (~83/min), which exhausts the budget within minu
 takes the forge calls down with it. Default `intake.intervalSeconds` is 300, so the same
 pass costs ~13/min. The clock is stamped *before* the pass, so a failing tracker waits out
 the interval instead of being retried on every poll.
+
+**The interval bounds one runner; a claim bounds the fleet.** ~13/min is comfortable and
+N × 13/min is not — ten replicas exhaust the hourly allowance and, because the limit is per
+*installation* rather than per endpoint, take every forge call down with them. So the
+interval becomes a bucket and the bucket becomes a claim: `refs/intake/<bucket>`, won by
+the same compare-and-swap that claims a task (§5). The winner ingests, the losers skip the
+pass outright and are not delayed by it.
+
+Nothing releases the ref — its existence *is* the record that the bucket has been served,
+which is what makes it idempotent across a restart. A runner that dies mid-pass costs one
+skipped interval, and intake is best-effort by design.
+
+Bucketing on wall-clock rather than on each runner's own last-intake time is what lets
+replicas agree without talking: two pods that booted forty seconds apart compute the same
+bucket. The agreement is approximate at a boundary and that is accepted rather than fixed —
+runners firing either side of one land in adjacent buckets and both win, so a fleet can
+ingest *twice* in an interval, but only twice however many replicas there are, because
+everyone before the boundary shares a ref and everyone after shares the other. Two passes
+the budget absorbs. A tighter scheme would need the runners to agree on a clock, which is a
+distributed clock to be wrong about in exchange for one saved request per five minutes.
+
+A claim that *errors* is not a claim someone else won, and is treated as a win: a
+state-repo blip must not stop intake fleet-wide and silently. A duplicated pass is
+idempotent (`hasTask`); a skipped one is work nobody sees.
 
 Ordering inside a single ingest is load-bearing: `state.json` is written first and
 `spec.md` last, because `spec.md` is the existence marker. A crash between the two leaves

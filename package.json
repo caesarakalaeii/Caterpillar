@@ -23,7 +23,8 @@
     "verify:github-issues": "node src/cli/verify-github-issues.ts",
     "verify:discord": "node src/cli/verify-discord.ts",
     "discord:register": "node src/cli/register-commands.ts",
-    "llm:login": "node src/cli/llm-login.ts"
+    "llm:login": "node src/cli/llm-login.ts",
+    "llm:holder": "node src/cli/llm-holder.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.1",

@@ -227,6 +227,10 @@ const buildRunner = (
 
   const config = {
     handoff: { thresholdFraction: 0.7 },
+    // The ceiling the agent's shell is built with (DESIGN.md §6.4). Generous here because
+    // these tests run real commands in a real worktree and none of them should reach it —
+    // the ceiling's own behaviour is covered in `exec.test.ts`.
+    limits: { commandTimeoutSeconds: 900 },
     // The runner reads the workspace profile to build the credential scope: the host a
     // task's repos must live on, and the state repo none of them may be (§9.1, §9.3).
     workspaces: new Map([
@@ -246,6 +250,7 @@ const buildRunner = (
   const runner = new AgentSessionRunner({
     config,
     store,
+    logger: SILENT_LOGGER,
     worktrees,
     credentials: new CredentialService(),
     llm: { models, model },
