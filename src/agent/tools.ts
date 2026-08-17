@@ -14,6 +14,11 @@
  * `handoff` is intentionally available to the agent as well as being triggered
  * automatically: an agent that knows it has reached a natural boundary produces a
  * better handoff document than one cut off at an arbitrary token count.
+ *
+ * The three `cluster_*` reads at the bottom are the same idea applied to the cluster
+ * (DESIGN.md §20): supervisor-mediated, so the ServiceAccount token stays here, and bound
+ * only for `kind: remediation` — see `toolsForKind`, which is where that is decided and the
+ * only place it is decided.
  */
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool } from "@earendil-works/pi-agent-core";

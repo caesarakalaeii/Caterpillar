@@ -23,6 +23,7 @@ import {
   type AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core/node";
 import type { Static, TSchema } from "@earendil-works/pi-ai";
+import type { ClusterReader } from "../cluster/client.ts";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
@@ -33,7 +34,6 @@ import type {
   TaskState,
   WorkspaceName,
 } from "../domain/task.ts";
-import type { ClusterReader } from "../cluster/client.ts";
 import type { ForgeFactory } from "../forge/types.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";

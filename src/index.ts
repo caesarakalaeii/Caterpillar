@@ -439,13 +439,6 @@ const createDigest = (options: {
 };
 
 /**
- * Start the read-only web view, if this runner was told to serve one (DESIGN.md §18).
- *
- * Its own port. The metrics port stays exactly what it was — one Service port for the
- * ServiceMonitor and one for the Ingress means "what is published" is answerable by
- * reading a Service rather than by reading this file.
- */
-/**
  * Build the cluster reader, if this runner was told it may read the cluster (DESIGN.md §20).
  *
  * Off by default, like the web view and the digest, and for a sharper reason than either: a
@@ -491,6 +484,13 @@ const createClusterReader = (config: RunnerConfig, logger: Logger): ClusterReade
   });
 };
 
+/**
+ * Start the read-only web view, if this runner was told to serve one (DESIGN.md §18).
+ *
+ * Its own port. The metrics port stays exactly what it was — one Service port for the
+ * ServiceMonitor and one for the Ingress means "what is published" is answerable by
+ * reading a Service rather than by reading this file.
+ */
 const startWebView = (options: {
   readonly config: RunnerConfig;
   readonly store: StateStore;
