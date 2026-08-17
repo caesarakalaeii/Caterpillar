@@ -12,7 +12,13 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { asTaskId, asWorkspaceName, type TaskSpec } from "../domain/task.ts";
+import {
+  asTaskId,
+  asWorkspaceName,
+  type TaskSpec,
+  type TaskState,
+} from "../domain/task.ts";
+import { EMPTY_POLICY, lookupPolicy, PolicyParseError } from "../remediation/policy.ts";
 import { Git } from "./git.ts";
 import { StateStore } from "./store.ts";
 
@@ -429,4 +435,246 @@ test("every council verdict is kept, not just the last", async () => {
     { index: 1, body: "changes requested: no tests" },
     { index: 4, body: "pass" },
   ]);
+});
+
+test("a `kind: remediation` spec round-trips through writeSpec and readSpec", async () => {
+  // `writeSpec` omits `kind` when it is the default, and losing it here would silently
+  // turn an alert-driven task back into an ordinary implementation task on the way in —
+  // which means the wrong system prompt, and a session never told the cluster is
+  // read-only evidence (DESIGN.md §20).
+  const subject = await store();
+  const spec: TaskSpec = {
+    ...SPEC,
+    id: asTaskId("ALERT-a1b2c3d4e5f60718"),
+    kind: "remediation",
+  };
+
+  await subject.writeSpec(spec);
+  assert.deepEqual(await subject.readSpec(spec.id), spec);
+  // Not merely equal after a round trip: the field must actually be on disk, because
+  // `readSpec` defaults an absent `kind` to `implement` and would answer the same.
+  assert.match(
+    await readFile(join(subject.taskDir(spec.id), "spec.md"), "utf8"),
+    /^kind: remediation$/m,
+  );
+});
+
+test("a remediation spec with no acceptance commands is refused", async () => {
+  // The brainstorm exemption is NOT widened to remediation. An alert-driven task ends in
+  // a pull request like any other, so §12 applies unchanged: with nothing the supervisor
+  // can run, the task could be created and never closed.
+  const subject = await store();
+  const task = asTaskId("ALERT-deadbeef");
+  await mkdir(join(subject.taskDir(task)), { recursive: true });
+  await writeFile(
+    join(subject.taskDir(task), "spec.md"),
+    [
+      "---",
+      "workspace: caesar",
+      "kind: remediation",
+      "repos:",
+      "  - github.com/acme/widget",
+      "acceptance: []",
+      "---",
+      "",
+      "# CaterpillarNoProgress is firing",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  await assert.rejects(subject.readSpec(task), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /acceptance/);
+    assert.match(error.message, /at least one command/);
+    return true;
+  });
+
+  // The same document as a brainstorm IS accepted, which is what proves the refusal above
+  // is about the kind rather than about the shape of the front matter.
+  const brainstorm = asTaskId("BS-1234-01");
+  await mkdir(join(subject.taskDir(brainstorm)), { recursive: true });
+  await writeFile(
+    join(subject.taskDir(brainstorm), "spec.md"),
+    ["---", "workspace: caesar", "kind: brainstorm", "repos:", "  - github.com/acme/widget", "---", "", "# an idea", ""].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual((await subject.readSpec(brainstorm)).acceptance, []);
+});
+
+test("readAlertPolicy on a state repo with no alerts/ returns an empty policy", async () => {
+  // The poll loop calls this every cycle. Most state repos have never heard of alerts, so
+  // a throw here would turn "this cluster has not opted in" into a supervisor logging a
+  // failure every 30 seconds (DESIGN.md §20).
+  const subject = await store();
+
+  assert.deepEqual(await subject.readAlertPolicy(), EMPTY_POLICY);
+});
+
+test("readAlertPolicy parses an operator-authored policy, and still throws on a bad one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-policy-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root));
+  const path = join(root, "alerts", "policy.yaml");
+  await mkdir(join(root, "alerts"), { recursive: true });
+  await writeFile(
+    path,
+    [
+      "version: 1",
+      "alerts:",
+      "  - alertname: CaterpillarNoProgress",
+      "    workspace: caesar",
+      "    repos:",
+      "      - github.com/acme/widget",
+      "    acceptance:",
+      "      - npm test",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const policy = await subject.readAlertPolicy();
+  assert.equal(policy.entries.length, 1);
+  assert.deepEqual(lookupPolicy(policy, "CaterpillarNoProgress")?.acceptance, ["npm test"]);
+
+  // A file that exists and does not parse is an operator mistake and must stay visible —
+  // the missing-file leniency above must not swallow it.
+  await writeFile(path, "version: 9\nalerts: []\n", "utf8");
+  await assert.rejects(subject.readAlertPolicy(), PolicyParseError);
+});
+
+test("an alert refusal record persists, carries its alertname, and clears", async () => {
+  const subject = await store();
+  const fingerprint = "a1b2c3d4e5f60718";
+
+  assert.equal(await subject.readAlertRefusal(fingerprint), undefined);
+
+  await subject.writeAlertRefusal(fingerprint, {
+    fingerprint,
+    alertname: "CaterpillarNoProgress",
+    reason: "no policy entry",
+  });
+  const record = await subject.readAlertRefusal(fingerprint);
+
+  assert.equal(record?.reason, "no policy entry");
+  // The alertname is STORED, not derived: a fingerprint is a hash, so `maxOpenTasks`
+  // could not otherwise tell which alert the task `ALERT-<fingerprint>` belongs to (§20).
+  assert.equal(record?.alertname, "CaterpillarNoProgress");
+  assert.ok(
+    !Number.isNaN(Date.parse(record?.at ?? "")),
+    "the record carries a parseable timestamp",
+  );
+
+  await subject.clearAlertRefusal(fingerprint);
+  assert.equal(await subject.readAlertRefusal(fingerprint), undefined);
+  // Idempotent, like `clearIntakeRejection`: the success path clears unconditionally.
+  await subject.clearAlertRefusal(fingerprint);
+});
+
+test("a fingerprint that is not one is never joined into a path", async () => {
+  // The fingerprint arrives in an HTTP body from outside the process and becomes a file
+  // name. `..` is a legal directory name that resolves out of `alerts/`.
+  const subject = await store();
+
+  for (const bad of ["../../etc/passwd", "..", ".", "A1B2", "a1b2/c3"]) {
+    await assert.rejects(
+      subject.writeAlertRefusal(bad, { fingerprint: bad, alertname: "X", reason: "r" }),
+      /not an alert fingerprint/,
+      `'${bad}' must be refused`,
+    );
+    assert.equal(await subject.readAlertRefusal(bad), undefined);
+  }
+});
+
+test("open tasks are counted per alertname using the one notion of terminal", async () => {
+  // `maxOpenTasks` exists so an alert that keeps firing while a fix is in review does not
+  // open a second task saying the same thing. It counts by joining `alerts/refusals/` to
+  // `tasks/` rather than by parsing ids, because a fingerprint does not carry its name.
+  const subject = await store();
+
+  const record = async (
+    fingerprint: string,
+    alertname: string,
+    status: TaskState["status"],
+  ): Promise<void> => {
+    const task = asTaskId(`ALERT-${fingerprint}`);
+    await subject.writeAlertRefusal(fingerprint, { fingerprint, alertname, task, reason: "opened" });
+    await subject.writeState({
+      id: task,
+      status,
+      phase: "implementing",
+      requires: [],
+      sessions: 0,
+      limits: { maxSessions: 20 },
+      usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+      progress: { lastProgressSession: 0, noProgressStreak: 0 },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  await record("aa01", "CaterpillarNoProgress", "running");
+  await record("aa02", "CaterpillarNoProgress", "ready");
+  // `done`, `failed` and `parked` are all terminal (`isTerminal`), deliberately reusing
+  // the supervisor's single definition rather than inventing a second one here. A parked
+  // task is waiting on a human, and a fresh firing is exactly the nudge that should be
+  // allowed to open a new task rather than be suppressed by one nobody is working on.
+  await record("aa03", "CaterpillarNoProgress", "done");
+  await record("aa04", "CaterpillarNoProgress", "parked");
+  await record("aa05", "CaterpillarNoProgress", "failed");
+  await record("bb01", "CaterpillarPodCrashLooping", "running");
+
+  assert.equal(await subject.countOpenAlertTasks("CaterpillarNoProgress"), 2);
+  assert.equal(await subject.countOpenAlertTasks("CaterpillarPodCrashLooping"), 1);
+  assert.equal(await subject.countOpenAlertTasks("SomethingElse"), 0);
+
+  // A record naming a task that no longer exists contributes nothing, so deleting a task
+  // by hand frees its slot rather than wedging the alert forever.
+  await subject.writeAlertRefusal("cc01", {
+    fingerprint: "cc01",
+    alertname: "CaterpillarNoProgress",
+    task: asTaskId("ALERT-cc01"),
+    reason: "opened",
+  });
+  assert.equal(await subject.countOpenAlertTasks("CaterpillarNoProgress"), 2);
+});
+
+test("commitAndPush stages alert records, and pull sweeps unpushed ones", async () => {
+  // Two halves of one rule. Without `alerts` in the `git add` list a refusal is recorded
+  // locally and never pushed — so Keel rolls the pod and the alert is re-notified, which
+  // is the spam the record exists to prevent. Without it in the `git clean` list a
+  // refusal whose commit never landed silences the alert on this runner while existing
+  // nowhere in git, which no operator can see and no other runner agrees with (§20).
+  const { store: subject, bare, other, root } = await sharedStateRepo();
+
+  await subject.writeAlertRefusal("a1b2c3", {
+    fingerprint: "a1b2c3",
+    alertname: "CaterpillarNoProgress",
+    reason: "no policy entry",
+  });
+  await subject.commitAndPush("chore(alerts): record a refusal", "origin", "main");
+
+  // Asserted on the REMOTE: the working tree looks identical either way.
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^alerts\/refusals\/a1b2c3\.json$/m);
+
+  // Now force the reset path, with an unpushed refusal on disk. The other clone has to
+  // catch up first, or its push is the one that gets rejected.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+  await subject.writeAlertRefusal("ff9900", {
+    fingerprint: "ff9900",
+    alertname: "CaterpillarPodCrashLooping",
+    reason: "no policy entry",
+  });
+  await subject.pull("origin", "main");
+
+  assert.equal(
+    existsSync(join(root, "alerts", "refusals", "ff9900.json")),
+    false,
+    "an unpushed refusal must not outlive the branch it was written on",
+  );
+  // The pushed one is tracked, so the sweep leaves it alone.
+  assert.ok(existsSync(join(root, "alerts", "refusals", "a1b2c3.json")));
 });
