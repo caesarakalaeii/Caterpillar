@@ -136,6 +136,13 @@ const config: RunnerConfig = {
   // No web view in the loop's tests: these exercise the supervisor, and a listening
   // socket per fixture is a port collision waiting for a parallel run.
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  cluster: {
+    enabled: false,
+    namespaces: [],
+    lokiUrl: "http://loki.invalid",
+    kubeApiUrl: "https://kube.invalid",
+    maxLogLines: 2000,
+  },
   web: {
     enabled: false,
     port: 8080,

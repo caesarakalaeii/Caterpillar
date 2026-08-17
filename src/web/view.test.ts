@@ -94,6 +94,13 @@ const CONFIG: RunnerConfig = {
   pollSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  cluster: {
+    enabled: false,
+    namespaces: [],
+    lokiUrl: "http://loki.invalid",
+    kubeApiUrl: "https://kube.invalid",
+    maxLogLines: 2000,
+  },
   web: {
     enabled: true,
     port: 8080,

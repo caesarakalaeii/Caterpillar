@@ -22,7 +22,11 @@ import type {
   ProposedPlan,
   RepoRef,
   SessionExitReason,
+  TaskKind,
 } from "../domain/task.ts";
+import type { ClusterReader } from "../cluster/client.ts";
+import { NamespaceNotAllowedError } from "../cluster/guard.ts";
+import { DESCRIBABLE_KINDS } from "../cluster/redact.ts";
 import type { Forge, PrResult } from "../forge/types.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { TrackerRef } from "../domain/task.ts";
@@ -94,7 +98,26 @@ export interface ToolContext {
    * but its own, and a bound function is the narrowest thing that expresses that.
    */
   readonly publish?: (name: string, path: string, note: string) => Promise<string>;
+  /**
+   * Read-only cluster access for a `remediation` session (DESIGN.md §20).
+   *
+   * Optional, and absent is the ORDINARY case: a runner with no cluster configuration, and
+   * every task that is not a remediation, leaves this undefined and `clusterTools` is then
+   * simply not constructible. There is no degraded mode in between — a tool that existed
+   * and answered "not configured" would invite the model to keep asking.
+   */
+  readonly cluster?: ClusterReader;
+  /**
+   * Records one cluster read for metrics (DESIGN.md §11). Optional like `publish`.
+   *
+   * A callback rather than the registry, for the same reason: the tool needs to count its
+   * own calls and nothing else, and `AgentMetrics` is the whole metric set.
+   */
+  readonly recordClusterRead?: (tool: string, outcome: ClusterReadOutcome, seconds: number) => void;
 }
+
+/** `denied` is a refused namespace or kind; `error` is everything the cluster got wrong. */
+export type ClusterReadOutcome = "ok" | "denied" | "error";
 
 export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrResult> => ({
   name: "open_pr",
@@ -289,6 +312,194 @@ export const controlTools = (ctx: ToolContext): readonly AgentTool[] => [
   publishArtifactTool(ctx) as AgentTool,
 ];
 
+const ClusterLogsParams = Type.Object({
+  namespace: Type.String({
+    description: "Namespace to read. Only the operator's allowlisted namespaces are reachable.",
+  }),
+  pod: Type.Optional(
+    Type.String({
+      description:
+        "Pod name, or a prefix with a trailing `.*` to cover a replica set's changing " +
+        "suffix (e.g. `caterpillar-7d9f-.*`). Omit for the whole namespace. No other " +
+        "pattern syntax is accepted.",
+    }),
+  ),
+  sinceMinutes: Type.Optional(
+    Type.Number({ description: "How far back to look. Default 30, maximum 1440 (24h)." }),
+  ),
+  limit: Type.Optional(
+    Type.Number({ description: "Maximum lines returned. Default 200, maximum 2000." }),
+  ),
+});
+
+const ClusterEventsParams = Type.Object({
+  namespace: Type.String({
+    description: "Namespace to read. Only the operator's allowlisted namespaces are reachable.",
+  }),
+  involvedObject: Type.Optional(
+    Type.String({
+      description:
+        "Narrow to one object: `name`, or `Kind/name` (e.g. `Pod/caterpillar-0`). " +
+        "Omit for every event in the namespace.",
+    }),
+  ),
+  limit: Type.Optional(
+    Type.Number({ description: "Maximum events returned, newest first. Default 50, maximum 200." }),
+  ),
+});
+
+const ClusterDescribeParams = Type.Object({
+  kind: Type.String({
+    description: `One of: ${DESCRIBABLE_KINDS.join(", ")}. No other kind can be read.`,
+  }),
+  name: Type.String({ description: "Object name, exact." }),
+  namespace: Type.String({
+    description: "Namespace to read. Only the operator's allowlisted namespaces are reachable.",
+  }),
+});
+
+/**
+ * Wrap one cluster read: time it, label its outcome, and turn a refusal into text.
+ *
+ * A denied namespace or an unreadable kind comes back as a normal tool RESULT rather than a
+ * thrown error, because it is not a fault the session can fix by retrying and it is not a
+ * fault at all from the supervisor's side. The message says which namespaces exist so the
+ * next call can be right, and the counter says a denial happened so an operator can see
+ * that their allowlist is the thing standing in the way.
+ */
+const clusterRead = async (
+  ctx: ToolContext,
+  tool: string,
+  read: (cluster: ClusterReader) => Promise<string>,
+) => {
+  const cluster = ctx.cluster;
+  // Unreachable: the tools are only constructed when a reader exists. Checked because the
+  // alternative is a crash inside a session over a field TypeScript already made optional.
+  if (cluster === undefined) return text("Cluster reads are not available for this task.");
+
+  const started = Date.now();
+  const finish = (outcome: ClusterReadOutcome): void => {
+    ctx.recordClusterRead?.(tool, outcome, (Date.now() - started) / 1000);
+  };
+
+  try {
+    const body = await read(cluster);
+    finish("ok");
+    return text(body);
+  } catch (error) {
+    // A namespace refusal and a validation refusal are both the agent asking for something
+    // outside the bound, and both are answerable in prose. An HTTP failure is not: it means
+    // the supervisor could not read what it was allowed to read, and the message is the
+    // only place that distinction is visible.
+    const denied = error instanceof NamespaceNotAllowedError || isRefusal(error);
+    finish(denied ? "denied" : "error");
+    const detail = error instanceof Error ? error.message : String(error);
+    return text(denied ? `Refused: ${detail}` : `The read failed: ${detail}`);
+  }
+};
+
+/** Names of the typed refusals the cluster modules raise for input they will not accept. */
+const isRefusal = (error: unknown): boolean =>
+  error instanceof Error &&
+  (error.name === "InvalidNameError" || error.name === "UnsupportedKindError");
+
+/**
+ * Read-only cluster access for a remediation session (DESIGN.md §20).
+ *
+ * Bound ONLY for `kind: remediation`, in `runner.ts`. The point of these being tools rather
+ * than `kubectl` in the agent's shell is that the ServiceAccount token stays with the
+ * supervisor: were it the pod's ambient credential, every task that ever ran on this runner
+ * would inherit cluster read access and the bound would be whatever the model chose to type
+ * (§9.2).
+ *
+ * Each description says four things, because what the description does not say the model
+ * does not know: that the tool is read-only, that the supervisor performs the call, that
+ * only allowlisted namespaces are reachable, and — for `describe` — that a Secret's values
+ * are never returned, so asking for them is a wasted turn.
+ */
+export const clusterLogsTool = (ctx: ToolContext): AgentTool<typeof ClusterLogsParams, null> => ({
+  name: "cluster_logs",
+  label: "Cluster logs",
+  description:
+    "READ-ONLY. Fetch container logs from Loki for a namespace, optionally one pod. The " +
+    "supervisor performs the query and you never hold a credential; only the operator's " +
+    "allowlisted namespaces are reachable, and nothing here can change the cluster. " +
+    "Returns `timestamp  pod  line`, oldest first.",
+  parameters: ClusterLogsParams,
+  execute: async (_id, params: Static<typeof ClusterLogsParams>) =>
+    clusterRead(ctx, "cluster_logs", (cluster) =>
+      cluster.logs({
+        namespace: params.namespace,
+        ...(params.pod === undefined ? {} : { pod: params.pod }),
+        ...(params.sinceMinutes === undefined ? {} : { sinceMinutes: params.sinceMinutes }),
+        ...(params.limit === undefined ? {} : { limit: params.limit }),
+      }),
+    ),
+});
+
+export const clusterEventsTool = (ctx: ToolContext): AgentTool<typeof ClusterEventsParams, null> => ({
+  name: "cluster_events",
+  label: "Cluster events",
+  description:
+    "READ-ONLY. List Kubernetes events in a namespace, newest first — the fastest way to " +
+    "see scheduling failures, image pull errors, probe failures and OOM kills. The " +
+    "supervisor performs the call and only the operator's allowlisted namespaces are " +
+    "reachable. Kubernetes expires events after about an hour, so an empty result usually " +
+    "means nothing happened recently rather than nothing happened.",
+  parameters: ClusterEventsParams,
+  execute: async (_id, params: Static<typeof ClusterEventsParams>) =>
+    clusterRead(ctx, "cluster_events", (cluster) =>
+      cluster.events({
+        namespace: params.namespace,
+        ...(params.involvedObject === undefined ? {} : { involvedObject: params.involvedObject }),
+        ...(params.limit === undefined ? {} : { limit: params.limit }),
+      }),
+    ),
+});
+
+export const clusterDescribeTool = (
+  ctx: ToolContext,
+): AgentTool<typeof ClusterDescribeParams, null> => ({
+  name: "cluster_describe",
+  label: "Cluster describe",
+  description:
+    "READ-ONLY. Fetch one Kubernetes object as YAML, with `spec` and `status` intact. The " +
+    "supervisor performs the call and only the operator's allowlisted namespaces are " +
+    `reachable. Kinds: ${DESCRIBABLE_KINDS.join(", ")}. A Secret comes back as key names ` +
+    "and byte lengths only — the values are never returned to you, by any phrasing, so " +
+    "asking for them is a wasted turn. ConfigMaps are returned in full.",
+  parameters: ClusterDescribeParams,
+  execute: async (_id, params: Static<typeof ClusterDescribeParams>) =>
+    clusterRead(ctx, "cluster_describe", (cluster) =>
+      cluster.describe({
+        kind: params.kind,
+        name: params.name,
+        namespace: params.namespace,
+      }),
+    ),
+});
+
+/** The three cluster reads. Constructible only where `ctx.cluster` is present. */
+export const clusterTools = (ctx: ToolContext): readonly AgentTool[] => [
+  clusterLogsTool(ctx) as AgentTool,
+  clusterEventsTool(ctx) as AgentTool,
+  clusterDescribeTool(ctx) as AgentTool,
+];
+
+/**
+ * Tools for a REMEDIATION session (DESIGN.md §20).
+ *
+ * A strict superset of `controlTools`: a remediation task is a writing kind, it ends in a
+ * pull request, and §12 applies to it unchanged — so it needs every control verb an
+ * `implement` task has, plus the evidence it was created to read. Nothing is taken away,
+ * and in particular there is no cluster WRITE of any kind: the cluster is evidence, not a
+ * workspace.
+ */
+export const remediationTools = (ctx: ToolContext): readonly AgentTool[] => [
+  ...controlTools(ctx),
+  ...clusterTools(ctx),
+];
+
 /**
  * Control-plane tools for a BRAINSTORM session (DESIGN.md §14.3).
  *
@@ -302,3 +513,27 @@ export const brainstormTools = (ctx: ToolContext): readonly AgentTool[] => [
   handoffTool(ctx) as AgentTool,
   submitPlanTool(ctx) as AgentTool,
 ];
+
+/**
+ * The control-plane bundle for a task KIND. One expression, one place to read.
+ *
+ * Exported and pure so the binding itself is testable: "an `implement` task never receives
+ * the cluster tools" is the security property of §20, and a property enforced inline in
+ * `runner.ts` could only be checked by running a whole session. `runner.ts` calls this and
+ * decides nothing else.
+ *
+ * The cluster reads are gated on the KIND and on the reader both. A runner with a configured
+ * reader still gives an `implement` or `brainstorm` task nothing — `ctx.cluster` is never
+ * populated for them — and a remediation task on a runner with no cluster configuration gets
+ * the ordinary control verbs rather than a crash.
+ */
+export const toolsForKind = (
+  // Optional because `TaskSpec.kind` is: a spec that names no kind is an `implement` task,
+  // and the default has to fall on the side with no cluster access.
+  kind: TaskKind | undefined,
+  ctx: ToolContext,
+): readonly AgentTool[] => {
+  if (kind === "brainstorm") return brainstormTools(ctx);
+  if (kind === "remediation" && ctx.cluster !== undefined) return remediationTools(ctx);
+  return controlTools(ctx);
+};
