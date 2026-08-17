@@ -227,9 +227,16 @@ test("the holder renews its own claim rather than losing it to itself", async ()
   // timestamp differs, the oid differs and the commit time advances — but a reader
   // expecting a new oid here would be looking at a bug that is not one.
   // What actually matters after a renewal: this runner is still the holder.
-  assert.equal(
+  //
+  // Asserted as "defined" and not as "equal to `renewed`" for the reason the paragraph
+  // above gives — and this line used to get it wrong, which made the test fail roughly one
+  // run in ten. Whether the oid moves depends on whether the two pushes land in the same
+  // whole second: same second, byte-identical commit, same oid; a second boundary between
+  // them, a new commit time and a new oid. Both are successful renewals, so the assertion
+  // has to be about success rather than about which side of a clock tick the test ran on.
+  assert.notEqual(
     await manager.claimStealable("refs/chat/holder", "held", renewed),
-    renewed,
+    undefined,
     "renewing again from the oid it was just given must still succeed",
   );
 

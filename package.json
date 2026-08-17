@@ -23,6 +23,7 @@
     "verify:github-issues": "node src/cli/verify-github-issues.ts",
     "verify:discord": "node src/cli/verify-discord.ts",
     "verify:manifests": "node src/cli/verify-manifests.ts",
+    "verify:cluster-read": "node src/cli/verify-cluster-read.ts",
     "discord:register": "node src/cli/register-commands.ts",
     "llm:login": "node src/cli/llm-login.ts",
     "llm:holder": "node src/cli/llm-holder.ts"

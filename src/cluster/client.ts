@@ -35,9 +35,14 @@ import { assertNamespaceAllowed } from "./guard.ts";
 import { isPodPattern, validateKind, validateName, validatePodPattern } from "./names.ts";
 import { assertKindDescribable, redactObject, renderObject } from "./redact.ts";
 
-/** Where the projected ServiceAccount volume lands in every pod. */
-const TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
-const CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+/**
+ * Where the projected ServiceAccount volume lands in every pod.
+ *
+ * Exported because `verify:cluster-read` reports on these two files by name: "the token is
+ * missing" is only actionable when the operator is told which path was looked at.
+ */
+export const TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+export const CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 
 /** Defaults for the two endpoints. Both overridable through config (§5). */
 export const DEFAULT_KUBE_API_URL = "https://kubernetes.default.svc";
@@ -90,6 +95,15 @@ export type HttpsGet = (options: {
   readonly url: string;
   readonly token: string;
   readonly ca: string;
+  /**
+   * `GET` unless stated. The only non-GET caller is the preflight's
+   * `SelfSubjectAccessReview`, which is a POST by the API's own design — asking "may I?"
+   * creates a review object. It is still a read in every sense that matters: the review is
+   * not persisted and answers only about the presented token.
+   */
+  readonly method?: "GET" | "POST";
+  /** JSON body, for `POST`. Ignored on a GET, where a body has no meaning here. */
+  readonly body?: string;
 }) => Promise<HttpResponse>;
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -121,18 +135,25 @@ export class ClusterRequestError extends Error {
 }
 
 /**
- * GET over HTTPS with an explicit CA. The whole reason this module does not use fetch.
+ * One request over HTTPS with an explicit CA. The whole reason this module does not use fetch.
  *
- * Deliberately minimal: one verb, no redirects followed, no retry. The kube API is one
- * network hop away inside the same cluster, so a failure here is a real failure and
- * retrying it would only delay the message reaching the session that has to act on it.
+ * Deliberately minimal: no redirects followed, no retry. The kube API is one network hop
+ * away inside the same cluster, so a failure here is a real failure and retrying it would
+ * only delay the message reaching the session that has to act on it.
+ *
+ * `POST` exists for exactly one caller — `preflight.ts`'s access reviews — and is NOT a
+ * write path into the cluster: a `SelfSubjectAccessReview` is how the API server is asked
+ * what the presented token may do, it stores nothing, and the client class above never
+ * passes a method at all. Sharing this function rather than growing a second one keeps the
+ * `ca`-per-request arrangement, and the absence of `rejectUnauthorized`, in one place.
  */
 export const httpsGet: HttpsGet = (options) =>
   new Promise<HttpResponse>((resolve, reject) => {
+    const body = options.method === "POST" ? (options.body ?? "") : undefined;
     const request = httpsRequest(
       options.url,
       {
-        method: "GET",
+        method: options.method ?? "GET",
         // `ca` REPLACES the default trust store for this request, which is exactly right:
         // the kube API is signed by the cluster CA and by nothing a public root would
         // vouch for. Note what is absent — `rejectUnauthorized` is left at its default of
@@ -141,6 +162,12 @@ export const httpsGet: HttpsGet = (options) =>
         headers: {
           authorization: `Bearer ${options.token}`,
           accept: "application/json",
+          ...(body === undefined
+            ? {}
+            : {
+                "content-type": "application/json",
+                "content-length": String(Buffer.byteLength(body, "utf8")),
+              }),
         },
       },
       (response) => {
@@ -155,10 +182,14 @@ export const httpsGet: HttpsGet = (options) =>
       },
     );
     request.on("error", reject);
+    if (body !== undefined) request.write(body);
     request.end();
   });
 
-interface Credentials {
+type Credentials = ClusterCredentials;
+
+/** The token and CA one process reads once. Exported for the preflight's own load. */
+export interface ClusterCredentials {
   readonly token: string;
   readonly ca: string;
 }
@@ -192,7 +223,7 @@ export interface ClusterClientOptions {
  * fallback would make a runner started outside the cluster silently accept anything
  * answering on `kubernetes.default.svc`.
  */
-const readServiceAccount = async (): Promise<Credentials> => {
+export const readServiceAccount = async (): Promise<Credentials> => {
   const load = async (path: string, what: string): Promise<string> => {
     try {
       return await readFile(path, "utf8");
@@ -230,12 +261,16 @@ const clamp = (value: number | undefined, fallback: number, max: number): number
 /**
  * Kind → the API route that GETs one object of it.
  *
+ * Exported so `preflight.ts` derives the RBAC it checks from THIS table rather than from a
+ * second hand-written list: a resource the client can reach and the preflight does not know
+ * about is precisely the 403 that would surface hours later inside a session.
+ *
  * A literal table rather than a discovery call. Discovery would be one more request, one
  * more failure mode, and — the part that matters — it would let the kind decide its own
  * path. Here the path for a kind is a line in this file, which is the same reasoning as
  * `DESCRIBABLE_KINDS` being a literal in `redact.ts`.
  */
-const ROUTES: Readonly<Record<string, string>> = {
+export const ROUTES: Readonly<Record<string, string>> = {
   Pod: "/api/v1/namespaces/{ns}/pods/{name}",
   Service: "/api/v1/namespaces/{ns}/services/{name}",
   ConfigMap: "/api/v1/namespaces/{ns}/configmaps/{name}",

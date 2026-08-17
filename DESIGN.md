@@ -2575,6 +2575,40 @@ Two consequences for `StateStore`, and they are separate rules that were found s
   agrees, and no operator can see why the notification stopped. `policy.yaml` is tracked,
   so the sweep cannot touch it.
 
+### Proving it works before an incident does
+
+Four of the five things this feature needs live in a **separate deployment repo** — an RBAC
+grant, a Service port, an Alertmanager route and a ConfigMap block — and the fifth is a file
+in the state repo. When one of them is wrong, the symptom is a confusing tool error inside an
+agent session, hours later, during the incident the alert was about.
+
+So it gets a preflight, the seventh in the family (`verify:github-app` and friends):
+`npm run verify:cluster-read`, run from inside the pod. Seven checks with a remedy on each
+failure — config, the projected token and CA, `GET /version` over TLS verified against that
+CA, the allowlisted namespaces, RBAC through `SelfSubjectAccessReview`, Loki, and the
+redaction promise against a real Secret rendered through `cluster/redact.ts` itself.
+
+Two of those deserve naming here because they are checks a preflight written from the happy
+path would not contain:
+
+- The RBAC check asserts the **negative**. `create`, `update`, `patch` and `delete` on `pods`
+  and `deployments` must come back DENIED, and an allowed write verb fails the run. The
+  entire safety argument above is that the token cannot write; a preflight confirming only
+  the reads it wants would pass against a `cluster-admin` binding and thereby certify the
+  opposite of the property being relied on.
+- The redaction check runs the real `redactObject`/`renderObject` over a real Secret and
+  asserts each decoded and each base64 value is absent from the output. A reimplementation
+  of the redaction inside the checker would only prove the checker agrees with itself.
+
+The checks are pure functions over an injected HTTP function in `cluster/preflight.ts`, for
+the reason `redact.ts` records for itself: the states worth asserting — a 403, an allowed
+write verb, a leaked value — are ones a healthy cluster will not produce on demand, and a
+check that needs a cluster to test is a check nobody tests.
+
+`docs/remediation-runbook.md` is the operator's end-to-end guide: the order of operations
+across the two repos, how to test the webhook by hand, how to write a policy entry, and the
+three levers for turning it off in a hurry.
+
 ### What is deliberately absent
 
 **No Alertmanager silence, ever** — not even a temporary one. A supervisor that can silence
