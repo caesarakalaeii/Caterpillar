@@ -160,10 +160,18 @@ export class AlertProcessor {
     let refused = 0;
     let changed = false;
 
+    // Tasks this PASS has created, per alertname. `countOpenAlertTasks` reads `state.json`
+    // files and cannot see a task created a moment ago in the same batch — so two distinct
+    // fingerprints of one alertname arriving together would each find zero open tasks and
+    // each create one, quietly overshooting a `maxOpenTasks` of 1. Counted here rather than
+    // by re-reading the tree, because the tree is the slower answer to a question this loop
+    // already knows.
+    const createdHere = new Map<string, number>();
+
     for (const alert of alerts) {
       let outcome: AlertOutcome;
       try {
-        outcome = await this.handle(alert, lookupPolicy(policy, alert.alertname));
+        outcome = await this.handle(alert, lookupPolicy(policy, alert.alertname), createdHere);
       } catch (error) {
         // One alert that cannot be filed must not cost the rest of the batch, and must
         // never cost the poll: the loop has tasks to run either way.
@@ -176,7 +184,10 @@ export class AlertProcessor {
       }
 
       this.deps.metrics?.observe(alert.alertname, outcome);
-      if (outcome === "created") created += 1;
+      if (outcome === "created") {
+        created += 1;
+        createdHere.set(alert.alertname, (createdHere.get(alert.alertname) ?? 0) + 1);
+      }
       if (outcome === "duplicate") duplicate += 1;
       if (outcome === "refused-no-policy" || outcome === "refused-max-open") refused += 1;
       // A duplicate writes nothing at all — that is the whole point of it.
@@ -199,6 +210,7 @@ export class AlertProcessor {
   private async handle(
     alert: FiringAlert,
     entry: AlertPolicyEntry | undefined,
+    createdHere: ReadonlyMap<string, number>,
   ): Promise<AlertOutcome> {
     const { store, logger } = this.deps;
 
@@ -228,7 +240,9 @@ export class AlertProcessor {
       );
     }
 
-    const open = await store.countOpenAlertTasks(alert.alertname);
+    const open =
+      (await store.countOpenAlertTasks(alert.alertname)) +
+      (createdHere.get(alert.alertname) ?? 0);
     if (open >= entry.maxOpenTasks) {
       return await this.refuse(
         alert,

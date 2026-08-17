@@ -230,6 +230,25 @@ test("maxOpenTasks refuses rather than opening a second task for the same alertn
   assert.match(sent.detail, /already has 2 open task/);
 });
 
+test("two fingerprints of one alertname in one batch do not both get a slot", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+
+  // `CaterpillarNoProgress` allows one open task. Both members are firing right now, and a
+  // count read from `tasks/` cannot see a task created a moment ago in the same pass — so
+  // without in-pass accounting both would find zero open tasks and both would be created.
+  const pass = await processor(store, notifier).process(
+    [alert(), alert({ fingerprint: "deadbeef" })],
+    "origin",
+    "main",
+  );
+
+  assert.equal(pass.created, 1);
+  assert.equal(pass.refused, 1);
+  assert.equal(store.specs.length, 1);
+  assert.equal(store.refusals.get("deadbeef")?.reason, "refused-max-open");
+});
+
 test("a refusal for a new reason speaks again", async () => {
   const store = new FakeStore();
   const notifier = new FakeNotifier();
