@@ -23,6 +23,12 @@ after(async () => {
 
 const BASE = {
   capabilities: ["linux"],
+  // Required, and validated in identity.test.ts. Present here only so these tests are
+  // about the `web` section rather than about a config that will not load.
+  identity: {
+    name: "caterpillar-agent[bot]",
+    email: "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+  },
   stateRepo: { url: "https://example.invalid/state.git", branch: "main", path: "/work/state" },
   paths: { mirrors: "/work/mirrors", tasks: "/work/tasks" },
   secretsDir: "/etc/caterpillar/secrets",

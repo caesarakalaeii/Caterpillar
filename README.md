@@ -350,6 +350,35 @@ advertises it if it is there (§8.1). Listing it explicitly still works and is k
 machine that advertises it without having it gets a warning at boot rather than a silent
 correction, since it may be about to gain it.
 
+## Who the fleet commits as
+
+Every commit the supervisor makes to the state repo and every commit the agent makes in a
+task worktree carries one configured identity:
+
+```json
+"identity": {
+  "name": "caterpillar-agent[bot]",
+  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com"
+}
+```
+
+It is **required** — there is no default, because a default is a claim about who wrote an
+audit trail and a wrong one is unnoticeable after the fact. A runner without it refuses to
+start rather than pick a name for you.
+
+The id prefix is load-bearing and the loader refuses the address without it. A bare
+`<login>@users.noreply.github.com` looks inert and is not: it is GitHub's pre-2017
+personal noreply form, so GitHub resolves it to whoever holds that login and signs your
+fleet's work with their name and avatar. That is not hypothetical — it is why this field
+exists (DESIGN.md §9.7). Get the id for an App's bot account from:
+
+```bash
+gh api users/<slug>%5Bbot%5D --jq .id
+```
+
+which is a **different** number from the App id in the secret: the App id names the
+application, this names the account it commits as.
+
 ## Verifying a GitHub App setup
 
 ```bash
@@ -461,6 +490,13 @@ question at a time — answer in the thread, where the task id is implied, so `!
 is the whole command. When the shape is settled it proposes a decomposition, the review
 council reads it with plan-specific lenses, and on a pass the tasks are created with a
 `wave` and a `blockedBy` (§14.3).
+
+**It does not wait for the queue to drain.** The thread greets you and starts listening
+straight away, a busy runner hands over at the end of the session it is in rather than at
+the end of the task, and claiming puts a brainstorm ahead of batch work — so the wait is
+the tail of one session, not however long the current task runs. Start talking in the
+thread immediately; what you type before the agent picks it up is kept, not dropped
+(§14.3).
 
 To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
 so, then archived. It works on a task that is *running*, not only on an idle one: the

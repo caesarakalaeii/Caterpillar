@@ -6,6 +6,7 @@ import {
   asTaskId,
   capabilitiesSatisfy,
   EMPTY_USAGE,
+  claimOrder,
   isClaimable,
   isTaskId,
   KNOWN_CAPABILITIES,
@@ -107,4 +108,46 @@ test("a task id may not be a relative path segment", async () => {
   assert.equal(isTaskId("TASK-1"), true);
   assert.equal(isTaskId("GH-acme-widget-12"), true);
   assert.equal(isTaskId("v1.2.3-fix"), true, "a dot inside an id is still ordinary");
+});
+
+test("a brainstorm is claimed before batch work, whatever its id sorts as", () => {
+  // The defect. A brainstorm's id is its Discord thread id, and thread ids are
+  // snowflakes — monotonically increasing — so a NEW brainstorm always sorts LAST
+  // under `(wave, id)`. It could therefore only ever start when the queue was empty,
+  // which for a runner working a multi-session task means never. Observed live: a
+  // brainstorm created at 19:35 was still unclaimed twenty minutes later while the
+  // runner re-claimed an older task six sessions running.
+  const older = { state: { ...BASE_STATE, id: asTaskId("BS-1537800044915331092-04") } as TaskState, kind: "implement" } as const;
+  const brainstorm = { state: { ...BASE_STATE, id: asTaskId("BS-1538626232302960801") } as TaskState, kind: "brainstorm" } as const;
+
+  assert.ok(claimOrder(brainstorm, older) < 0, "the human waiting at a keyboard goes first");
+  assert.ok(claimOrder(older, brainstorm) > 0, "and the order is antisymmetric");
+});
+
+test("priority does not reorder a plan's waves among themselves", () => {
+  // `blockedBy` is the authority and `isClaimable` enforces it, but the wave order is
+  // what keeps a runner from taking wave 3 while wave 1 is still claimable. Putting
+  // brainstorms first must not disturb that.
+  const wave = (n: number, id: string) =>
+    ({
+      state: {
+        ...BASE_STATE,
+        id: asTaskId(id),
+        plan: { parent: asTaskId("P"), wave: n, blockedBy: [] },
+      } as TaskState,
+      kind: "implement",
+    }) as const;
+
+  assert.ok(claimOrder(wave(1, "P-99"), wave(3, "P-01")) < 0, "earlier wave first");
+  assert.ok(claimOrder(wave(2, "P-01"), wave(2, "P-02")) < 0, "then by id");
+});
+
+test("two brainstorms fall back to wave and id, so runners agree", () => {
+  // Priority is a tie-break, not a replacement for the total order: two runners sorting
+  // the same queue must reach the same answer or they claim the same task at once and
+  // one of them wastes a CAS.
+  const bs = (id: string) => ({ state: { ...BASE_STATE, id: asTaskId(id) } as TaskState, kind: "brainstorm" }) as const;
+
+  assert.ok(claimOrder(bs("BS-1"), bs("BS-2")) < 0);
+  assert.equal(claimOrder(bs("BS-1"), bs("BS-1")), 0);
 });

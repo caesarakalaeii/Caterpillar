@@ -136,6 +136,20 @@ export class ChatInbox {
     return taken;
   }
 
+  /**
+   * Is anything matching `select` queued? Consumes nothing.
+   *
+   * The counterpart to `takeWhere`, for a caller that must NOT take the request: a
+   * session in flight asking whether a human is waiting on a brainstorm. It cannot serve
+   * one — creating the task writes the state repo, and this session holds the working
+   * copy — so all it does is stop after the current session and hand back to the loop,
+   * which drains properly on the very next poll. Taking the request to look at it would
+   * strand the human the check exists for.
+   */
+  some(select: (request: ChatRequest) => boolean): boolean {
+    return this.queue.some(select);
+  }
+
   get size(): number {
     return this.queue.length;
   }

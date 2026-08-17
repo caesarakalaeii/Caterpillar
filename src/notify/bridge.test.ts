@@ -337,3 +337,72 @@ test("chatting while the agent is busy says nothing at all", async () => {
 
   assert.equal(posted(calls).length, 0, "silence is the correct reply to ordinary chat");
 });
+
+test("a brainstorm thread starts talking before the loop has settled anything", async () => {
+  // The defect: `startBrainstorm` opened the thread, then AWAITED the loop before saying
+  // anything in it or binding it. The loop is blocked for the whole of a session, so the
+  // human watched an empty thread with their idea at the top of it and no sign that
+  // anything had received it — twenty minutes, in the run this was written from.
+  //
+  // Nothing here needs the state repo. The task's id is its thread id by construction
+  // (§14.3), so both the acknowledgement and the binding are knowable the moment Discord
+  // hands back the thread, and neither has to wait for a write.
+  const threads = new ThreadIndex();
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      data: {
+        name: "brainstorm",
+        options: [
+          { name: "topic", value: "make the overlay themeable" },
+          { name: "repo", value: "acme/widget" },
+        ],
+      },
+    }),
+  );
+
+  // Deliberately BEFORE settling: this is the whole point.
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+
+  const inThread = posted(calls).filter((call) => call.url.includes("/channels/999/"));
+  assert.equal(inThread.length, 1, "the thread must say something while the loop is busy");
+  assert.match(String(inThread[0]?.body["content"]), /BS-999/);
+
+  assert.equal(
+    threads.taskFor("999"),
+    asTaskId("BS-999"),
+    "an idea typed into the thread before the loop catches up must not be dropped",
+  );
+
+  for (const request of inbox.drain()) request.settle({ kind: "started", task: asTaskId("BS-999") });
+  await handled;
+});
+
+test("a brainstorm the loop refuses says so in its thread, and stops listening to it", async () => {
+  // The other half. Binding early is only safe if a refusal takes the binding back —
+  // otherwise a thread nothing owns keeps swallowing everything typed into it, which is
+  // exactly what `threadBindings` refuses to do for terminal tasks.
+  const threads = new ThreadIndex();
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      data: {
+        name: "brainstorm",
+        options: [
+          { name: "topic", value: "make the overlay themeable" },
+          { name: "repo", value: "nobody/widget" },
+        ],
+      },
+    }),
+  );
+
+  await settleQueued(inbox, { kind: "refused", reason: "No workspace owns `nobody`." });
+  await handled;
+
+  const inThread = posted(calls).filter((call) => call.url.includes("/channels/999/"));
+  assert.equal(inThread.length, 2, "the refusal belongs in the thread, under the idea");
+  assert.match(String(inThread[1]?.body["content"]), /No workspace owns/);
+  assert.equal(threads.taskFor("999"), undefined, "a thread with no task must not be bound");
+});

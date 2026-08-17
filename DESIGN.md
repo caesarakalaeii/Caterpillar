@@ -33,6 +33,7 @@ and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment
 | Workspace | **PVC** bare mirrors + one **git worktree** per task |
 | LLM access | All runners → **in-cluster proxy** that holds the credential |
 | Git credentials | **GitHub App**, supervisor-minted, scoped per task; repo-scoped tokens on Codeberg |
+| Commit identity | The author App's **own bot account**, configured per deployment (§9.7) |
 | Autonomy | Push branches, open/update PRs. **No merging. No cluster writes.** |
 | Human channel | **Discord** — questions, parks, terminal outcomes only |
 | Metrics | **Prometheus/Grafana** for everything else |
@@ -1138,6 +1139,39 @@ does not — there is no Anthropic key anywhere in `caesar-deployment`.
 
 Swapping to a private provider later remains a config change.
 
+### 9.7 Who the fleet commits as
+
+One configured identity authors everything the runner writes — the state repo's audit
+trail and the agent's work in a task worktree alike. They are the same actor, and two
+identities would make the history read as though there were a second author nobody
+configured.
+
+**It is configuration, not a constant.** The address names the App installed for *this*
+deployment, so there is nothing correct to hardcode, and no default is offered either: a
+default is a claim about who wrote an audit trail, and after the fact a wrong claim is
+indistinguishable from a right one. A runner that has not been told refuses to start.
+
+**A forge resolves an address to an ACCOUNT.** That is the whole hazard, and it is not
+theoretical — it is what this section was written after. The identity read
+`caterpillar@users.noreply.github.com`, which looks like a reserved, inert address for a
+project called caterpillar. It is not. It is GitHub's pre-2017 personal noreply form, and
+GitHub resolves it to the account holding that login: an unrelated person, who became the
+author of 129 commits across four repositories, on their contribution graph, with their
+avatar, in repositories they have never seen.
+
+So `load.ts` refuses one shape outright — a `users.noreply.github.com` address without
+the numeric id prefix. `<id>+<login>@users.noreply.github.com` cannot make that mistake,
+because a numeric id names exactly one account: it is either yours or it does not exist.
+Only that domain is checked; a runner pushing to Codeberg has no github noreply address
+to get wrong and must not be made to invent an id prefix that means nothing there.
+
+The deployed value is the author App's own bot account,
+`caterpillar-agent[bot] <316492202+caterpillar-agent[bot]@users.noreply.github.com>` —
+which is what GitHub already stamps on the merge commits that App makes (§12.1), so the
+history is self-consistent rather than carrying two names for one actor. Note that the
+bot account's id is **not** the App id in the secret: the App id names the application,
+this names the account it commits as.
+
 ---
 
 ## 10. Kubernetes
@@ -1449,6 +1483,42 @@ ref — derived from something external and immutable, never from a title.
 **Refinement is one question at a time.** `ask_human` already parks the task and releases
 the lease, so a question costs nothing while a human thinks. That makes the expensive
 thing not the round trip but the batch: six questions at once get one answer covering two.
+
+**A brainstorm does not queue behind batch work.** Someone typed it and is watching the
+thread; an implementation task is throughput and nobody is watching any single session of
+it. Three things follow, and all three were bugs before they were rules:
+
+*Claiming puts a brainstorm first.* Ordering was `(wave, id)`, and a brainstorm's id is
+its Discord thread id — a snowflake, so the newest brainstorm always sorted **last**,
+behind every task already in the repo including the children of previous brainstorms. It
+could therefore only start when the queue was empty, which for a runner working a
+multi-session task means never. Observed: a brainstorm created at 19:35 was still
+unclaimed twenty minutes later while the runner re-claimed an older task six sessions
+running. Priority is a tie-break ahead of the existing order, never a replacement for it
+— waves still order among themselves and the id is still the final key, so two runners
+sorting the same queue reach the same answer.
+
+*A session in flight yields at its boundary.* `workTask` drives one task through as many
+sessions as it needs, and the poll loop — with it the chat drain and the next claim — is
+blocked for all of them. So the runner checks the inbox at each session boundary and, if
+a brainstorm is waiting, puts the task back to `ready` and hands the runner over.
+Deliberately not an interrupt: `/cancel` aborts a session because stopping it *is* the
+intent, whereas here the session is doing legitimate work and an interrupted session
+records nothing at all (§6.4). Waiting for the boundary costs the human the tail of one
+session and costs the task nothing. It is `ready` rather than `running` because
+re-claiming a `running` task is the crash-recovery path (§6.2) and writes a journal entry
+about a runner that died — true after a killed pod, a lie once per brainstorm.
+
+*The thread talks before the write lands.* The bridge opens the thread, binds it, and
+greets the human immediately, then queues the creation. All of that is free: the task's
+id **is** the thread id, so nothing about the greeting or the binding needs the state repo
+written first. Binding early is safe because ordering makes it safe — the creation is
+queued ahead of anything typed afterwards and `drain` preserves that order, so by the time
+an answer is applied its task exists. A refusal takes the binding back, because a bound
+thread with no task behind it swallows what is typed into it in silence.
+
+None of this makes the runner concurrent. It still works one task at a time (§6); what
+changed is which task it picks up next and how soon it is free to pick.
 
 **The agent proposes the decomposition, the supervisor performs it.** `submit_plan` carries
 local ids; real `TaskId`s are assigned by the supervisor, for the same reason it assigns

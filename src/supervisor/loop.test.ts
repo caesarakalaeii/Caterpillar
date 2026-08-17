@@ -108,6 +108,7 @@ await seedTask(TASK);
 const config: RunnerConfig = {
   runnerId: "test-runner",
   capabilities: ["linux"],
+  identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
   paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
@@ -1459,4 +1460,127 @@ test("a digest that is due is published from the poll loop, and a failing one is
     calls.length >= 2,
     `the loop must keep polling after a digest throws — it called it ${calls.length} time(s)`,
   );
+});
+
+test("a queued brainstorm gets the runner at the next session boundary", async () => {
+  // The defect, observed live: `workTask` drives ONE task through as many sessions as it
+  // needs, and the poll loop — and with it the chat drain — is blocked for all of them.
+  // A task that keeps handing off therefore holds the runner indefinitely, so a human
+  // typing `/brainstorm` got a thread that opened and then said nothing, for as long as
+  // the current task felt like running. Twenty minutes and six sessions, in the case
+  // this test is written from.
+  //
+  // The fix is deliberately NOT an interrupt. A session that is aborted records nothing
+  // (§6.4), so cutting one short to answer a chat command would throw away real work; the
+  // runner finishes the session it is in and hands back at the boundary instead.
+  const BUSY = asTaskId("SMOKE-YIELD");
+  // A session ceiling out of reach, so the runner is released by the fix under test and
+  // by nothing else. At the shared fixture's 20 the stub burns through the lot in a
+  // couple of seconds, the task parks itself on the limit, and the brainstorm then gets
+  // claimed by an ordinary idle poll — which is the bug passing the test.
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new ChatInbox();
+
+  // Hands off forever: without a yield this task never gives the runner back.
+  let sessions = 0;
+  const runner: SessionRunner = {
+    run: async (spec) => {
+      if (spec.id === BUSY) sessions += 1;
+      // Long enough that "did it stop after this one" is a question about the boundary
+      // check rather than a race with it.
+      await sleep(100);
+      return {
+        reason: "handoff",
+        usage: EMPTY_USAGE,
+        contextTokens: 0,
+        summary: "more to do",
+      } satisfies SessionOutcome;
+    },
+  };
+
+  const supervisor = new Supervisor({
+    // `applyBrainstorm` has to resolve the repo to a workspace, and the shared fixture
+    // configures none.
+    config: {
+      ...config,
+      workspaces: new Map([
+        [
+          asWorkspaceName("test"),
+          {
+            name: asWorkspaceName("test"),
+            forge: {
+              kind: "github" as const,
+              host: "github.com",
+              owner: "acme",
+              apiBase: "https://api.github.com",
+            },
+            secretRef: "test",
+          },
+        ],
+      ]),
+    },
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Wait until the runner is genuinely stuck on it, so the brainstorm arrives mid-task
+  // rather than into an idle poll — which would prove nothing.
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && sessions < 2) await sleep(50);
+  assert.ok(sessions >= 2, "the fixture must actually occupy the runner");
+
+  const BRAINSTORM = asTaskId("BS-1538626232302960801");
+  const outcome = await inbox.submit({
+    kind: "brainstorm",
+    topic: "make the thing faster",
+    repo: "acme/widget",
+    threadId: "1538626232302960801",
+    author: "caesar",
+  });
+
+  const held = sessions;
+
+  // The brainstorm must reach the state repo — which only happens on a poll, which only
+  // happens once the runner has let go of `BUSY`.
+  let created: TaskState | undefined;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    created = await store.tryReadState(BRAINSTORM);
+    if (created !== undefined) break;
+    await sleep(50);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "started", "the request must be settled, not left hanging");
+  assert.ok(created !== undefined, "a queued brainstorm must not wait for the task to finish");
+  assert.ok(
+    sessions <= held + 1,
+    `the runner must stop after the session it was in, not run on (${held} -> ${sessions})`,
+  );
+
+  await seedTask(BUSY, { status: "done" });
+  await seedTask(BRAINSTORM, { status: "done" });
 });

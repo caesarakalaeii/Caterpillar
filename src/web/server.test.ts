@@ -32,6 +32,7 @@ after(async () => {
 const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
   runnerId: "pod-test",
   capabilities: ["linux"],
+  identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: { nixpkgs: "github:NixOS/nixpkgs/pin", timeoutSeconds: 900, gcIntervalHours: 24, gcKeepDays: 7 },
   stateRepo: {
     url: "https://example.invalid/state.git",
