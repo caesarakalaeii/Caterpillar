@@ -359,6 +359,7 @@ const createDigest = (options: {
             llm: options.llm,
             timeZone: digest.timeZone,
             thresholdFraction: config.handoff.thresholdFraction,
+            maxSessionSeconds: config.limits.maxSessionSeconds,
           }),
         }
       : {}),

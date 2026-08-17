@@ -44,6 +44,10 @@ const run = async (
     tools: [],
     budget: new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 }),
     control: {},
+    // Generous: every test using this helper is about what a session MAKES of a
+    // transcript, and a ceiling those hit would be a flake rather than a finding. The one
+    // test that is about the ceiling builds its own session below.
+    timeoutSeconds: 3600,
     ...(signal === undefined ? {} : { signal }),
   });
 };
@@ -101,4 +105,53 @@ test("an interruption is not recorded as a session failure", async () => {
   assert.equal(result.outcome.reason, "interrupted");
   assert.equal(result.outcome.error, undefined);
   assert.match(result.outcome.summary, /stopped from outside/);
+});
+
+test("a session whose provider never answers is stopped by its own wall clock", async () => {
+  // The defect this pins, observed in the cluster: the supervisor armed a deadline around
+  // the AGENT's session only. `ReviewCouncil`, `PlanMaintainer` and `LlmSummariser` all
+  // run sessions too, and all three called `runSession` with no signal at all — so a
+  // provider request that never returned wedged the whole single-threaded runner. One
+  // did: 7h20m inside `council.start`, zero restarts, the poll loop and the chat drain
+  // frozen behind it, /healthz answering 200 the entire time.
+  //
+  // The ceiling therefore belongs to `runSession` rather than to whoever calls it. A
+  // caller may add a signal of its own; it cannot take this away, and — because the
+  // field is required — the next call site cannot quietly omit it.
+  const faux = fauxProvider({ models: [{ id: "faux-model", contextWindow: 200_000, maxTokens: 4096 }] });
+  const models = createModels();
+  models.setProvider(faux.provider);
+
+  // A request that hangs until it is aborted, which is what a real one does. Resolving
+  // it on abort rather than leaving it pending is the honest model: an HTTP request that
+  // is cancelled unwinds, it does not vanish.
+  faux.setResponses([
+    (_context, options) =>
+      new Promise((resolve) => {
+        const keepalive = setInterval(() => {}, 1_000);
+        const settle = (): void => {
+          clearInterval(keepalive);
+          resolve(fauxAssistantMessage("", { stopReason: "aborted" }));
+        };
+        if (options?.signal?.aborted === true) settle();
+        else options?.signal?.addEventListener("abort", settle, { once: true });
+      }),
+  ]);
+
+  const started = Date.now();
+  const result = await runSession({
+    models,
+    model: faux.getModel() as unknown as Model<Api>,
+    systemPrompt: "system",
+    initialPrompt: "review the change",
+    tools: [],
+    budget: new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 }),
+    control: {},
+    timeoutSeconds: 0.25,
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.outcome.reason, "interrupted", "the wall clock must stop it");
+  assert.ok(elapsed >= 200, `it must not stop before its ceiling (${elapsed}ms)`);
+  assert.ok(elapsed < 15_000, `nor run on past it (${elapsed}ms)`);
 });

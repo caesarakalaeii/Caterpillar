@@ -227,6 +227,10 @@ const buildRunner = (
 
   const config = {
     handoff: { thresholdFraction: 0.7 },
+    // Far out of reach. These tests are about what a session makes of a transcript, and
+    // every one of them finishes in milliseconds — a ceiling they could hit would be a
+    // flake rather than a finding.
+    limits: { maxSessionSeconds: 3600 },
     // The runner reads the workspace profile to build the credential scope: the host a
     // task's repos must live on, and the state repo none of them may be (§9.1, §9.3).
     workspaces: new Map([

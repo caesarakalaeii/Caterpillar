@@ -166,6 +166,7 @@ export class PlanMaintainer implements Maintainer {
       };
 
       const result = await runSession({
+        timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
         systemPrompt: `${SYSTEM_PROMPT}\n\nYour working directory is ${checkout.root}.`,

@@ -214,6 +214,10 @@ export class ReviewCouncil implements Council {
 
     try {
       const result = await runSession({
+        // A reviewer is a session and gets a session's ceiling. Nothing bounded this
+        // before, and three reviewers run concurrently under `Promise.all` — so one
+        // request that never returned held the runner, and the other two with it.
+        timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
         systemPrompt: `${lens.prompt}\n\nYour working directory is ${worktree}.`,
