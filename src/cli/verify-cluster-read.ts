@@ -26,12 +26,7 @@
  * the right CA rather than a client that stops looking.
  */
 import { readFile } from "node:fs/promises";
-import {
-  CA_PATH,
-  TOKEN_PATH,
-  httpsGet,
-  type HttpsGet,
-} from "../cluster/client.ts";
+import { CA_PATH, TOKEN_PATH, httpsGet } from "../cluster/client.ts";
 import {
   checkAccess,
   checkConfig,
@@ -261,24 +256,38 @@ const main = async (): Promise<number> => {
   results.push(credentials.result);
   report(2, TOTAL, credentials.result, args.json);
 
+  const first = namespaces[0];
+
   if (credentials.credentials === undefined) {
-    // Everything after this needs a credential. Reported as skips rather than left out, so
-    // the summary still lists seven checks and nobody has to wonder which ones ran.
+    // Every kube check needs a credential; LOKI DOES NOT. It is plain HTTP with no bearer
+    // in this deployment, so it is still run here — an operator debugging from a
+    // workstation with a port-forward gets the one answer that is available to them
+    // instead of a screen of skips.
     for (const [index, name] of [
       [3, "kube API"],
       [4, "namespaces"],
       [5, "RBAC"],
-      [6, "Loki"],
-      [7, "redaction"],
     ] as const) {
       const skipped: CheckResult = {
         name,
         status: "skip",
-        detail: "not attempted: no ServiceAccount token",
+        detail: "not attempted: no ServiceAccount token — see check 2",
       };
       results.push(skipped);
       report(index, TOTAL, skipped, args.json);
     }
+
+    const loki = await lokiCheck(config.lokiUrl, first, args.skipLoki);
+    results.push(loki);
+    report(6, TOTAL, loki, args.json);
+
+    const redaction: CheckResult = {
+      name: "redaction",
+      status: "skip",
+      detail: "not attempted: no ServiceAccount token, so no Secret could be read — see check 2",
+    };
+    results.push(redaction);
+    report(7, TOTAL, redaction, args.json);
     return finish(results, args.json);
   }
 
@@ -289,7 +298,7 @@ const main = async (): Promise<number> => {
     // The real transport, with the cluster CA pinned per request. `client.ts`'s own helper,
     // not a second one — the `ca`-without-`rejectUnauthorized` arrangement is the property
     // being reused, and a copy of it here would be a second place to get that wrong.
-    http: httpsGet satisfies HttpsGet,
+    http: httpsGet,
   };
 
   // 3: the API server answers, over verified TLS.
@@ -297,52 +306,57 @@ const main = async (): Promise<number> => {
   results.push(version);
   report(3, TOTAL, version, args.json);
 
-  // 4: each allowlisted namespace exists. Runs even when /version failed, because a
-  // 403-shaped failure there and a missing namespace here have different remedies and an
-  // operator would rather see both than run this twice.
-  const nsResult = await checkNamespaces(kube, namespaces);
+  // 4, 5 and 7 all speak to the API server, so an unreachable one makes them thirty
+  // identical connection errors rather than thirty findings. Reported as skips pointing at
+  // check 3, which is the only one an operator can act on.
+  const reachable = version.status === "pass";
+  const blocked = (name: string): CheckResult => ({
+    name,
+    status: "skip",
+    detail: "not attempted: the kube API did not answer — see check 3",
+  });
+
+  // 4: each allowlisted namespace exists.
+  const nsResult = reachable ? await checkNamespaces(kube, namespaces) : blocked("namespaces");
   results.push(nsResult);
   report(4, TOTAL, nsResult, args.json);
 
   // 5: RBAC, reads and — the load-bearing half — writes.
-  const access = await checkAccess(kube, namespaces);
-  results.push(access.result);
-  report(5, TOTAL, access.result, args.json);
+  const rbac = reachable ? (await checkAccess(kube, namespaces)).result : blocked("RBAC");
+  results.push(rbac);
+  report(5, TOTAL, rbac, args.json);
 
-  // 6: Loki.
-  const first = namespaces[0];
-  if (args.skipLoki) {
-    const skipped = {
-      name: "Loki",
-      status: "skip" as const,
-      detail: "--skip-loki: cluster_logs will fail at runtime unless Loki exists",
-    };
-    results.push(skipped);
-    report(6, TOTAL, skipped, args.json);
-  } else if (first === undefined) {
-    const skipped = {
-      name: "Loki",
-      status: "skip" as const,
-      detail: "no namespace to query — see check 1",
-    };
-    results.push(skipped);
-    report(6, TOTAL, skipped, args.json);
-  } else {
-    const loki = await checkLoki({
-      lokiUrl: config.lokiUrl,
-      namespace: first,
-      fetch: (input, init) => fetch(input, init),
-    });
-    results.push(loki);
-    report(6, TOTAL, loki, args.json);
-  }
+  // 6: Loki, which is a different address and a different process — so it is attempted
+  // whatever the kube API did.
+  const loki = await lokiCheck(config.lokiUrl, first, args.skipLoki);
+  results.push(loki);
+  report(6, TOTAL, loki, args.json);
 
   // 7: redaction, against a real Secret, through `redact.ts` itself.
-  const redaction = await redactionCheck(kube, first);
+  const redaction = reachable ? await redactionCheck(kube, first) : blocked("redaction");
   results.push(redaction);
   report(7, TOTAL, redaction, args.json);
 
   return finish(results, args.json);
+};
+
+/** Check 6, or the reason it was not run. Needs no credential: Loki is plain HTTP here. */
+const lokiCheck = async (
+  lokiUrl: string,
+  namespace: string | undefined,
+  skipLoki: boolean,
+): Promise<CheckResult> => {
+  if (skipLoki) {
+    return {
+      name: "Loki",
+      status: "skip",
+      detail: "--skip-loki: cluster_logs will fail at runtime unless Loki exists",
+    };
+  }
+  if (namespace === undefined) {
+    return { name: "Loki", status: "skip", detail: "no namespace to query — see check 1" };
+  }
+  return checkLoki({ lokiUrl, namespace, fetch: (input, init) => fetch(input, init) });
 };
 
 /** Find a Secret, read it, and hand the RAW object to the redactor the tools use. */
