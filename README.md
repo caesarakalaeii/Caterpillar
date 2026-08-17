@@ -184,6 +184,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/cluster/names.ts` | The only path from a model string to a URL or a LogQL selector (§20). |
 | `src/cluster/redact.ts` | Kind allowlist and Secret redaction. Pure, and the whole boundary (§20). |
 | `src/cluster/client.ts` | Logs, events and describe. `node:https` with the cluster CA (§20). |
+| `src/remediation/policy.ts` | `alerts/policy.yaml` — which alerts may become tasks. Pure (§20). |
+| `src/remediation/receiver.ts` | The Alertmanager webhook. Answers fast, writes nothing, trusts nothing (§20). |
+| `src/remediation/queue.ts` | Firing alert → `spec.md`, on the loop's thread of control (§20). |
 
 ## Invariants worth not breaking
 
@@ -380,6 +383,37 @@ failure for a permission an operator has not granted.
 Without `cluster.enabled` a remediation task still runs — it gets the ordinary control verbs
 and diagnoses from the repository. It does not crash, and it does not quietly acquire the
 reads either.
+
+## Alerts that become tasks
+
+The fifth intake path (§14, §20). Alertmanager posts a firing alert to the supervisor's own
+webhook port, and if an operator has already said what that alert means, it becomes a
+`kind: remediation` task that runs like any other one and ends in a pull request.
+
+```json
+"remediation": { "enabled": true, "port": 8081 }
+```
+
+It needs one secret — `caterpillar-remediation`, key `webhook-token` — and **refuses to
+start without it**. This is the only listener in the process that can cause a task to
+exist, and a task is a session with a shell and a forge credential, so an unauthenticated
+one is a remote code execution path. The token is compared in constant time; `/healthz`
+answers ahead of the check, because the kubelet probes the pod directly and a probe that
+gets 401 restarts a healthy container forever.
+
+An alert becomes a task only if `alerts/policy.yaml` **in the state repo** has an entry for
+its `alertname`, and that entry supplies the workspace, the repos and the acceptance
+commands verbatim — nothing here synthesises a completion gate. An unlisted alert is
+refused *once*, durably, in `alerts/refusals/<fingerprint>.json`: Alertmanager re-sends a
+firing alert every few minutes and Keel rolls the pod on every push, so anything remembered
+in memory would re-notify all day. The task id is `ALERT-<fingerprint>`, which is what makes
+an alert firing for an hour one task rather than twenty.
+
+**The session cannot touch the cluster.** Not a restart, not a scale, not a silence. The
+cluster is evidence — read-only observations the supervisor performs — and the only output
+is a pull request that the review council reads like any other. A fix that is not code is a
+legitimate outcome, and the session is told so explicitly, because the alternative is a
+plausible patch attached to an incident nobody diagnosed.
 
 ## Passing work between machines
 

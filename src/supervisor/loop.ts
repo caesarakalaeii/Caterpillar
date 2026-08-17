@@ -49,7 +49,7 @@ import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.t
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
-import type { AlertPass, AlertQueue } from "../remediation/queue.ts";
+import type { AlertPass } from "../remediation/queue.ts";
 import type { FiringAlert } from "../remediation/receiver.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
@@ -109,6 +109,11 @@ export interface ProgressProbe {
 export interface Intake {
   /** One pass over every tracker (DESIGN.md §14). */
   ingest(remote: string, branch: string): Promise<IntakePass>;
+}
+
+/** Whatever the webhook accepted since the last poll (§20). Implemented by `AlertQueue`. */
+export interface AlertSource {
+  drain(): readonly FiringAlert[];
 }
 
 /** Firing alerts → remediation specs (DESIGN.md §20). Implemented by `AlertProcessor`. */
@@ -171,7 +176,7 @@ export interface SupervisorDeps {
    * that must not know what happens next and drained here, where the state repo may be
    * written — the same split the chat inbox makes for the Discord bridge.
    */
-  readonly alerts?: { readonly queue: AlertQueue; readonly ingester: AlertIngester };
+  readonly alerts?: { readonly queue: AlertSource; readonly ingester: AlertIngester };
   /**
    * Requests arriving from the inbound Discord bridge (§7). Optional: without a bridge
    * a question is answered by committing the file by hand.

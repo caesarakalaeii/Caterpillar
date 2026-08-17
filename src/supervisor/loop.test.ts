@@ -25,6 +25,7 @@ import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { type Notifier, NullNotifier } from "../notify/discord.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
+import type { FiringAlert } from "../remediation/receiver.ts";
 import type { Council } from "../review/council.ts";
 import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
@@ -1634,4 +1635,83 @@ test("/resume still refuses a task that finished", async () => {
 
   assert.deepEqual(outcome, { kind: "not-resumable", status: "done" });
   assert.equal((await pushedState(FINISHED))?.status, "done", "nothing should have been written");
+});
+
+test("the alert queue is drained on the poll loop, and a failure there is not fatal", async () => {
+  // The wiring half of DESIGN.md §20. The receiver hands alerts over in memory, and the
+  // only thread of control allowed to write the state repo is this one — so an alert that
+  // is accepted and never drained is a task that silently never exists. Asserted through a
+  // running supervisor rather than by calling the private method, because "on every tick"
+  // is the property, and it is the sort of thing a later refactor drops.
+  const alerts: FiringAlert[] = [
+    {
+      alertname: "CaterpillarNoProgress",
+      fingerprint: "abc123",
+      labels: [{ key: "alertname", value: "CaterpillarNoProgress" }],
+      annotations: [],
+    },
+  ];
+  const passes: number[] = [];
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    alerts: {
+      queue: {
+        drain: () => alerts.splice(0, alerts.length),
+      },
+      ingester: (() => {
+        let first = true;
+        return {
+          process: (queued: readonly FiringAlert[]) => {
+            passes.push(queued.length);
+            // The first pass throws, which is what a state repo that rejects a push looks
+            // like from here. The loop must keep polling: a task the fleet cannot file is
+            // not a reason to stop working the tasks it already has.
+            if (first) {
+              first = false;
+              return Promise.reject(new Error("push rejected"));
+            }
+            return Promise.resolve({ seen: queued.length, created: 0, duplicate: 0, refused: 0 });
+          },
+        };
+      })(),
+    },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && passes.length === 0) await sleep(50);
+
+  // A second delivery after the failed pass, to prove the loop is still running.
+  alerts.push({
+    alertname: "CaterpillarBudget",
+    fingerprint: "def456",
+    labels: [{ key: "alertname", value: "CaterpillarBudget" }],
+    annotations: [],
+  });
+  while (Date.now() < deadline && passes.length < 2) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(passes, [1, 1], "every tick with a queued alert must produce exactly one pass");
 });
