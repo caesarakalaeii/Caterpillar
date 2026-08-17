@@ -269,5 +269,5 @@ test("Node is not describable, because a node's fields are not this feature's bu
   // Named separately from the loop above because it is the one an alert most invites: a
   // memory-pressure alert points at a node, and widening the list to reach it should be a
   // code review rather than a config change. The list is a literal for that reason.
-  assert.ok(!DESCRIBABLE_KINDS.includes("Node"));
+  assert.ok(!(DESCRIBABLE_KINDS as readonly string[]).includes("Node"));
 });
