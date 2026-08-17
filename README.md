@@ -574,9 +574,21 @@ again; the thread keeps its history and un-archives if anyone posts in it. Nothi
 `journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
 repo by hand, once no lease is held.
 
+`/resume <task>` brings one back, from `parked` **or** `failed`. That matters more than it
+sounds: a task can fail for a reason that has nothing to do with it — a runner brought up
+without a usable model credential will fail whatever it claims — and a plan's later waves
+are blocked by whatever failed, so a handful of unrelated failures can stall a whole plan.
+`done` is the one status `/resume` refuses; coming back from that is a re-run, not a
+recovery.
+
 Waves describe what **may** run concurrently. One runner still works one task at a time —
 actual parallelism means scaling the StatefulSet, which the git-ref leasing already makes
 safe. A rejected plan creates nothing.
+
+In a fleet, **every replica connects to Discord but exactly one acts on it**, decided by a
+compare-and-swap on `refs/chat/holder`. The connections are what keep the bot online
+through a rollout; acting four times is what would open four threads for one
+`/brainstorm`.
 
 ## Registering the slash commands
 

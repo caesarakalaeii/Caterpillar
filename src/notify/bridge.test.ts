@@ -48,7 +48,12 @@ const state = (over: Partial<TaskState> = {}): TaskState => ({
   ...over,
 });
 
-const harness = (over: { readonly threads?: ThreadIndex } = {}): {
+const harness = (
+  over: {
+    readonly threads?: ThreadIndex;
+    readonly leadership?: { readonly held: () => boolean };
+  } = {},
+): {
   readonly bridge: DiscordBridge;
   readonly inbox: ChatInbox;
   readonly calls: Call[];
@@ -73,6 +78,8 @@ const harness = (over: { readonly threads?: ThreadIndex } = {}): {
     snapshot,
     logger: SILENT_LOGGER,
     ...(over.threads === undefined ? {} : { threads: over.threads }),
+    // Absent means "act", so every test written before the fleet existed still applies.
+    ...(over.leadership === undefined ? {} : { leadership: over.leadership }),
     fetch,
   });
 
@@ -405,4 +412,42 @@ test("a brainstorm the loop refuses says so in its thread, and stops listening t
   assert.equal(inThread.length, 2, "the refusal belongs in the thread, under the idea");
   assert.match(String(inThread[1]?.body["content"]), /No workspace owns/);
   assert.equal(threads.taskFor("999"), undefined, "a thread with no task must not be bound");
+});
+
+test("a replica that does not hold the chat claim acts on nothing", async () => {
+  // Four replicas each ran the gateway and each handled every event, because nothing said
+  // one of them should. Reads mostly hid it — Discord accepts one response per interaction
+  // token, so three replicas just logged a failure — but `/brainstorm` does not: its id is
+  // derived from the thread Discord has just created for it, so four replicas would open
+  // four threads and mint four unrelated tasks from one command. `!answer` is worse
+  // still: four runners writing the same state repo, which is how a runner ends up with a
+  // commit that can never rebase.
+  const { bridge, inbox, calls } = harness({ leadership: { held: () => false } });
+
+  await bridge.handleInteraction(
+    interaction({
+      data: {
+        name: "brainstorm",
+        options: [
+          { name: "topic", value: "make the overlay themeable" },
+          { name: "repo", value: "acme/widget" },
+        ],
+      },
+    }),
+  );
+  await bridge.handleMessage("!answer yes", "operator", THREAD);
+
+  assert.equal(inbox.size, 0, "it must queue nothing for the loop");
+  assert.equal(calls.length, 0, "and say nothing to Discord — not even a refusal");
+});
+
+test("the replica that holds the claim behaves exactly as before", async () => {
+  // The gate must be the only difference. A leadership check that also changed what the
+  // holder does would be a second behaviour nobody asked for.
+  const { bridge, inbox, calls } = harness({ leadership: { held: () => true } });
+
+  await bridge.handleInteraction(interaction({ data: { name: "tasks" } }));
+
+  assert.equal(inbox.size, 0, "a listing still never queues work");
+  assert.match(String((callback(calls).body["data"] as { content: string }).content), /GH-acme-widget-42/);
 });

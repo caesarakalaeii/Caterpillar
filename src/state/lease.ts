@@ -139,6 +139,44 @@ export class LeaseManager {
     return this.casRef(ref, message, "");
   }
 
+  /**
+   * Claim `ref` for as long as this runner keeps renewing it (DESIGN.md §7).
+   *
+   * The middle ground between `claim`, which is per task, and `claimOnce`, which is won
+   * forever: this is for the things a FLEET must do exactly once at a time, whoever is
+   * up. The Discord gateway is the case it was written for. Four replicas each ran the
+   * bridge, and nothing said they should not — so one `/brainstorm` would have opened
+   * four threads and minted four tasks, since a brainstorm's id is derived from the
+   * thread Discord just created, and one `!answer` would have been four runners writing
+   * the same state repo.
+   *
+   * Stealable on the same terms as a task lease, and for the same reason: the ref
+   * outlives the process that wrote it, so a claim nobody can take is one nobody can
+   * ever hold again — the fleet would lose its bridge permanently at the first deleted
+   * pod. Pass `held` to renew, which moves the ref and so keeps its commit time fresh;
+   * a holder that stops renewing goes stale and is taken over.
+   *
+   * Undefined means "someone else has it", which is the ordinary answer for three
+   * replicas out of four.
+   */
+  async claimStealable(
+    ref: string,
+    message: string,
+    held?: string,
+  ): Promise<string | undefined> {
+    const existing = await this.git.lsRemote(this.remote, ref);
+
+    // Renewing: CAS from exactly the oid we believe we wrote. If that is not what is
+    // there, we lost the ref while we thought we held it and must not take it back
+    // silently — the caller has to learn that it stopped being the holder.
+    if (held !== undefined) {
+      return existing === held ? this.casRef(ref, message, held) : undefined;
+    }
+
+    if (existing !== undefined && !(await this.isStale(existing))) return undefined;
+    return this.casRef(ref, message, existing ?? "");
+  }
+
   /** Whether the remote has `ref` at all. */
   async hasRef(ref: string): Promise<boolean> {
     return (await this.git.lsRemote(this.remote, ref)) !== undefined;
