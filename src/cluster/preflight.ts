@@ -420,6 +420,13 @@ export const checkKubeVersion = async (kube: KubeContext): Promise<CheckResult> 
  * is `allowed: true` for a namespace that does not exist — so an allowlist with a typo in it
  * passes every RBAC check and then returns nothing from every read. This check is the one
  * that catches the typo.
+ *
+ * A 403 is a SKIP rather than a failure, and that distinction is load-bearing. `namespaces`
+ * is a cluster-scoped resource and none of the three tools ever reads one — they read pods,
+ * events and the nine other namespaced kinds — so a correctly scoped Role deliberately does
+ * NOT grant `get namespaces`, and failing the run over it would teach operators to widen a
+ * grant this feature does not want. What is lost is only this check's ability to tell a typo
+ * from a missing permission, which the skip says out loud.
  */
 export const checkNamespaces = async (
   kube: KubeContext,
@@ -427,6 +434,7 @@ export const checkNamespaces = async (
 ): Promise<CheckResult> => {
   const lines: string[] = [];
   const problems: string[] = [];
+  const unprovable: string[] = [];
 
   for (const namespace of namespaces) {
     let response: HttpResponse;
@@ -448,12 +456,8 @@ export const checkNamespaces = async (
       continue;
     }
     if (response.status === 403) {
-      lines.push(`${namespace}  403 forbidden`);
-      problems.push(
-        `${namespace}: the ServiceAccount lacks 'get namespaces' for it — grant get on ` +
-          `resource 'namespaces' (core group, cluster-scoped) or accept that this one line ` +
-          `stays red while the per-namespace reads below work`,
-      );
+      lines.push(`${namespace}  403 — 'get namespaces' not granted (expected; not needed)`);
+      unprovable.push(namespace);
       continue;
     }
     if (response.status === 404) {
@@ -476,7 +480,23 @@ export const checkNamespaces = async (
       lines,
     );
   }
-  return pass("namespaces", `${namespaces.length} namespace(s) reachable`, lines);
+  if (unprovable.length === namespaces.length) {
+    return skip(
+      "namespaces",
+      `existence unproved for ${unprovable.join(", ")}: the token cannot 'get namespaces', ` +
+        `which is correct for a namespaced read-only Role`,
+      `this check cannot tell a typo in cluster.namespaces from a namespace that is simply ` +
+        `not readable cluster-scoped. Confirm the spelling by hand — ` +
+        `kubectl get ns ${unprovable.join(" ")} — or grant 'get namespaces' if you want this ` +
+        `line green. The per-namespace reads in check 5 are the ones the tools use.`,
+    );
+  }
+  return pass(
+    "namespaces",
+    `${namespaces.length - unprovable.length} of ${namespaces.length} namespace(s) confirmed to exist` +
+      (unprovable.length === 0 ? "" : `; ${unprovable.join(", ")} unprovable without 'get namespaces'`),
+    lines,
+  );
 };
 
 /**
@@ -548,7 +568,10 @@ export const renderAccessTable = (outcomes: readonly AccessOutcome[]): readonly 
     // Two columns rather than one: "allowed" is a pass on a read and a failure on a write,
     // and collapsing them into a single "ok" would hide exactly that distinction.
     const expected = outcome.query.want === outcome.allowed ? "ok  " : "WRONG";
-    const note = outcome.error ?? outcome.reason ?? "";
+    // The API server's `reason` is one long line naming the binding, and on the happy path
+    // it is the same line twenty-two times. Printed only where it explains something: an
+    // error, or a verdict that is not the one the feature needs.
+    const note = outcome.error ?? (expected === "ok  " ? "" : (outcome.reason ?? outcome.query.why));
     return `  ${grant}  ${verdict}  ${expected}${note.length === 0 ? "" : `  ${note}`}`;
   });
 };
