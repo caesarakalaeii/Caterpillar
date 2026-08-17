@@ -74,8 +74,29 @@ export class AlertQueue {
   }
 }
 
+/**
+ * The part of `StateStore` this path uses.
+ *
+ * Structural rather than the class itself, and that is a testing decision with a design
+ * reason behind it: written out, the list IS the claim that the alert path reads the policy,
+ * writes one refusal record, counts open tasks and writes one task — and nothing else. A
+ * dependency on the whole store would leave that claim to a reader's inspection, and would
+ * make a fake store a hundred lines of methods nobody calls.
+ */
+export type AlertStore = Pick<
+  StateStore,
+  | "readAlertPolicy"
+  | "readAlertRefusal"
+  | "writeAlertRefusal"
+  | "countOpenAlertTasks"
+  | "hasTask"
+  | "writeState"
+  | "writeSpec"
+  | "commitAndPush"
+>;
+
 export interface AlertProcessorDeps {
-  readonly store: StateStore;
+  readonly store: AlertStore;
   readonly notifier: Notifier;
   readonly logger: Logger;
   /** Session cap stamped into each new task's `state.json`, as at intake. */
