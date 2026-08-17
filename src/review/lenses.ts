@@ -53,6 +53,10 @@ work is \`blocking: false\` — say it, and let it merge.
 If you cannot review the change — you could not find the diff, the worktree is not what
 you expected — say so and return \`decision: "changes"\` with \`blocking: false\`. Do not
 guess, and do not pass to be agreeable: an abstention is recorded as an abstention.
+
+Your verdict is published verbatim as a review on the pull request. Sign it with nothing:
+no model name, no vendor, no tool, no 🤖. The lens you read through is the only identity
+the review has, and the supervisor already labels it.
 `.trim();
 
 const lens = (key: string, title: string, body: string): Lens => ({

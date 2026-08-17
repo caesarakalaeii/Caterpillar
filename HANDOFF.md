@@ -329,13 +329,21 @@ scripts this session used, which is strictly better than a commit per file.
 | Namespace | `caterpillar` |
 | Context | **`default`** in `~/.kube/config` |
 | ArgoCD app | `caterpillar`, `Synced` / `Healthy`, sync wave 6 |
-| Pod | 1 replica, `Recreate`, `/healthz` + `/metrics` on 9090 |
-| PVC | `caterpillar-work`, 20Gi RWO, bound |
+| Fleet | `StatefulSet/caterpillar`, `RollingUpdate`, `/healthz` + `/metrics` on 9090 |
+| Volumes | `work-caterpillar-N` (10Gi) + `nix-caterpillar-N` (15Gi), one pair per replica |
+| Singletons | `caterpillar-credentials` (1Gi) and `caterpillar-nix-cache` (50Gi), **1 replica each, never more** |
+| Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, retained until the credential is migrated |
 | Image | `ghcr.io/caesarakalaeii/caterpillar:main`, rolled by Keel (`policy: force`, `trigger: poll`) |
 
 Deploy = merge to `main`. CI builds and pushes, Keel notices within ~45–90s and rolls the
-Deployment. Watch it with `gh run watch`, then poll the pod name — it changes, so comparing
-`imageID` against the old pod is unnecessary.
+workload. Watch it with `gh run watch`. Pod names are now **stable** (`caterpillar-0`,
+`caterpillar-1`, …), so unlike the Deployment era you cannot tell a roll happened by the
+name changing — compare `imageID`, or watch `kubectl -n caterpillar rollout status
+statefulset/caterpillar`.
+
+Scale with `kubectl -n caterpillar scale statefulset/caterpillar --replicas=N`. Nothing
+else is needed; leases make it safe. What bounds N is node disk and the subscription's
+per-account rate limit, not this repo — see README "Scaling the fleet in the cluster".
 
 **`CONFIG_PATH` is `/etc/caterpillar/config/config.json`** — the ConfigMap mounts a
 directory. `log.level` and `intake.intervalSeconds` are **absent** from the deployed
@@ -372,20 +380,36 @@ Decisions the user made by interview (do not re-litigate):
 
 ### The subscription credential is the sharp edge
 
-`llm.credentialsPath` is `/work/credentials/anthropic.json` on the PVC and **cannot become a
-Secret**. Refreshing rotates the refresh token and pi writes the new one back inside
-`CredentialStore.modify`; a read-only mount means the supervisor works until the access token
-expires and then stops. `FileCredentialStore` locks around the read-modify-write; 30s to
-acquire, a lock older than 60s is treated as abandoned.
+It **cannot become a Secret**. Refreshing rotates the refresh token and pi writes the new
+one back inside `CredentialStore.modify`; a read-only mount means the runner works until
+the access token expires and then stops. `FileCredentialStore` locks around the
+read-modify-write; 30s to acquire, a lock older than 60s is treated as abandoned.
+
+**In the fleet it lives on `caterpillar-credentials`, not on a runner.** Same property,
+one step further: there is no `ReadWriteMany` storage class here, so every replica gets its
+own volume and would get its own *copy* — and the first replica to refresh invalidates all
+the others, locking the fleet out about an hour in, silently. So one pod owns it and the
+runners read it over HTTP and never write. `llm.credentialsUrl` is the runners' field and
+**wins over** `llm.credentialsPath`, which is now the holder's.
 
 Seed it with `npm run llm:login -- --out ./auth.json` on a machine with a browser, then
-`kubectl cp` it in. **`/work/credentials` does not exist on a fresh PVC** and `kubectl cp`
-will not create a missing parent — `mkdir -p` it in the pod first.
+`kubectl cp` it onto the **holder**. **`/work/credentials` does not exist on a fresh
+volume** and `kubectl cp` will not create a missing parent — `mkdir -p` it in the pod first.
+Full commands in `caesar-deployment/apps/workloads/caterpillar/README.md`, prerequisite 4.
 
-- **The pod does NOT crash-loop without the credential.** It boots, serves `/healthz`, and
-  idles; the credential is read lazily when a session starts.
-- Refresh is **lazy, not scheduled**. An expired access token on an idle supervisor is normal.
-- **Deleting the PVC destroys the credential**, not just mirrors and worktrees.
+- **Nothing crash-loops without the credential.** The holder boots, serves `/healthz` and
+  answers 404; runners read that as "not seeded yet" and idle. It is read lazily.
+- Refresh is **lazy, not scheduled**. An expired access token on an idle fleet is normal.
+- **Deleting `caterpillar-credentials` destroys the credential.** Recovery is the browser
+  login again — there is no other copy.
+- **Do not scale the holder past 1.** A second replica is a second writer, which is the
+  condition it exists to make impossible.
+
+**MIGRATION, not yet done:** the live `caterpillar-work` PVC still holds the credential
+from the single-replica era. It is deliberately still in `kustomization.yaml` so ArgoCD's
+`prune` does not delete it — copy the file onto the holder, verify
+`llm.credential-source source=holder` in a runner's logs, and only then remove `pvc.yaml`.
+The order is written out in that file's own header.
 
 ### Discord: every half is LIVE
 
