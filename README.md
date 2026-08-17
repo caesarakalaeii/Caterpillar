@@ -415,6 +415,12 @@ is a pull request that the review council reads like any other. A fix that is no
 legitimate outcome, and the session is told so explicitly, because the alternative is a
 plausible patch attached to an incident nobody diagnosed.
 
+Turning this on touches four things in the deployment repo and one file in the state repo,
+in an order that matters. **`docs/remediation-runbook.md`** is the end-to-end guide: the
+order of operations, how to test the webhook by hand with `curl`, two worked
+`alerts/policy.yaml` entries, the three levers for turning it off in a hurry, and what to do
+about a 401, a 403 or an empty Loki result.
+
 ## Passing work between machines
 
 Inputs never move. A game install, a USB device, a human — a task that needs one declares
@@ -626,6 +632,32 @@ only proof the outbound half works, since everything short of a live request is 
 agreeing with itself. It leaves one message behind. The URL comes from the environment,
 never argv: its last path segment is the credential, and nothing prints it, including on
 failure.
+
+## Verifying cluster reads from inside the pod
+
+```bash
+kubectl -n caterpillar exec -it caterpillar-0 -- npm run verify:cluster-read
+kubectl -n caterpillar exec -it caterpillar-0 -- npm run verify:cluster-read -- --namespace monitoring
+kubectl -n caterpillar exec -it caterpillar-0 -- npm run verify:cluster-read -- --skip-loki --json
+```
+
+Seven checks in order, each with a remedy on failure: the `cluster` config block, the
+projected token and CA, `GET /version` over TLS verified against that CA, each allowlisted
+namespace, RBAC through `SelfSubjectAccessReview`, Loki (`/ready` and one real bounded
+`query_range`), and the redaction promise against a **real Secret**, rendered through
+`cluster/redact.ts` itself rather than a copy that would only agree with itself.
+
+The check worth the most is the **negative** one. Alongside every read it needs, it asserts
+`create`, `update`, `patch` and `delete` on `pods` and `deployments` are **denied** — a
+preflight that only confirmed the reads it wanted would pass just as cheerfully against a
+`cluster-admin` binding and would have certified the opposite of the property this whole
+feature rests on. An allowed write verb fails the run.
+
+It must run in a pod: the token and the CA come from the projected ServiceAccount volume,
+and there is no flag that skips TLS verification. Outside a cluster it exits non-zero with
+one line saying so. `docs/remediation-runbook.md` has the order of operations either side of
+it — RBAC, ConfigMap, `alerts/policy.yaml`, the webhook secret, the Alertmanager route — and
+how to turn the whole thing off in a hurry.
 
 ## Not yet built
 
