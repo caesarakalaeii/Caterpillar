@@ -95,13 +95,23 @@ const dirName = (path: string): string => {
   return cut < 0 ? "" : path.slice(0, cut);
 };
 
-/** `a/b/../c` → `a/c`. Kustomization references are relative and routinely use `..`. */
+/**
+ * `a/b/../c` → `a/c`. Kustomization references are relative and routinely use `..`.
+ *
+ * A leading `..` is PRESERVED rather than popped off the front. An overlay saying
+ * `../../base` means two levels up, and collapsing that to `base` silently resolves the
+ * reference against the wrong directory — which reads as a dangling reference and an
+ * orphan for every file in the real target. Only a `..` that has something to cancel is
+ * cancelled.
+ */
 export const normalizePath = (path: string): string => {
   const out: string[] = [];
   for (const part of path.split("/")) {
     if (part === "" || part === ".") continue;
     if (part === "..") {
-      out.pop();
+      const last = out.at(-1);
+      if (last === undefined || last === "..") out.push("..");
+      else out.pop();
       continue;
     }
     out.push(part);
@@ -226,18 +236,21 @@ export const checkRequiredFields = (doc: ManifestDoc): readonly Finding[] => {
   const at = { line: doc.line, doc: doc.index };
   const kind = asString(doc.value["kind"]);
 
-  if (asString(doc.value["apiVersion"]) === undefined) {
+  // kustomize's own configuration is not an object sent to an apiserver. A
+  // `kustomization.yaml` legitimately carries no `metadata.name`, and a
+  // `kustomizeconfig.yaml` carries no apiVersion or kind either — it is a bare mapping of
+  // field specs. Neither is a mistake, so neither is checked against the object shape.
+  if (isKustomizeConfig(doc.file)) return [];
+  const isKustomizationDoc = isKustomization(doc.file) || kind === "Kustomization";
+
+  if (asString(doc.value["apiVersion"]) === undefined && !isKustomizationDoc) {
     findings.push(error(doc.file, `document ${doc.index} has no \`apiVersion\``, at));
   }
-  if (kind === undefined) {
+  if (kind === undefined && !isKustomization(doc.file)) {
     findings.push(error(doc.file, `document ${doc.index} has no \`kind\``, at));
   }
 
-  // `kind: Kustomization` (and a kustomizeconfig) has no `metadata.name` and never
-  // needs one — it is kustomize's own configuration, not an object sent to an apiserver.
-  if (isKustomization(doc.file) || isKustomizeConfig(doc.file) || kind === "Kustomization") {
-    return findings.filter((finding) => !finding.message.includes("apiVersion"));
-  }
+  if (isKustomizationDoc) return findings;
 
   const metadata = doc.value["metadata"];
   const name = isRecord(metadata) ? asString(metadata["name"]) : undefined;
@@ -410,6 +423,39 @@ const REFERENCE_LISTS = [
 
 const GENERATOR_LISTS = ["configMapGenerator", "secretGenerator"] as const;
 
+/** The fields whose entries are patches rather than whole objects. See findDuplicates. */
+const PATCH_LISTS = ["patches", "patchesStrategicMerge", "patchesJson6902"] as const;
+
+/**
+ * Files referenced as patches, root-relative.
+ *
+ * Collected separately from every other reference because duplicate detection has to
+ * skip them: a strategic-merge patch shares its target's apiVersion, kind and name by
+ * design.
+ */
+export const findPatchFiles = (
+  files: FileMap,
+  parsedByFile: ReadonlyMap<string, ParsedFile>,
+): ReadonlySet<string> => {
+  const patches = new Set<string>();
+  for (const kustomization of files.keys()) {
+    if (!isKustomization(kustomization)) continue;
+    const dir = dirName(kustomization);
+    const doc = parsedByFile.get(kustomization)?.docs.find((candidate) => candidate.value !== null);
+    const value = doc?.value;
+    if (value === undefined || value === null) continue;
+    for (const field of PATCH_LISTS) {
+      const list = value[field];
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) {
+        const path = typeof entry === "string" ? entry : isRecord(entry) ? asString(entry["path"]) : undefined;
+        if (path !== undefined) patches.add(joinPath(dir, path));
+      }
+    }
+  }
+  return patches;
+};
+
 export interface KustomizationRefs {
   /** Paths, relative to the kustomization's directory, normalised. */
   readonly paths: ReadonlySet<string>;
@@ -489,7 +535,26 @@ export const kustomizationRefs = (value: Record<string, unknown>): Kustomization
   return { paths, unresolved };
 };
 
-const isYamlFile = (path: string): boolean => path.endsWith(".yaml") || path.endsWith(".yml");
+/**
+ * The files a generator manifest itself points at.
+ *
+ * `generators: [ksops.yaml]` is one hop, not two: the kustomization names the generator,
+ * and the GENERATOR names the `*.enc.yaml` files in its own `files:` list. A validator
+ * that only reads the kustomization sees the encrypted file as referenced by nobody and
+ * reports every secret in the deployment repo as orphaned — the precise false failure
+ * that would get this gate switched off in a week. So a document sitting in a directory
+ * that has a kustomization also contributes its `files:` entries as references.
+ */
+export const generatorRefs = (value: Record<string, unknown>): ReadonlySet<string> => {
+  const paths = new Set<string>();
+  const files = value["files"];
+  if (!Array.isArray(files)) return paths;
+  for (const entry of files) {
+    if (typeof entry !== "string") continue;
+    paths.add(normalizePath(entry));
+  }
+  return paths;
+};
 
 /**
  * Orphan detection: a `*.yaml` sibling of a `kustomization.yaml` that the kustomization
@@ -505,36 +570,44 @@ export const findOrphans = (
   parsedByFile: ReadonlyMap<string, ParsedFile>,
 ): readonly Finding[] => {
   const findings: Finding[] = [];
+
+  // Every directory that holds at least one walked file, so a reference to a directory
+  // can be told apart from a reference to something that is not in the tree at all.
   const directories = new Set<string>();
   for (const path of files.keys()) directories.add(dirName(path));
+  const isDirectory = (path: string): boolean =>
+    directories.has(path) || [...directories].some((dir) => dir.startsWith(`${path}/`));
 
-  /** Directories covered by some parent kustomization's directory reference. */
-  const coveredDirs = new Set<string>();
-  const refsByDir = new Map<string, KustomizationRefs>();
-  const kustomizationOf = new Map<string, string>();
+  for (const kustomization of files.keys()) {
+    if (!isKustomization(kustomization)) continue;
+    const dir = dirName(kustomization);
+    const doc = parsedByFile.get(kustomization)?.docs.find((candidate) => candidate.value !== null);
+    const value = doc?.value;
+    if (value === undefined || value === null) continue;
 
-  for (const path of files.keys()) {
-    if (!isKustomization(path)) continue;
-    const dir = dirName(path);
-    const parsed = parsedByFile.get(path);
-    const doc = parsed?.docs.find((candidate) => candidate.value !== null);
-    if (doc?.value === undefined || doc.value === null) continue;
-    const refs = kustomizationRefs(doc.value);
-    refsByDir.set(dir, refs);
-    kustomizationOf.set(dir, path);
-    for (const rel of refs.paths) {
-      const resolved = joinPath(dir, rel);
-      // A reference with no YAML extension is a directory reference (or a file that does
-      // not exist — reported below as a dangling reference, not as an orphan).
-      if (!isYamlFile(resolved)) coveredDirs.add(resolved);
+    const direct = kustomizationRefs(value);
+
+    // Resolved to root-relative paths once, here, so nothing downstream has to reason
+    // about which directory a `../` was written relative to.
+    const referenced = new Set<string>();
+    for (const rel of direct.paths) referenced.add(joinPath(dir, rel));
+
+    // Follow ONE hop through each referenced generator. `generators: [ksops.yaml]` names
+    // the generator; the generator's own `files:` names the `*.enc.yaml`. Without this
+    // hop every SOPS file in the deployment repo reads as orphaned. See generatorRefs.
+    for (const target of [...referenced]) {
+      const generator = parsedByFile.get(target);
+      if (generator === undefined) continue;
+      const generatorDir = dirName(target);
+      for (const generatorDoc of generator.docs) {
+        if (generatorDoc.value === null) continue;
+        for (const nested of generatorRefs(generatorDoc.value)) {
+          referenced.add(joinPath(generatorDir, nested));
+        }
+      }
     }
-  }
 
-  for (const [dir, refs] of refsByDir) {
-    const kustomization = kustomizationOf.get(dir) ?? `${dir}/kustomization.yaml`;
-    const referenced = new Set([...refs.paths].map((rel) => joinPath(dir, rel)));
-
-    for (const note of refs.unresolved) {
+    for (const note of direct.unresolved) {
       findings.push(
         warning(
           kustomization,
@@ -544,18 +617,15 @@ export const findOrphans = (
       );
     }
 
-    // A reference to a file that is not on disk. Reported as a warning: the target may
-    // legitimately live outside the validated root.
-    for (const rel of refs.paths) {
-      const resolved = joinPath(dir, rel);
-      if (files.has(resolved)) continue;
-      if (directories.has(resolved) || [...directories].some((d) => d.startsWith(`${resolved}/`))) {
-        continue;
-      }
+    // A reference to something not in the tree. A warning, never an error: the target may
+    // legitimately live outside <dir>, and a false failure on a pre-existing tree is
+    // worse than a missed orphan.
+    for (const resolved of referenced) {
+      if (files.has(resolved) || isDirectory(resolved)) continue;
       findings.push(
         warning(
           kustomization,
-          `references '${rel}', which is not in the validated tree — either it is ` +
+          `references '${resolved}', which is not in the validated tree — either it is ` +
             "outside <dir> or the reference is stale",
         ),
       );
@@ -563,8 +633,7 @@ export const findOrphans = (
 
     for (const path of files.keys()) {
       if (dirName(path) !== dir) continue;
-      if (isKustomization(path)) continue;
-      if (isKustomizeConfig(path)) continue;
+      if (isKustomization(path) || isKustomizeConfig(path)) continue;
       if (referenced.has(path)) continue;
       findings.push(
         error(
@@ -575,10 +644,6 @@ export const findOrphans = (
       );
     }
   }
-
-  // A directory that has no kustomization at all is only checked when a parent covers
-  // it; without a kustomization there is nothing to be orphaned from.
-  void coveredDirs;
 
   return findings;
 };
@@ -601,14 +666,25 @@ const describe = (value: Record<string, unknown>): string => {
   return namespace === undefined ? `${kind}/${name}` : `${kind}/${name} in ${namespace}`;
 };
 
-/** Two objects that will fight over the same name — the second silently wins. */
-export const findDuplicates = (docs: readonly ManifestDoc[]): readonly Finding[] => {
+/**
+ * Two objects that will fight over the same name — the second silently wins.
+ *
+ * `patchFiles` are excluded, and must be. A strategic-merge patch deliberately carries
+ * the same apiVersion, kind and name as the object it patches — that identity is how
+ * kustomize knows what to patch. Counting it as a duplicate would fail every overlay in
+ * existence, which is exactly the kind of false positive that makes a gate untrustworthy.
+ */
+export const findDuplicates = (
+  docs: readonly ManifestDoc[],
+  patchFiles: ReadonlySet<string> = new Set(),
+): readonly Finding[] => {
   const findings: Finding[] = [];
   const seen = new Map<string, ManifestDoc>();
   for (const doc of docs) {
     if (doc.value === null) continue;
     if (isEncrypted(doc.file)) continue; // see isEncrypted
     if (isKustomization(doc.file) || isKustomizeConfig(doc.file)) continue;
+    if (patchFiles.has(doc.file)) continue; // see above: a patch shares its target's identity
     const key = identity(doc.value);
     if (key === undefined) continue;
     const first = seen.get(key);
@@ -734,7 +810,7 @@ export const validateTree = (
   }
 
   for (const finding of findOrphans(files, parsedByFile)) push(finding);
-  for (const finding of findDuplicates(allDocs)) push(finding);
+  for (const finding of findDuplicates(allDocs, findPatchFiles(files, parsedByFile))) push(finding);
   for (const finding of checkRequired(allDocs, options.require ?? [], options.namespace, root)) {
     push(finding);
   }
