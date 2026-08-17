@@ -8,7 +8,7 @@
  * The transcript is NOT replayed. The journal is the source of truth on resume,
  * which is what makes crash recovery cheap and keeps a handoff bounded.
  */
-import type { TaskSpec, TaskState } from "../domain/task.ts";
+import type { TaskKind, TaskSpec, TaskState } from "../domain/task.ts";
 
 export interface PromptParts {
   readonly spec: TaskSpec;
@@ -99,6 +99,59 @@ Writing the tasks:
 The plan goes to a review council before anything is created. It may come back with
 changes; that is ordinary, and you will be told exactly what to fix.`;
 
+/**
+ * The remediation system prompt (DESIGN.md §20).
+ *
+ * The same job as an implementation task — it writes code, it opens a pull request, §12
+ * grades it — so this is `SYSTEM_PROMPT` plus the three things that are true only of a
+ * task an alert created, each of which the session gets wrong by default:
+ *
+ *   The cluster is EVIDENCE, not a workspace. A model told an alert is firing reaches for
+ *   `kubectl rollout restart` within a turn or two, because that is what fixes an alert
+ *   in the world it learned from. Saying it cannot is cheaper than discovering it tried.
+ *
+ *   A manual-only fix is a real answer. The alternative is a session that invents a code
+ *   change because it was asked for one, which is the worst possible outcome here: a
+ *   plausible patch attached to a real incident that nobody has diagnosed.
+ *
+ *   The alert is a symptom and the task is the cause. Silencing the alert is not the
+ *   work.
+ */
+export const REMEDIATION_SYSTEM_PROMPT = `${SYSTEM_PROMPT}
+
+This task was created by a FIRING ALERT rather than by a human writing an issue. Three
+things follow from that, and they are not negotiable:
+
+- **You must not change the cluster.** Not a restart, not a scale, not an edit, not a
+  delete, not a silence in Alertmanager. Anything you can see of the cluster is read-only
+  evidence, gathered for you, and there is no path from this session to a write. If the
+  only fix is an operational one, say so — do not go looking for a way to apply it.
+- **A fix that is not code is a legitimate outcome.** Plenty of alerts are configuration,
+  capacity, a dependency that is down, or a threshold that is wrong. If that is what you
+  find, write up the diagnosis and call \`ask_human\` with it, or \`handoff\` if a
+  different machine is needed. Do NOT invent a code change to have something to open a
+  pull request with: a plausible patch on a real incident is worse than no patch, because
+  it looks like the incident was handled.
+- **The alert is the symptom.** Fix what made it fire. Widening a threshold, deleting the
+  assertion, or making the check no longer run are all ways of making the alert stop
+  without making anything better, and the review council reads for exactly that.
+
+If you do change code, everything else is unchanged: the supervisor runs the acceptance
+criteria, the pull request and CI are the other half of the gate, and \`done\` is still
+only a claim.`;
+
+/** The system prompt for a task of this kind. `implement` is the default and the base. */
+export const systemPromptFor = (kind: TaskKind | undefined): string => {
+  switch (kind) {
+    case "brainstorm":
+      return BRAINSTORM_SYSTEM_PROMPT;
+    case "remediation":
+      return REMEDIATION_SYSTEM_PROMPT;
+    default:
+      return SYSTEM_PROMPT;
+  }
+};
+
 const section = (title: string, body: string | undefined): string =>
   body === undefined || body.trim().length === 0 ? "" : `\n## ${title}\n\n${body.trim()}\n`;
 
@@ -106,16 +159,17 @@ const section = (title: string, body: string | undefined): string =>
 export const buildPrompt = (parts: PromptParts): string => {
   const { spec, state } = parts;
   const brainstorm = spec.kind === "brainstorm";
+  const remediation = spec.kind === "remediation";
 
   const header = [
-    `# ${brainstorm ? "Brainstorm" : "Task"} ${spec.id}`,
+    `# ${brainstorm ? "Brainstorm" : remediation ? "Alert" : "Task"} ${spec.id}`,
     "",
     `Workspace: ${spec.workspace}`,
     `Session: ${state.sessions + 1}`,
     `Phase: ${state.phase}`,
     `Repos in scope: ${spec.repos.map((r) => `${r.owner}/${r.name}`).join(", ")}`,
     "",
-    brainstorm ? "## The idea" : "## Goal",
+    brainstorm ? "## The idea" : remediation ? "## The alert" : "## Goal",
     "",
     spec.goal,
     ...(brainstorm
@@ -143,9 +197,16 @@ export const buildPrompt = (parts: PromptParts): string => {
     ? first
       ? "\nStart by reading enough of the repository to make this concrete. Then ask your first question.\n"
       : "\nContinue refining. When the shape is settled, call `submit_plan`.\n"
-    : first
-      ? "\nThis is the first session. Start by orienting yourself in the repo, then begin.\n"
-      : "\nContinue from the handoff above. Verify its assumptions before trusting them.\n";
+    : remediation && first
+      ? // Said explicitly on the first session because the default move on an alert is to
+        // start patching, and the diagnosis is the part that is worth anything: a fix
+        // written before the cause is understood is a guess with a pull request attached.
+        "\nThis is the first session. Diagnose before you change anything: establish what " +
+        "is actually failing and why, from the evidence and the code, and only then decide " +
+        "whether there is a code change to make.\n"
+      : first
+        ? "\nThis is the first session. Start by orienting yourself in the repo, then begin.\n"
+        : "\nContinue from the handoff above. Verify its assumptions before trusting them.\n";
 
   return `${header}\n${body}${closing}`;
 };

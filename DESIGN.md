@@ -2053,3 +2053,172 @@ waits on a network, so the pod's abort signal reaches it. Aborted, the day is re
 rather than half-published: the next boot publishes it whole, prose included. The
 alternative is the silent failure again — a claimed day, torn down mid-publish, that
 nothing ever revisits.
+
+## 20. Alert-driven remediation
+
+A fifth intake path (§14): **a firing Alertmanager alert becomes a task**, whose goal is
+"diagnose and fix this", and which then runs like every other task and ends in a pull
+request.
+
+The gap it closes is narrow and real. Every other intake path starts with a human deciding
+something is worth doing. Monitoring already knows something is wrong — it knows before
+anyone is awake, it knows precisely which rule fired and with which labels, and today that
+knowledge reaches a Discord channel and stops. An operator reads it hours later, forms the
+same diagnosis the evidence already implied, and files an issue that becomes a task. The
+alert is a task intake source that was being routed to a human for transcription.
+
+```
+Alertmanager  →  POST /alerts  →  policy lookup  →  spec.md (kind: remediation)
+                                       │                        │
+                                  no entry?                  normal claim,
+                                  refusal record             normal session,
+                                                             §12 gate, PR
+```
+
+### It never writes to the cluster
+
+**A remediation session cannot change the cluster. Not a restart, not a scale, not an
+edit, not a silence.** This is the load-bearing constraint of the whole design and every
+other decision below follows from it.
+
+The reason is not caution about capability, it is what the two options actually are. An
+agent that may restart a Deployment will restart the Deployment, because that is what
+makes an alert stop, and it will do it before it understands why the alert fired. What
+that produces is a fleet that erases its own evidence: the crash loop is gone, the pod is
+new, the logs are rotated, and the cause is now unknowable. It also produces a system
+whose blast radius is "whatever the model thought would help" against a live cluster, with
+no review step anywhere in it — the exact inverse of the arrangement §9.3 and §12 build for
+code, where nothing the agent does reaches production without a human approving a diff.
+
+So the cluster is **evidence**, not a workspace. Reads are supervisor-mediated: the session
+asks for a described observation and the supervisor performs it, against a namespace
+allowlist that is **supervisor configuration**, not something the alert path can widen for
+itself. The output of a remediation task is the same artifact as every other task's — a
+pull request against a repo — and the same two gates decide whether it is any good.
+
+A corollary that has to be said out loud in the system prompt, because the model will not
+assume it: **a fix that is not code is a legitimate outcome.** Plenty of alerts are
+capacity, configuration, a dependency that is down, or a threshold that was always wrong.
+A session that finds one of those should write up the diagnosis and `ask_human` (or
+`handoff`), and it is told explicitly not to invent a code change in order to have
+something to open a pull request with. A plausible patch attached to a real incident is
+worse than no patch, because it looks like the incident was handled.
+
+The same prompt says the alert is the *symptom*. Widening a threshold, deleting an
+assertion, or making a check no longer run all make the alert stop without making anything
+better, and the review council (§12.1) reads for exactly that.
+
+### `kind: remediation`
+
+A third task kind (§4.1), alongside `implement` and `brainstorm`. It is a **writing** kind:
+it gets `write` and `edit`, the full control verbs including `open_pr` and `done`, and §12
+applies to it **unchanged**.
+
+It is a separate kind only because its ORIGIN changes what the session must be told. The
+`brainstorm` exemption from acceptance criteria is deliberately **not** widened to it: a
+brainstorm's gate is the council's verdict on a plan, and it has nothing to run, whereas a
+remediation task ends in a pull request and therefore needs commands the supervisor can
+run. A remediation spec with no acceptance criteria is refused by `readSpec` for the same
+reason an ordinary one is — it could be created and never closed.
+
+Concretely, the kind selects a system prompt and nothing else about the session's shape.
+
+### `alerts/policy.yaml`
+
+An alert becomes a task **only if an operator said in advance what that alert means and how
+a fix for it is verified**. That statement is a file in the **state repo**:
+
+```yaml
+version: 1
+alerts:
+  - alertname: CaterpillarNoProgress        # required, exact match on the alert label
+    workspace: caesar                       # required, a known workspace
+    repos:                                  # required, >= 1, host/owner/name
+      - github.com/caesarakalaeii/caterpillar
+    acceptance:                             # required, >= 1 command (§12)
+      - npm run check
+      - npm test
+    requires: []                            # optional, from KNOWN_CAPABILITIES
+    goalPrefix: |                           # optional prose prepended to the goal
+      This alert usually means a session wedged on a provider cooldown.
+    runbook: https://runbooks.example/…      # optional URL surfaced in the goal
+    maxOpenTasks: 1                          # optional, default 1
+```
+
+**In the state repo, not this repo and not a ConfigMap.** Adding an alert must be a commit
+to the thing the supervisor already polls — reviewable, revertable, and live on the next
+cycle — rather than a redeploy. It is operator-authored and the supervisor never writes it;
+there is no `writeAlertPolicy`, which is what keeps "which alerts may create tasks" outside
+the fleet's own reach.
+
+**There is deliberately no `namespaces` field.** Which namespaces a session may read is a
+bound the operator sets on the whole process, in supervisor configuration. A per-alert
+allowlist would let an entry in a file the alert path consults widen its own access, which
+is not a bound at all. A field here that nothing reads would be worse than no field.
+
+Parsing is **strict**, and the reason is one specific typo. `acceptence:` silently ignored
+produces an entry with no acceptance commands — indistinguishable from omitting the
+completion gate, and the symptom is a queue of tasks nothing can ever mark done rather than
+a message anyone would read. So unknown keys, unknown top-level keys, an unknown
+capability, a duplicate `alertname`, an empty `acceptance`, a malformed repo ref and a
+`version` other than 1 are all **parse errors**, each naming the offending entry and field.
+Failures are a typed `PolicyParseError`, never a bare `Error`: the supervisor loop has to
+tell "the operator wrote this wrong", which deserves one clear message and no retry, from an
+IO failure a later poll might survive.
+
+A **missing** `alerts/policy.yaml` is an **empty policy**, not an error. The loop reads it
+every cycle, and most state repos have never heard of alerts — a throw there would turn
+"this cluster has not opted in" into a supervisor logging a failure every thirty seconds. A
+file that exists and does not parse still throws, because that one is a mistake to fix.
+
+### Task identity, and not opening the same task twice
+
+Task ids on this path are **`ALERT-<fingerprint>`**, from Alertmanager's own fingerprint.
+Deterministic and derived from the fingerprint alone, which is what makes the path
+idempotent: Alertmanager re-sends a firing alert for as long as it fires, and an id that
+varied would create a fresh task every few minutes.
+
+The fingerprint becomes a directory name under `tasks/` and arrives in an HTTP body from
+outside the process, so it is **checked, not trusted** — constrained to lowercase hex,
+which is what Alertmanager renders anyway. That keeps every id this path produces inside
+the existing `isTaskId` guard rather than relaxing that guard, for every other intake path,
+to accommodate this one.
+
+`maxOpenTasks` (default 1) stops an alert that keeps firing while a fix is in review from
+opening a second task saying the same thing. "Open" is `!isTerminal(status)` — the one
+notion of task status the supervisor already has, deliberately not a second one. A
+**`parked`** remediation task therefore counts as closed: it is waiting on a human, and a
+fresh firing is exactly the nudge that should be allowed to open a new task rather than be
+suppressed by one nobody is working on.
+
+Counting is a join from `alerts/refusals/` to `tasks/`, because a fingerprint is a hash and
+does not carry its alertname — so the **alertname is recorded** in each record rather than
+parsed back out of an id. A record naming a task that no longer exists contributes nothing,
+so deleting a task by hand frees its slot instead of wedging the alert forever.
+
+### `alerts/refusals/<fingerprint>.json`
+
+Every decision the receiver makes about an alert is written down, durably and pushed, not
+kept in memory. This is the intake-rejection record (§14) again, and for a reason recorded
+there verbatim: **Keel rolls the pod on every push to main**, so an in-memory set of
+already-handled alerts is emptied on every deploy — and since Alertmanager re-sends a
+firing alert every few minutes, every deploy would re-notify for every alert the supervisor
+had already declined. The record makes the fleet quieter than the alert instead of noisier.
+
+Two consequences for `StateStore`, and they are separate rules that were found separately:
+
+- `alerts` is in `commitAndPush`'s staging list. Without it a refusal is written locally
+  and never pushed, which is exactly the spam the record exists to prevent.
+- `alerts` is in the reset path's `git clean` list. Without it a refusal whose commit never
+  landed silences the alert on this runner while existing nowhere in git: no other runner
+  agrees, and no operator can see why the notification stopped. `policy.yaml` is tracked,
+  so the sweep cannot touch it.
+
+### What is deliberately absent
+
+**No Alertmanager silence, ever** — not even a temporary one. A supervisor that can silence
+an alert can hide its own failure to fix it, and the alert an operator most needs to see is
+the one about the supervisor.
+
+**No auto-merge.** The pull request is reviewed like any other. An alert firing at 03:00 is
+not a reason to lower the bar; it is a reason to have the diagnosis written down by 08:00.

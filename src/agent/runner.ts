@@ -43,7 +43,7 @@ import type { WorktreeManager } from "../workspace/worktree.ts";
 import type { ToolchainResolver } from "../workspace/toolchain.ts";
 import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
-import { BRAINSTORM_SYSTEM_PROMPT, buildPrompt, SYSTEM_PROMPT } from "./prompt.ts";
+import { buildPrompt, systemPromptFor } from "./prompt.ts";
 import { runSession } from "./session.ts";
 import { brainstormTools, controlTools, type ControlSink, type ToolContext } from "./tools.ts";
 
@@ -160,6 +160,11 @@ export class AgentSessionRunner {
       // is not a sandbox — `bash` is still there and a determined session could use it —
       // but it is the difference between a tool the model reaches for by habit and one
       // it has to decide to misuse.
+      //
+      // This tests for `brainstorm` rather than for "not implement" on purpose:
+      // `remediation` is a WRITING kind (§20) and must fall in with `implement`, getting
+      // `write`, `edit` and the full control verbs — an alert-driven task that could not
+      // edit a file or call `open_pr` would be a session with nowhere to put its fix.
       const brainstorm = spec.kind === "brainstorm";
       const tools: AgentTool[] = [
         bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
@@ -221,7 +226,7 @@ export class AgentSessionRunner {
       const result = await runSession({
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${brainstorm ? BRAINSTORM_SYSTEM_PROMPT : SYSTEM_PROMPT}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,
+        systemPrompt: `${systemPromptFor(spec.kind)}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,
         initialPrompt: prompt,
         tools,
         budget,
