@@ -1584,3 +1584,46 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   await seedTask(BUSY, { status: "done" });
   await seedTask(BRAINSTORM, { status: "done" });
 });
+
+test("/resume brings back a task that FAILED, not only one that parked", async () => {
+  // The gap this closes, found the hard way. `applyResume` accepted `parked` and nothing
+  // else, so `failed` was terminal with no route back from chat at all — the only way
+  // out was an operator editing state.json by hand, which is the exact race `/resume`
+  // was introduced to remove. §7 makes that argument for `parked`; it is the same
+  // argument, word for word, for `failed`.
+  //
+  // It stopped being theoretical when a misconfigured runner marked six tasks `failed`
+  // in ninety seconds for `Provider is not configured: anthropic` — nothing to do with
+  // any of them — and took two more down with them, because a plan's later waves are
+  // blocked by whatever failed. Eight tasks, no command that could touch one.
+  const BROKEN = asTaskId("RESUME-FAILED");
+  await seedTask(BROKEN, { status: "failed", progress: { lastProgressSession: 1, noProgressStreak: 2 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: BROKEN });
+
+  assert.deepEqual(outcome, { kind: "resumed", from: "failed" }, "the reply must say what it came back from");
+
+  const pushed = await pushedState(BROKEN);
+  assert.equal(pushed?.status, "ready", "and it must be claimable on the REMOTE, not just locally");
+  assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is forgiven, as it is for a park");
+  assert.equal(pushed?.progress.lastProgressSession, 1, "history is not");
+
+  const journal = await new Git(origin).run("show", `main:tasks/${BROKEN}/journal.md`);
+  assert.match(journal, /Resumed/);
+
+  await retire(BROKEN);
+});
+
+test("/resume still refuses a task that finished", async () => {
+  // `done` stays refused. Resuming it would re-run work that already passed every gate
+  // and merged — the one terminal status where coming back is not a recovery.
+  const FINISHED = asTaskId("RESUME-DONE");
+  await seedTask(FINISHED, { status: "done" });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "resume", task: FINISHED });
+
+  assert.deepEqual(outcome, { kind: "not-resumable", status: "done" });
+  assert.equal((await pushedState(FINISHED))?.status, "done", "nothing should have been written");
+});

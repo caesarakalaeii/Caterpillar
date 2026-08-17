@@ -15,7 +15,11 @@ import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
 import { test } from "node:test";
 import { asRunnerId, asTaskId } from "../domain/task.ts";
-import { LeaseLostError, heldLease, startHeartbeat, type Lease } from "./lease.ts";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Git } from "./git.ts";
+import { LeaseLostError, LeaseManager, heldLease, startHeartbeat, type Lease } from "./lease.ts";
 
 const TASK = asTaskId("LEASE-1");
 const RUNNER = asRunnerId("test-runner");
@@ -143,4 +147,115 @@ test("a failed renewal reports the loss once and stops renewing", async () => {
 test("heldLease resolves to exactly the lease it was given", async () => {
   const held = lease("fixed");
   assert.deepEqual(await heldLease(held).current(), held);
+});
+
+/**
+ * A real remote, because the thing under test IS the compare-and-swap. A stub that always
+ * agrees would pass while two runners both believed they had won.
+ */
+const remoteFixture = async (): Promise<{
+  manager: LeaseManager;
+  other: LeaseManager;
+  /** Builds a further manager over the same remote — used to vary the stale threshold. */
+  join: (runner: string, staleAfterSeconds: number) => LeaseManager;
+}> => {
+  const hermetic: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  };
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-lease-"));
+  const origin = join(root, "origin.git");
+  const a = join(root, "a");
+  const b = join(root, "b");
+
+  const setup = new Git(root, hermetic);
+  await setup.run("init", "--quiet", "--bare", "--initial-branch=main", origin);
+  await setup.run("clone", "--quiet", origin, a);
+  await setup.run("clone", "--quiet", origin, b);
+
+  // `casRef` builds a commit, and the global config is nulled out for hermeticity, so
+  // without this every claim fails with "Author identity unknown".
+  for (const dir of [a, b]) {
+    const git = new Git(dir, hermetic);
+    await git.run("config", "user.email", "runner@example.invalid");
+    await git.run("config", "user.name", "runner");
+  }
+
+  const of = (dir: string, runner: string, staleAfterSeconds: number): LeaseManager =>
+    new LeaseManager({
+      git: new Git(dir, hermetic),
+      remote: "origin",
+      runner: asRunnerId(runner),
+      staleAfterSeconds,
+    });
+
+  return {
+    manager: of(a, "runner-a", 300),
+    other: of(b, "runner-b", 300),
+    join: (runner, staleAfterSeconds) => of(b, runner, staleAfterSeconds),
+  };
+};
+
+test("a stealable ref is won by exactly one runner, and refused to the other", async () => {
+  // The fleet needs one holder for things that must not happen four times — the Discord
+  // gateway most of all. Four replicas each ran the bridge, so a single `/brainstorm`
+  // would have opened four threads and minted four tasks, and one `!answer` would have
+  // been four writes to the same state repo.
+  const { manager, other } = await remoteFixture();
+
+  const won = await manager.claimStealable("refs/chat/holder", "held by runner-a");
+  assert.notEqual(won, undefined, "the first runner must win");
+
+  const lost = await other.claimStealable("refs/chat/holder", "held by runner-b");
+  assert.equal(lost, undefined, "and the second must be refused, not queued");
+});
+
+test("the holder renews its own claim rather than losing it to itself", async () => {
+  // Renewal is what makes the claim stealable-but-not-stolen: the ref moves, so its
+  // commit time advances, so nobody else ever sees it as stale while the holder lives.
+  const { manager, other } = await remoteFixture();
+
+  const first = await manager.claimStealable("refs/chat/holder", "held");
+  assert.ok(first !== undefined);
+  const renewed = await manager.claimStealable("refs/chat/holder", "held", first);
+  assert.notEqual(renewed, undefined, "the holder must be able to renew its own ref");
+
+  // Deliberately NOT asserting the oid changed. `casRef` commits an empty tree with a
+  // fixed message, so within one second the commit is byte-identical and git accepts the
+  // push as a no-op. That is harmless — renewals are a poll interval apart, so the
+  // timestamp differs, the oid differs and the commit time advances — but a reader
+  // expecting a new oid here would be looking at a bug that is not one.
+  // What actually matters after a renewal: this runner is still the holder.
+  assert.equal(
+    await manager.claimStealable("refs/chat/holder", "held", renewed),
+    renewed,
+    "renewing again from the oid it was just given must still succeed",
+  );
+
+  assert.equal(
+    await other.claimStealable("refs/chat/holder", "held by runner-b"),
+    undefined,
+    "a renewed claim is still refused to everyone else",
+  );
+});
+
+test("a claim whose holder went away is taken over", async () => {
+  // Without this the fleet loses the bridge for good the first time a pod is deleted: the
+  // ref outlives the process that made it, so a claim nobody can steal is a claim nobody
+  // can ever hold again.
+  const { manager, join: over } = await remoteFixture();
+  assert.ok((await manager.claimStealable("refs/chat/holder", "held by runner-a")) !== undefined);
+
+  // A threshold of zero plus a real second of age, rather than a negative threshold:
+  // `isStale` compares whole seconds, so a claim made in this same second is age 0 and
+  // `0 > 0` is false. Waiting exercises the arithmetic production actually uses.
+  const stealer = over("runner-b", 0);
+  await sleep(1100);
+
+  assert.notEqual(
+    await stealer.claimStealable("refs/chat/holder", "held by runner-b"),
+    undefined,
+    "a stale claim must be takeable",
+  );
 });

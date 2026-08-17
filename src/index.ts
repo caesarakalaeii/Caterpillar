@@ -25,6 +25,7 @@ import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
 import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
+import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { ChatInbox } from "./supervisor/inbox.ts";
@@ -177,7 +178,16 @@ const main = async (): Promise<void> => {
     identity: config.identity,
     ...(stateCredentials !== undefined ? { envProvider: stateCredentials.gitEnv } : {}),
   });
-  const store = new StateStore(config.stateRepo.path, git);
+  // The salvage hook is how a runner says it had to set its own commits aside. At `error`
+  // deliberately: it means two runners recorded the same task and one of them lost, which
+  // is never routine — but the runner keeps working, so nothing else would raise it.
+  const store = new StateStore(config.stateRepo.path, git, (salvaged) => {
+    logger.error("state.salvaged", {
+      ref: salvaged.ref,
+      commit: salvaged.commit,
+      detail: salvaged.detail,
+    });
+  });
   const metrics = new AgentMetrics();
 
   // Parsed once: every workspace's scope excludes the same state repo, and a task
@@ -255,11 +265,20 @@ const main = async (): Promise<void> => {
     logger,
   });
 
+  // Built before both users: the supervisor refreshes it on every poll, the bridge reads
+  // it on every inbound event (DESIGN.md §7). One replica of a fleet acts on Discord.
+  const chat = new ChatLeadership({
+    claims: leases,
+    runner: asRunnerId(config.runnerId),
+    logger,
+  });
+
   const supervisor = new Supervisor({
     config,
     store,
     leases,
     ...(digester === undefined ? {} : { digest: digester }),
+    chat,
     runner: new AgentSessionRunner({
       config,
       store,
@@ -327,7 +346,7 @@ const main = async (): Promise<void> => {
   const bridge =
     discord.bot === undefined
       ? Promise.resolve()
-      : runBridge(discord.bot, inbox, snapshot, threads, logger, controller.signal).catch(
+      : runBridge(discord.bot, inbox, snapshot, threads, logger, controller.signal, chat).catch(
           (error: unknown) => {
             logger.error("bridge.failed", errorFields(error));
           },
@@ -525,8 +544,11 @@ const runBridge = (
   threads: ThreadIndex,
   logger: Logger,
   signal: AbortSignal,
+  leadership: ChatLeadership,
 ): Promise<void> => {
-  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger });
+  // Every replica connects; one acts (§7). The connection is what keeps the bot online
+  // through a rollout, and it costs nothing — it is acting four times that broke things.
+  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership });
 
   return new DiscordGateway({
     token: bot.token,

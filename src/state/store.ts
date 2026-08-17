@@ -176,13 +176,31 @@ const parseToolchain = (value: unknown, task: TaskId): ToolchainSpec | undefined
   };
 };
 
+/** What `pull` moved aside, and where it put it. */
+export interface SalvagedCommits {
+  /** `refs/salvaged/<oid>` — local to this checkout, and on its volume. */
+  readonly ref: string;
+  readonly commit: string;
+  /** Git's own account of the conflict. */
+  readonly detail: string;
+}
+
 export class StateStore {
   private readonly root: string;
   private readonly git: Git;
 
-  constructor(root: string, git: Git) {
+  /**
+   * Called when `pull` had to move unmergeable local commits aside. Optional because a
+   * store with nowhere to report it still recovers correctly — but a fleet that salvages
+   * silently is one where two runners are quietly disagreeing about a task and nobody
+   * finds out, so the supervisor always passes one.
+   */
+  private readonly onSalvage: ((event: SalvagedCommits) => void) | undefined;
+
+  constructor(root: string, git: Git, onSalvage?: (event: SalvagedCommits) => void) {
     this.root = root;
     this.git = git;
+    this.onSalvage = onSalvage;
   }
 
   taskDir(task: TaskId): string {
@@ -868,7 +886,29 @@ export class StateStore {
     // a checkout stuck in a rebase fails every subsequent git call with a message about
     // the rebase rather than about the conflict.
     await this.git.tryRun("rebase", "--abort");
-    throw new GitError(["rebase", `${remote}/${branch}`], rebased);
+
+    // A conflict here is UNRESOLVABLE, not transient, and throwing made it fatal to the
+    // runner rather than to the pull: `pollOnce` logs and retries in thirty seconds, and
+    // the retry is the identical rebase. Two of a four-replica fleet sat in that loop
+    // indefinitely — claiming nothing, draining no chat, answering every probe — and a
+    // restart does not help, because the commit is on the volume.
+    //
+    // It is reachable whenever two runners record the same task: one has its push refused
+    // (a forge outage will do it), keeps the commit, and another takes the task over and
+    // pushes its own. `journal.md` is append-only, so the two appends collide on the same
+    // line and no rebase can ever apply.
+    //
+    // Resetting unconditionally is not the alternative — `pull` did exactly that once and
+    // destroyed five tasks' work (see its note). So the commits are moved aside to a ref
+    // and the runner carries on: nothing is destroyed, the ref outlives the pod because
+    // the volume does, and a human has an object to look at. The remote wins because it
+    // has to: it is what every other runner already agrees on.
+    const stranded = await this.git.run("rev-parse", "HEAD");
+    const ref = `refs/salvaged/${stranded.slice(0, 12)}`;
+    await this.git.tryRun("update-ref", ref, stranded);
+    await this.git.run("reset", "--hard", `${remote}/${branch}`);
+
+    this.onSalvage?.({ ref, commit: stranded, detail: rebased.stdout || rebased.stderr });
   }
 
   /**

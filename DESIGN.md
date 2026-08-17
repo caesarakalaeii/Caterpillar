@@ -283,6 +283,28 @@ the same reason is real history, and the second park means something the first d
 }
 ```
 
+### 4.3 A local commit that can never merge is set aside, not retried
+
+`pull` keeps unpushed commits by rebasing onto the remote rather than resetting over them —
+it used to reset, and that destroyed five tasks' work. But a rebase can conflict, and a
+conflict here is **unresolvable rather than transient**: `journal.md` is append-only, so
+two runners appending to the same task collide on the same line and no retry will ever
+apply.
+
+Throwing made that fatal to the runner rather than to the pull. `pollOnce` logs
+`poll.failed` and tries again in thirty seconds, and the retry is the identical rebase. On
+a four-replica fleet two runners sat in that loop indefinitely within minutes of the fleet
+existing — claiming nothing, draining no chat, answering every probe — and a restart does
+not help, because the commit is on the volume.
+
+It is reachable whenever two runners record the same task: one has its push refused (a
+forge outage will do it), keeps the commit, and another takes the task over and pushes its
+own. So the commits are moved to `refs/salvaged/<oid>` and the runner carries on. Nothing
+is destroyed, the ref outlives the pod because the volume does, and the event is logged at
+`error` — the runner recovers, so nothing else would raise it, and two runners disagreeing
+about a task is never routine. The remote wins because it has to: it is what every other
+runner already agrees on.
+
 ---
 
 ## 5. Leasing
@@ -758,6 +780,38 @@ can share a thread (a plan's children inherit their brainstorm's), so a parent g
 `done` does not close the thread its children still talk in, and when more than one is
 live the task AWAITING an answer owns it. Nothing is deleted: parking stops the work, and
 the journal is the audit trail.
+
+**`/resume` brings back `parked` AND `failed`, but never `done`.** `failed` was left out
+of the original command, and it was an oversight rather than a decision — the argument for
+`/resume` existing is that the alternative is an operator editing `state.json`, which is a
+race against the loop that owns the working copy, and that argument is the same word for
+word for a task that failed. It stopped being theoretical when a runner brought up with no
+usable provider credential marked six tasks `failed` in ninety seconds, for a reason that
+was nothing to do with any of them, and stalled two more behind them — a plan's later waves
+are blocked by whatever failed, so the fleet had eight tasks it could not touch and no
+command that could help. `done` stays refused: it is the one terminal status where coming
+back is not a recovery but a re-run of work that passed every gate and merged.
+
+**One replica of a fleet acts on Discord.** Every replica connects to the gateway — that
+is what keeps the bot online across a rollout, and a connection costs nothing — but
+exactly one may act on what arrives over it, decided by a compare-and-swap on
+`refs/chat/holder` (`claimStealable`) refreshed from the poll loop. The same mechanism as
+a task lease and as the digest's day ref, because the state repo is the only thing the
+fleet shares and so the only place a fleet-wide decision can be made.
+
+Nothing said this at first, and four replicas each handled every event. Reads mostly hid
+it: Discord accepts one response per interaction token, so three replicas simply failed
+and logged it. `/brainstorm` did not hide it at all — a brainstorm's id is derived from
+the thread Discord has just created for it, so one command would open four threads and
+mint four unrelated tasks. An `!answer` was four runners writing the same state repo,
+which is how a runner ends up holding a commit that can never rebase (§4).
+
+The claim is stealable on the same terms as a lease, and for the same reason: the ref
+outlives the process that wrote it, so a claim nobody can take is one nobody can ever hold
+again — the fleet would lose its bridge permanently at the first deleted pod. It is
+refreshed from the loop rather than a timer of its own, so a replica whose loop is blocked
+by a session stops advertising itself as the holder instead of holding a claim it cannot
+currently answer on.
 
 **`/resume` forgives the no-progress streak, and nothing else.** `checkLimits` runs
 *before* a claim's first session, so any limit still met at resume time parks the task

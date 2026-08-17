@@ -678,3 +678,51 @@ test("commitAndPush stages alert records, and pull sweeps unpushed ones", async 
   // The pushed one is tracked, so the sweep leaves it alone.
   assert.ok(existsSync(join(root, "alerts", "refusals", "a1b2c3.json")));
 });
+
+test("a local commit that can never rebase is salvaged, not retried forever", async () => {
+  // The failure this closes, observed on a four-replica fleet within minutes of it
+  // existing. Two runners recorded the SAME task's session — one had its push refused
+  // during a GitHub outage and kept the commit locally, another took the task over and
+  // pushed its own — and `journal.md` is append-only, so the two appends conflict on the
+  // same line and no rebase can ever apply.
+  //
+  // `pull` threw, `pollOnce` logged `poll.failed`, and thirty seconds later it tried the
+  // identical rebase again. Two of the four runners sat in that loop indefinitely,
+  // claiming nothing, draining no chat, healthy to every probe. A restart does not help:
+  // the commit is on the volume.
+  //
+  // Resetting unconditionally is not the answer either — `pull` used to do exactly that
+  // and it destroyed five tasks' worth of work (see the note on `pull`). So the commits
+  // are moved aside to a ref and the runner carries on: nothing is lost, and a human has
+  // something to look at.
+  const { store, git, other, root, otherRoot } = await sharedStateRepo();
+
+  // Both writers append a different line to the same file. Append-only plus two authors
+  // is precisely the shape that cannot merge.
+  await writeFile(join(otherRoot, "journal.md"), "**Exit:** done-claimed — theirs\n", "utf8");
+  await other.run("add", "-A");
+  await other.run("commit", "--quiet", "-m", "theirs");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await writeFile(join(root, "journal.md"), "**Exit:** error — ours\n", "utf8");
+  await git.run("add", "-A");
+  await git.run("commit", "--quiet", "-m", "ours");
+  const stranded = await git.run("rev-parse", "HEAD");
+
+  // Must not throw: throwing is what wedged the runner.
+  await store.pull("origin", "main");
+
+  assert.equal(
+    await git.run("rev-parse", "HEAD"),
+    await git.run("rev-parse", "origin/main"),
+    "the runner must end up on the remote, able to poll again",
+  );
+  assert.equal(
+    (await git.tryRun("rev-parse", "--verify", `refs/salvaged/${stranded.slice(0, 12)}`)).stdout.trim(),
+    stranded,
+    "and the commit it could not merge must still exist somewhere",
+  );
+  // Not mid-rebase: a checkout left in one fails every later git call with a message
+  // about the rebase rather than about the conflict.
+  assert.equal((await git.tryRun("rev-parse", "--verify", "REBASE_HEAD")).code !== 0, true);
+});

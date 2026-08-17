@@ -158,6 +158,12 @@ export interface SupervisorDeps {
    */
   readonly inbox?: ChatInbox;
   /**
+   * Which replica acts on Discord (DESIGN.md §7). Refreshed here rather than on a timer
+   * of its own: a timer would keep renewing the claim while a session blocked the loop,
+   * advertising a holder that cannot answer anything.
+   */
+  readonly chat?: { readonly refresh: () => Promise<void> };
+  /**
    * In-memory view of every task, refreshed once per poll for the chat interface.
    * Optional: nothing in the loop reads it, and without a bridge nothing needs it.
    */
@@ -203,6 +209,24 @@ export interface SupervisorDeps {
    */
   readonly closer?: ThreadCloser;
 }
+
+/**
+ * Terminal statuses `/resume` may bring back.
+ *
+ * `parked` was the only one for a long time, and `failed` being left out was an
+ * oversight rather than a decision: §7's argument for the command existing — that the
+ * alternative is an operator editing `state.json`, which is a race against the loop that
+ * owns the working copy — is the same argument, word for word, for a task that failed.
+ *
+ * It stopped being theoretical when a runner with no usable provider credential marked
+ * six tasks `failed` in ninety seconds, for a reason that was nothing to do with any of
+ * them, and stalled two more behind them: a plan's later waves are blocked by whatever
+ * failed, so the fleet had eight tasks it could not touch and no command that could help.
+ *
+ * `done` is deliberately NOT here. Resuming it would re-run work that passed every gate
+ * and merged — the one terminal status where coming back is not a recovery.
+ */
+const RESUMABLE: readonly TaskStatus[] = ["parked", "failed"];
 
 export class Supervisor {
   /** 0 means "never ran", so the first pass happens at boot. */
@@ -264,6 +288,10 @@ export class Supervisor {
     // provider cooldown: answering a question and ingesting an issue cost no tokens,
     // and a queue that keeps filling while the provider is down is the correct
     // behaviour — it is only starting sessions that has to stop.
+    // Before the drain, because the drain is the holder's job: a replica that just lost
+    // the claim must not serve the requests it collected while it had it.
+    await this.deps.chat?.refresh();
+
     await this.applyChatRequests();
     await this.maybeIngest();
     await this.maybeDigest(signal);
@@ -1752,7 +1780,12 @@ export class Supervisor {
 
     const state = await store.tryReadState(request.task);
     if (state === undefined) return { kind: "unknown-task" };
-    if (state.status !== "parked") return { kind: "not-resumable", status: state.status };
+    if (!RESUMABLE.includes(state.status)) {
+      return { kind: "not-resumable", status: state.status };
+    }
+    // Remembered before the transition, because the reply says which terminal status the
+    // task is coming back FROM and `transition` overwrites it.
+    const from = state.status;
 
     // Taken for the write and released immediately, exactly as `applyPark` does: every
     // push verifies lease ownership first (§5.1), and a resume is no exception. A parked
@@ -1787,7 +1820,7 @@ export class Supervisor {
           ? `it has used ${state.sessions} of ${state.limits.maxSessions} sessions`
           : undefined;
 
-      return { kind: "resumed", from: "parked", ...(exhausted === undefined ? {} : { exhausted }) };
+      return { kind: "resumed", from, ...(exhausted === undefined ? {} : { exhausted }) };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

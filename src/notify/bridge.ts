@@ -48,6 +48,22 @@ export interface BridgeDeps {
   readonly logger: Logger;
   /** Thread ↔ task, so a reply in a thread needs no task id (§14.3). */
   readonly threads?: ThreadIndex;
+  /**
+   * Whether THIS replica is the one that acts on Discord (DESIGN.md §7).
+   *
+   * Absent means yes, which keeps a single-replica runner and every test that predates
+   * the fleet working unchanged. In a fleet every replica holds a gateway connection —
+   * that is what keeps the bot online through a rollout, and a connection costs nothing —
+   * but exactly one may act on what arrives over it.
+   *
+   * Without this, four replicas each handled every event. Reads mostly hid it, because
+   * Discord accepts one response per interaction token and the other three simply failed.
+   * `/brainstorm` did not: a brainstorm's id is derived from the thread Discord has just
+   * created for it, so one command opened four threads and minted four unrelated tasks.
+   * An `!answer` was four runners writing the same state repo, which is how a runner ends
+   * up holding a commit that can never rebase.
+   */
+  readonly leadership?: { readonly held: () => boolean };
   readonly fetch?: FetchLike;
 }
 
@@ -65,6 +81,18 @@ export class DiscordBridge {
   }
 
   /**
+   * Is this replica the one that acts? Absent leadership means yes — see `BridgeDeps`.
+   *
+   * Checked at both inbound doors rather than deeper in, so a non-holder does no IO at
+   * all: no reply, no thread, nothing queued. Silence is deliberate; a non-holder saying
+   * "not me" would be three extra messages per command, and the holder is already
+   * answering.
+   */
+  private acts(): boolean {
+    return this.deps.leadership?.held() ?? true;
+  }
+
+  /**
    * A message typed in the channel, or in one of our threads.
    *
    * A thread carries a task, so a bare `!answer` typed there needs no id — the thread is
@@ -73,6 +101,7 @@ export class DiscordBridge {
    * them is exactly the friction this set out to remove.
    */
   async handleMessage(content: string, author: string, channelId: string): Promise<void> {
+    if (!this.acts()) return;
     const thread = this.deps.threads?.taskFor(channelId);
     const command = parseCommand(content, thread);
     if (command === undefined) return;
@@ -99,6 +128,7 @@ export class DiscordBridge {
 
   /** A slash command, button click or modal submission. */
   async handleInteraction(interaction: Interaction): Promise<void> {
+    if (!this.acts()) return;
     const { bot, logger } = this.deps;
     const who = interactionUser(interaction);
 
