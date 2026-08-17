@@ -81,6 +81,31 @@ export type Notification =
     }
   | { readonly kind: "failed"; readonly task: TaskId; readonly error: string }
   /**
+   * A firing alert became a task (DESIGN.md §20). The intake notification of the fifth
+   * intake path: an operator who is looking at the alert should be able to see, in the same
+   * channel, that the fleet has already picked it up.
+   */
+  | {
+      readonly kind: "alert-task";
+      readonly task: TaskId;
+      readonly alertname: string;
+      readonly severity?: string;
+    }
+  /**
+   * A firing alert was declined, and this is the ONE message about it.
+   *
+   * Sent once per alert per reason, never once per delivery: Alertmanager re-sends a firing
+   * alert every few minutes, and the durable record under `alerts/refusals/` is what makes
+   * the second delivery silent (§20). The `detail` is supervisor-authored prose, not
+   * anything from the payload.
+   */
+  | {
+      readonly kind: "alert-refused";
+      readonly alertname: string;
+      readonly fingerprint: string;
+      readonly detail: string;
+    }
+  /**
    * The model provider stopped answering and this runner is sitting it out (§6.3).
    *
    * Sent ONCE per incident, not once per attempt: the runner keeps re-checking on a
@@ -520,6 +545,11 @@ export const componentsFor = (
       );
     case "parked":
     case "failed":
+    // An alert notification is a statement, not a prompt. Creating the task has already
+    // happened, and a refusal is fixed by committing a policy entry rather than by
+    // pressing anything here.
+    case "alert-task":
+    case "alert-refused":
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -536,6 +566,20 @@ const frame = (notification: Notification, hint: boolean): string => {
   // rather than about a task, so it is the one that does not have one.
   if (notification.kind === "digest") {
     return fit(notification.body, (text) => text);
+  }
+  // The other notification with no task: the alert was refused, so no task was created and
+  // there is nothing to name but the alert itself.
+  if (notification.kind === "alert-refused") {
+    return fit(notification.detail, (text) =>
+      [
+        `🔔 **${notification.alertname}** is firing and was NOT turned into a task.`,
+        "",
+        text,
+        "",
+        `Fingerprint \`${notification.fingerprint}\`. This is said once, not once per ` +
+          `delivery — the decision is recorded in \`alerts/refusals/\` in the state repo.`,
+      ].join("\n"),
+    );
   }
 
   const task = notification.task;
@@ -608,6 +652,12 @@ const frame = (notification: Notification, hint: boolean): string => {
       );
     case "failed":
       return fit(notification.error, (text) => `**${task}** failed — ${text}`);
+    case "alert-task":
+      return (
+        `🔔 **${notification.alertname}** is firing — created \`${task}\`` +
+        `${notification.severity === undefined ? "" : ` (severity ${notification.severity})`}.\n` +
+        `It is queued like any other task and ends in a pull request; nothing touches the cluster.`
+      );
     case "provider-unavailable":
       return fit(notification.detail, (text) =>
         [

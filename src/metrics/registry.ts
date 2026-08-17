@@ -167,6 +167,24 @@ export class AgentMetrics {
     "cumulative seconds spent in supervisor-mediated cluster reads",
   );
 
+  /**
+   * Alertmanager deliveries, by alertname and by what the receiver did (DESIGN.md §20).
+   *
+   * The `outcome` label is deliberately NOT collapsed into ok/error. The failure this whole
+   * feature exists to prevent is an alert that nobody notices has been declined four
+   * hundred times, and `outcome="refused-no-policy"` is the series that says so without
+   * anyone reading a log line. `refused-max-open` is a different fact — the fleet is
+   * already working on it — and merging the two would hide the one that needs a commit.
+   *
+   * `alertname` is empty for an unauthenticated or unparseable delivery, because there is no
+   * alertname to attribute it to and taking one from a body that failed authentication
+   * would let a stranger choose a label value.
+   */
+  readonly alerts = this.registry.counter(
+    "caterpillar_alerts_received_total",
+    "Alertmanager deliveries by alertname and outcome",
+  );
+
   render(): string {
     return this.registry.render();
   }

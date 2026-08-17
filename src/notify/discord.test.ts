@@ -236,6 +236,7 @@ test("every notification kind renders with the task id and its payload", async (
       retryInSeconds: 1800,
     },
     { kind: "provider-recovered", task: TASK },
+    { kind: "alert-task", task: TASK, alertname: "CaterpillarNoProgress", severity: "warning" },
   ];
 
   for (const notification of cases) {
@@ -243,6 +244,24 @@ test("every notification kind renders with the task id and its payload", async (
     assert.match(content, /SMOKE-1/, notification.kind);
     assert.ok(size(content) > 0 && size(content) <= CONTENT_LIMIT, notification.kind);
   }
+});
+
+test("a refused alert names the alert rather than a task, and says it speaks once", () => {
+  // The one notification besides the digest that has no task: the alert was declined, so
+  // no task was created and there is nothing else to name (DESIGN.md §20). A reader also
+  // has to be told the silence afterwards is deliberate, or the natural conclusion from one
+  // message about an alert that keeps firing is that the receiver stopped working.
+  const content = render({
+    kind: "alert-refused",
+    alertname: "CaterpillarNoProgress",
+    fingerprint: "a1b2c3d4",
+    detail: "`alerts/policy.yaml` has no entry for `CaterpillarNoProgress`.",
+  });
+
+  assert.match(content, /CaterpillarNoProgress/);
+  assert.match(content, /a1b2c3d4/);
+  assert.match(content, /alerts\/refusals\//);
+  assert.ok(size(content) <= CONTENT_LIMIT);
 });
 
 test("a pause says what broke, that no task is at fault, and when it retries", () => {

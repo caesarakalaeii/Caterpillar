@@ -21,6 +21,7 @@ import type {
   CommitIdentity,
   DigestConfig,
   LlmConfig,
+  RemediationConfig,
   RunnerConfig,
   WebConfig,
   WorkspaceProfile,
@@ -70,6 +71,7 @@ interface RawConfig {
   readonly web?: Record<string, unknown>;
   readonly digest?: Record<string, unknown>;
   readonly cluster?: Record<string, unknown>;
+  readonly remediation?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -378,6 +380,19 @@ const clusterConfig = (cluster: Record<string, unknown>): ClusterConfig => {
   };
 };
 
+/**
+ * Validate the `remediation` block (DESIGN.md §20).
+ *
+ * Off by default — see `RemediationConfig` for why this one's default matters more than the
+ * web view's. The port is validated even when the receiver is disabled, for the reason
+ * `digestConfig` validates its zone: a typo in a field nobody is using is discovered the
+ * day someone enables it, in the cluster, by a supervisor that throws at boot.
+ */
+const remediationConfig = (remediation: Record<string, unknown>): RemediationConfig => ({
+  enabled: bool(remediation["enabled"], "remediation.enabled", false),
+  port: port(remediation["port"], "remediation.port", 8081),
+});
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -464,5 +479,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     web: webConfig(raw.web ?? {}),
     digest: digestConfig(raw.digest ?? {}),
     cluster: clusterConfig(raw.cluster ?? {}),
+    remediation: remediationConfig(raw.remediation ?? {}),
   };
 };

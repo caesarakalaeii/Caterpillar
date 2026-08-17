@@ -1,14 +1,14 @@
 /**
  * Tests for the sections whose DEFAULTS are load-bearing — `web` (DESIGN.md §18), `digest`
- * (§19) and `cluster` (§20).
+ * (§19), `cluster` (§20) and `remediation` (§20).
  *
- * All three default to off, and all three do something outward-facing when they are on: one
+ * All four default to off, and all four do something outward-facing when they are on: one
  * opens a port that answers with agent transcripts, one posts to a shared channel and
  * commits to a shared repo, one reads a live cluster with the supervisor's own
- * ServiceAccount. A runner someone started on a laptop must not begin doing any of it
- * because it was upgraded, and one that HAS been told to must not silently do it wrongly —
- * unauthenticated, at an hour a misspelt zone quietly turned into UTC, or against a
- * namespace nobody allowed.
+ * ServiceAccount, and one opens a port on which a firing alert becomes a task. A runner
+ * someone started on a laptop must not begin doing any of it because it was upgraded, and
+ * one that HAS been told to must not silently do it wrongly — unauthenticated, at an hour a
+ * misspelt zone quietly turned into UTC, or against a namespace nobody allowed.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -207,4 +207,27 @@ test("maxLogLines is clamped down to the built-in ceiling, and nonsense is refus
   await assert.rejects(() => load({ cluster: { maxLogLines: 0 } }), ConfigError);
   await assert.rejects(() => load({ cluster: { maxLogLines: 12.5 } }), ConfigError);
   await assert.rejects(() => load({ cluster: { maxLogLines: "many" } }), ConfigError);
+});
+
+test("a config that says nothing about remediation opens no webhook port", async () => {
+  // The default that matters most of the three: this listener is the only one that can
+  // cause a task to exist, and a task is a session with a shell and a forge credential
+  // (DESIGN.md §20).
+  const config = await load({});
+
+  assert.equal(config.remediation.enabled, false);
+  assert.equal(config.remediation.port, 8081);
+});
+
+test("the remediation port is validated even with the receiver off", async () => {
+  // Same reasoning as the digest's timezone: a typo in a field nobody is using is
+  // otherwise discovered the day someone enables it, in the cluster, at boot.
+  await assert.rejects(() => load({ remediation: { port: 0 } }), ConfigError);
+  await assert.rejects(() => load({ remediation: { port: 70000 } }), ConfigError);
+  await assert.rejects(() => load({ remediation: { port: 8081.5 } }), ConfigError);
+  await assert.rejects(() => load({ remediation: { enabled: "yes" } }), ConfigError);
+
+  const config = await load({ remediation: { enabled: true, port: 9101 } });
+  assert.equal(config.remediation.enabled, true);
+  assert.equal(config.remediation.port, 9101);
 });

@@ -49,6 +49,8 @@ import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.t
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
+import type { AlertPass } from "../remediation/queue.ts";
+import type { FiringAlert } from "../remediation/receiver.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -109,6 +111,20 @@ export interface Intake {
   ingest(remote: string, branch: string): Promise<IntakePass>;
 }
 
+/** Whatever the webhook accepted since the last poll (§20). Implemented by `AlertQueue`. */
+export interface AlertSource {
+  drain(): readonly FiringAlert[];
+}
+
+/** Firing alerts → remediation specs (DESIGN.md §20). Implemented by `AlertProcessor`. */
+export interface AlertIngester {
+  process(
+    alerts: readonly FiringAlert[],
+    remote: string,
+    branch: string,
+  ): Promise<AlertPass>;
+}
+
 export interface Digester {
   /**
    * Publish the day's digest if one is due, and if this runner wins the claim for it
@@ -152,6 +168,15 @@ export interface SupervisorDeps {
    * shared channel and a shared repo, so a runner has to be told to publish one.
    */
   readonly digest?: Digester;
+  /**
+   * The Alertmanager receiver's queue and the thing that empties it (§20). Optional and
+   * off by default: without `remediation.enabled` there is no listener to fill it.
+   *
+   * Both together rather than one object, because the queue is filled by an HTTP handler
+   * that must not know what happens next and drained here, where the state repo may be
+   * written — the same split the chat inbox makes for the Discord bridge.
+   */
+  readonly alerts?: { readonly queue: AlertSource; readonly ingester: AlertIngester };
   /**
    * Requests arriving from the inbound Discord bridge (§7). Optional: without a bridge
    * a question is answered by committing the file by hand.
@@ -294,6 +319,7 @@ export class Supervisor {
 
     await this.applyChatRequests();
     await this.maybeIngest();
+    await this.drainAlerts();
     await this.maybeDigest(signal);
 
     if (await this.coolingDown()) return;
@@ -401,6 +427,35 @@ export class Supervisor {
       logger.info("intake.pass", { ...(await intake.ingest("origin", config.stateRepo.branch)) });
     } catch (error) {
       logger.warn("intake.failed", { ...errorFields(error) });
+    }
+  }
+
+  /**
+   * Turn whatever the alert receiver accepted since the last poll into tasks (§20).
+   *
+   * Every tick, not on an interval of its own: the queue is in memory and already bounded
+   * by the receiver, so there is no rate limit to respect — the work is proportional to
+   * what Alertmanager actually delivered, and an empty queue costs an array swap. Ahead of
+   * the cooldown gate, like intake, because creating a task spends no tokens and a queue
+   * that keeps filling while the provider is down is the correct behaviour.
+   *
+   * Failures never propagate. An alert that cannot be filed is one task that does not
+   * exist yet and will be re-delivered while it keeps firing; a throw here would stop the
+   * runner from working the tasks it already has.
+   */
+  private async drainAlerts(): Promise<void> {
+    const { alerts, config, logger } = this.deps;
+    if (alerts === undefined) return;
+
+    const queued = alerts.queue.drain();
+    if (queued.length === 0) return;
+
+    try {
+      logger.info("alert.pass", {
+        ...(await alerts.ingester.process(queued, "origin", config.stateRepo.branch)),
+      });
+    } catch (error) {
+      logger.warn("alert.pass-failed", errorFields(error));
     }
   }
 
@@ -1937,9 +1992,11 @@ export class Supervisor {
       );
     } catch (error) {
       this.deps.logger.warn("notify.failed", {
-        // The digest is about the fleet, not about a task, so it is the one notification
-        // with nothing to name here (§19).
-        ...(notification.kind === "digest" ? {} : { task: notification.task }),
+        // A digest is about the fleet (§19) and a refused alert never became a task (§20),
+        // so those two are the notifications with nothing to name here.
+        ...(notification.kind === "digest" || notification.kind === "alert-refused"
+          ? {}
+          : { task: notification.task }),
         kind: notification.kind,
         ...errorFields(error),
       });

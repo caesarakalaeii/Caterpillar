@@ -1540,6 +1540,15 @@ journal entry so the next session sees it at all.
 | `caterpillar_context_overrun_total` | counter | **should always be 0** — see §6.1 |
 | `caterpillar_provider_outage_total{kind}` | counter | sessions the provider refused — §6.3 |
 | `caterpillar_provider_cooldown_seconds{runner}` | gauge | >0 means idle **on purpose** — §6.3 |
+| `caterpillar_alerts_received_total{alertname,outcome}` | counter | Alertmanager deliveries — §20 |
+
+`outcome` is one of `created`, `duplicate`, `refused-no-policy`, `refused-max-open`,
+`malformed`, `unauthorized`, and it is deliberately not collapsed into ok/error. The failure
+the alert path is most likely to have is an alert nobody notices has been declined four
+hundred times, and `outcome="refused-no-policy"` is the series that says so without anyone
+reading a log line. `alertname` is empty for a delivery that failed authentication or never
+parsed: there is no alertname to attribute it to, and taking one from such a body would let
+a stranger choose a label value.
 
 **Alerts**
 
@@ -1551,6 +1560,15 @@ journal entry so the next session sees it at all.
   exactly like an idle one.
 - task in `awaiting-human` > 24h — you forgot
 - `caterpillar_cost_usd_total` over per-task budget
+
+The first four of those are the natural first entries in `alerts/policy.yaml` (§20), because
+each of them is about the fleet's own code and each has a repo whose tests would demonstrate
+a fix: a context overrun is a handoff-threshold defect, a no-progress streak is usually a
+task the supervisor keeps re-claiming for a reason a session can find, and a lease age with
+no heartbeat is a supervisor that stopped. The provider-cooldown alert is the interesting
+one to leave OUT — nothing in this repo can fix an account that is out of budget, so it
+would produce a task whose honest outcome is always `ask_human`. `awaiting-human > 24h` is
+about a human rather than about the code and belongs to nobody but the operator.
 
 ### 11.1 No-progress detector
 
@@ -1741,13 +1759,26 @@ leave the supervisor, because Kubernetes RBAC cannot express "keys but not value
 
 ## 14. Task intake
 
-Four paths, all converging on a `spec.md`:
+Five paths, all converging on a `spec.md`:
 
 1. **GitHub issue** labelled `agent` → ingester renders a spec. (`caesar`)
 2. **Vikunja task** labelled `agent` → ingester renders a spec. (`electric-boogaloo`)
 3. **Discord** `/brainstorm` → refine into a plan → child tasks (§14.3). Fastest, works
    from a phone, and the only path that produces acceptance criteria by asking for them.
 4. **Hand-committed** `tasks/TASK-x/spec.md` (most control over acceptance criteria).
+5. **A firing Alertmanager alert** → `POST /alerts` on the supervisor's own webhook port →
+   policy lookup → a `kind: remediation` spec (§20). The only path with no human in it at
+   all, which is why it is also the only one that must be opted into twice: the receiver is
+   off by default and refuses to start without its bearer token, and an alert becomes a task
+   only if an operator has already written an entry for its `alertname` in the state repo's
+   `alerts/policy.yaml`. The entry supplies the workspace, the repos and the acceptance
+   commands verbatim — this path synthesises none of them. An unlisted alert is refused
+   once, durably, rather than per delivery.
+
+Path 5 answers Alertmanager in milliseconds and enqueues in memory; the spec is written on
+the supervisor's own thread of control on the next poll, because the loop owns the state repo
+working copy. Everything after the spec is identical to every other path: it is claimed,
+sessioned, gated by §12 and ends in a pull request.
 
 Tracker-sourced specs keep a back-reference (`tracker: {type, id}`) so the supervisor can
 mirror lifecycle transitions back per §9.5. The state repo remains the source of truth —
