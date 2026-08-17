@@ -36,7 +36,9 @@ import type {
 import type { ForgeFactory } from "../forge/types.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
+import type { Logger } from "../obs/log.ts";
 import type { LiveSession } from "../obs/live.ts";
+import { BoundedExecutionEnv } from "./exec.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
@@ -87,6 +89,13 @@ export interface AgentSessionRunnerOptions {
   readonly bindings: WorkspaceBindings;
   readonly metrics: AgentMetrics;
   readonly toolchain: ToolchainResolver;
+  /**
+   * Required, unlike `live`: the only evidence a command was cut off for running too long
+   * is the line this emits (DESIGN.md §6.4). A silent default would make the hang
+   * detector and a genuinely failing test indistinguishable, which is the state this was
+   * built to get out of.
+   */
+  readonly logger: Logger;
   /**
    * Where the in-flight session is published for the web view (DESIGN.md §18). Optional:
    * a runner with no web view has nothing to publish to, and the session runs identically
@@ -150,10 +159,17 @@ export class AgentSessionRunner {
       // wrapping each command would put quoting between the model and its own shell.
       const toolchain = await this.options.toolchain.resolve(spec, worktree);
       const execContext: ExecContext = {
-        env: new NodeExecutionEnv({
+        // Bounded, not bare. pi's bash tool leaves the timeout to the model and defaults
+        // to none, so this is where a command that never returns stops being able to hold
+        // the lease for hours (DESIGN.md §6.4). It covers all four spawn sites for the
+        // same reason the toolchain does — they resolve through here.
+        env: new BoundedExecutionEnv({
           cwd: worktree,
           shellPath: toolchain.shell,
           shellEnv: toolchain.env,
+          timeoutSeconds: this.options.config.limits.commandTimeoutSeconds,
+          logger: this.options.logger,
+          task: spec.id,
         }),
       };
       // A brainstorm reads and asks; it does not write. Withholding `write` and `edit`

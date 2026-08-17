@@ -130,9 +130,13 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
+| `src/llm/credentials.ts` | The rotating OAuth credential as a locked file (§9.6). |
+| `src/llm/credential-holder.ts` | The one pod that owns and refreshes it, over HTTP (§9.6). |
+| `src/llm/credential-client.ts` | A runner's read-only view of it. Never writes (§9.6). |
 | `src/llm/outage.ts` | Provider outage vs. the task's own error. Pure, no IO (§6.3). |
 | `src/supervisor/cooldown.ts` | The runner's back-off after a refusal. Pure, clock injected (§6.3). |
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
+| `src/agent/exec.ts` | The agent's shell with a per-command ceiling — the hang detector (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
@@ -236,6 +240,16 @@ awkward, the change is probably wrong.
     did it" without checking the ref — a rejected push is also what a dead network looks
     like. The asymmetry is the point: publishing twice is visible, while a day marked
     published and never published is silent, and nothing would ever revisit it (§19).
+12. **No command from the agent's shell runs without a ceiling.** pi's bash tool
+    documents its `timeout` as *"Defaults to no timeout"*, so without one the model
+    decides whether a command may block forever — and everything in the supervisor is
+    single-threaded, so a hung command stops the poll loop, the chat drain and intake
+    while the heartbeat keeps renewing the lease and `/healthz` keeps answering 200. A
+    runner that looks healthier the longer it is wedged. `BoundedExecutionEnv` both
+    defaults *and* clamps `limits.commandTimeoutSeconds` (900), in the agent's shell and
+    the review council's — it was the council's that wedged, for 2h42m, on an `npm test`
+    whose subprocess never exited. `limits.maxSessionSeconds` is the backstop, not the
+    fix: four hours is an outage, not a hang detector (§6.4).
 
 ## The web view
 
@@ -350,6 +364,47 @@ advertises it if it is there (§8.1). Listing it explicitly still works and is k
 machine that advertises it without having it gets a warning at boot rather than a silent
 correction, since it may be about to gain it.
 
+## Scaling the fleet in the cluster
+
+```bash
+kubectl -n caterpillar scale statefulset/caterpillar --replicas=4
+```
+
+Nothing else. Task claiming is a compare-and-swap on a git ref with a fencing token (§5),
+so replicas coordinate through the state repo and never with each other. Two things had to
+exist first, and both are singletons that must stay at one replica:
+
+| | Why a fleet needs it |
+|---|---|
+| `caterpillar-credentials` | Refreshing the Anthropic token **rotates the refresh token**, and the cluster has no `ReadWriteMany` storage class. N replicas would hold N copies and the first refresh would invalidate N−1 of them (§9.6). One pod owns it; runners read it over HTTP and never write. |
+| `caterpillar-nix-cache` | Every replica materialises its own `/nix`, so N replicas would fetch the same 3.8G closure N times over the public internet. A pull-through cache in front of `cache.nixos.org` makes that one internet fetch and N−1 LAN copies (§8.1). |
+
+Two config fields turn them on, and a fleet's ConfigMap carries **both** credential fields
+because one object configures the runners and the holder:
+
+```jsonc
+"llm": {
+  "credentialsUrl":  "http://caterpillar-credentials:8081",   // the RUNNERS read this
+  "credentialsPath": "/work/credentials/anthropic.json"       // the HOLDER writes this
+},
+"toolchain": {
+  "substituters": ["http://caterpillar-nix-cache/"],
+  "trustedPublicKeys": []        // none needed: the proxy passes upstream signatures through
+}
+```
+
+`credentialsUrl` **wins** in a runner. That precedence is load-bearing: a runner preferring
+the path would open a private copy on its own volume and start rotating a token its peers
+are using. A runner with only `credentialsPath` — a machine runner, a local `docker run` —
+is unchanged and fully supported.
+
+What bounds the replica count is not this repo: node disk (each replica claims its own
+`work` + `nix` volumes from a node-local storage class) and the **subscription's
+per-account rate limit**, which is shared with your own interactive usage. The fleet
+degrades rather than failing tasks when it is hit (§6.3), but many replicas contending for
+one subscription mostly produces many runners in cooldown. Scaling *down* leaves the claims
+behind — Kubernetes never deletes a StatefulSet's volumes.
+
 ## Who the fleet commits as
 
 Every commit the supervisor makes to the state repo and every commit the agent makes in a
@@ -378,6 +433,19 @@ gh api users/<slug>%5Bbot%5D --jq .id
 
 which is a **different** number from the App id in the secret: the App id names the
 application, this names the account it commits as.
+
+**And nothing it writes carries a second name.** No `Co-Authored-By` trailer, no "Generated
+with" footer, no 🤖, no model or tool name — in commit messages, PR titles and bodies,
+review comments, journal entries or code comments. The only attribution is Caterpillar
+itself, and it is already on the commit as the identity above.
+
+This is a rule in the system prompts because the default is the opposite: a model reaches
+for those trailers unprompted, having learned them from a corpus full of them, and the
+fleet was signing its work with the name of the harness it resembles. A second name in the
+message body also contradicts the configured author, which is the exact failure this
+section exists to prevent. It is enforced in three prompts — the agent's, the review
+council's shared preamble, and the digest summariser — because they publish to three
+different places (DESIGN.md §9.7).
 
 ## Verifying a GitHub App setup
 
@@ -507,7 +575,7 @@ again; the thread keeps its history and un-archives if anyone posts in it. Nothi
 repo by hand, once no lease is held.
 
 Waves describe what **may** run concurrently. One runner still works one task at a time —
-actual parallelism means scaling the Deployment, which the git-ref leasing already makes
+actual parallelism means scaling the StatefulSet, which the git-ref leasing already makes
 safe. A rejected plan creates nothing.
 
 ## Registering the slash commands

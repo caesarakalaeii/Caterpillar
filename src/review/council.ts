@@ -42,6 +42,7 @@ import type { LlmRuntime } from "../llm/models.ts";
 import { classifyProviderFailure } from "../llm/outage.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
 import { PLAN_LENSES, PR_LENSES, type Lens } from "./lenses.ts";
@@ -150,9 +151,33 @@ export class ReviewCouncil implements Council {
     // module exists to prevent (see `workspace/toolchain.ts`).
     const toolchain = await this.options.toolchain.resolve(spec, worktree);
 
-    const results = await Promise.all(
-      lenses.map((lens) => this.runReviewer(lens, worktree, prompt, spec, toolchain)),
-    );
+    // The council's own ceiling, and until it existed there was NONE (DESIGN.md §6.4).
+    // `maxSessionSeconds` in the supervisor loop wraps `runner.run` and is cleared before
+    // the council is convened, so a reviewer that hung had nothing above it at all — the
+    // implementation session was bounded at four hours and the review of it was bounded
+    // by nothing. The per-command timeout should mean this never fires; it is here
+    // because that was true of the session ceiling too, right up until it was not.
+    const deadline = new AbortController();
+    const timer = setTimeout(() => {
+      logger.error("council.timeout", {
+        task: spec.id,
+        session: state.sessions,
+        maxSeconds: this.options.config.limits.maxSessionSeconds,
+      });
+      deadline.abort();
+    }, this.options.config.limits.maxSessionSeconds * 1000);
+    timer.unref();
+
+    let results: Awaited<ReturnType<typeof this.runReviewer>>[];
+    try {
+      results = await Promise.all(
+        lenses.map((lens) =>
+          this.runReviewer(lens, worktree, prompt, spec, toolchain, deadline.signal),
+        ),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
 
     const verdict = decide(results.map((r) => r.verdict));
     const usage = results.reduce<UsageTotals>((total, r) => addUsage(total, r.usage), EMPTY_USAGE);
@@ -186,6 +211,7 @@ export class ReviewCouncil implements Council {
     prompt: string,
     spec: TaskSpec,
     toolchain: ResolvedEnv,
+    signal?: AbortSignal,
   ): Promise<{
     readonly verdict: ReviewerVerdict;
     readonly usage: UsageTotals;
@@ -199,11 +225,20 @@ export class ReviewCouncil implements Council {
     // that stopped for its own reasons still speaks through its verdict.
     const control: ControlSink = {};
 
+    // Bounded, exactly as the agent's own shell is (DESIGN.md §6.4). This is not a
+    // symmetry nicety — THIS is the shell that wedged. A reviewer ran `npm test`, one
+    // subprocess never exited, and it sat in that call for 2h42m holding the task's lease.
+    // A reviewer is told the suite has already passed and not to run it again; it ran it
+    // anyway, which is the whole argument for the ceiling living here rather than in a
+    // prompt.
     const execContext: ExecContext = {
-      env: new NodeExecutionEnv({
+      env: new BoundedExecutionEnv({
         cwd: worktree,
         shellPath: toolchain.shell,
         shellEnv: toolchain.env,
+        timeoutSeconds: config.limits.commandTimeoutSeconds,
+        logger,
+        task: spec.id,
       }),
     };
     const tools: AgentTool[] = [
@@ -228,6 +263,11 @@ export class ReviewCouncil implements Council {
           thresholdFraction: config.handoff.thresholdFraction,
         }),
         control,
+        // A reviewer cut off by the council deadline reaches the `sink.decision ===
+        // undefined` branch below and is recorded as an ABSTENTION, which is the honest
+        // reading: it did not decide. It is deliberately not an outage, so the runner
+        // does not back off from a provider that was answering fine.
+        ...(signal === undefined ? {} : { signal }),
       });
 
       if (sink.decision === undefined) {

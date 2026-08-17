@@ -149,7 +149,7 @@ export class ToolchainResolver {
     this.logger = options.logger;
     this.config = options.config;
     this.tasksDir = options.tasksDir;
-    this.baseEnv = options.baseEnv ?? process.env;
+    this.baseEnv = withBinaryCaches(options.baseEnv ?? process.env, options.config);
     this.repo = options.repo;
   }
 
@@ -562,6 +562,49 @@ interface PrintDevEnv {
  * has to live with them — the timeout next to the nix invocation it bounds, the nixpkgs
  * pin next to the flake it is substituted into.
  */
+/**
+ * Fold the configured binary caches into `NIX_CONFIG` (DESIGN.md §8.1).
+ *
+ * `NIX_CONFIG` rather than `--option` flags on the one `print-dev-env` call, for three
+ * reasons that all matter:
+ *
+ *   It reaches every nix in the session, not one. `nix-collect-garbage`, and — the real
+ *   prize — whatever the AGENT runs in its bash tool. A task whose work is `nix build`
+ *   gets the cache without the supervisor knowing that is what it is doing.
+ *
+ *   It survives `print-dev-env`. The resolved devShell environment is what the four spawn
+ *   sites inherit, and a flag on the resolver's own argv would not be in it.
+ *
+ *   It is honoured. These are `extra-substituters` and `extra-trusted-public-keys`, which
+ *   nix accepts from an untrusted caller only for a trusted user — and this image runs
+ *   SINGLE-USER nix, where `node` owns /nix and is therefore trusted. Behind a daemon
+ *   they would be silently dropped, which is worth knowing before anyone adds one.
+ *
+ * APPENDED, never assigned. The image already ships
+ * `NIX_CONFIG="experimental-features = nix-command flakes"`, and replacing it turns every
+ * flake reference into an error about an experimental feature — a failure that reads as a
+ * broken flake rather than as a clobbered variable.
+ */
+const withBinaryCaches = (
+  env: NodeJS.ProcessEnv,
+  config: ToolchainConfig,
+): NodeJS.ProcessEnv => {
+  const lines: string[] = [];
+  if (config.substituters.length > 0) {
+    lines.push(`extra-substituters = ${config.substituters.join(" ")}`);
+  }
+  if (config.trustedPublicKeys.length > 0) {
+    lines.push(`extra-trusted-public-keys = ${config.trustedPublicKeys.join(" ")}`);
+  }
+  if (lines.length === 0) return env;
+
+  const existing = env["NIX_CONFIG"];
+  return {
+    ...env,
+    NIX_CONFIG: existing === undefined ? lines.join("\n") : `${existing}\n${lines.join("\n")}`,
+  };
+};
+
 export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
   // A release branch, not `nixos-unstable`: an unattended agent that picks up a silent
   // toolchain bump produces a red acceptance run with no diff to explain it.
@@ -571,6 +614,10 @@ export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
   timeoutSeconds: 900,
   gcIntervalHours: 24,
   gcKeepDays: 14,
+  // Empty, so a machine runner and a `docker run` behave exactly as they did before this
+  // existed. The cluster fills them in; nothing else has an in-cluster cache to point at.
+  substituters: [],
+  trustedPublicKeys: [],
 };
 
 /**

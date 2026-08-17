@@ -16,7 +16,7 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
 import type { Tracker, TrackerItem, TrackerTransition } from "../tracker/types.ts";
-import { Ingester, intakeDue } from "./ingest.ts";
+import { Ingester, intakeDue, intakeRef } from "./ingest.ts";
 
 const WORKSPACE = asWorkspaceName("caesar");
 const roots: string[] = [];
@@ -338,4 +338,51 @@ test("several items in one pass produce one commit", async () => {
     1,
     "one intake pass is one commit, not one per item",
   );
+});
+
+test("runners that booted at different moments compute the SAME intake bucket", () => {
+  // The property the fleet claim rests on. If two pods bucketed from their own boot time
+  // they would contend for two different refs, both would win, and both would ingest —
+  // which is precisely the request storm the claim exists to prevent.
+  const interval = 300;
+  // Deliberately bucket-ALIGNED: the agreement is over a bucket, and starting mid-bucket
+  // would be asserting the boundary case below rather than this one.
+  const aligned = Math.floor(1_700_000_000_000 / 300_000) * 300_000;
+
+  assert.equal(intakeRef(aligned, interval), intakeRef(aligned + 40_000, interval));
+  assert.equal(intakeRef(aligned, interval), intakeRef(aligned + 299_999, interval));
+});
+
+test("two runners straddling a bucket boundary cost one extra pass, not N", () => {
+  // The honest limit of wall-clock bucketing. Runners whose intervals fire either side of
+  // a boundary land in ADJACENT buckets and both win, so a fleet of ten can ingest twice
+  // in one interval — never ten times, because everyone before the boundary shares one
+  // ref and everyone after shares the other. Two passes is ~132 requests against an
+  // ~83/min budget for a single minute, which the hourly allowance absorbs; ten passes is
+  // what would not be absorbed.
+  const interval = 300;
+  const boundary = Math.floor(1_700_000_000_000 / 300_000) * 300_000 + 300_000;
+
+  const before = new Set([
+    intakeRef(boundary - 1, interval),
+    intakeRef(boundary - 20_000, interval),
+  ]);
+  const after = new Set([intakeRef(boundary, interval), intakeRef(boundary + 20_000, interval)]);
+
+  assert.equal(before.size, 1, "everyone before the boundary contends for one ref");
+  assert.equal(after.size, 1, "everyone after it contends for one other ref");
+  assert.equal(new Set([...before, ...after]).size, 2, "at most two passes, never N");
+});
+
+test("a new interval is a new bucket, so intake is not claimed once and never again", () => {
+  const interval = 300;
+  const base = 1_700_000_000_000;
+
+  assert.notEqual(intakeRef(base, interval), intakeRef(base + 300_000, interval));
+});
+
+test("the intake ref lives under refs/intake, away from leases and digests", () => {
+  // Shares the compare-and-swap with them but must not share a namespace: a bucket number
+  // colliding with a task id would make one silently claim the other.
+  assert.match(intakeRef(1_700_000_000_000, 300), /^refs\/intake\/\d+$/);
 });
