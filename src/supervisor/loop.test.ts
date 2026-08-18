@@ -2071,3 +2071,59 @@ test("the idle sweep runs, and is told which tasks are live rather than guessing
     "a task the state repo calls done is not live, or the sweep can never remove anything",
   );
 });
+
+test("a survey that came back empty does not sweep the whole volume", async () => {
+  // The one way the live-task guard can be true and useless at the same time. `survey`
+  // skips a state that will not parse, and `listTasks` walks a CHECKOUT that a failed pull
+  // can leave empty — so "no tasks" and "the state repo is unreadable right now" arrive at
+  // the sweep as the same value, and one of those two readings means every directory on
+  // the volume is an orphan. A real state repo always holds at least the task this runner
+  // has been working, so an empty survey is evidence about the repo and not about disk.
+  //
+  // `listTasks` is the exact surface that goes quiet: it walks `tasks/` on disk and
+  // answers `[]` when the directory is not there. Overridden rather than staged with a
+  // real broken checkout because `pull` runs first on every poll and would heal it — which
+  // is itself worth knowing, and is why this failure is transient and easy to miss.
+  class BlindStore extends StateStore {
+    override listTasks(): Promise<readonly TaskId[]> {
+      return Promise.resolve([]);
+    }
+  }
+
+  const { reaper, swept } = recordingReaper();
+  const supervisor = new Supervisor({
+    config: { ...config, workspace: { reap: { intervalHours: 0, keepHours: 72 } } },
+    store: new BlindStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no task should be claimed here")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  // Several idle polls at `pollSeconds: 1` — long past the point the interval would have
+  // let a sweep through if the guard were not there.
+  await sleep(4_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(
+    swept,
+    [],
+    "an unreadable state repo must never be read as 'every worktree here is an orphan'",
+  );
+});

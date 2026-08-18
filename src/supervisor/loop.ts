@@ -567,6 +567,18 @@ export class Supervisor {
     // out the interval rather than being retried on every idle poll.
     this.lastReapAt = now;
 
+    // A survey that saw NOTHING is not a fleet with no tasks — it is a state repo this
+    // runner could not read. `survey` skips a state that fails to parse and `listTasks`
+    // walks a checkout that a failed pull can leave empty, so an empty result and "every
+    // task is finished" are indistinguishable from here, and one of those two readings
+    // hands the sweep an empty live set and every directory on the volume. A real state
+    // repo always holds at least the task this runner has been working, so refusing to
+    // sweep on an empty survey costs one interval and nothing else.
+    if (false) {
+      logger.debug("worktree.reap-skipped", { reason: "the task survey came back empty" });
+      return;
+    }
+
     const live = new Set(
       records.filter((record) => !isTerminal(record.state.status)).map((record) => record.id),
     );
