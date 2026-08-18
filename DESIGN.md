@@ -678,10 +678,14 @@ into `agent.prompt()` via pi's `abort()`:
    tool documents `timeout` as optional with **no default**, so the model decides whether
    a command may block forever — and a provider request can hang just as well as a
    command can. `npm run dev`, a test runner waiting on stdin, a
-   `nix build` against a dead cache — the promise never settles, and everything in the
-   supervisor is single-threaded, so the poll loop, the chat drain and intake stop with
-   it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
-   indicator stays on: a runner that looks healthier the longer it is wedged.
+   `nix build` against a dead cache — the promise never settles. The heartbeat keeps
+   renewing, `/healthz` keeps answering 200, and the typing indicator stays on: a runner
+   that looks healthier the longer it is wedged.
+
+   This used to take everything else down with it. The supervisor ran one loop, so the
+   chat drain, intake, alerts and the digest stopped with the session too — see *Two
+   loops* below, which is the fix and which changes what the paragraph above costs: a
+   wedged session is now a wedged session rather than a wedged runner.
 
 #### It happened, and the session ceiling was the wrong place to catch it
 
@@ -748,14 +752,145 @@ deliberately distinct from it: no provider misbehaved, so no cooldown starts. Ch
 task a session for a deploy would also count it against the no-progress streak, which is
 how a pod restart could park a task that was doing fine.
 
-**`/cancel` needs the queue read while the session runs.** `ChatInbox` is drained in the
-poll loop, which is blocked for the entire duration of a session — so a cancel sat in the
-queue until the session it was meant to stop had already finished, and the operator's
-Discord reply hung until then. `workTask` therefore watches for park requests naming its
-own task and takes only those (`takeWhere`), leaving everything else queued: the rest
-write the state repo, and this session holds the lease those writes would have to fence
-against. The reply says `cancelling`, not `parked`, because the session may take a turn
-boundary to unwind and the human is waiting on a Discord interaction.
+#### Two loops: housekeeping does not wait for a session
+
+The supervisor's `run()` was one `while`, and one iteration of it did `store.pull` →
+`chat.refresh` → `applyChatRequests` → `maybeIngest` → `drainAlerts` → `maybeDigest` →
+`claimNext` → `workTask`. `workTask` runs a whole session, which is hours, so every step
+before it lived in that session's shadow. The consequences were not hypothetical: a
+labelled GitHub issue was not ingested until the session ended (`maybeIngest` had its own
+interval, but an interval is only an interval if something consults it); a `/resume` or
+`/answer` sat unread in the `ChatInbox`; and the Discord holder claim — refreshed from
+that same loop — could neither be renewed nor stood down from, so a mid-session replica
+went on advertising itself as the holder while answering nothing (§7).
+
+The workarounds that existed confirmed the diagnosis rather than fixing it: a
+`CANCEL_POLL_MS` interval that watched for one request kind, and `yieldToBrainstorm`,
+which hands the whole runner back at a session boundary.
+
+So the timing is split in two, in `src/supervisor/loop.ts`:
+
+- **The housekeeping loop**, on `housekeepingSeconds`: `store.pull`, `chat.refresh`,
+  `applyChatRequests`, `maybeIngest`, `drainAlerts`, `maybeDigest`, and
+  `toolchain.maybeCollectGarbage()` when idle. It runs whether or not a session is in
+  flight.
+- **The work loop**, on `pollSeconds`: `store.pull` → `coolingDown` → `claimNext` →
+  `workTask`. It blocks for the session, as it always did. `pollSeconds` is now a claim
+  *backoff* — how long an idle runner waits before looking for work again — and nothing a
+  human waits on depends on it. `housekeepingSeconds` defaults to `pollSeconds` and is
+  clamped to it.
+
+  The work loop pulls too, and that is not redundant with housekeeping's pull. The single
+  loop did pull-then-claim in one pass, so a claim was always decided from a checkout
+  refreshed moments earlier; splitting the loops broke that silently, because `pull`
+  declines while the tree is dirty and the tree is dirty for the *whole* of a session. The
+  first claim after every session would then be decided from a view of `tasks/` predating
+  it. The lease CAS does not cover that gap — `isClaimable` is a filter over local state,
+  and the CAS succeeds freely once another runner has released — so a task finished
+  elsewhere hours ago looks ready and claimable, and this runner opens a session on
+  already-merged work, which §6.2 names as the worst outcome the system has. Mid-session
+  the call is a no-op `"skipped"`; it is only ever a real pull when the tree is clean,
+  which is exactly when a claim is about to be made.
+
+This is **not** task concurrency, and §6's one-session-at-a-time rule is unchanged: there
+is one work loop, so there is one `workTask`. What is concurrent is housekeeping against a
+session. Both loops contain their own failures for the reason the single loop did — a
+throw out of `run()` reaches main's `finally`, which closes `/healthz` and the credential
+socket and then blocks forever on `await bridge`, leaving a live process that polls nothing
+and that systemd never restarts because it never exited. Splitting the loop doubled the
+number of places that can happen. Both honour the same `AbortSignal`, and `run` awaits both
+so a throw that did escape ends the process rather than leaving one loop turning.
+
+**The two loops share one git checkout, and that is the hard part.** `StateStore` is a
+single working copy; `commitAndPush` stages the tree and `push` rebases on conflict. Two
+concurrent writers get `index.lock` at best and a commit carrying the other's half-written
+state at worst — exactly the reasoning §7 already gives for why the Discord bridge does not
+touch git. Two mechanisms, and both are needed:
+
+1. **A serialising mutex** (`src/state/serial.ts`) in front of every `StateStore` method
+   that runs git. A promise chain, no dependency, fair, and a throw releases it — a
+   rejected tail would make one failed push wedge every later write. It is deliberately not
+   re-entrant: a public method calling another public one is the bug, and an ownership
+   token would hide it.
+2. **`pull` declines while the tree is dirty.** Mutual exclusion says a pull does not land
+   inside a `git add`; it says nothing about one landing between a session's `writeState`
+   and the `commitAndPush` that would have persisted it, which is a window of *minutes*.
+   `pull` does `reset --hard` and `clean -ffdq` over `tasks/`, `intake/` and `alerts/`, and
+   that combination once destroyed five tasks' work outright (§4.3). So every write sets a
+   dirty flag, the commit clears it, and a pull that finds it set returns `"skipped"` and
+   tries again next tick. Skipping is cheap and safe in a way resetting is not: the state
+   repo is authoritative but never urgent, a session commits at defined points
+   (`recordSession`, `push`), and the very next housekeeping tick after one of those finds
+   a clean tree. The failure modes are not symmetrical — a deferred refresh costs one
+   interval and a taken one costs a task.
+
+   One flag covers both writers, which looks too simple and is not. `commitAndPush` stages
+   `tasks`, `intake`, `digests` and `alerts` with `add -A` — the whole of what the
+   supervisor writes — so whichever loop commits carries the other's pending files with it
+   and the tree afterwards really is clean. What the two lose is attribution, not
+   durability: a commit message occasionally undersells its contents. That is the right way
+   round.
+
+   The flag is backed by a monotonic write counter, because writes deliberately do *not*
+   take the mutex. `commitAndPush` samples the counter before its first `add` and clears
+   the flag only if it has not moved, so a write that lands *during* a commit — after the
+   `add` that would have staged it — leaves the tree marked dirty rather than being lost
+   to the next `pull`. That window is only a few subprocess spawns wide, but a session's
+   `publishArtifact` can fall into it and then go hours before its own commit.
+
+   The same counter closes the mirror-image window *inside* `pull`, and this is the one
+   that bites. `dirty` is a sample, and `pull` does a network `fetch` — hundreds of
+   milliseconds — before it touches anything. A write landing in that gap is invisible to
+   the check at the top and deleted by the `clean -ffdq` at the bottom, which is the
+   original five-task incident still reachable after the flag was added. `pullNow`
+   therefore re-reads the generation after its fetch and abandons the refresh if it moved,
+   reporting `"skipped"`. It stopped being theoretical the moment the work loop began
+   pulling before each claim: that put a pull in the same instant as a `/brainstorm`
+   creating a task, the spec was written between the fetch and the clean, and the
+   `commitAndPush` immediately after found nothing to commit and reported success — a task
+   acknowledged to a human that existed nowhere. Read it as one rule with two instances:
+   anything that samples `dirty` and then spends time before touching the tree must
+   re-check that nothing was written while it was not looking.
+
+   `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
+   needs the two to be one unit. **No production path uses it today** — the supervisor's
+   writes go through `writeState`/`appendJournal` and rely entirely on the dirty flag and
+   its counter, which is what makes sessions safe. It exists because the gap it closes is
+   real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
+   then commits can have its files swept into another writer's commit under the wrong
+   message. That costs attribution, not durability, which is precisely why the supervisor
+   accepts it rather than restructuring every session write into a held-lock unit.
+
+**`/cancel` keeps its own interval, and it is not redundant.** Housekeeping drains the
+inbox during a session now, which is what `CANCEL_POLL_MS` was built to work around — but
+not for the one request kind it exists for. A `/cancel` naming the task *this runner is
+currently running* cannot be served from housekeeping: acting on it means writing state
+under a lease the session holds, and only the session can stand down from it. So
+`applyChatRequests` leaves exactly those requests queued and takes everything else, and
+`workTask` watches for park requests naming its own task and takes only those
+(`takeWhere`). The reply says `cancelling`, not `parked`, because the session may take a
+turn boundary to unwind and the human is waiting on a Discord interaction.
+
+The watcher also wants a tighter interval than housekeeping does: it is an in-memory queue
+check, where housekeeping's interval is tuned against a git fetch and a Discord round trip.
+
+**That split depends on the queue being able to take selectively, and one cannot.**
+`RedisChatQueue.takeWhere` is a stub returning empty — a selective pop from a shared list
+is a Lua script, and it was never needed while the only caller was the in-session watcher
+(§21). Routing the whole housekeeping drain through `takeWhere` therefore drained *nothing*
+on a Redis-backed fleet for the duration of every session: `/resume`, `/answer`, `/merge`
+and `/brainstorm` all unserved, silently, on exactly the multi-replica path the split was
+aimed at. Worse, the in-session watcher polls that same stub, so an in-flight `/cancel` had
+no path at all and deleting the pod was the only way to stop a session — which strands the
+task (§6.2).
+
+So `ChatDrainer` carries an explicit `selective` flag and the loop branches on it. Where it
+is true, the behaviour above stands. Where it is false, housekeeping drains *everything*
+and routes a park naming the in-flight task to the session directly, through a handler
+`workTask` installs for its own duration and clears in its `finally`. The handler settles
+`cancelling` and aborts the session — the same two things the watcher does, because it is
+the same function. A queue that cannot take selectively must say so rather than answering
+"nothing matched" to every question.
 
 Stopping the session is **not** cancelling the task, and the difference is easy to miss:
 an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
@@ -790,12 +925,16 @@ every runner that is not this pod. A gateway connection is dialled OUT, so there
 ingress, no TLS, and no URL to leak. Node ships a global WebSocket, so it costs no
 dependency either.
 
-The bridge does **not** touch the state repo. The poll loop owns that working copy, and
-two git invocations interleaving in it is `index.lock` at best; a websocket handler
+The bridge does **not** touch the state repo. The supervisor's loops own that working copy,
+and two git invocations interleaving in it is `index.lock` at best; a websocket handler
 writing it concurrently would be a race with no owner. So a command is submitted to an
-in-process inbox, the loop drains it *before claiming* — so a task unparked by an answer
-is claimable on the same pass — and the submitter is told what actually happened. Silence
+in-process inbox, the housekeeping loop drains it — on that loop's interval, whether or not
+a session is in flight (§6.4) — and the submitter is told what actually happened. Silence
 would leave a human unable to tell a typo from an offline bridge.
+
+That argument is also why the two supervisor loops take a mutex rather than each opening
+their own checkout: they are both loops, so neither can queue for the other the way the
+bridge queues for them. See §6.4.
 
 Answering also **resets `noProgressStreak`**. `awaiting-human` is only ever reached from a
 session that produced no commit, so a task answered at the no-progress limit would park
@@ -842,16 +981,28 @@ is the same failure again.
 
 **Acknowledge in 3 seconds, deliver the outcome separately.** Discord gives an interaction
 three seconds to be answered and then keeps its token alive for fifteen minutes. The
-supervisor settles a request when its poll loop next comes round, which may be several
-hours into a session. The natural design — defer, then follow up on the interaction token —
-therefore works in testing and fails the first time a session runs long. So a click is
+supervisor settles a request when its loop next comes round. That was once several hours
+into a session; since the housekeeping split (§6.4) it is one housekeeping interval, which
+removes the pathological case but not the design. The natural design — defer, then follow
+up on the interaction token — works in testing and fails whenever settlement outruns
+fifteen minutes, and a housekeeping pass that waits on a git fetch still can. So a click is
 acknowledged immediately with what is knowable at click time, and the real outcome arrives
 afterwards as an ordinary channel message from the bot.
 
 Reads never take that path at all. `/tasks`, `/task` and autocomplete are served from an
-in-memory snapshot the loop refreshes once per poll, from the same sweep that decides what
-to claim. Going through the inbox for a listing would mean waiting on a session to finish
-before being told what it is doing.
+in-memory snapshot, refreshed by the same sweep that decides what to claim. Going through
+the inbox for a listing would mean waiting on a session to finish before being told what it
+is doing.
+
+The **housekeeping** loop refreshes it, not only the work loop (§6.4), and that is not
+belt-and-braces. The sweep publishes the snapshot on its way to picking a task, so on the
+work loop alone it stops the moment a session claims and does not run again until the
+session ends — `/tasks` would keep answering in milliseconds from a view taken hours ago,
+showing the running task as `ready` and missing every task created since. The same sweep
+publishes the thread bindings, so an `!answer` typed into a thread opened during the
+session would find no binding and be swallowed. That is this section's own defect arriving
+through the reader rather than the writer, and it is the reason a read being fast is not
+the same as a read being right.
 
 **Buttons can only come from the bot.** Discord refuses interactive components from a
 webhook the application does not own, and `webhook-url` is a webhook created in the
@@ -909,9 +1060,19 @@ back is not a recovery but a re-run of work that passed every gate and merged.
 **One replica of a fleet acts on Discord.** Every replica connects to the gateway — that
 is what keeps the bot online across a rollout, and a connection costs nothing — but
 exactly one may act on what arrives over it, decided by a compare-and-swap on
-`refs/chat/holder` (`claimStealable`) refreshed from the poll loop. The same mechanism as
-a task lease and as the digest's day ref, because the state repo is the only thing the
-fleet shares and so the only place a fleet-wide decision can be made.
+`refs/chat/holder` (`claimStealable`) refreshed from the **housekeeping** loop (§6.4). The
+same mechanism as a task lease and as the digest's day ref, because the state repo is the
+only thing the fleet shares and so the only place a fleet-wide decision can be made.
+
+It was refreshed from the single poll loop, and deliberately not from a timer of its own:
+a timer would keep renewing the claim while a session blocked the loop, advertising a
+holder that could not currently answer anything. That objection is void now, because the
+thing on the other side of the claim moved with it — the housekeeping loop IS what drains
+the inbox and applies `/resume` and `/answer`. A replica that renews here is by
+construction a replica that can answer. The arrangement it replaces had the worse failure
+anyway: renewing and *stepping down* are both the same call, so a replica that took the
+claim and then started a four-hour session did neither for four hours — it went on
+believing it was the holder while the claim went stale, online and answering nothing.
 
 Nothing said this at first, and four replicas each handled every event. Reads mostly hid
 it: Discord accepts one response per interaction token, so three replicas simply failed
@@ -1766,11 +1927,14 @@ all, and divided by the first it says what one task actually costs on disk.
 
 The `work_*` family answers the one question the supervisor could not previously answer
 about itself: where the disk went. It is produced by a directory walk
-(`workspace/usage.ts`) that is READ-ONLY, runs only from the poll loop's idle branch beside
-the nix store collection, and is rate-limited to `usage.intervalHours` — one `stat` per
-file over a tree carrying a `node_modules` per task is not something to do on the thread
-that claims work. It is bounded by `usage.deadlineSeconds` and reports what it has with
-`caterpillar_work_partial` set rather than blocking the loop or throwing the pass away.
+(`workspace/usage.ts`) that is READ-ONLY, runs only from the **work** loop's idle branch,
+and is rate-limited to `usage.intervalHours` — one `stat` per file over a tree carrying a
+`node_modules` per task is not something to do on the thread that claims work. It stayed on
+the work loop when the nix store collection moved to housekeeping (§6.4), and the asymmetry
+is deliberate: this walk spends its time inside *this* process, and housekeeping is what a
+human waiting on `/resume` is waiting for. An idle work loop has nothing better to do. It is
+bounded by `usage.deadlineSeconds` and reports what it has with `caterpillar_work_partial`
+set rather than blocking the loop or throwing the pass away.
 
 `category` is disjoint and sums to what THIS runner can account for, which is not the same
 as what the volume holds — another process on the same disk makes `work_fs_bytes` the only
@@ -2100,9 +2264,16 @@ running. Priority is a tie-break ahead of the existing order, never a replacemen
 sorting the same queue reach the same answer.
 
 *A session in flight yields at its boundary.* `workTask` drives one task through as many
-sessions as it needs, and the poll loop — with it the chat drain and the next claim — is
-blocked for all of them. So the runner checks the inbox at each session boundary and, if
-a brainstorm is waiting, puts the task back to `ready` and hands the runner over.
+sessions as it needs, and the **work** loop is blocked for all of them. Since the
+housekeeping split (§6.4) the chat drain is no longer blocked with it, so the brainstorm
+request is drained, answered and turned into a task on schedule — but the runner it needs
+is still occupied, and a claim is what only the work loop can make. So the runner checks
+the inbox at each session boundary and, if a brainstorm is waiting, puts the task back to
+`ready` and hands the runner over. Housekeeping fixed the latency of *acknowledging*; this
+fixes the latency of *starting*, and neither substitutes for the other.
+
+The check reads the queue without taking from it — the request is left for
+`applyChatRequests` on the housekeeping loop, which is what actually creates the task now.
 Deliberately not an interrupt: `/cancel` aborts a session because stopping it *is* the
 intent, whereas here the session is doing legitimate work and an interrupted session
 records nothing at all (§6.4). Waiting for the boundary costs the human the tail of one
@@ -3120,8 +3291,8 @@ requirements that happen to have one answer:
 - **A Redis outage must degrade the fleet to the single-replica arrangement, not take it
   down.** This is the one that decides the code. Every operation is bounded by a timeout and
   passes through `RedisGuard`, which turns a failure into the in-memory answer and a
-  throttled warn line. Nothing in `src/redis/` may throw into the poll loop, for the reason
-  the loop's own try/catch exists (§6, `supervisor/loop.ts`): a live process that answers
+  throttled warn line. Nothing in `src/redis/` may throw into either supervisor loop (§6.4),
+  for the reason their try/catch exists (§6, `supervisor/loop.ts`): a live process that answers
   `/healthz` and does no work is worse than a crash, because nothing restarts it.
 
 The reading of a failure is `ChatLeadership.refresh`'s (§7), one layer down. "I could not
@@ -3162,5 +3333,16 @@ the intake pass stay in-process for the reason they were put there: they write t
 repo, and the loop owns the state repo working copy.
 
 **No `takeWhere` over Redis.** Selectively removing one entry from a shared list is a Lua
-script racing every other drainer, and the one caller that needed it — a session watching
-for a cancel — has a channel now.
+script racing every other drainer, so `RedisChatQueue.takeWhere` and `some` return empty.
+
+That absence is only safe because it is **declared**, and it was not declared once. A queue
+that answers "nothing matched" to every question is indistinguishable from an empty one,
+and the housekeeping split briefly routed its entire drain through `takeWhere` while a
+session was in flight — so a Redis-backed runner served no chat request at all for the
+duration of every session, and an in-flight `/cancel` had no path whatsoever, because the
+in-session watcher polls the same stub and nothing in the process calls
+`CancelSignals.request`. `ChatDrainer.selective` exists so that a caller must decide what
+to do about it rather than silently receiving nothing; `applyChatRequests` reads it and
+drains everything, routing an in-flight cancel to the session in process (§6.4). If a real
+selective pop is ever written, that flag flips and the branch disappears — but the flag
+must never be flipped without it.

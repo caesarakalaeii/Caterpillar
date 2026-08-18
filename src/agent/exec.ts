@@ -9,9 +9,10 @@
  * This is not hypothetical. A review council reviewer ran `npm test` in a task worktree,
  * one test subprocess never exited, and the reviewer sat in that tool call for **two hours
  * and forty-two minutes** — holding the task's lease, renewing it on schedule, answering
- * `/healthz` with 200 the whole time. Everything in the supervisor is single-threaded, so
- * the poll loop, the chat drain and intake stopped with it. From outside it was
- * indistinguishable from a runner doing careful work.
+ * `/healthz` with 200 the whole time. At the time everything in the supervisor was one
+ * loop, so the chat drain and intake stopped with it too; housekeeping has since been split
+ * onto its own timer (§6.4), which contains that half of the damage but not this one — the
+ * task itself is still wedged. From outside it was indistinguishable from careful work.
  *
  * The acceptance gate never had this problem: `verifier.ts` has always passed a 15-minute
  * `timeout` to `execFile`. That asymmetry was the whole bug — the gate could not wedge and

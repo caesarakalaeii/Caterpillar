@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { GitError, type Git } from "./git.ts";
+import { Serial } from "./serial.ts";
 import {
   asTaskId,
   asWorkspaceName,
@@ -251,9 +252,122 @@ export interface SalvagedCommits {
   readonly detail: string;
 }
 
+/**
+ * The git a caller may run while it holds the checkout exclusively.
+ *
+ * Deliberately tiny. `StateStore`'s public methods each take the mutex themselves and it
+ * is not re-entrant, so calling one from inside `exclusively` deadlocks; this handle is the
+ * unlocked equivalent of the two that matter, and its narrowness is what stops the mistake
+ * being available in the first place. Plain filesystem writes on the store are fine from
+ * inside — they run no git.
+ */
+export interface ExclusiveTree {
+  commitAndPush(message: string, remote: string, branch: string): Promise<void>;
+  pull(remote: string, branch: string): Promise<"pulled" | "skipped">;
+}
+
+/**
+ * The one working copy of the state repo.
+ *
+ * **Hard invariant: every method here that runs git holds `serial` for the whole of it,
+ * and every method that WRITES the working tree marks it dirty.** Both halves became
+ * load-bearing when the supervisor split its timing into two loops (DESIGN.md §6.4): a
+ * housekeeping loop that pulls, drains chat, ingests and publishes, and a work loop that
+ * runs one session at a time. They are independent, so they run concurrently, and this is
+ * ONE checkout.
+ *
+ * Without the mutex the two interleave `git add` and `git commit` in that checkout:
+ * `index.lock` at best, and at worst a commit carrying half of the other writer's state —
+ * which is precisely the reasoning `src/supervisor/inbox.ts` gives for why the Discord
+ * bridge does not touch git at all. The bridge queues and the loop drains; these two loops
+ * cannot do that for each other, because both of them ARE loops, so they take a lock.
+ *
+ * The mutex alone is not enough for `pull`, and that is the second half. `pull` does
+ * `reset --hard` and `clean -ffdq` over `tasks/`, `intake/` and `alerts/` — see its own
+ * note about the five tasks that cost destroyed. Mutual exclusion only says the pull does
+ * not run DURING a `git add`; it says nothing about a pull landing between a session's
+ * `writeState` and the `commitAndPush` that was going to persist it, which is a window of
+ * minutes and the exact shape of the incident. So writes set `dirty`, `commitAndPush`
+ * clears it, and `pull` declines while it is set and reports that it did. The housekeeping
+ * loop simply tries again on its next tick; a session commits at defined points
+ * (`Supervisor.recordSession`, `Supervisor.push`), so the window always closes.
+ *
+ * `dirty` deliberately errs towards "yes": it is set by any write, including one whose
+ * commit later turns out to be a no-op. A pull skipped for no reason costs one interval;
+ * a pull taken for no reason costs a session.
+ *
+ * One flag is enough for two writers, and that is worth being explicit about because it
+ * looks like it should not be. Housekeeping committing a `/resume` while a session is
+ * halfway through `recordSession` clears the flag on the strength of ITS commit — and that
+ * is sound, because `stageCommitPush` stages `tasks`, `intake`, `digests` and `alerts` with
+ * `add -A`, which is the whole of what the supervisor ever writes. Whoever commits carries
+ * the other's pending files with it, so the tree afterwards is genuinely clean and the flag
+ * is not lying. What the two writers lose is attribution, not durability: one commit
+ * message undersells its contents, which is a far better trade than a destroyed task.
+ * `store.test.ts` pins it, and narrowing `add -A` to per-task pathspecs would break it —
+ * the `add -A` property is what makes one writer's commit speak for the other's files.
+ *
+ * That argument covers writes that COMPLETED before the `add`. It says nothing about a
+ * write that lands during the commit itself, and that window is real: `stageCommitPush` is
+ * several subprocess spawns wide, and store writes are plain `writeFile` + `touched()` that
+ * do NOT take the mutex — deliberately, since holding it across a session's minutes-long
+ * write-then-commit window is the deadlock `exclusively` exists to avoid. A session's
+ * `publishArtifact` landing between the `add -A tasks` and a naive `dirty = false` would be
+ * in neither the commit nor the flag, and the next housekeeping `pull` would `clean -ffdq`
+ * it away — the destroyed-task incident again, through a two-hundred-millisecond hole
+ * instead of a two-minute one. So the flag is backed by a monotonic write COUNTER
+ * (`writeGeneration`): `stageCommitPush` samples it before the first `add` and clears
+ * `dirty` only if it has not moved. A write that raced the commit leaves the flag set, the
+ * next `pull` declines, and the next commit carries the file. Erring towards "dirty" costs
+ * an interval; erring the other way costs a task.
+ *
+ * The same counter closes the mirror-image window inside `pull` itself, and for the same
+ * reason: `dirty` is a sample, and `pull` does a network `fetch` before it does anything
+ * destructive. A write landing in that gap was invisible to the check at the top and
+ * deleted by the `clean` at the bottom — the original incident, still reachable after the
+ * flag was added. `pullNow` therefore re-reads the generation after its fetch and declines
+ * the reset if it moved. Read it as one rule with two instances rather than two tricks:
+ * anything that samples `dirty` and then spends time before touching the tree must
+ * re-check that nothing was written while it was not looking.
+ *
+ * `pull` is NOT the only destructive reset in this file, and the `dirty` gate protects
+ * only that one. `rebaseOnto` — reached from `push` when the remote has moved — opens with
+ * `reset --hard HEAD`, and its salvage path resets to the remote outright. Both run under
+ * the mutex, so no other GIT command interleaves, but a session's plain `writeFile` is not
+ * under the mutex and a write landing in that window is reverted with everything else.
+ * Three things keep it acceptable rather than merely unnoticed. It is far narrower than
+ * the pull window — microseconds inside one already-running git command, against the
+ * minutes between a `writeState` and its commit. It only happens on a rejected push, which
+ * needs another runner to have written the branch in the same instant. And it is not new:
+ * `reset --hard` was what the old code did on EVERY pull, and this is the residue of that
+ * after the dangerous case was removed. Closing it properly means writes taking the mutex,
+ * which is what `exclusively` is for — so if a session is ever seen losing a write here,
+ * that is the fix, not another flag.
+ */
 export class StateStore {
   private readonly root: string;
   private readonly git: Git;
+
+  /** Serialises every git invocation in this checkout. See the class docstring. */
+  private readonly serial: Serial;
+
+  /**
+   * True once something has been written into the working tree and not yet committed.
+   *
+   * Read only by `pull`, and only to decline. See the class docstring for why mutual
+   * exclusion on its own does not cover this case.
+   */
+  private dirty = false;
+
+  /**
+   * Incremented by every write. Only ever compared with itself.
+   *
+   * This is what makes clearing `dirty` after a commit honest. Writes do not hold the
+   * mutex, so one can land in the middle of `stageCommitPush`; sampling this before the
+   * first `git add` and re-reading it after the commit is how that writer is detected and
+   * the flag left set for the next commit to clear. See the class docstring.
+   */
+  private writeGeneration = 0;
 
   /**
    * Called when `pull` had to move unmergeable local commits aside. Optional because a
@@ -274,16 +388,87 @@ export class StateStore {
    */
   private readonly runnerId: string;
 
+  /**
+   * `serial` is injected rather than always owned so that anything else sharing this
+   * checkout — the bootstrap path, a CLI verifier — can be serialised against it too. It
+   * defaults to a private one, because a store nobody shares is still a store that must
+   * not be entered twice.
+   */
   constructor(
     root: string,
     git: Git,
     onSalvage?: (event: SalvagedCommits) => void,
     runnerId?: string,
+    serial?: Serial,
   ) {
     this.root = root;
     this.git = git;
     this.onSalvage = onSalvage;
     this.runnerId = sanitiseRunnerId(runnerId ?? "local");
+    this.serial = serial ?? new Serial();
+  }
+
+  /**
+   * Run `body` with the checkout to itself, as one write-then-commit unit.
+   *
+   * **Nothing in the supervisor calls this yet**, and that is deliberate rather than an
+   * oversight — say so here so the next reader does not assume sessions are protected by
+   * it. What protects sessions is `dirty` plus its write counter: a session writes without
+   * the lock, `pull` declines while anything is uncommitted, and the cost of that route is
+   * attribution (another writer's commit may carry these files) rather than durability.
+   * This exists for a caller that cannot accept even that cost, and there is one concrete
+   * prospect rather than a hypothetical: the `reset --hard` inside `rebaseOnto` is the one
+   * destructive path the `dirty` gate does NOT cover, because it fires between an `add` and
+   * a commit that the writing session is not party to. The class docstring argues why that
+   * window is tolerable today — microseconds wide, only on a rejected push. If it ever
+   * stops being tolerable, routing session writes through here is the fix, and that is the
+   * plan this method is being kept against. If the window is closed some other way, or a
+   * year passes with no caller, delete it: an affordance with no caller and no plan is one
+   * to delete.
+   *
+   * It is the atomic form for anything that writes and then persists:
+   * the mutex on its own only says no other writer is inside a `git add`, and a caller that
+   * writes, releases, and then calls `commitAndPush` has handed the interval between the
+   * two to whoever asks next. `git add -A` stages the WHOLE tree, so that other writer's
+   * commit carries this one's half-written files under the wrong message — the mixed commit
+   * in the class docstring, arrived at without a single interleaved git call.
+   *
+   * `body` receives a handle rather than nothing because the mutex is deliberately not
+   * re-entrant (see `Serial`): calling `this.commitAndPush` from inside would deadlock, so
+   * the handle exposes the unlocked body of it instead. Nothing else on the store may be
+   * called from in here — the handle is the entire vocabulary.
+   */
+  exclusively<T>(body: (tree: ExclusiveTree) => Promise<T>): Promise<T> {
+    return this.serial.run(() =>
+      body({
+        commitAndPush: (message, remote, branch) => this.stageCommitPush(message, remote, branch),
+        pull: async (remote, branch) => {
+          // Same gate as the public `pull`, for the same reason: a caller holding the tree
+          // for a write-then-commit unit may still want a refresh at the top of it, and it
+          // is no safer here than anywhere else while something is uncommitted.
+          if (this.dirty) return "skipped";
+          await this.pullNow(remote, branch);
+          return "pulled";
+        },
+      }),
+    );
+  }
+
+  /** True while a write is waiting for its commit. Diagnostics, and `pull`'s gate. */
+  get hasUncommittedState(): boolean {
+    return this.dirty;
+  }
+
+  /**
+   * Record that the working tree has been written.
+   *
+   * Every write path calls this. It is a method rather than a bare assignment so that the
+   * one place the flag is set is greppable, and so a future write helper that forgets it
+   * is visible as an absence rather than as a missing `= true`.
+   */
+  private touched(): void {
+    this.dirty = true;
+    this.writeGeneration += 1;
   }
 
   taskDir(task: TaskId): string {
@@ -411,6 +596,7 @@ export class StateStore {
 
     await mkdir(dir, { recursive: true });
     await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
+    this.touched();
   }
 
   private intakePath(task: TaskId): string {
@@ -469,11 +655,13 @@ export class StateStore {
       `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
       "utf8",
     );
+    this.touched();
   }
 
   /** Idempotent: the success path clears unconditionally. */
   async clearIntakeRejection(task: TaskId): Promise<void> {
     await rm(this.intakePath(task), { force: true });
+    this.touched();
   }
 
   /**
@@ -547,12 +735,14 @@ export class StateStore {
       `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
       "utf8",
     );
+    this.touched();
   }
 
   /** Idempotent, like `clearIntakeRejection`: the success path clears unconditionally. */
   async clearAlertRefusal(fingerprint: string): Promise<void> {
     if (!isAlertFingerprint(fingerprint)) return;
     await rm(this.alertRefusalPath(fingerprint), { force: true });
+    this.touched();
   }
 
   /**
@@ -621,6 +811,7 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const next: TaskState = { ...state, updatedAt: new Date().toISOString() };
     await writeFile(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    this.touched();
   }
 
   /**
@@ -657,6 +848,7 @@ export class StateStore {
           encoding: "utf8",
           flag: "wx",
         });
+        this.touched();
         return;
       } catch (error: unknown) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -701,6 +893,7 @@ export class StateStore {
     const dir = this.taskDir(task);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "handoff.md"), `${body.trim()}\n`, "utf8");
+    this.touched();
   }
 
   async readIfPresent(task: TaskId, file: string): Promise<string | undefined> {
@@ -719,6 +912,7 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(session).padStart(3, "0")}.jsonl.gz`;
     await writeFile(join(dir, name), gzipSync(Buffer.from(jsonl, "utf8")));
+    this.touched();
   }
 
   /**
@@ -833,6 +1027,7 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(index).padStart(3, "0")}-question.md`;
     await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+    this.touched();
   }
 
   /** Mirror of `writeQuestion`. The file's existence is what marks a question answered. */
@@ -841,6 +1036,7 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(index).padStart(3, "0")}-answer.md`;
     await writeFile(join(dir, name), `${answer.trim()}\n`, "utf8");
+    this.touched();
   }
 
   /**
@@ -873,6 +1069,7 @@ export class StateStore {
     await mkdir(dir, { recursive: true });
     const name = `${String(index).padStart(3, "0")}-verdict.md`;
     await writeFile(join(dir, name), `${body.trim()}\n`, "utf8");
+    this.touched();
   }
 
   /** The most recent verdict, if the council has ever run on this task. */
@@ -914,6 +1111,7 @@ export class StateStore {
     }
 
     await writeFile(join(dir, name), contents);
+    this.touched();
   }
 
   async listArtifacts(task: TaskId): Promise<readonly string[]> {
@@ -946,6 +1144,7 @@ export class StateStore {
     const dir = join(this.root, "digests");
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, `${date}.md`), `${body.trimEnd()}\n`, "utf8");
+    this.touched();
   }
 
   /**
@@ -982,8 +1181,43 @@ export class StateStore {
     return readFile(path, "utf8");
   }
 
-  /** Commit and push all pending state changes with the supervisor's credential. */
-  async commitAndPush(message: string, remote: string, branch: string): Promise<void> {
+  /**
+   * Commit and push all pending state changes with the supervisor's credential.
+   *
+   * Holds the mutex for the WHOLE of stage-commit-push. Splitting it would put another
+   * writer's `git add -A` between this one's add and its commit, and the commit would then
+   * carry both — a state.json for a task this runner is not working, pushed under this
+   * runner's message. See the class docstring.
+   *
+   * `dirty` is cleared once the COMMIT lands, not once the push does, and that boundary is
+   * chosen rather than convenient. What `dirty` protects against is `pull` resetting over
+   * work that exists only in the working tree; a local commit is not in the working tree,
+   * and `pull` already goes out of its way to preserve local commits by rebasing them
+   * (§4.3). Waiting for the push instead would mean a rejected push — a forge outage, a
+   * hook, no network — left the flag set forever, and this runner would stop pulling
+   * entirely, silently, until it was restarted. That trade is the wrong way round: a
+   * rejected push is a routine event and a wedged runner is not.
+   *
+   * It is cleared inside the lock and before the push, so a push that throws still leaves
+   * a committed tree marked clean, and a `git commit` that throws leaves it dirty.
+   *
+   * And it is cleared CONDITIONALLY, on the write generation not having moved since the
+   * first `add`. Writes do not take the mutex, so a session's `publishArtifact` or
+   * `appendJournal` can land inside this method — after its file would have been staged,
+   * before the flag is cleared. Such a write is in neither the commit nor the flag, and the
+   * next `pull` would `clean -ffdq` it out of existence; a session then goes hours to its
+   * next commit with the loss already taken. Leaving the flag set costs one skipped pull.
+   */
+  commitAndPush(message: string, remote: string, branch: string): Promise<void> {
+    return this.serial.run(() => this.stageCommitPush(message, remote, branch));
+  }
+
+  /** The body of `commitAndPush`, assuming the caller already holds the mutex. */
+  private async stageCommitPush(message: string, remote: string, branch: string): Promise<void> {
+    // Sampled BEFORE the first `add`, so any write that this commit might have missed —
+    // including one racing the very first `git add` — moves it. See the docstring above.
+    const staged = this.writeGeneration;
+
     // Each path is staged only when it exists: `git add` fails the WHOLE command on a
     // pathspec that matches nothing (`fatal: pathspec 'tasks' did not match any files`),
     // and none of these directories is guaranteed. A freshly bootstrapped state repo has
@@ -1000,6 +1234,12 @@ export class StateStore {
     if (await this.git.hasUncommittedChanges()) {
       await this.git.run("commit", "-m", message);
     }
+    // Everything written into the tree BEFORE this commit began is now in it, so `pull` may
+    // safely run again: it rebases local commits rather than discarding them. If a write
+    // landed while we were committing, the generation moved and the flag stays set — that
+    // file may not be in the commit, and a pull must keep declining until one carries it.
+    if (this.writeGeneration === staged) this.dirty = false;
+
     // NOT `else return`. A clean tree does not mean there is nothing to push: after a
     // rejected push the tree is clean and the commit is still local. Returning here made
     // that loss permanent in principle — every subsequent call returned before pushing,
@@ -1052,11 +1292,18 @@ export class StateStore {
    * Replay local commits on top of the remote.
    *
    * The working tree is discarded first, deliberately. `git rebase` refuses outright on a
-   * dirty tree, and this runs from the poll loop, which would then log the same failure
+   * dirty tree, and this runs from a loop that would then log the same failure
    * and retry it forever — a livelock in the recovery path, which is worse than the
    * failure it recovers from. Discarding uncommitted changes is also exactly what the old
    * `reset --hard <remote>` did, so nothing is lost here that survived before: the point
    * of this method is protecting local COMMITS, which that reset destroyed.
+   *
+   * Since housekeeping and a session now run concurrently, be clear about who that
+   * discard can hit. The caller holds the mutex, so no other git command interleaves — but
+   * a session's `writeFile` does not take the mutex, and one landing between the `add -A`
+   * above and this reset is reverted. The window is microseconds wide and only opens on a
+   * rejected push; the class docstring says why that is accepted rather than patched, and
+   * what the real fix would be.
    */
   private async rebaseOnto(remote: string, branch: string): Promise<void> {
     await this.git.run("reset", "--hard", "HEAD");
@@ -1111,9 +1358,64 @@ export class StateStore {
    * `listTasks` enumerates the filesystem, so those became tasks the runner claimed and
    * worked while they existed nowhere in git. That happened: five of them, and the money
    * spent on them is in HANDOFF.md.
+   *
+   * **It declines outright while the working tree holds uncommitted state**, and returns
+   * `"skipped"` to say so. That is the second half of the invariant in the class docstring,
+   * and it is not the same guarantee the mutex gives. Since the supervisor's housekeeping
+   * and work loops became independent (DESIGN.md §6.4) this runs on a timer that knows
+   * nothing about the session: the mutex stops a pull from landing inside a `git add`, but
+   * a session's window between `writeState` and the `commitAndPush` that persists it is
+   * minutes long, and `reset --hard` plus `clean -ffdq` over `tasks/` inside that window
+   * destroys the session's work — which is exactly the incident above, reproduced by a
+   * timer instead of by a bug.
+   *
+   * Skipping is safe and cheap. The state repo is authoritative but not urgent: a
+   * refresh deferred by one housekeeping interval changes nothing, because a session
+   * commits at defined points (`Supervisor.recordSession`, `Supervisor.push`) and the very
+   * next tick after one of those finds a clean tree. The failure mode of the alternative
+   * is not symmetrical — it is a destroyed task.
    */
-  async pull(remote: string, branch: string): Promise<void> {
+  pull(remote: string, branch: string): Promise<"pulled" | "skipped"> {
+    return this.serial.run(async () => {
+      // Checked INSIDE the lock. Outside it, a session could take the lock between the
+      // check and the fetch, write, and be reset over by a pull that had already decided
+      // the tree was clean.
+      if (this.dirty) return "skipped";
+      return (await this.pullNow(remote, branch)) ? "pulled" : "skipped";
+    });
+  }
+
+  /**
+   * The body of `pull`. Returns whether it actually refreshed anything.
+   *
+   * Holding the mutex and having seen a clean tree is NOT enough, and this is the subtlest
+   * corner of the whole invariant. Store writes deliberately do not take the mutex, so
+   * `dirty` is only a sample of the instant it was read — and the `fetch` below is a
+   * network round trip, hundreds of milliseconds during which a write can land. The
+   * destructive part comes AFTER that, so a `writeSpec` arriving mid-fetch is deleted by
+   * the `clean -ffdq tasks` at the bottom having never been visible to the check at the
+   * top.
+   *
+   * That is not hypothetical: it is the five-destroyed-tasks incident, and it was still
+   * reachable after the `dirty` gate was added. It surfaced the moment the work loop began
+   * pulling before each claim, which put a pull in the same instant as a `/brainstorm`
+   * creating a task — the spec was written between this method's `fetch` and its `clean`,
+   * and vanished before the `commitAndPush` three lines later could stage it. The commit
+   * then found nothing to commit and reported success.
+   *
+   * So the generation is re-read after the fetch and before anything destructive, exactly
+   * as `stageCommitPush` re-reads it after its `add`. A write that raced us leaves the
+   * fetch's work in place (it is only a ref update, and harmless) and declines the reset:
+   * the tree is now genuinely dirty, so `pull`'s own gate would have refused had it been
+   * asked a moment later. Deferring a refresh costs one housekeeping interval; taking it
+   * costs a task.
+   */
+  private async pullNow(remote: string, branch: string): Promise<boolean> {
+    const before = this.writeGeneration;
     await this.git.run("fetch", remote, branch);
+    // The window the `dirty` check at the top could not see. Everything below this line
+    // reverts or deletes working-tree files.
+    if (this.writeGeneration !== before || this.dirty) return false;
 
     const ahead = await this.git.tryRun("rev-list", "--count", `${remote}/${branch}..HEAD`);
     const unpushed = ahead.code === 0 && ahead.stdout.trim() !== "0";
@@ -1138,6 +1440,7 @@ export class StateStore {
     for (const path of ["tasks", "intake", "alerts"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }
+    return true;
   }
 }
 

@@ -79,6 +79,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     ],
   ]),
   pollSeconds: 30,
+  housekeepingSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: true, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   cluster: {

@@ -91,11 +91,12 @@ export interface LimitsConfig {
    * Wall-clock ceiling on ONE session, in seconds.
    *
    * Not a budget — a hang detector. pi's bash tool documents `timeout` as optional with
-   * no default, so the model decides whether a command can block forever, and everything
-   * in the supervisor is single-threaded: a `npm run dev` that never returns stops the
-   * poll loop, the chat drain and intake with it, while the heartbeat keeps renewing the
-   * lease and /healthz keeps answering 200. Generous on purpose; a session that
-   * legitimately needs longer than this is one nobody is watching.
+   * no default, so the model decides whether a command can block forever. Housekeeping now
+   * runs on its own timer (§6.4), so a `npm run dev` that never returns no longer takes
+   * chat and intake down with it — but it still holds the work loop indefinitely, so the
+   * runner claims nothing further while the heartbeat keeps renewing the lease and /healthz
+   * keeps answering 200. Generous on purpose; a session that legitimately needs longer than
+   * this is one nobody is watching.
    */
   readonly maxSessionSeconds: number;
   /**
@@ -162,9 +163,10 @@ export interface WorkspacePathsConfig {
 export interface UsageConfig {
   /**
    * Hours between measurements. Modelled on `toolchain.gcIntervalHours` and throttled for
-   * the same reason it is: the poll loop is single-threaded, and this walk is proportional
-   * to inode count over a tree that includes one `node_modules` per task. Hourly is often
-   * enough to catch a volume filling and rare enough that nobody notices the cost.
+   * the same reason it is: this walk is proportional to inode count over a tree that
+   * includes one `node_modules` per task, and it runs on the work loop's idle branch, whose
+   * next act would otherwise be claiming a task. Hourly is often enough to catch a volume
+   * filling and rare enough that nobody notices the cost.
    *
    * 0 disables the measurement entirely — an interval of zero would otherwise mean
    * "every idle poll", which is the one setting that could actually hurt.
@@ -429,6 +431,19 @@ export interface RunnerConfig {
   readonly workspaces: ReadonlyMap<WorkspaceName, WorkspaceProfile>;
   /** Seconds between claim attempts when no task is available. */
   readonly pollSeconds: number;
+  /**
+   * Seconds between housekeeping passes — pull, chat drain, intake, alerts, digest,
+   * leadership (DESIGN.md §6.4).
+   *
+   * Its own interval because housekeeping runs on its own loop, independent of whether a
+   * session is in flight. `pollSeconds` is a floor on how often an IDLE runner looks for
+   * work, which is a throughput question; this is a ceiling on how long a human waits for
+   * `/resume` to be noticed, which is a latency one, and the two have no reason to agree.
+   *
+   * Defaults at or below `pollSeconds` for that reason: making housekeeping slower than
+   * claiming would reintroduce the very latency the split exists to remove.
+   */
+  readonly housekeepingSeconds: number;
   /** Directory of mounted secret files, keyed by `secretRef`. */
   readonly secretsDir: string;
   readonly log: LogConfig;
@@ -501,8 +516,8 @@ export interface RedisConfig {
    * Ceiling on ONE command, milliseconds.
    *
    * Short on purpose. Every read on this plane is in front of a human — Discord's
-   * interaction budget is 3 seconds — and every write is in the poll loop, which must
-   * never block on a socket that is not going to answer. Exceeding it degrades; it does
+   * interaction budget is 3 seconds — and every write is in one of the supervisor's loops,
+   * which must never block on a socket that is not going to answer. Exceeding it degrades; it does
    * not throw (`redis/guarded.ts`).
    */
   readonly commandTimeoutMs: number;
