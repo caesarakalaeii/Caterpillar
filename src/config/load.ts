@@ -68,6 +68,8 @@ interface RawConfig {
     readonly gcKeepDays?: unknown;
     readonly substituters?: unknown;
     readonly trustedPublicKeys?: unknown;
+    readonly minFreeGb?: unknown;
+    readonly maxFreeGb?: unknown;
   };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
@@ -96,6 +98,37 @@ const num = (value: unknown, field: string, fallback?: number): number => {
     throw new ConfigError(`${field} must be a finite number`);
   }
   return value;
+};
+
+/**
+ * The nix store's disk quota (DESIGN.md §8.1).
+ *
+ * Validated together rather than as two independent numbers, because the ORDER between
+ * them is the setting. `max-free` at or below `min-free` means nix has already met its
+ * target the moment it starts collecting, so it collects on every single build and frees
+ * almost nothing each time — a store that thrashes its garbage collector while still
+ * filling the disk, which reads from outside as "the quota is on and not working".
+ *
+ * Refused at boot rather than corrected, because either number could be the typo and
+ * picking one would be guessing which.
+ */
+const nixFreeSpace = (
+  toolchain: RawConfig["toolchain"],
+): { minFreeGb: number; maxFreeGb: number } => {
+  const minFreeGb = num(toolchain?.minFreeGb, "toolchain.minFreeGb", DEFAULTS.minFreeGb);
+  const maxFreeGb = num(toolchain?.maxFreeGb, "toolchain.maxFreeGb", DEFAULTS.maxFreeGb);
+
+  if (minFreeGb < 0) throw new ConfigError("toolchain.minFreeGb cannot be negative");
+  // 0 is the documented off switch, and off means neither number applies.
+  if (minFreeGb > 0 && maxFreeGb <= minFreeGb) {
+    throw new ConfigError(
+      `toolchain.maxFreeGb (${maxFreeGb}) must exceed toolchain.minFreeGb (${minFreeGb}) — ` +
+        `the gap between them is the hysteresis, and without one nix collects on every ` +
+        `build and frees almost nothing`,
+    );
+  }
+
+  return { minFreeGb, maxFreeGb };
 };
 
 /**
@@ -479,6 +512,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         raw.toolchain?.trustedPublicKeys,
         "toolchain.trustedPublicKeys",
       ),
+      ...nixFreeSpace(raw.toolchain),
     },
     stateRepo: {
       url: str(raw.stateRepo?.url, "stateRepo.url"),

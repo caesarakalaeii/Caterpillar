@@ -58,6 +58,8 @@ const CONFIG: RunnerConfig = {
     gcKeepDays: 7,
     substituters: [],
     trustedPublicKeys: [],
+    minFreeGb: 5,
+    maxFreeGb: 20,
   },
   stateRepo: {
     url: "https://github.com/acme/state.git",

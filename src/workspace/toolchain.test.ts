@@ -533,15 +533,58 @@ test("trusted keys are emitted separately from the caches that need them", async
   assert.match(config, /^extra-trusted-public-keys = cache\.invalid:AAAA other\.invalid:BBBB$/m);
 });
 
-test("no configured cache leaves NIX_CONFIG exactly as the environment had it", async () => {
+test("nothing configured at all leaves NIX_CONFIG exactly as the environment had it", async () => {
   // A machine runner and a local `docker run` have no in-cluster cache to point at, and
-  // must behave precisely as they did before this existed.
-  const untouched = await cached({}, { NIX_CONFIG: "experimental-features = flakes" }).resolve(
+  // must behave precisely as they did before any of this existed. `minFreeGb: 0` is the
+  // documented off switch and has to be given explicitly, because the quota — unlike the
+  // caches — is ON by default.
+  const off = { minFreeGb: 0 };
+
+  const untouched = await cached(off, { NIX_CONFIG: "experimental-features = flakes" }).resolve(
     spec,
     "/tmp/wt",
   );
   assert.equal(untouched.env["NIX_CONFIG"], "experimental-features = flakes");
 
-  const absent = await cached({}).resolve(spec, "/tmp/wt");
+  const absent = await cached(off).resolve(spec, "/tmp/wt");
   assert.equal(absent.env["NIX_CONFIG"], undefined);
+});
+
+test("the store quota reaches nix as min-free/max-free, in bytes", async () => {
+  // The only bound on the store that actually exists. A volumeClaimTemplate's 15Gi is a
+  // scheduling request under `local-path` and enforces nothing, so without these a store
+  // that grows to 60Gi fills the node and takes every other pod on it down.
+  const resolved = await cached({ minFreeGb: 5, maxFreeGb: 20 }).resolve(spec, "/tmp/wt");
+  const config = resolved.env["NIX_CONFIG"] ?? "";
+
+  // Plain integers, not "5G": nix silently ignores a value it cannot parse, which would
+  // leave the quota off while the config insists it is on.
+  assert.match(config, /^min-free = 5368709120$/m);
+  assert.match(config, /^max-free = 21474836480$/m);
+});
+
+test("the quota is on by default, because an unbounded store fills a node", async () => {
+  // Deliberately unlike the caches, which default to empty. A workstation runner filling
+  // a laptop's disk is the same failure as a replica filling caesar2, with a shorter fuse.
+  const resolved = await new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: DEFAULT_TOOLCHAIN_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    baseEnv: { PATH: process.env["PATH"] ?? "" },
+  }).resolve(spec, "/tmp/wt");
+
+  assert.match(resolved.env["NIX_CONFIG"] ?? "", /^min-free = \d+$/m);
+});
+
+test("minFreeGb 0 switches the quota off without switching the caches off", async () => {
+  // The two are independent levers on one variable, and a runner that turned off its
+  // cache to turn off its quota would silently start substituting from the internet.
+  const resolved = await cached({
+    minFreeGb: 0,
+    substituters: ["http://cache.invalid/"],
+  }).resolve(spec, "/tmp/wt");
+  const config = resolved.env["NIX_CONFIG"] ?? "";
+
+  assert.match(config, /extra-substituters = http:\/\/cache\.invalid\//);
+  assert.ok(!config.includes("min-free"), "the quota must be absent, not zeroed");
 });
