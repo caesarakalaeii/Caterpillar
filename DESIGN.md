@@ -91,6 +91,13 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 │    outbound: questions, parks, outcomes                    │
 │    inbound:  !answer → commits answer to state repo        │
 │                                                            │
+│  redis (HA, in namespace all-chat)   ← §21                 │
+│    the EPHEMERAL plane, and only it:                       │
+│    chat inbox, task snapshot,                              │
+│    presence, cancel signals.                               │
+│    Optional, off by default. No lease                      │
+│    and no state is ever in it.                             │
+│                                                            │
 │  intake                                                    │
 │    GitHub issues (label: agent) → task spec                │
 │    Discord /brainstorm          → plan → task specs        │
@@ -108,6 +115,12 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 
 The supervisor binary is identical everywhere; only its declared capabilities differ.
 Runners **poll outward**, so a machine behind NAT needs no inbound connectivity.
+
+Two planes, and it is worth being blunt about which is which. **Git is authoritative** for
+leases, task state, the journal and the audit trail; **Redis is ephemeral** and carries only
+what has to cross a process boundary now that the Discord bot is its own pod. A runner with
+no Redis is a supported deployment and is what the dedicated machine above actually is —
+§21 argues the split, and why the leases in §5 are not on it.
 
 ---
 
@@ -340,6 +353,12 @@ fleet has not seen before, not the journal.
 ## 5. Leasing
 
 Git has no transactions, so mutual exclusion rides on atomic ref updates.
+
+There is a Redis in the cluster and this does not use it. That is a decision rather than an
+omission, and §21 makes the case: the fence below compares an exact OID, and a key that can
+evaporate leaves nothing to compare against — a fence that fails **open**, which is the one
+way for two runners to work the same branch. Ref CAS fails **closed**: a ref that vanished is
+a ref whose `--force-with-lease` is rejected.
 
 **Claim** — succeeds only if the ref does not yet exist:
 
@@ -2497,6 +2516,12 @@ DNS and one HTTP GET per refresh rather than by a file in git. That is what make
 registry unnecessary rather than overdue: the objection was never to knowing, it was to a
 commit per runner per interval, forever.
 
+§21 adds a presence heartbeat in Redis, and it does not change any of the above. It is a
+DISPLAY: advisory, expiring, and explicitly forbidden as an input to routing or claiming.
+The sentence this section is titled with still holds in the sense it was written in — there
+is no registry anything DEPENDS on. An idle runner now appears on a page; nothing decides
+anything because of it.
+
 `state.owner` is a mirror of the lease and is never cleared (`transition` in
 `supervisor/loop.ts` stamps it and nothing unstamps it), so on a task that is not `running`
 it names the runner that worked it LAST. The view says "last run by" there rather than
@@ -2862,3 +2887,119 @@ the one about the supervisor.
 
 **No auto-merge.** The pull request is reviewed like any other. An alert firing at 03:00 is
 not a reason to lower the bar; it is a reason to have the diagnosis written down by 08:00.
+
+---
+
+## 21. The ephemeral plane, and why the leases are not on it
+
+There is now an HA Redis in the cluster's `all-chat` namespace. That is a genuinely useful
+thing to have, and the reason it exists here at all is one specific need: the Discord bot
+is becoming its own process, and a bot in a different pod from the supervisor cannot reach
+into the supervisor's heap. `ChatInbox` and `TaskSnapshot` were in-process objects because
+the bridge and the loop were in one process. They no longer are.
+
+So Redis carries what has to cross a process boundary, and only that:
+
+| | lives in Redis | lives in git |
+|---|---|---|
+| chat inbox — an intent, and the outcome that answers it | ✔ | |
+| task snapshot — the `TaskSummary[]` an autocomplete reads | ✔ | |
+| presence — which runners are alive, for display | ✔ | |
+| cancel signals — reaching a session already running | ✔ | |
+| **leases** | | ✔ |
+| **task state** — `state.json`, phase, sessions, usage | | ✔ |
+| **journal, transcripts, artifacts, audit** | | ✔ |
+
+The line is not "small things in Redis, big things in git". It is: **anything whose loss is
+a degraded display stays in Redis; anything whose loss is a lost task stays in git.**
+
+### Why the leases are not moving
+
+A Redis lock with a TTL is the textbook answer, and it is a worse answer than the one
+already here — not marginally, and not for a reason about Redis's own durability.
+
+A task in this system survives a pod restart, an exhausted context window, and a move to a
+different machine, and it survives all three for one reason: **nothing about it is in
+RAM.** The claim is a ref, the state is a file, the history is a commit. A runner that dies
+mid-session leaves a lease commit with a timestamp, and the next runner reads that
+timestamp and decides. Nobody has to be told anything. Nothing has to be handed over.
+
+`LeaseManager` claims by compare-and-swap on a ref, and `assertHeld` fences by comparing an
+**exact OID** before every irreversible act (§5.1). That comparison is the whole mechanism,
+and it needs two things: a value that is durable, and a value that is *the same one* the
+lease was granted with. A Redis key gives neither on the axis that matters. If the key
+evaporates — an eviction under `maxmemory`, a failover that loses the last second of
+writes, an operator's `FLUSHALL`, a network partition healed the wrong way — there is
+nothing left to compare against, and a fence that cannot fail is not a fence. Worse, it
+fails *open*: two runners each holding a key that no longer exists both conclude they are
+fine, and they work the same branch.
+
+The git version cannot fail that way. A ref that vanished is a ref whose CAS fails, because
+`--force-with-lease` against an OID that is not there is a rejection, not a permission. And
+a ref cannot half-exist: the failure mode of the authoritative plane is *refusal*, which
+costs a poll interval, rather than *ambiguity*, which costs a task.
+
+There is also a plainer argument. The state repo is the only thing every runner already
+shares — a machine behind NAT on someone's desk has it, and does not have the cluster's
+Redis. Moving the claim to Redis would make the fleet's central coordination unavailable to
+exactly the runner the capability system exists to include.
+
+### It has to be optional, and the tests are how that stays true
+
+`redis.enabled` defaults to false and every consumer has an in-memory implementation
+selected when it is. That is not politeness toward small deployments; it is three separate
+requirements that happen to have one answer:
+
+- A single-replica runner has no process boundary to cross, so Redis would buy it nothing
+  and cost it a dependency.
+- The whole test suite has to run on a laptop with nothing listening on 6379. The contract
+  in `src/redis/contract.test.ts` is written once and executed against both implementations,
+  so "they behave the same" is checked rather than asserted; the third run, against a real
+  server, registers only when `REDIS_TEST_URL` names one.
+- **A Redis outage must degrade the fleet to the single-replica arrangement, not take it
+  down.** This is the one that decides the code. Every operation is bounded by a timeout and
+  passes through `RedisGuard`, which turns a failure into the in-memory answer and a
+  throttled warn line. Nothing in `src/redis/` may throw into the poll loop, for the reason
+  the loop's own try/catch exists (§6, `supervisor/loop.ts`): a live process that answers
+  `/healthz` and does no work is worse than a crash, because nothing restarts it.
+
+The reading of a failure is `ChatLeadership.refresh`'s (§7), one layer down. "I could not
+reach Redis" is read as "there is no cancel pending", "no runner is present", "the snapshot
+is what I last saw" — never as an exception for somebody else to handle, and never as the
+affirmative answer. A cancel signal that defaulted to *true* on a network blip would abort a
+session every time a socket hiccuped.
+
+### Presence is advisory, and §18 still means what it said
+
+§18 says "There is no runner registry", and that stays true in the sense it was written in:
+there is no registry anything **depends** on. Presence exists so the web view and the bot
+can show which runners are alive, and it is in the same category as the log ring — useful,
+disposable, safe to be wrong. Nothing may route, claim, steal, or decide a lease is dead
+from it. A runner missing from the display is a runner whose last heartbeat did not land,
+which happens for reasons that have nothing to do with whether it is working: a paused pod,
+a slow node, a clock. Those answers come from the lease refs and only from there.
+
+### Cancels get a channel because the loop is blocked
+
+`/cancel` already worked in one process, through a two-second interval that filters the
+in-process queue while a session runs (§6.4) — and it worked *because* the submitter and the
+session were the same process. With a separate bot they are not. So a cancel is published on
+a channel and written to a key with a TTL: the channel is the fast path, and the key is what
+makes it correct, because Redis pub/sub is fire-and-forget and a session that subscribes a
+millisecond late would otherwise run to completion with a human waiting on it. The session
+checks the key once on subscribing and at turn boundaries thereafter. The in-process path is
+untouched and still runs; the two abort the same controller.
+
+### What is deliberately absent
+
+**No lease in Redis, no state in Redis, no journal in Redis.** Not as a first phase, not
+behind a flag. The argument above is not about the current Redis being insufficiently
+reliable — a more reliable one would not change it.
+
+**No Redis-backed queue for anything a human is not waiting on.** The alert queue (§20) and
+the intake pass stay in-process for the reason they were put there: they write the state
+repo, and the loop owns the state repo working copy.
+
+**No `takeWhere` over Redis.** Selectively removing one entry from a shared list is a Lua
+script racing every other drainer, and the one caller that needed it — a session watching
+for a cancel — has a channel now.

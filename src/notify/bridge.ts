@@ -20,8 +20,8 @@
  */
 import type { Logger } from "../obs/log.ts";
 import { brainstormId } from "../plan/brainstorm.ts";
-import type { ChatInbox } from "../supervisor/inbox.ts";
-import type { TaskSnapshot } from "../supervisor/snapshot.ts";
+import type { ChatSubmitter } from "../redis/inbox.ts";
+import type { SnapshotReader } from "../redis/snapshot.ts";
 import type { DiscordBot } from "./bot.ts";
 import { parseCommand, type Command } from "./commands.ts";
 import { answerModal, disableAll, type ActionRow } from "./components.ts";
@@ -43,8 +43,17 @@ import type { ThreadIndex } from "./threads.ts";
 
 export interface BridgeDeps {
   readonly bot: DiscordBot;
-  readonly inbox: ChatInbox;
-  readonly snapshot: TaskSnapshot;
+  /**
+   * Where a command that writes the state repo goes (§7).
+   *
+   * The INTERFACE rather than `ChatInbox`, because the submitter and the loop need not be
+   * the same process: with Redis configured this is a list the standalone bot pushes onto
+   * and the supervisor drains (`redis/inbox.ts`). Without it, it is the same in-process
+   * queue it has always been.
+   */
+  readonly inbox: ChatSubmitter;
+  /** Reads answered without touching git. Interface for the same reason `inbox` is. */
+  readonly snapshot: SnapshotReader;
   readonly logger: Logger;
   /** Thread ↔ task, so a reply in a thread needs no task id (§14.3). */
   readonly threads?: ThreadIndex;
@@ -140,7 +149,7 @@ export class DiscordBridge {
       await this.answer(
         interaction,
         autocomplete(
-          this.deps.snapshot.suggest(query).map((task) => ({
+          (await this.deps.snapshot.suggest(query)).map((task) => ({
             name: `${task.id} — ${task.status}`,
             value: task.id,
           })),
@@ -271,11 +280,13 @@ export class DiscordBridge {
         return command.reason;
       case "list": {
         const tasks =
-          command.status === undefined ? snapshot.all() : snapshot.withStatus(command.status);
+          command.status === undefined
+            ? await snapshot.all()
+            : await snapshot.withStatus(command.status);
         return describeList(tasks, command.status);
       }
       case "show":
-        return describeTask(command.task, snapshot.find(command.task));
+        return describeTask(command.task, await snapshot.find(command.task));
       case "answer":
         return describeOutcome(
           command.task,

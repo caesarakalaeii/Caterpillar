@@ -22,6 +22,7 @@ import type {
   CommitIdentity,
   DigestConfig,
   LlmConfig,
+  RedisConfig,
   RemediationConfig,
   RunnerConfig,
   WebConfig,
@@ -78,6 +79,7 @@ interface RawConfig {
   readonly digest?: Record<string, unknown>;
   readonly cluster?: Record<string, unknown>;
   readonly remediation?: Record<string, unknown>;
+  readonly redis?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -399,6 +401,43 @@ const remediationConfig = (remediation: Record<string, unknown>): RemediationCon
   port: port(remediation["port"], "remediation.port", 8081),
 });
 
+/**
+ * Validate the `redis` block (DESIGN.md §21).
+ *
+ * Off by default, and everything is validated whether it is on or not — `digestConfig`'s
+ * reason: a typo in a field nobody is using is otherwise discovered the day someone
+ * enables it, in the cluster, by a supervisor that throws at boot.
+ *
+ * The URL's SCHEME is checked rather than the whole thing parsed. `redis://` and
+ * `rediss://` are the two the driver understands, and an `http://` here is not a
+ * connection that fails once — it is a client that retries a nonsense endpoint forever
+ * while every read on the plane quietly times out and degrades, which looks from the logs
+ * like a Redis that is merely down.
+ */
+const redisConfig = (redis: Record<string, unknown>): RedisConfig => {
+  const url = str(redis["url"], "redis.url", "redis://localhost:6379");
+  if (!/^rediss?:\/\//.test(url)) {
+    throw new ConfigError(
+      `redis.url must start with redis:// or rediss:// (got '${url.split(":")[0] ?? ""}:...')`,
+    );
+  }
+
+  const commandTimeoutMs = num(redis["commandTimeoutMs"], "redis.commandTimeoutMs", 1000);
+  if (!Number.isInteger(commandTimeoutMs) || commandTimeoutMs < 1) {
+    throw new ConfigError("redis.commandTimeoutMs must be a positive integer");
+  }
+
+  return {
+    enabled: bool(redis["enabled"], "redis.enabled", false),
+    url,
+    ...(redis["secretRef"] === undefined
+      ? {}
+      : { secretRef: str(redis["secretRef"], "redis.secretRef") }),
+    commandTimeoutMs,
+    keyPrefix: str(redis["keyPrefix"], "redis.keyPrefix", "caterpillar:"),
+  };
+};
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -504,5 +543,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     digest: digestConfig(raw.digest ?? {}),
     cluster: clusterConfig(raw.cluster ?? {}),
     remediation: remediationConfig(raw.remediation ?? {}),
+    redis: redisConfig(raw.redis ?? {}),
   };
 };
