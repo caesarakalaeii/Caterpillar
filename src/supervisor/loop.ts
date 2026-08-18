@@ -1663,10 +1663,6 @@ export class Supervisor {
   ): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
-    if (request.repos.length === 0) {
-      return { kind: "refused", reason: "A brainstorm needs at least one repo to read." };
-    }
-
     const repos: RepoRef[] = [];
     for (const raw of request.repos) {
       const repo = parseRepo(raw);
@@ -1681,10 +1677,11 @@ export class Supervisor {
     // two of them is precisely the blast radius the workspace model exists to bound (§9.1).
     // A brainstorm that spans two is refused outright rather than narrowed to one, because
     // silently dropping a repo the human asked for produces a plan about half a system.
-    const resolved: { readonly repo: RepoRef; readonly profile: WorkspaceProfile }[] = [];
+    const byWorkspace = new Map<WorkspaceName, string[]>();
+    let profile: WorkspaceProfile | undefined;
     for (const repo of repos) {
-      const profile = resolveWorkspace(config.workspaces, repo);
-      if (profile === undefined) {
+      const owner = resolveWorkspace(config.workspaces, repo);
+      if (owner === undefined) {
         return {
           kind: "refused",
           reason:
@@ -1692,17 +1689,11 @@ export class Supervisor {
             `configured, so I cannot guess which credentials to use.`,
         };
       }
-      resolved.push({ repo, profile });
+      profile ??= owner;
+      byWorkspace.set(owner.name, [...(byWorkspace.get(owner.name) ?? []), qualifiedSlug(repo)]);
     }
 
-    const profile = (resolved[0] as { readonly profile: WorkspaceProfile }).profile;
-    if (resolved.some((entry) => entry.profile.name !== profile.name)) {
-      const byWorkspace = new Map<string, string[]>();
-      for (const entry of resolved) {
-        const slugs = byWorkspace.get(entry.profile.name) ?? [];
-        slugs.push(qualifiedSlug(entry.repo));
-        byWorkspace.set(entry.profile.name, slugs);
-      }
+    if (byWorkspace.size > 1) {
       const where = [...byWorkspace]
         .map(([name, slugs]) => `\`${name}\` (${slugs.join(", ")})`)
         .join(" and ");
@@ -1713,6 +1704,12 @@ export class Supervisor {
           `bundle, and one brainstorm session cannot hold two — run a brainstorm per ` +
           `workspace instead.`,
       };
+    }
+    // Also the empty-list refusal: `profile` is set by the loop above for every repo that
+    // resolved, so undefined here means there were none to resolve. One refusal rather
+    // than two, and it cannot drift out of step with the loop that fills it.
+    if (profile === undefined) {
+      return { kind: "refused", reason: "A brainstorm needs at least one repo to read." };
     }
 
     const id = brainstormId(request.threadId);

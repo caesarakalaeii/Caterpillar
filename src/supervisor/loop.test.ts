@@ -1704,6 +1704,27 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
   assert.match(outcome.kind === "refused" ? outcome.reason : "", /stranger/);
 });
 
+test("a brainstorm with no repos at all is refused by the loop too", async () => {
+  // The slash layer already refuses it, but the inbox is a public seam — anything that
+  // can submit a request can submit an empty list, and creating a brainstorm with nothing
+  // to read produces a plan about an imaginary codebase.
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read nothing",
+      repos: [],
+      threadId: "1538626232302960806",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /at least one repo/);
+});
+
 test("a brainstorm with an unparseable repo is refused by name", async () => {
   const store = new StateStore(statePath, stateGit);
   const outcome = await throughInbox(
