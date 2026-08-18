@@ -25,8 +25,15 @@ import {
   type Interaction,
 } from "./interactions.ts";
 
-/** Discord's application-command option types. Only strings are used here. */
+/** Discord's application-command option types. */
 const OPTION_STRING = 3;
+/**
+ * An integer, for `/tasks page:`. Typed rather than a string so the client refuses "two"
+ * before an interaction is ever sent, and `min_value` stops a 0 or a negative reaching the
+ * pagination at all — `describeList` clamps as well, because a client-side bound is a
+ * convenience and never a guarantee.
+ */
+const OPTION_INTEGER = 4;
 
 /** The modal's single field. Its id is ours to choose and must round-trip on submit. */
 export const ANSWER_FIELD = "text";
@@ -61,7 +68,7 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
   },
   {
     name: "tasks",
-    description: "List tasks and their status",
+    description: "List tasks, most recently updated first",
     options: [
       {
         name: "status",
@@ -69,6 +76,13 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
         type: OPTION_STRING,
         required: false,
         choices: STATUSES.map((status) => ({ name: status, value: status })),
+      },
+      {
+        name: "page",
+        description: "Page of the listing, 25 per page. 1 by default.",
+        type: OPTION_INTEGER,
+        required: false,
+        min_value: 1,
       },
     ],
   },
@@ -228,11 +242,17 @@ const fromCommand = (interaction: Interaction): Intent => {
     }
     case "tasks": {
       const status = optionValue(interaction, "status");
+      // Parsed defensively and dropped when it is not a number. A malformed page is not
+      // worth refusing a listing over — the default page is the one almost everybody wants,
+      // and `describeList` clamps whatever does arrive.
+      const raw = Number(optionValue(interaction, "page"));
+      const page = Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : undefined;
       return {
         kind: "run",
         command: {
           kind: "list",
           ...(status !== undefined && isStatus(status) ? { status } : {}),
+          ...(page === undefined ? {} : { page }),
         },
       };
     }

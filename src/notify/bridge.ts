@@ -283,7 +283,7 @@ export class DiscordBridge {
           command.status === undefined
             ? await snapshot.all()
             : await snapshot.withStatus(command.status);
-        return describeList(tasks, command.status);
+        return describeList(tasks, command.status, command.page);
       }
       case "show":
         return describeTask(command.task, await snapshot.find(command.task));
