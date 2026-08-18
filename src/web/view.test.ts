@@ -80,6 +80,8 @@ const CONFIG: RunnerConfig = {
     commandTimeoutSeconds: 900,
     sabotageMaxCommands: 40,
     sabotageMinFreeGb: 5,
+    ciSettleSeconds: 1200,
+    ciPollSeconds: 30,
   },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },

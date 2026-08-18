@@ -158,6 +158,8 @@ const config: RunnerConfig = {
     commandTimeoutSeconds: 900,
     sabotageMaxCommands: 40,
     sabotageMinFreeGb: 5,
+    ciSettleSeconds: 1200,
+    ciPollSeconds: 30,
   },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
@@ -4556,4 +4558,106 @@ test("a merge that fails halfway names what DID land", async () => {
   const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
   assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
   assert.match(reason, /half-landed/);
+});
+
+test("CI that has not finished releases the task instead of spending a session on it", async () => {
+  // The BS-...-07 regression, at the loop level.
+  //
+  // A pending CI run is not a rejected completion claim: gate 1 has passed, the branch
+  // will not change while nobody is working on it, and there is nothing an agent could
+  // do. Treating it as a rejection sent the task back to `ready` and started a fresh
+  // session, which could only wait — so it committed nothing and §11.1 scored it
+  // no-progress, truthfully. Three of those parked finished work behind an open PR.
+  //
+  // The fix is to stop starting those sessions, NOT to stop counting them: the detector
+  // was right about every session it was shown.
+  const WAITING = asTaskId("SMOKE-CI-1");
+  await seedTask(WAITING, { pr: { number: 12, url: "https://example.invalid/pr/12" } });
+
+  let sessions = 0;
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () => {
+        sessions += 1;
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    // Still running after the verifier's own bounded wait.
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+    },
+    // The honest probe for a session that only waited: nothing happened.
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.reject(new Error("the council must not run on a pending gate")),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(WAITING);
+    const held = await new Git(origin).tryRun("show-ref", "--verify", leaseRef(WAITING));
+    // Released: back to `ready` with the lease dropped, rather than held for another
+    // session against a CI queue.
+    if (state?.status === "ready" && state.sessions >= 1 && held.code !== 0) {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "ready", "a task waiting on CI stays claimable");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    1,
+    "the session that DID run is still scored honestly — the fix is not to fudge the count",
+  );
+  assert.equal(
+    sessions,
+    1,
+    "the runner must not start a second session while CI is still running",
+  );
+
+  // The journal must not call this a rejection: it is what the next session reads, and
+  // "REJECTED" would send an agent looking for a defect that does not exist.
+  const journal = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${WAITING}/journal/001.md`,
+  );
+  if (journal.code === 0) {
+    assert.doesNotMatch(journal.stdout, /REJECTED/);
+  }
 });

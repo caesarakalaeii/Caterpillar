@@ -65,6 +65,8 @@ interface RawConfig {
     readonly commandTimeoutSeconds?: unknown;
     readonly sabotageMaxCommands?: unknown;
     readonly sabotageMinFreeGb?: unknown;
+    readonly ciSettleSeconds?: unknown;
+    readonly ciPollSeconds?: unknown;
   };
   readonly toolchain?: {
     readonly nixpkgs?: unknown;
@@ -631,6 +633,11 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
       ),
       sabotageMaxCommands,
       sabotageMinFreeGb,
+      // 20 minutes. Comfortably longer than this repo's own CI (~5 minutes) plus time
+      // queueing behind other runs, and short enough that a check which is genuinely
+      // stuck reaches an agent within one session slot rather than pinning the runner.
+      ciSettleSeconds: num(raw.limits?.ciSettleSeconds, "limits.ciSettleSeconds", 20 * 60),
+      ciPollSeconds: num(raw.limits?.ciPollSeconds, "limits.ciPollSeconds", 30),
     },
     llm: llmConfig(llm),
     workspaces,

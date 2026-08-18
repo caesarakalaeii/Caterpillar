@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import type { WorkspaceBindings } from "../agent/runner.ts";
+import type { CheckConclusion, Forge } from "../forge/types.ts";
 import {
   asTaskId,
   asWorkspaceName,
@@ -72,12 +73,55 @@ const state: TaskState = {
 
 const NO_PR = "no pull request has been opened — call open_pr before claiming done";
 
-const verifierFor = (worktree: string, baseEnv: NodeJS.ProcessEnv): AcceptanceVerifier => {
+/** A task with a PR recorded, so gate 2 actually consults the forge. */
+const stateWithPr: TaskState = {
+  ...state,
+  pr: { number: 1, url: "https://example.invalid/pr/1" },
+};
+
+/**
+ * A forge whose CI answers come from a script, one per call, so a run that is pending
+ * and then finishes can be expressed without a clock.
+ */
+const forgeAnswering = (
+  script: readonly CheckConclusion[],
+): { readonly bindings: WorkspaceBindings; readonly calls: () => number } => {
+  let calls = 0;
+  const forge = {
+    kind: "fake",
+    checks: () => {
+      const conclusion = script[Math.min(calls, script.length - 1)] ?? "pending";
+      calls += 1;
+      return Promise.resolve({ conclusion, summary: `${conclusion}: 1 check` });
+    },
+    revoke: () => Promise.resolve(),
+  } as unknown as Forge;
+
+  return {
+    bindings: {
+      // `as never` like the sibling stub below: `ForgeFactory` also carries the repo-reach
+      // and catalogue methods, and none of them is on the path these tests exercise.
+      forges: new Map([[asWorkspaceName("test"), { forTask: () => Promise.resolve(forge) }]]) as never,
+      trackers: new Map(),
+    },
+    calls: () => calls,
+  };
+};
+
+const verifierFor = (
+  worktree: string,
+  baseEnv: NodeJS.ProcessEnv,
+  extra: {
+    readonly bindings?: WorkspaceBindings;
+    readonly ci?: ConstructorParameters<typeof AcceptanceVerifier>[0]["ci"];
+  } = {},
+): AcceptanceVerifier => {
   const worktrees = {
     ensureWorktree: (_repo: RepoRef, _task: TaskId): Promise<string> =>
       Promise.resolve(worktree),
   } as unknown as WorktreeManager;
-  const bindings: WorkspaceBindings = { forges: new Map(), trackers: new Map() };
+  const bindings: WorkspaceBindings =
+    extra.bindings ?? { forges: new Map(), trackers: new Map() };
 
   return new AcceptanceVerifier({
     worktrees,
@@ -89,6 +133,7 @@ const verifierFor = (worktree: string, baseEnv: NodeJS.ProcessEnv): AcceptanceVe
       identity: TEST_IDENTITY,
       baseEnv,
     }),
+    ...(extra.ci !== undefined ? { ci: extra.ci } : {}),
   });
 };
 
@@ -138,7 +183,6 @@ test("the acceptance shell does not source a login profile", async () => {
   assert.equal(result.detail, NO_PR);
 });
 
-/* ───────────────────────────── gate 2: CI, per repo ───────────────────────────── */
 
 const PRIMARY: RepoRef = { host: "github.com", owner: "o", name: "r" };
 const SIBLING: RepoRef = { host: "github.com", owner: "o", name: "r-extension" };
@@ -247,4 +291,106 @@ test("a repo with no CI still passes, and says so once per repo", async () => {
   assert.equal(result.passed, true, result.detail);
   assert.match(result.detail, /NOTE:/);
   assert.match(result.detail, /acceptance criteria alone/);
+});
+
+/**
+ * The pending-CI regression. BS-...-07 was parked with a green branch and an open PR
+ * because a CI run that had not finished was reported as a failed gate, the completion
+ * claim was journalled as REJECTED, and the supervisor spent a fresh session on a task
+ * whose only blocker was a queue. Each of those sessions had nothing to do, committed
+ * nothing, and was scored no-progress — truthfully. The sessions were the bug.
+ */
+test("a pending CI run is reported as pending, not as a failed gate", async () => {
+  const worktree = await scratch();
+  const { bindings } = forgeAnswering(["pending"]);
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, false);
+  // The flag is the whole point: `passed: false` alone cannot be told apart from red CI,
+  // and it was that conflation that turned a wait into a park.
+  assert.equal(result.pending, true);
+  assert.match(result.detail, /CI has not finished/);
+});
+
+test("red CI is a real rejection and is never marked pending", async () => {
+  const worktree = await scratch();
+  const { bindings } = forgeAnswering(["failure"]);
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, false);
+  assert.notEqual(result.pending, true);
+  assert.match(result.detail, /CI is red/);
+});
+
+test("the gate waits for a pending CI run and passes when it goes green", async () => {
+  const worktree = await scratch();
+  const { bindings, calls } = forgeAnswering(["pending", "pending", "success"]);
+  let clock = 0;
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+    ci: {
+      settleMs: 60_000,
+      pollMs: 1_000,
+      now: () => clock,
+      sleep: (ms: number) => {
+        clock += ms;
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, true);
+  assert.equal(calls(), 3);
+});
+
+test("waiting for CI is bounded — a run that never settles still reports pending", async () => {
+  const worktree = await scratch();
+  const { bindings } = forgeAnswering(["pending"]);
+  let clock = 0;
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+    ci: {
+      settleMs: 5_000,
+      pollMs: 1_000,
+      now: () => clock,
+      sleep: (ms: number) => {
+        clock += ms;
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.pending, true);
+  // Bounded by the budget, not left to spin: a check that never settles must reach an
+  // agent rather than pin the runner forever.
+  assert.equal(clock, 5_000);
+});
+
+test("a failing acceptance command is never blamed on CI", async () => {
+  // Gate 1 short-circuits, so a red acceptance run must not consult the forge at all —
+  // otherwise a broken build would wait out the CI budget before reporting itself.
+  const worktree = await scratch();
+  const { bindings, calls } = forgeAnswering(["pending"]);
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+    ci: { settleMs: 60_000, pollMs: 1_000 },
+  });
+
+  const result = await verifier.verify(specWith(["exit 1"]), stateWithPr);
+
+  assert.equal(result.passed, false);
+  assert.notEqual(result.pending, true);
+  assert.equal(calls(), 0);
 });

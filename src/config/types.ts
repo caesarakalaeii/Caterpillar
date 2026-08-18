@@ -140,6 +140,23 @@ export interface LimitsConfig {
    * machine with one replica and nothing to fill.
    */
   readonly sabotageMinFreeGb: number;
+  /**
+   * How long the completion gate waits for a PENDING CI run to settle, in seconds.
+   *
+   * A pending check is not a rejection: §12's first gate has already passed and there
+   * is nothing for an agent to fix, so spending a session on it produces a session that
+   * commits nothing and is scored as no-progress. Three of those parked BS-...-07 while
+   * its PR sat waiting on a CI queue — the work was finished and the detector was right
+   * about every session it saw; the sessions should never have been started.
+   *
+   * So the supervisor waits here instead, in the same session slot, the way
+   * `ProviderCooldown` waits out a provider. Bounded: past this the claim is rejected
+   * normally, because a check that never settles is a real problem an agent should be
+   * told about rather than something to block the runner forever.
+   */
+  readonly ciSettleSeconds: number;
+  /** Gap between polls of a pending CI run, in seconds. */
+  readonly ciPollSeconds: number;
 }
 
 export interface StateRepoConfig {

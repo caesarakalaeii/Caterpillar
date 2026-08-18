@@ -10,7 +10,7 @@
  */
 import { execFile } from "node:child_process";
 import { repoSlug, taskPullRequests, type RepoRef, type TaskSpec, type TaskState } from "../domain/task.ts";
-import type { Forge, ForgeFactory } from "../forge/types.ts";
+import type { CheckStatus, Forge, ForgeFactory } from "../forge/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import {
   TASK_SHELL_ARGS,
@@ -23,6 +23,20 @@ export interface VerificationResult {
   readonly passed: boolean;
   readonly detail: string;
   readonly prUrl?: string;
+  /**
+   * True when the gate reached no verdict because CI has not finished — as distinct
+   * from a verdict of "no".
+   *
+   * These are not the same event and treating them alike is what parked BS-...-07: a
+   * pending run was journalled as a rejected completion claim, the task went back to
+   * `ready`, and a fresh session was spent on a task whose only blocker was a CI queue.
+   * That session had nothing to do, committed nothing, and was scored no-progress
+   * — correctly, by §11.1's definition. Three of them parked finished work.
+   *
+   * A caller that cannot wait may treat this as `passed: false` and lose nothing; a
+   * caller that can should wait instead of burning a session.
+   */
+  readonly pending?: boolean;
 }
 
 export interface CommandResult {
@@ -60,7 +74,27 @@ export interface AcceptanceVerifierOptions {
    * (see `workspace/toolchain.ts`).
    */
   readonly toolchain: ToolchainResolver;
+  /**
+   * How long to wait for a pending CI run before giving up and reporting it, and how
+   * often to re-ask. Omitted means do not wait at all, which is the old behaviour and
+   * what the unit tests want.
+   */
+  readonly ci?: CiWaitOptions;
 }
+
+export interface CiWaitOptions {
+  readonly settleMs: number;
+  readonly pollMs: number;
+  /** Injected so the wait is testable without spending the wall clock. */
+  readonly now?: () => number;
+  readonly sleep?: (ms: number) => Promise<void>;
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 
 export class AcceptanceVerifier {
   private readonly options: AcceptanceVerifierOptions;
@@ -133,7 +167,7 @@ export class AcceptanceVerifier {
     try {
       const notes: string[] = [];
       for (const pr of prs) {
-        const status = await forge.checks(pr.repo, `agent/${spec.id}`);
+        const status = await this.awaitChecks(forge, pr.repo, spec);
         const where = prs.length === 1 ? "" : `${repoSlug(pr.repo)}: `;
 
         switch (status.conclusion) {
@@ -144,7 +178,11 @@ export class AcceptanceVerifier {
           // session is told to fix, and a red suite in one repo is a full session's work
           // whether or not the other is also red.
           case "pending":
-            return { passed: false, detail: `CI has not finished — ${where}${status.summary}` };
+            return {
+              passed: false,
+              pending: true,
+              detail: `CI has not finished — ${where}${status.summary}`,
+            };
           case "failure":
             return { passed: false, detail: `CI is red — ${where}${status.summary}` };
           case "none":
@@ -167,6 +205,48 @@ export class AcceptanceVerifier {
     } finally {
       await forge.revoke().catch(() => undefined);
     }
+  }
+
+  /**
+   * Ask the forge for CI, and keep asking while it says "still running".
+   *
+   * The wait belongs HERE rather than in the loop because a pending run is a property
+   * of the gate, not of the agent: gate 1 has already passed, the branch is not going
+   * to change while nobody is working on it, and the only thing separating this task
+   * from a verdict is time. Returning "not passed" and letting the supervisor start
+   * another session spends a session to do nothing but sleep, and §11.1 then scores
+   * that session honestly and parks the task — which is exactly what happened to
+   * BS-...-07 with a green branch and an open PR.
+   *
+   * Bounded by `settleMs`: a check that never settles is reported pending, the claim is
+   * rejected as before, and an agent gets told. Waiting forever would trade a spurious
+   * park for a wedged runner.
+   *
+   * The budget is per repo, not per gate, because `checkCi` calls this once for each repo
+   * the task opened a PR in (§9.4.1). A two-repo task can therefore wait up to twice
+   * `settleMs` in the worst case. That is deliberate: the repos' CI runs are independent,
+   * and a shared budget would let a slow first repo spend the whole allowance and report
+   * the second as pending without ever having asked it twice.
+   */
+  private async awaitChecks(forge: Forge, repo: RepoRef, spec: TaskSpec): Promise<CheckStatus> {
+    const ci = this.options.ci;
+    const ref = `agent/${spec.id}`;
+    let status = await forge.checks(repo, ref);
+    if (ci === undefined || ci.settleMs <= 0) return status;
+
+    const now = ci.now ?? Date.now;
+    const sleep = ci.sleep ?? realSleep;
+    const deadline = now() + ci.settleMs;
+
+    while (status.conclusion === "pending" && now() < deadline) {
+      // Never overshoot the deadline: with a long poll interval and a short budget the
+      // wait would otherwise last the interval rather than the budget.
+      const remaining = deadline - now();
+      await sleep(Math.min(ci.pollMs, remaining));
+      status = await forge.checks(repo, ref);
+    }
+
+    return status;
   }
 }
 
