@@ -242,3 +242,22 @@ test("the nix store path is where nix would look for it", async () => {
   assert.equal(nixStoreDir({}), "/nix/store");
   assert.equal(nixStoreDir({ NIX_STORE_DIR: "/mnt/nix/store" }), "/mnt/nix/store");
 });
+
+test("an interval of zero turns the measurement off rather than running it constantly", async () => {
+  // 0 would otherwise mean "every idle poll", which at the default poll interval is the
+  // one setting that could actually hurt. An operator reaching for 0 wants less, not more.
+  const { root, mirrorsDir, tasksDir } = await workRoot();
+  let clock = 1_000_000;
+  const monitor = new UsageMonitor({
+    workRoot: root,
+    mirrorsDir,
+    tasksDir,
+    intervalHours: 0,
+    now: () => clock,
+  });
+
+  assert.equal(await monitor.maybeMeasure(), undefined);
+  clock += 24 * 60 * 60 * 1000;
+  assert.equal(await monitor.maybeMeasure(), undefined, "still off a day later");
+  assert.equal(monitor.current(), undefined, "and there is nothing for the page to show");
+});
