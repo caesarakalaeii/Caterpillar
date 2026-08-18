@@ -40,7 +40,7 @@ import {
   type Chrome,
   type Page,
 } from "../web/pages.ts";
-import { parseTranscript } from "../web/transcript.ts";
+import type { TranscriptEntry } from "../web/transcript.ts";
 import type { DigestView, DiskView, IntakeView, RunnerExport, TaskDetail } from "../web/view.ts";
 import type { Aggregator } from "./aggregate.ts";
 import { fleetWithRunners, runnerFrom, viewerLogsPage } from "./pages.ts";
@@ -317,9 +317,9 @@ const handleTask = async (
 
     if (route.api) return json(200, value);
 
-    // The runner's `/api/tasks/<id>/sessions/<n>` already returns parsed entries, so this
-    // renders them; `parseTranscript` stays imported for the raw path's tests to lean on
-    // the same parser the runner used.
+    // The runner already parsed the transcript — `/api/tasks/<id>/sessions/<n>` returns
+    // entries, not JSONL — so this renders them rather than re-parsing. One parser, on the
+    // side that owns the file; two would eventually disagree about what a tool call is.
     const detail = await options.aggregator.fromAny<TaskDetail>({
       ...forward,
       path: `/api/tasks/${route.id}`,
@@ -332,7 +332,7 @@ const handleTask = async (
         task: route.id,
         session: ordinal,
         sessions: detail.value?.sessions ?? [],
-        entries: value.entries as ReturnType<typeof parseTranscript>,
+        entries: value.entries as readonly TranscriptEntry[],
       }),
       200,
       user,
