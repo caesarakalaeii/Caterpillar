@@ -2084,6 +2084,45 @@ Ordering inside a single ingest is load-bearing: `state.json` is written first a
 a task the claim loop skips and the next pass recreates cleanly; the reverse order would
 wedge the item as permanently existing and never claimable.
 
+### 14.5 A refusal that nobody can see is a refusal that did not happen
+
+Everything above is durable and none of it was *visible*. A refused item was a warn line in
+one pod's stdout, a JSON file in the state repo, and a comment on a tracker item nobody is
+watching — so a fleet whose only labelled issue was refused looked exactly like a fleet
+nobody had given work to. That is how this was reported: "I have never seen an agent pick up
+an issue", about a fleet that had worked an issue across five sessions and opened a PR.
+
+Three things changed, and each of them is the smallest one that answers the question.
+
+**The refusal record grew the fields a page needs.** `{digest, reason, at}` could not be
+rendered as anything but text: `GH-caesarakalaeii-all-chat-724` does not say where the owner
+ends and the repo begins, so nothing could link to the item being refused. `url`, `title`
+and `workspace` are now written too, and all three are **optional** on read. That is not
+tidiness: the digest is the suppression key, a record whose *shape* changed must not read as
+a record whose *item* changed, or the first poll after a deploy re-comments on every open
+refusal — the exact spam §14.2 exists to prevent. `listIntakeRejections()` is the mirror of
+the `listAlertRefusals()` the alert path already had.
+
+**The pass is remembered, in memory, for one runner.** `IntakePass {seen, created, rejected,
+failed}` was returned, logged once, and discarded; `seen` is the field that separates
+"nobody labelled anything" from "the tracker returned three items and none became tasks".
+It is now held by `IntakeStatus` alongside the timestamp and the `refs/intake/<bucket>` this
+runner contended for, and rendered as one line on the fleet page. **Not in git**, for the
+reason §18 gives for not writing a runner registry: a record committed every interval is a
+commit per runner per interval forever, and a pass that mattered is already durable as a
+task or as a refusal record. A runner that *lost* the claim records that fact rather than a
+pass of zero — on a fleet of four, three do so every interval, and zeroes would report a
+working intake as a broken one.
+
+**Intake got a metric.** It had none, which made it the only path Grafana could not answer a
+question about. `caterpillar_intake_total{workspace,outcome}` counts decisions with
+`outcome ∈ created|rejected|skipped` — the three answers `ingestItem` already returns,
+uncollapsed, because `skipped` is the normal case and `rejected` is the one that needs a
+human. `caterpillar_intake_items{workspace}` is a **gauge** of `seen`: counters only grow,
+so a tracker that has gone quiet looks identical to one nobody is polling, while a gauge
+goes back to zero when the last labelled item becomes a task. Only the runner that won the
+interval publishes it, so aggregate it with `max` and not `sum`.
+
 ---
 
 ## 15. Risks and open questions
@@ -2328,6 +2367,49 @@ unbounded copy of every transcript. The tap is `SessionOptions.onMessage`, calle
 `message_end` subscription that was already there for usage accounting — and wrapped in a
 `try`, because an observer that throws would tear down pi's event dispatch mid-session,
 which is a live view costing the task it was watching.
+
+### `/intake`, the page for the paths that produce nothing
+
+Every other page here answers a question about a task that exists. `/intake` answers the one
+asked when none does: *I labelled an issue / an alert fired, and nothing happened.* It is fed
+entirely by records that already existed and that nothing rendered.
+
+- **Refused tracker items** (`intake/<task-id>.json`, §14.5) — with a link back to the item,
+  which is what the record's new `url` field is for.
+- **The alert ledger** (`alerts/refusals/`). The directory is misnamed: `queue.ts` writes a
+  record on the success path too (`reason: "created"`, with `task`), so it is a complete list
+  of every alert this fleet has decided anything about, refusals and tasks alike.
+- **Which alerts are opted in** (`alerts/policy.yaml`, §20). An operator learns here that an
+  alert fired and was refused because it was never listed. A **missing** file is rendered as
+  that sentence with the runbook next to it rather than as an empty table — "nobody listed
+  it" is the refusal least likely to be guessed, and an empty table reads as "nothing has
+  happened". A file that does not *parse* is rendered as its `PolicyParseError` for the same
+  reason: the poll loop catches that error into a log nobody is reading.
+- **Whether the receiver is listening.** `remediation.enabled` and the `cluster` bounds are
+  now on `/runner` and on this page. A disabled receiver is the single most likely reason a
+  firing alert produced nothing, and it was invisible.
+
+The page is a new front door to agent-authored bytes and inherits every rule above verbatim:
+an alertname is whatever a Prometheus rule's template produced and a refusal reason quotes a
+tracker item anyone with an account can edit. Its tests assert the escaping again rather than
+trusting `html.ts` to have been reached.
+
+### A task says where it came from
+
+`TaskSpec.tracker` has been on every ingested task since intake shipped and no page rendered
+it. There are four ways a task can exist — a labelled tracker item, a brainstorm's plan, a
+firing alert, a hand-committed spec — and the fleet page could not distinguish work a human
+asked for from work the fleet proposed to itself.
+
+The source is decided from the spec, not from the id: `kind` is authoritative for a
+brainstorm and a remediation task, and `spec.tracker` identifies an ingested one because
+`kind: implement` is also what a hand-committed spec defaults to. The **link** is recovered
+from the goal's prose (`Tracker item: …`, `- Rule: …`), because a `TrackerRef` carries no
+URL and a `FiringAlert`'s `generatorURL` is written into the goal and nowhere else; for
+`github-issues` the ref alone is enough to rebuild it as a fallback. Vikunja's is not — its
+web address depends on the instance's frontend — and a guessed link that 404s is worse than
+the plain text it falls back to. An alert task's **alertname** comes from the ledger, since
+`ALERT-<fingerprint>` is a hash and cannot carry one.
 
 ### There is no runner registry
 

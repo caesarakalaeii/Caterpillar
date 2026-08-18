@@ -94,6 +94,7 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | Thread chat + typing indicator | deployed; thread answering exercised (3 answers) |
 | Artifact channel, small path (§17) | merged; **never used** |
 | Runner installer (§8) | merged; **no second runner exists yet** |
+| **Web view (§18)** | implemented and deployed — fleet, task, session, logs, runner, digests, and **`/intake`**: what intake and the alert receiver refused, and when intake last ran |
 | **Daily digest (§19)** | implemented and tested; **off until the ConfigMap enables it** — nothing is published yet |
 | Container image + CI | built and pushed by CI on every push to `main` |
 | Deployment | **LIVE** |
@@ -283,6 +284,16 @@ acceptance:             # REQUIRED — at least one command that must exit 0
 An item without acceptance criteria is **refused** and commented on **once**, because a task
 with no machine-checkable criteria can never satisfy §12. Refusals are recorded at
 `intake/<task-id>.json`, keyed by a digest of title and body; editing the item re-opens it.
+
+**A refusal shows up on `/intake`.** That is where to look when a labelled item produced
+nothing: the page renders every record under `intake/` with a link back to the item, the
+alert ledger (`alerts/refusals/`, which records the success path too, not only refusals),
+which alertnames `alerts/policy.yaml` opts in — or that the file is absent — and whether the
+alert receiver is listening at all. The fleet page carries one line saying when intake last
+ran on that runner and what it saw. On a fleet of four, three runners report "another runner
+served this interval" per interval; that is the design (one runner wins `refs/intake/<bucket>`)
+and not a fault. Grafana has the same facts in `caterpillar_intake_total{workspace,outcome}`
+and `caterpillar_intake_items{workspace}`.
 **In Vikunja the `agent` marker must be the first line INSIDE a code block** — TipTap cannot
 put text on the fence line.
 
