@@ -96,6 +96,12 @@ export class InMemoryCancelSignals implements CancelSignals {
     watchers.add(onCancel);
     this.watchers.set(task, watchers);
 
+    // Fire immediately for a cancel that is ALREADY pending, matching the Redis
+    // implementation's post-subscribe key check. Without it the two sides of the
+    // interface disagree about a session that starts just after a `/cancel` was
+    // submitted, and the in-memory one is the side that runs to completion.
+    if (this.pending.has(task)) onCancel();
+
     return Promise.resolve({
       close: (): Promise<void> => {
         watchers.delete(onCancel);

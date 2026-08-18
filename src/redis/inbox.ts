@@ -211,9 +211,12 @@ export class RedisChatQueue implements ChatQueue {
   /** Race the subscription against the give-up timer, re-reading the key before failing. */
   private async await(outcome: Promise<ChatOutcome>, channel: string): Promise<ChatOutcome> {
     let timer: NodeJS.Timeout | undefined;
+    // NOT unref'd. This timer is the only thing that will ever settle a submission the
+    // loop never answers, and an unref'd one lets the process exit with the submitter's
+    // promise pending forever — which reads to the caller as a hang, not a timeout.
+    // Cleared in the `finally` below, so it cannot hold a finished process open either.
     const expiry = new Promise<undefined>((resolve) => {
       timer = setTimeout(() => resolve(undefined), this.submitTimeoutMs);
-      timer.unref();
     });
 
     try {

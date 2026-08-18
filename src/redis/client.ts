@@ -114,9 +114,12 @@ export const withTimeout = async <T>(
   try {
     return await Promise.race([
       work,
+      // NOT unref'd. This timer is the only thing that will reject a command the driver
+      // never settles, and an unref'd one lets the process exit with the caller's promise
+      // still pending — a hang, which is the exact failure the timeout exists to prevent.
+      // The `finally` below clears it, so it can never hold a finished process open.
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new RedisTimeoutError(operation, ms)), ms);
-        timer.unref();
       }),
     ]);
   } finally {
