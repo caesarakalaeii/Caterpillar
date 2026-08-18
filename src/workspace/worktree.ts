@@ -201,7 +201,24 @@ export class WorktreeManager {
     }
 
     const mirror = this.git.at(path);
-    await mirror.run("fetch", "--prune", "origin", ...(await this.refspecs(mirror)));
+    // The REFRESH needs the credential helper exactly as much as the clone above does, and
+    // this line is why it has to be passed rather than read from config: since the helper
+    // became per-task it lives in each worktree's `config.worktree` (`configureTask`), and
+    // a mirror is not a worktree — `configureShared` writes it nowhere. So a fetch with no
+    // `-c` goes out ANONYMOUS and a private repo answers `could not read Username`.
+    //
+    // The shape of the bug is what made it worth a comment: the clone path authenticates,
+    // so a repo's FIRST task succeeded and built the mirror, and every task afterwards
+    // failed on the refresh. That reads as "the second task on a repo is broken" rather
+    // than as a credential problem, and the tests did not catch it because a `file://`
+    // origin needs no credential to fetch from.
+    await mirror.run(
+      ...this.credentialArgs(task),
+      "fetch",
+      "--prune",
+      "origin",
+      ...(await this.refspecs(mirror)),
+    );
     return path;
   }
 
