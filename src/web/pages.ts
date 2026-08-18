@@ -564,6 +564,7 @@ export const runnerPage = (exported: RunnerExport): Html => html`<main>
       <div><dt>nixpkgs</dt><dd>${exported.toolchain.nixpkgs}</dd></div>
       <div><dt>resolve timeout</dt><dd>${exported.toolchain.timeoutSeconds}s</dd></div>
       <div><dt>store gc</dt><dd>every ${exported.toolchain.gcIntervalHours}h, keep ${exported.toolchain.gcKeepDays}d</dd></div>
+      <div><dt>worktree reap</dt><dd>every ${exported.workspace.reap.intervalHours}h, keep ${exported.workspace.reap.keepHours}h</dd></div>
       <div><dt>mirrors</dt><dd>${exported.paths.mirrors}</dd></div>
       <div><dt>worktrees</dt><dd>${exported.paths.tasks}</dd></div>
     </dl>

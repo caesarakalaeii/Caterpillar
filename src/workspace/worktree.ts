@@ -5,12 +5,51 @@
  * Session starts cost a fetch rather than a clone, tasks stay isolated, and a
  * corrupted worktree is discardable without touching the mirror.
  */
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Git } from "../state/git.ts";
-import type { CommitIdentity } from "../config/types.ts";
-import type { RepoRef, TaskId } from "../domain/task.ts";
+import type { CommitIdentity, WorktreeReapConfig } from "../config/types.ts";
+import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
+
+/**
+ * Defaults for worktree reaping, and the reasoning behind each number.
+ *
+ * The interval matches `DEFAULT_TOOLCHAIN_CONFIG.gcIntervalHours` deliberately: both
+ * sweeps are janitorial, both only ever run on an idle poll, and an operator reading the
+ * two lines in the web view should not have to wonder why they disagree.
+ *
+ * The keep-age does NOT match `gcKeepDays`. A store path is shared by every task that
+ * resolved the same environment, so keeping it two weeks is cheap and re-fetching it is
+ * expensive; a worktree belongs to exactly one task, and a task whose directory has not
+ * been touched in three days is either finished (in which case the targeted removal
+ * failed to run, which is what the sweep exists for) or so far from resuming that a fresh
+ * clone costs less than the disk. Three days also comfortably outlives a weekend, which
+ * is the realistic gap between a task parking for a human on Friday and being answered.
+ */
+export const DEFAULT_REAP_CONFIG: WorktreeReapConfig = {
+  intervalHours: 24,
+  keepHours: 72,
+};
+
+/** What one reap actually removed. Reported by the caller as a log line and a metric. */
+export interface ReapResult {
+  /** Task directories removed — not repos. One task with four repos counts once. */
+  readonly worktrees: number;
+  /**
+   * Bytes reclaimed, measured BEFORE the removal by walking the tree.
+   *
+   * Apparent size (`stat.size` summed over regular files), not blocks on disk: the number
+   * exists to tell an operator whether reaping is worth anything, and a walk that also
+   * asked about sparseness and hard links would cost more than the removal it precedes.
+   * It is an estimate and the log line says so by naming it `approxBytes`.
+   */
+  readonly bytes: number;
+  /** Task ids removed, for the log line. Bounded by what one sweep found. */
+  readonly tasks: readonly TaskId[];
+}
+
+const EMPTY_REAP: ReapResult = { worktrees: 0, bytes: 0, tasks: [] };
 
 /** Where a task's repos landed. `root` is the agent's working directory. */
 export interface TaskCheckout {
@@ -28,6 +67,13 @@ export interface WorktreeOptions {
   /** Unix socket the helper talks to. */
   readonly socketPath: string;
   readonly identity: CommitIdentity;
+  /**
+   * When finished worktrees are thrown away. Optional, defaulting to
+   * `DEFAULT_REAP_CONFIG`, because every caller that only creates worktrees — the
+   * verifier, the progress probe, the digest's mirror reader — has no opinion about it
+   * and should not have to hold one.
+   */
+  readonly reap?: WorktreeReapConfig;
 }
 
 const mirrorPath = (mirrorsDir: string, repo: RepoRef): string =>
@@ -374,6 +420,206 @@ export class WorktreeManager {
   }
 
   /**
+   * Throw away everything one task left on this runner's disk.
+   *
+   * The targeted half of DESIGN.md §2's worktree reaping, called from the supervisor the
+   * moment a task reaches a state it will not resume from IN PLACE — done, failed, or a
+   * lease another runner has taken. Deliberately not called on handoff or on
+   * `awaiting-human`: those sessions resume against this very checkout, and reaping there
+   * would trade a few gigabytes for a re-clone and a re-install on every single handoff,
+   * which is the opposite of the trade this is making.
+   *
+   * `removeWorktree` alone is not enough, and that is the part worth reading `checkout()`
+   * for. It removes `<tasksDir>/<task>/<repo.name>` for the repos it is handed, but a
+   * multi-repo task also has:
+   *
+   *   - `<root>/repos/<name>` for every sibling, each a linked worktree of its own mirror
+   *     with its own administrative record — `<root>` being the FIRST repo's worktree, so
+   *     removing that one takes the siblings' directories with it while leaving every
+   *     sibling mirror still believing its worktree exists;
+   *   - `<tasksDir>/<task>/.caterpillar`, where `ToolchainResolver.materialise` caches the
+   *     resolved devShell environment;
+   *   - the `<tasksDir>/<task>` directory itself, which git will never remove because git
+   *     does not know it exists.
+   *
+   * So the order is: ask each mirror to remove its own worktrees (both layouts, because a
+   * repo can be the workspace of one task and a sibling of another), then `rm -rf` the
+   * task directory wholesale, then prune every mirror we touched. The final `rm` is what
+   * makes this honest rather than best-effort: git's `worktree remove` refuses a
+   * worktree with a submodule, an in-flight `.git/index.lock`, or anything else it finds
+   * surprising, and a reap that leaves the biggest directory on the volume behind because
+   * git had an opinion about it would fail silently and forever.
+   *
+   * Idempotent by construction and never throws: `removeWorktree` uses `tryRun`, `rm`
+   * takes `force`, and `prune` is `tryRun`. Calling it twice does nothing the second
+   * time, which matters because the supervisor's terminal paths overlap — `applyOutcome`
+   * can return true from a branch that `parkFailed` also covers.
+   */
+  async removeTaskWorktrees(task: TaskId, repos: readonly RepoRef[]): Promise<ReapResult> {
+    const root = this.taskDir(task);
+    if (!existsSync(root)) return EMPTY_REAP;
+
+    const bytes = await treeSize(root);
+    const workspace = repos[0];
+
+    for (const repo of repos) {
+      const mirror = mirrorPath(this.options.mirrorsDir, repo);
+      if (!existsSync(mirror)) continue;
+      const git = this.git.at(mirror);
+
+      // Both places `ensureTaskCheckout` can have put this repo. Passing a path that was
+      // never a worktree of this mirror is not an error — git says "is not a working
+      // tree" and `tryRun` swallows it — so asking about both is cheaper than working out
+      // which one applies from a `repos` array whose order the caller chose.
+      await git.tryRun("worktree", "remove", "--force", join(root, repo.name));
+      if (workspace !== undefined && repo !== workspace) {
+        await git.tryRun(
+          "worktree",
+          "remove",
+          "--force",
+          join(root, workspace.name, "repos", repo.name),
+        );
+      }
+    }
+
+    await this.removeTree(root);
+    await this.pruneMirrors(repos);
+
+    return { worktrees: 1, bytes, tasks: [task] };
+  }
+
+  /**
+   * Sweep `tasksDir` for worktrees no live task claims — the safety net, not the plan.
+   *
+   * The targeted removal covers the case where the supervisor reaches a terminal path and
+   * gets to act on it. It cannot cover the case this exists for: a pod killed mid-session,
+   * a node evicted, a Keel roll landing between the merge and the removal. In every one of
+   * those the task moves on — another replica claims it, works it in its OWN `tasksDir`,
+   * finishes it — and the directory on this runner is orphaned with nothing that will ever
+   * name it again. On a 20Gi ReadWriteOnce volume that is how the disk fills.
+   *
+   * Two guards, and the first one is the whole reason this takes a parameter it could have
+   * inferred:
+   *
+   *   - **`live` is given, never derived.** Deleting the worktree of a task a session is
+   *     working right now is the worst outcome this code can produce — the agent's
+   *     uncommitted work, its index, and its resolved environment all go at once, mid-turn,
+   *     and what it reports afterwards is a git error about a directory that vanished. The
+   *     supervisor knows exactly which tasks it holds a lease for; this module would have
+   *     to guess from mtimes and lock files, and a guess is not a safety property. So the
+   *     caller states it.
+   *   - **age.** `keepHours` measured from the task directory's mtime. It is what protects
+   *     a task between sessions on THIS runner: parked awaiting a human, handed off and
+   *     waiting to be re-claimed, or sitting behind a provider cooldown. Those are not live
+   *     and must not be reaped for hours yet.
+   *
+   * Everything it finds that is not a directory it leaves alone, and a directory whose name
+   * is not a task id it also leaves alone: `tasksDir` is the supervisor's, but it is on a
+   * volume an operator can reach, and a sweep is not the place to be inventive about
+   * unexpected files.
+   */
+  async reapStaleWorktrees(opts: {
+    /** Tasks this runner is working, or otherwise refuses to have swept. */
+    readonly live: ReadonlySet<TaskId>;
+    /** Overrides the configured keep-age. Used by tests and by nothing else. */
+    readonly keepHours?: number;
+    /** Injected clock, for the same reason. */
+    readonly now?: number;
+  }): Promise<ReapResult> {
+    const { tasksDir } = this.options;
+    if (!existsSync(tasksDir)) return EMPTY_REAP;
+
+    const keepHours = opts.keepHours ?? (this.options.reap ?? DEFAULT_REAP_CONFIG).keepHours;
+    const cutoff = (opts.now ?? Date.now()) - keepHours * 60 * 60 * 1000;
+
+    const entries = await readdir(tasksDir, { withFileTypes: true }).catch(() => []);
+    let worktrees = 0;
+    let bytes = 0;
+    const reaped: TaskId[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const task = asTaskId(entry.name);
+      if (opts.live.has(task)) continue;
+
+      const path = join(tasksDir, entry.name);
+      const info = await stat(path).catch(() => undefined);
+      if (info === undefined || info.mtimeMs > cutoff) continue;
+
+      bytes += await treeSize(path);
+      await this.removeTree(path);
+      worktrees += 1;
+      reaped.push(task);
+    }
+
+    // AFTER the removals, and over every mirror rather than the ones a task named: the
+    // sweep does not know which repos an orphaned directory held — the state repo that
+    // could say is on another replica by now — so the only way to stop the administrative
+    // records accumulating is to ask every mirror on the volume. `prune` on a mirror with
+    // nothing to prune is a directory listing.
+    if (worktrees > 0) await this.pruneAllMirrors();
+
+    return { worktrees, bytes, tasks: reaped };
+  }
+
+  /** `<tasksDir>/<task>`, resolved. The only directory a reap is ever allowed to remove. */
+  private taskDir(task: TaskId): string {
+    return join(resolve(this.options.tasksDir), task);
+  }
+
+  /**
+   * `rm -rf`, but only ever strictly inside `tasksDir`.
+   *
+   * The assertion is not decoration and it is not a test of this file's own arithmetic —
+   * it is a test of the TASK ID, which is the one part of the path that comes from outside
+   * this process. Task ids are read from directory names on a volume and from a state repo
+   * that intake writes, and `join(tasksDir, "..")` resolves to the parent of every mirror
+   * on the PVC. A single `..` reaching this function without the check would delete the
+   * mirrors, the nix store's GC roots and the state checkout, on a timer, with a log line
+   * that said it had reclaimed a lot of disk.
+   *
+   * `relative()` rather than a string prefix: `startsWith(tasksDir)` is true of
+   * `/work/tasks-old`, which is exactly the sort of sibling an operator makes while
+   * debugging the thing that filled the disk.
+   */
+  private async removeTree(path: string): Promise<void> {
+    assertInside(resolve(this.options.tasksDir), path);
+    await rm(path, { recursive: true, force: true });
+  }
+
+  /**
+   * `git worktree prune` on each mirror a reap touched.
+   *
+   * Necessary because the removals above do not all go through git. `rm -rf` leaves the
+   * mirror's `worktrees/<name>` administrative directory intact, and git keeps those
+   * forever unless asked: they hold a lock file, a HEAD and a gitdir pointer per task, so
+   * they leak inodes at exactly the rate tasks are created. Worse, an unpruned record
+   * still HOLDS its branch as far as `worktree list --porcelain` is concerned — which is
+   * what `checkedOutBranches` reads to build the fetch refspec, so a mirror that is never
+   * pruned accumulates a permanent exclusion per finished task and slowly stops tracking
+   * upstream at all.
+   *
+   * `tryRun`, like everything else here: a prune that fails costs some stale metadata, and
+   * that is not a reason to fail a reap that already reclaimed the bytes.
+   */
+  private async pruneMirrors(repos: readonly RepoRef[]): Promise<void> {
+    const seen = new Set<string>();
+    for (const repo of repos) {
+      const mirror = mirrorPath(this.options.mirrorsDir, repo);
+      if (seen.has(mirror) || !existsSync(mirror)) continue;
+      seen.add(mirror);
+      await this.git.at(mirror).tryRun("worktree", "prune");
+    }
+  }
+
+  /** Prune every mirror on this volume — the sweep's only option. See `reapStaleWorktrees`. */
+  private async pruneAllMirrors(): Promise<void> {
+    for (const mirror of await findMirrors(this.options.mirrorsDir)) {
+      await this.git.at(mirror).tryRun("worktree", "prune");
+    }
+  }
+
+  /**
    * Point this checkout at the credential helper, and make its pushes narrow.
    *
    * `credential.useHttpPath` is REQUIRED: without it git omits `path` from the
@@ -440,3 +686,94 @@ export class WorktreeManager {
     await git.run("config", "remote.origin.push", "HEAD");
   }
 }
+
+/**
+ * Refuse any path that is not strictly beneath `root`. Throws rather than returning false.
+ *
+ * A boolean would be a decision the caller could forget to act on, and the one caller is a
+ * recursive delete. `relative()` is the test rather than `startsWith`, because a prefix
+ * comparison says `/work/tasks-old` is inside `/work/tasks`; and `..` is rejected on its
+ * own segment boundary rather than as a substring, so a task genuinely named `..foo` is
+ * not refused for a resemblance.
+ *
+ * `root` itself is refused too — `relative()` answers `""` for it. A reap that emptied
+ * `tasksDir` wholesale would take every live task's worktree with it, and there is no
+ * caller that wants that: the sweep removes children, never the directory it enumerates.
+ */
+export const assertInside = (root: string, path: string): void => {
+  const rel = relative(resolve(root), resolve(path));
+  const escapes = rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  if (escapes) {
+    throw new Error(`refusing to remove ${path}: it is not inside ${root}`);
+  }
+};
+
+/**
+ * Apparent size of everything under `path`, in bytes. Never throws.
+ *
+ * Walked with `withFileTypes` and no `stat` on directories, so the cost is one `readdir`
+ * per directory plus one `lstat` per file — measurably less than the `rm -rf` that follows
+ * it, which is the bar this had to clear to be worth reporting at all.
+ *
+ * Symlinks are counted as their own (tiny) size and never followed. `ensureTaskCheckout`
+ * can leave a sibling repo as a link, and following one would count another task's
+ * worktree — or, if a repo's own tree contains a link to `/`, walk the whole volume.
+ *
+ * Errors are swallowed per entry: a file removed by something else between the readdir and
+ * the stat is normal, and a metric is not worth failing a reap over.
+ */
+const treeSize = async (path: string): Promise<number> => {
+  let total = 0;
+  const pending = [path];
+
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    if (dir === undefined) continue;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const child = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(child);
+        continue;
+      }
+      const info = await stat(child).catch(() => undefined);
+      total += info?.isFile() === true ? info.size : 0;
+    }
+  }
+
+  return total;
+};
+
+/**
+ * Every bare mirror under `mirrorsDir`, by its `HEAD` file.
+ *
+ * The layout is `<mirrorsDir>/<host>/<owner>/<name>.git`, three levels deep and fixed by
+ * `mirrorPath`, so this walks to that depth rather than recursing without bound — a mirror
+ * contains an objects tree with thousands of directories in it, and a naive recursive walk
+ * looking for `HEAD` would descend into all of them.
+ *
+ * `HEAD` rather than the `.git` suffix, for the same reason `syncMirror` tests for it: a
+ * directory left behind by a failed clone has the name and none of the contents, and
+ * running `worktree prune` inside one produces an error about a missing repository.
+ */
+const findMirrors = async (mirrorsDir: string): Promise<readonly string[]> => {
+  const found: string[] = [];
+  const hosts = await readdir(mirrorsDir, { withFileTypes: true }).catch(() => []);
+
+  for (const host of hosts.filter((entry) => entry.isDirectory())) {
+    const owners = await readdir(join(mirrorsDir, host.name), { withFileTypes: true }).catch(
+      () => [],
+    );
+    for (const owner of owners.filter((entry) => entry.isDirectory())) {
+      const repos = await readdir(join(mirrorsDir, host.name, owner.name), {
+        withFileTypes: true,
+      }).catch(() => []);
+      for (const repo of repos.filter((entry) => entry.isDirectory())) {
+        const path = join(mirrorsDir, host.name, owner.name, repo.name);
+        if (existsSync(join(path, "HEAD"))) found.push(path);
+      }
+    }
+  }
+
+  return found;
+};
