@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -20,7 +20,7 @@ import {
 } from "../domain/task.ts";
 import { EMPTY_POLICY, lookupPolicy, PolicyParseError } from "../remediation/policy.ts";
 import { Git } from "./git.ts";
-import { StateStore } from "./store.ts";
+import { type SalvagedCommits, StateStore } from "./store.ts";
 
 const roots: string[] = [];
 
@@ -28,10 +28,13 @@ after(async () => {
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
 });
 
-const store = async (): Promise<StateStore> => {
+const store = async (): Promise<StateStore> => (await storeAt()).subject;
+
+/** The same store, with the checkout path a test needs when it writes a file by hand. */
+const storeAt = async (): Promise<{ subject: StateStore; root: string }> => {
   const root = await mkdtemp(join(tmpdir(), "caterpillar-store-"));
   roots.push(root);
-  return new StateStore(root, new Git(root));
+  return { subject: new StateStore(root, new Git(root)), root };
 };
 
 const SPEC: TaskSpec = {
@@ -168,6 +171,92 @@ test("an intake rejection round-trips and is keyed by task id", async () => {
   );
 });
 
+test("the optional fields a page needs round-trip, and the digest keeps its meaning", async () => {
+  // The record grew `url`, `title` and `workspace` so `/intake` can link to the item being
+  // refused — `GH-acme-widget-96` does not say where the owner ends and the repo begins.
+  // They are decoration: the DIGEST is the suppression key and covers the item's title and
+  // body, so adding them must not change what "already refused" means.
+  const subject = await store();
+  const id = asTaskId("GH-acme-widget-96");
+
+  await subject.writeIntakeRejection(id, {
+    digest: "deadbeef",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/96",
+    title: "the widget drops frames",
+    workspace: "caesar",
+  });
+
+  const record = await subject.readIntakeRejection(id);
+  assert.equal(record?.digest, "deadbeef");
+  assert.equal(record?.url, "https://github.com/acme/widget/issues/96");
+  assert.equal(record?.title, "the widget drops frames");
+  assert.equal(record?.workspace, "caesar");
+});
+
+test("listIntakeRejections reads an old-shape record beside a new-shape one", async () => {
+  // The whole reason the new fields are OPTIONAL. Records written before they existed are
+  // in every state repo the fleet has ever polled, and a listing that skipped them — or,
+  // worse, a reader that treated them as unreadable — would make the first poll after this
+  // build re-comment on every open refusal, which is the tracker spam §14.2 exists to stop.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "intake"), { recursive: true });
+
+  // Written by hand, exactly as the shipped code wrote it: digest, reason, at. Nothing else.
+  await writeFile(
+    join(root, "intake", "GH-acme-widget-1.json"),
+    `${JSON.stringify({ digest: "old", reason: "no acceptance", at: "2026-08-01T00:00:00.000Z" })}\n`,
+    "utf8",
+  );
+  await subject.writeIntakeRejection(asTaskId("GH-acme-widget-2"), {
+    digest: "new",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/2",
+    title: "a second item",
+    workspace: "caesar",
+  });
+
+  // Neither of these is a task and neither is a rejection: a directory listing is whatever
+  // is on the disk, and a page that turned any of it into a `/tasks/<id>` link would build
+  // a path from an unvalidated string.
+  await writeFile(join(root, "intake", "README.md"), "not a record\n", "utf8");
+  await writeFile(join(root, "intake", "a name with spaces.json"), "{}\n", "utf8");
+  await writeFile(join(root, "intake", "...json"), "{}\n", "utf8");
+  await writeFile(join(root, "intake", "GH-acme-widget-3.json"), "{ not json", "utf8");
+
+  const listed = await subject.listIntakeRejections();
+  assert.deepEqual(
+    listed.map((record) => record.task),
+    [asTaskId("GH-acme-widget-1"), asTaskId("GH-acme-widget-2")],
+  );
+
+  const [old, fresh] = listed;
+  assert.equal(old?.reason, "no acceptance");
+  assert.equal(old?.url, undefined, "an old record simply has no url");
+  assert.equal(old?.workspace, undefined);
+  assert.equal(fresh?.url, "https://github.com/acme/widget/issues/2");
+  assert.equal(fresh?.title, "a second item");
+});
+
+test("listIntakeRejections on a state repo with no intake/ is empty, not a throw", async () => {
+  const subject = await store();
+  assert.deepEqual(await subject.listIntakeRejections(), []);
+});
+
+test("hasAlertPolicy separates a missing policy from an empty one", async () => {
+  // `readAlertPolicy` answers a missing file with EMPTY_POLICY, which is right for the
+  // poll loop and wrong for a page: "nobody has ever opted an alert in" and "the file
+  // lists nothing" want different sentences, and only one is fixed by writing the file.
+  const { subject, root } = await storeAt();
+  assert.equal(await subject.hasAlertPolicy(), false);
+
+  await mkdir(join(root, "alerts"), { recursive: true });
+  await writeFile(join(root, "alerts", "policy.yaml"), "version: 1\nalerts: []\n", "utf8");
+
+  assert.equal(await subject.hasAlertPolicy(), true);
+  assert.deepEqual((await subject.readAlertPolicy()).entries, []);
+});
+
 test("a rejection is cleared once the item is finally ingested", async () => {
   const subject = await store();
   const id = asTaskId("GH-acme-widget-98");
@@ -227,6 +316,10 @@ const sharedStateRepo = async (): Promise<{
   git: Git;
   bare: Git;
   other: Git;
+  /** A store on the SECOND checkout, writing as a different runner. */
+  otherStore: StateStore;
+  /** Every salvage the first store reported, in order — what feeds the metric and log. */
+  salvaged: SalvagedCommits[];
   root: string;
   otherRoot: string;
 }> => {
@@ -258,7 +351,21 @@ const sharedStateRepo = async (): Promise<{
   await other.run("config", "user.email", "other@example.invalid");
   await other.run("config", "user.name", "other");
 
-  return { store: new StateStore(root, git), git, bare, other, root, otherRoot };
+  // The hook is captured rather than discarded: it is the ONLY way a salvage becomes
+  // visible — the runner recovers and carries on, so `caterpillar_salvaged_commits_total`
+  // and the `state.salvaged` error line are all an operator ever sees (§4.3).
+  const salvaged: SalvagedCommits[] = [];
+
+  return {
+    store: new StateStore(root, git, (event) => salvaged.push(event), "runner-a"),
+    git,
+    bare,
+    other,
+    otherStore: new StateStore(otherRoot, other, undefined, "runner-b"),
+    salvaged,
+    root,
+    otherRoot,
+  };
 };
 
 test("a push rejected by a concurrent writer is rebased and retried, not lost", async () => {
@@ -695,7 +802,7 @@ test("a local commit that can never rebase is salvaged, not retried forever", as
   // and it destroyed five tasks' worth of work (see the note on `pull`). So the commits
   // are moved aside to a ref and the runner carries on: nothing is lost, and a human has
   // something to look at.
-  const { store, git, other, root, otherRoot } = await sharedStateRepo();
+  const { store, git, other, salvaged, root, otherRoot } = await sharedStateRepo();
 
   // Both writers append a different line to the same file. Append-only plus two authors
   // is precisely the shape that cannot merge.
@@ -722,7 +829,169 @@ test("a local commit that can never rebase is salvaged, not retried forever", as
     stranded,
     "and the commit it could not merge must still exist somewhere",
   );
+
+  // A silent salvage is the failure mode this hook exists to prevent: the runner recovers,
+  // so without it an operator never learns the fleet disagreed about a task. This is the
+  // path that increments `caterpillar_salvaged_commits_total` and logs `state.salvaged`.
+  assert.equal(salvaged.length, 1, "the salvage must be reported, not swallowed");
+  assert.equal(salvaged[0]?.commit, stranded);
+  assert.equal(salvaged[0]?.ref, `refs/salvaged/${stranded.slice(0, 12)}`);
+  assert.notEqual(salvaged[0]?.detail, "", "git's own account of the conflict is carried");
   // Not mid-rebase: a checkout left in one fails every later git call with a message
   // about the rebase rather than about the conflict.
   assert.equal((await git.tryRun("rev-parse", "--verify", "REBASE_HEAD")).code !== 0, true);
+});
+
+/*
+ * The journal, sharded (DESIGN.md §4.1).
+ *
+ * These tests exist because of one incident: two runners recorded the same task, both
+ * appended to a single `journal.md`, and the loser's commit could never be rebased on.
+ * The shape of the file is the fix, so the shape of the file is what is asserted.
+ */
+
+test("each journal entry lands as its own file, and readJournal puts them back in order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-journal-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root), undefined, "pod-7f3a");
+  const task = asTaskId("JOURNAL-1");
+
+  await subject.appendJournal(task, 1, "Started the widget.");
+  await subject.appendJournal(task, 2, "Finished the widget.");
+  await subject.appendJournal(task, 10, "Opened the PR.");
+
+  const shards = (await readdir(join(root, "tasks", task, "journal"))).sort();
+  assert.equal(shards.length, 3, "one file per entry — that is the whole point");
+  assert.equal(
+    existsSync(join(root, "tasks", task, "journal.md")),
+    false,
+    "and nothing is appended to the old single file",
+  );
+  for (const name of shards) {
+    assert.match(
+      name,
+      /^\d{4}-\d{8}T\d{9}Z-pod-7f3a\.md$/,
+      "the name must sort chronologically and carry the runner that wrote it",
+    );
+  }
+
+  // Zero-padded to four digits, so session 10 sorts after session 2 rather than between
+  // 1 and 2 — the mistake a three-digit or unpadded name makes on the longest task.
+  const journal = (await subject.readJournal(task)) ?? "";
+  assert.ok(
+    journal.indexOf("Started") < journal.indexOf("Finished"),
+    "entries concatenate oldest first",
+  );
+  assert.ok(journal.indexOf("Finished") < journal.indexOf("Opened the PR"), journal);
+  assert.match(journal, /## Session 1 — /);
+  assert.match(journal, /## Session 10 — /);
+});
+
+test("readJournal is undefined for a task that has never written one", async () => {
+  const subject = await store();
+  assert.equal(await subject.readJournal(asTaskId("JOURNAL-EMPTY")), undefined);
+});
+
+test("a legacy journal.md is read, prepended, and never touched", async () => {
+  // Backward compatibility is mandatory: the live state repo has `journal.md` files
+  // written before the sharding, and they are the audit trail for those tasks. Reading
+  // them is required; rewriting them would put the unmergeable conflict straight back,
+  // this time in the migration itself.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-journal-legacy-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root), undefined, "pod-7f3a");
+  const task = asTaskId("JOURNAL-2");
+
+  const legacy = "\n## Session 1 — 2026-01-01T00:00:00.000Z\n\nThe old world.\n";
+  await mkdir(join(root, "tasks", task), { recursive: true });
+  await writeFile(join(root, "tasks", task, "journal.md"), legacy, "utf8");
+
+  await subject.appendJournal(task, 2, "The new world.");
+
+  const journal = (await subject.readJournal(task)) ?? "";
+  assert.match(journal, /The old world\./);
+  assert.match(journal, /The new world\./);
+  assert.ok(
+    journal.indexOf("The old world") < journal.indexOf("The new world"),
+    "legacy content comes first — it happened first",
+  );
+  assert.equal(
+    await readFile(join(root, "tasks", task, "journal.md"), "utf8"),
+    legacy,
+    "the legacy file is read, not rewritten and not deleted",
+  );
+});
+
+test("appendJournal never overwrites an entry, even twice in the same millisecond", async () => {
+  // Append-only survives the format change. Two entries for one session written back to
+  // back would otherwise collide on the timestamp and silently drop one from the audit
+  // trail.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-journal-collide-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root), undefined, "pod-7f3a");
+  const task = asTaskId("JOURNAL-3");
+
+  await Promise.all([
+    subject.appendJournal(task, 4, "first"),
+    subject.appendJournal(task, 4, "second"),
+    subject.appendJournal(task, 4, "third"),
+  ]);
+
+  assert.equal((await readdir(join(root, "tasks", task, "journal"))).length, 3);
+  const journal = (await subject.readJournal(task)) ?? "";
+  for (const body of ["first", "second", "third"]) assert.match(journal, new RegExp(body));
+});
+
+test("two runners recording the same task produce commits that rebase cleanly", async () => {
+  // THE test. This is the incident that wedged two of a four-replica fleet: runner A's
+  // push was refused during a forge outage and it kept its commit; runner B took the
+  // task over and pushed its own journal entry. With one append-only `journal.md` the
+  // two appends collided on the same line and no rebase could ever apply — `pull` threw,
+  // `pollOnce` retried the identical rebase every thirty seconds, forever.
+  //
+  // Sharded, the two runners write different paths, so the histories commute exactly as
+  // `commitAndPush` has always assumed they do. Constructed with two real checkouts of a
+  // real bare repo, because the claim is about git's behaviour and not about ours.
+  const { store, git, bare, otherStore, other, salvaged, root } = await sharedStateRepo();
+  const task = asTaskId("SHARED-1");
+
+  // Runner B gets there first and pushes.
+  await otherStore.appendJournal(task, 3, "**Exit:** done-claimed — theirs");
+  await otherStore.commitAndPush("chore(state): runner B records SHARED-1", "origin", "main");
+
+  // Runner A wrote its entry without ever seeing B's, and its push was refused.
+  await store.appendJournal(task, 3, "**Exit:** error — ours");
+  await git.run("add", "-A");
+  await git.run("commit", "--quiet", "-m", "runner A records SHARED-1");
+  const stranded = await git.run("rev-parse", "HEAD");
+
+  // Must not throw, and must not salvage: there is nothing to conflict over any more.
+  await store.pull("origin", "main");
+  assert.equal(
+    (await git.tryRun("rev-parse", "--verify", `refs/salvaged/${stranded.slice(0, 12)}`)).code !== 0,
+    true,
+    "a rebase that applies has nothing to set aside",
+  );
+  // The assertion the whole task reduces to: this is the exact scenario that used to
+  // salvage, and `caterpillar_salvaged_commits_total` is fed by this hook. Zero here means
+  // the journal conflict class is gone by construction rather than by better recovery.
+  assert.deepEqual(salvaged, [], "the journal must no longer be able to force a salvage");
+
+  await store.commitAndPush("chore(state): runner A pushes after rebase", "origin", "main");
+
+  // Both entries are on the remote, in one journal, and each runner's name is on its own.
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^tasks\/SHARED-1\/journal\/0003-.*-runner-a\.md$/m);
+  assert.match(listed, /^tasks\/SHARED-1\/journal\/0003-.*-runner-b\.md$/m);
+
+  const journal = (await store.readJournal(task)) ?? "";
+  assert.match(journal, /done-claimed — theirs/);
+  assert.match(journal, /error — ours/);
+
+  // And the other runner sees the same thing once it pulls — one history, not two.
+  await otherStore.pull("origin", "main");
+  const theirs = (await otherStore.readJournal(task)) ?? "";
+  assert.equal(theirs, journal, "both runners must agree on the journal");
+  assert.ok(existsSync(join(root, "tasks", task, "journal")));
+  await other.run("rev-parse", "HEAD");
 });

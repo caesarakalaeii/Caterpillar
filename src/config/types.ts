@@ -141,6 +141,40 @@ export interface WorkspacePathsConfig {
   readonly mirrors: string;
   /** Per-task worktrees. */
   readonly tasks: string;
+  /**
+   * The volume both of the above live on — what `df` would be run against.
+   *
+   * Only the usage measurement reads it (`workspace/usage.ts`): it is what `statfs` is
+   * asked about, and what the `other` category is measured relative to. Defaulted to the
+   * directory containing `mirrors` and `tasks` rather than required, because every
+   * existing config predates it and a mandatory field would refuse to load them.
+   */
+  readonly root: string;
+}
+
+/**
+ * Measuring the work volume (`workspace/usage.ts`).
+ *
+ * Its own section rather than a field under `paths`, because these are the two numbers an
+ * operator tunes when the measurement itself becomes the problem — a volume big enough
+ * that walking it costs real time — and `paths` is about WHERE things are.
+ */
+export interface UsageConfig {
+  /**
+   * Hours between measurements. Modelled on `toolchain.gcIntervalHours` and throttled for
+   * the same reason it is: the poll loop is single-threaded, and this walk is proportional
+   * to inode count over a tree that includes one `node_modules` per task. Hourly is often
+   * enough to catch a volume filling and rare enough that nobody notices the cost.
+   *
+   * 0 disables the measurement entirely — an interval of zero would otherwise mean
+   * "every idle poll", which is the one setting that could actually hurt.
+   */
+  readonly intervalHours: number;
+  /**
+   * Ceiling on ONE measurement. Hitting it reports what was measured with `partial` set,
+   * rather than blocking the loop until the walk finishes or throwing away the work.
+   */
+  readonly deadlineSeconds: number;
 }
 
 /**
@@ -348,6 +382,7 @@ export interface RunnerConfig {
   readonly toolchain: ToolchainConfig;
   readonly stateRepo: StateRepoConfig;
   readonly paths: WorkspacePathsConfig;
+  readonly usage: UsageConfig;
   readonly lease: LeaseConfig;
   readonly handoff: HandoffConfig;
   readonly limits: LimitsConfig;
@@ -363,6 +398,8 @@ export interface RunnerConfig {
   readonly digest: DigestConfig;
   readonly cluster: ClusterConfig;
   readonly remediation: RemediationConfig;
+  /** The ephemeral cross-process plane (DESIGN.md §21). Off by default. */
+  readonly redis: RedisConfig;
 }
 
 /**
@@ -386,6 +423,57 @@ export interface RemediationConfig {
    * the loser fails with an EADDRINUSE that names neither.
    */
   readonly port: number;
+}
+
+/**
+ * The ephemeral cross-process plane (DESIGN.md §21).
+ *
+ * `enabled` defaults to FALSE, and the default here is load-bearing in a way the web
+ * view's and the digest's are not. Redis carries the chat inbox, the task snapshot,
+ * presence and cancel signals — four things a single-replica runner already does
+ * perfectly well in its own heap. Turning it on is what lets a SEPARATE process (the
+ * standalone Discord bot) see them; leaving it off is not a degraded mode, it is the
+ * arrangement every runner has always run in.
+ *
+ * Which is also why nothing here may become required. A Redis outage has to degrade the
+ * fleet to exactly this configuration, not take it down — so every consumer falls back
+ * to its in-memory implementation and the supervisor keeps working its tasks. The
+ * authoritative plane is git and stays git: leases, task state, the journal and the audit
+ * trail are unaffected by anything in this block (§5, §21).
+ *
+ * There is no password field. It is a credential, so it lives in the mounted secret named
+ * by `secretRef` under the key `password`, like every other credential (§9).
+ */
+export interface RedisConfig {
+  readonly enabled: boolean;
+  /**
+   * `redis://host:port` or `rediss://` for TLS. One field rather than host+port because
+   * the HA deployment is addressed by a Service name and the scheme is the only place
+   * TLS can be asked for — two fields would need a third to say the same thing.
+   */
+  readonly url: string;
+  /**
+   * Mounted secret holding `password`. Optional: a Redis reachable only inside the
+   * namespace's NetworkPolicy is a supported deployment, and requiring a credential for
+   * it would mean inventing one.
+   */
+  readonly secretRef?: string;
+  /**
+   * Ceiling on ONE command, milliseconds.
+   *
+   * Short on purpose. Every read on this plane is in front of a human — Discord's
+   * interaction budget is 3 seconds — and every write is in the poll loop, which must
+   * never block on a socket that is not going to answer. Exceeding it degrades; it does
+   * not throw (`redis/guarded.ts`).
+   */
+  readonly commandTimeoutMs: number;
+  /**
+   * Prefix on every key this deployment writes.
+   *
+   * So two fleets can share one server without a staging supervisor draining production's
+   * chat inbox. Defaulted rather than required, because the common case is one fleet.
+   */
+  readonly keyPrefix: string;
 }
 
 export interface IntakeConfig {

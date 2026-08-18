@@ -130,6 +130,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
+| `src/workspace/usage.ts` | What is on the work volume, by category. Read-only, idle-only (§11). |
 | `src/llm/credentials.ts` | The rotating OAuth credential as a locked file (§9.6). |
 | `src/llm/credential-holder.ts` | The one pod that owns and refreshes it, over HTTP (§9.6). |
 | `src/llm/credential-client.ts` | A runner's read-only view of it. Never writes (§9.6). |
@@ -174,6 +175,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/web/transcript.ts` | A pi transcript → renderable turns. Pure, no IO (§18). |
 | `src/web/pages.ts` | The pages. Given a view model, returns HTML (§18). |
 | `src/web/server.ts` | Routing, security headers, and the `GET`/`HEAD`-only gate (§18). |
+| `src/view/discovery.ts` | Which runners exist, from the headless Service's SRV record. No kube API (§18). |
+| `src/view/fanout.ts` | One GET per runner, forwarding the identity, reporting the failures (§18). |
+| `src/view/aggregate.ts` | Four runners' answers merged into one page (§18). |
+| `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
 | `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
@@ -187,6 +192,13 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/remediation/policy.ts` | `alerts/policy.yaml` — which alerts may become tasks. Pure (§20). |
 | `src/remediation/receiver.ts` | The Alertmanager webhook. Answers fast, writes nothing, trusts nothing (§20). |
 | `src/remediation/queue.ts` | Firing alert → `spec.md`, on the loop's thread of control (§20). |
+| `src/redis/client.ts` | The nine-method Redis surface. The driver stops here (§21). |
+| `src/redis/guarded.ts` | The one place a Redis failure becomes a value instead of a throw (§21). |
+| `src/redis/inbox.ts` | Chat intents over a list, outcomes over a reply channel (§21). |
+| `src/redis/snapshot.ts` | The task list as ONE key, cached in process for autocomplete (§21). |
+| `src/redis/presence.ts` | Which runners are alive. Advisory, for display only (§21). |
+| `src/redis/cancel.ts` | `/cancel` reaching a session that is already running (§21). |
+| `src/redis/plane.ts` | One decision at boot: Redis, or the objects that were already there (§21). |
 
 ## Invariants worth not breaking
 
@@ -207,11 +219,13 @@ awkward, the change is probably wrong.
    audit trail cannot be rewritten by the thing being audited.
 4. **Every push verifies the lease first.** Claim-time exclusion is not enough — a
    partitioned runner must not resurrect stale work.
-5. **`journal.md` appends; `handoff.md` is overwritten.** An append-forever handoff
+5. **The journal appends; `handoff.md` is overwritten.** An append-forever handoff
    eventually consumes the context window it exists to preserve. The journal keeps every
-   entry on disk, but reaches a prompt as a bounded VIEW — repeats collapsed, oldest
-   entries elided and declared — because append-only and unbounded-in-context are
-   different properties and only the first is wanted (§4.1).
+   entry on disk — one file per entry under `journal/`, so two runners recording the same
+   task write different paths and their commits still rebase — but reaches a prompt as a
+   bounded VIEW: repeats collapsed, oldest entries elided and declared, because
+   append-only and unbounded-in-context are different properties and only the first is
+   wanted (§4.1).
 6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
    the state repo is written and pushed, and a mirroring failure only logs — an
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
@@ -267,15 +281,36 @@ awkward, the change is probably wrong.
     grammar. `cluster_describe` reads eleven kinds and returns a Secret as key names and
     byte lengths: RBAC cannot express "keys but not values", so `cluster/redact.ts` is the
     entire boundary and is tested as one (§20).
+14. **Redis is never authoritative, and a Redis outage degrades rather than fails.** It
+    carries the ephemeral cross-process plane and only that — chat inbox, task snapshot,
+    presence, cancel signals — because the Discord bot is its own process and cannot reach
+    into the supervisor's heap. Leases, task state, the journal and the audit trail stay on
+    git refs: `assertHeld` fences by comparing an **exact OID**, and a key that can
+    evaporate leaves nothing to compare against, so that fence fails *open* while ref CAS
+    fails *closed*. Every operation in `src/redis/` is bounded by a timeout and passes
+    through `RedisGuard`, which turns a failure into today's in-memory answer and a
+    throttled warn line; nothing there may throw into the poll loop. `redis.enabled`
+    defaults to false, and with it off the runner is byte-for-byte what it has always been
+    (§21).
 
 ## The web view
 
 A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Authelia —
-what is running where, the runner's own log, the messages of the session in flight, every
+what is running where, the fleet's logs, the messages of the sessions in flight, every
 stored transcript, and each task's spec, journal, questions, council verdicts and
-artifacts. It runs inside the supervisor process, on its own port, because the two things
-it exists for — this process's log and this process's live session — are in memory and not
-in git until later (§18).
+artifacts. `/intake` is where a **refusal** shows up: a labelled item that could not become
+a task, an alert that fired with no policy entry, and whether the alert receiver is
+listening at all.
+
+Every runner serves it on its own port, in-cluster. In front of them sits
+**`caterpillar-view`** — the same image with a different command — which discovers the ready
+pods through the headless Service and **aggregates**: task data from the first healthy
+responder, because the state repo is identical everywhere, and the live sessions and log
+rings unioned across all of them, because those exist in one process's memory each. A
+replica that does not answer is rendered as unreachable next to its name rather than
+dropped, since a missing runner reads as an idle one. It holds no credential, no volume and
+no ServiceAccount token, and it forwards the `Remote-User` header it received rather than
+asking the runners to relax their own check (§18).
 
 It is off unless a runner is told otherwise:
 
@@ -289,6 +324,51 @@ header — it is a fail-closed check on an Ingress whose forward-auth annotation
 dropped, which would otherwise publish every transcript and look like a working deployment.
 
 Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
+
+The viewer, locally, against runners you name yourself:
+
+```sh
+VIEW_RUNNERS=one=http://localhost:8080 VIEW_REQUIRE_FORWARDED_USER=false \
+  VIEW_PORT=8090 npm run start:view
+```
+
+## Where the disk went
+
+The scaling mechanisms — a bare mirror per repo, a worktree per task with its own
+`node_modules`, a nix store per replica — fill a volume, and for a long time nothing in
+this process could say which of them did it. Now the supervisor measures its own `work`
+volume and reports it in both places it reports anything else:
+
+```
+caterpillar_work_fs_bytes{runner,kind="total"|"free"}   # from statfs
+caterpillar_work_bytes{runner,category}                  # mirrors|tasks|nix|other
+caterpillar_work_entry_bytes{runner,category,name}       # the largest few, `other` for the rest
+caterpillar_work_partial{runner}                         # 1 when the walk ran out of time
+caterpillar_work_measured_timestamp_seconds{runner}      # how stale the numbers above are
+```
+
+and as a **Disk** section on `/runner` in the web view, with the largest tasks and mirrors
+named. Alert on `caterpillar_work_fs_bytes` — it is the only figure that also counts what
+another process on the volume is using — and use the categories to find out who.
+
+Three properties of the walk are deliberate and worth knowing before reading a graph:
+
+- **Idle-only and hourly.** It runs from the same branch of the poll loop as the nix store
+  collection, because it is one `stat` per file over a tree with a `node_modules` per task
+  and the loop is single-threaded. On a runner that is never idle it never runs, which is
+  why the page shows a timestamp as prominently as the bytes.
+- **Apparent size**, like `du --apparent-size`, not allocated blocks. It is what a human
+  means by "this checkout is 400 MB". The "is the volume full" question is answered exactly
+  by `kind="free"`, which needs no summing at all.
+- **Read-only**, without exception, and it can never fail a poll. A measurement that hits
+  its deadline reports what it has with `caterpillar_work_partial` set rather than throwing
+  the work away or blocking the loop.
+
+Both knobs default sensibly and `0` turns the whole thing off:
+
+```json
+"usage": { "intervalHours": 1, "deadlineSeconds": 120 }
+```
 
 ## The daily digest
 
@@ -420,6 +500,60 @@ in an order that matters. **`docs/remediation-runbook.md`** is the end-to-end gu
 order of operations, how to test the webhook by hand with `curl`, two worked
 `alerts/policy.yaml` entries, the three levers for turning it off in a hurry, and what to do
 about a 401, a 403 or an empty Loki result.
+
+## Turning on Redis
+
+Nothing needs it. `redis.enabled` defaults to false and every runner has run that way from
+the beginning — the chat inbox, the task snapshot, presence and cancels are four objects in
+the supervisor's heap. Turn it on when something else needs to see them, which for now means
+one thing: the Discord bot becoming its own process, in its own pod, unable to reach into a
+heap it is not in.
+
+```json
+"redis": {
+  "enabled": true,
+  "url": "redis://redis-ha.all-chat.svc.cluster.local:6379",
+  "secretRef": "caterpillar-redis",
+  "commandTimeoutMs": 1000,
+  "keyPrefix": "caterpillar:"
+}
+```
+
+The password is a credential, so it is not in that block. If `secretRef` is set, the key
+`password` is read from the mounted secret directory like every other credential (§9); a
+Redis reachable only inside the namespace's NetworkPolicy needs no `secretRef` at all.
+`keyPrefix` is what lets two fleets share one server without a staging supervisor draining
+production's chat inbox.
+
+**What it does not do** is as important as what it does. No lease moves, no task state moves,
+no journal entry moves. `assertHeld` still compares an exact OID against a git ref, and §21
+of DESIGN.md argues at length why that is not a decision anyone should revisit: a fence over
+a key that can evaporate fails *open*, which is how two runners end up working one branch.
+
+**When Redis goes away**, the fleet degrades to exactly the configuration above with
+`enabled` set back to false. Every operation is bounded by `commandTimeoutMs` and passes
+through `RedisGuard`, which logs one throttled `redis.degraded` line per operation per 30
+seconds and returns the in-memory answer. A cancel that cannot be read is *not pending*; a
+presence that cannot be written is *one runner missing from a page*; a snapshot that cannot
+be fetched is *the last one this process saw*. The supervisor keeps claiming and working
+tasks throughout, because none of that is where the work lives.
+
+```
+redis.degraded    operation=presence.heartbeat failures=3 error=...
+redis.recovered   operation=presence.heartbeat failures=41
+```
+
+To exercise the real driver rather than the in-memory one, point the suite at a server:
+
+```bash
+REDIS_TEST_URL=redis://localhost:6399 npm test
+```
+
+Four extra tests register and the contract in `src/redis/contract.test.ts` runs a third time,
+against the same `createDriver` the supervisor uses. Without the variable they do not
+register at all, which is what keeps `npm test` green on a machine with nothing on 6379 —
+and running it *with* one is worth doing before touching `src/redis/`, because the last
+defect found there was a cold start that only a real socket could show.
 
 ## Passing work between machines
 
@@ -732,7 +866,7 @@ so, then archived. It works on a task that is *running*, not only on an idle one
 session stops at the next turn boundary, nothing from it is recorded, and the park lands
 on the following poll (the reply says `cancelling` until then). The task is never claimed
 again; the thread keeps its history and un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
-`journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
+the journal is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
 repo by hand, once no lease is held.
 
 `/resume <task>` brings one back, from `parked` **or** `failed`. That matters more than it

@@ -430,7 +430,10 @@ export class AgentSessionRunner {
     readonly recoveryNote?: string;
   }> {
     const { store, llm } = this.options;
-    const raw = await store.readIfPresent(spec.id, "journal.md");
+    // The whole history, shards and legacy file alike: the journal is the source of
+    // truth on resume (§4.1), so a resumed session must not see only the entries that
+    // happen to be in one format.
+    const raw = await store.readJournal(spec.id);
     // The FILE keeps every entry (invariant 5); the PROMPT gets a bounded view of it.
     // Unbounded, a long task pays for its whole history at the start of every session —
     // SMOKE-1's journal reached 347KB, nearly all of it one repeated park entry.
