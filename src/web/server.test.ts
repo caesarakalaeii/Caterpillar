@@ -476,3 +476,45 @@ test("before the first measurement the runner json simply has no disk key", asyn
   assert.equal(json.disk, undefined);
   assert.match(await (await fetch(`${harness.url}/runner`)).text(), /Not measured yet/);
 });
+
+test("/intake renders the refusals nobody could see, and /api/intake says the same", async () => {
+  // The page this whole issue is about: a refusal was a warn line in one pod's stdout, a
+  // JSON file in the state repo, and a comment on a GitHub issue — and a fleet whose only
+  // labelled issue was refused looked exactly like a fleet nobody had given work to.
+  const harness = await serve();
+  await harness.store.writeIntakeRejection(asTaskId("GH-acme-widget-724"), {
+    digest: "d1",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/724",
+    title: "please fix the widget",
+    workspace: "caesar",
+  });
+
+  const response = await fetch(`${harness.url}/intake`);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /GH-acme-widget-724/);
+  assert.match(body, /no `agent` block/);
+  assert.match(body, /href="https:\/\/github\.com\/acme\/widget\/issues\/724"/);
+
+  const api = await fetch(`${harness.url}/api/intake`);
+  assert.equal(api.status, 200);
+  const json = (await api.json()) as { rejections: { task: string }[]; policyMissing: boolean };
+  assert.deepEqual(json.rejections.map((r) => r.task), ["GH-acme-widget-724"]);
+  assert.equal(json.policyMissing, true);
+});
+
+test("/intake is refused a write and refused an unauthenticated request, like every other page", async () => {
+  // A new front door inherits every rule §18 states rather than being trusted to have
+  // been added behind them.
+  const harness = await serve({ requireForwardedUser: true });
+
+  const write = await fetch(`${harness.url}/intake`, { method: "POST" });
+  assert.equal(write.status, 405);
+
+  const anonymous = await fetch(`${harness.url}/intake`);
+  assert.equal(anonymous.status, 401);
+
+  const vouched = await fetch(`${harness.url}/intake`, { headers: { "remote-user": "caesar" } });
+  assert.equal(vouched.status, 200);
+});

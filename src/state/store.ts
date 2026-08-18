@@ -491,9 +491,24 @@ export class StateStore {
    * one IS an operator mistake and must be visible.
    */
   async readAlertPolicy(): Promise<AlertPolicy> {
-    const path = join(this.root, "alerts", "policy.yaml");
-    if (!existsSync(path)) return EMPTY_POLICY;
-    return parsePolicy(await readFile(path, "utf8"));
+    if (!existsSync(this.alertPolicyPath())) return EMPTY_POLICY;
+    return parsePolicy(await readFile(this.alertPolicyPath(), "utf8"));
+  }
+
+  private alertPolicyPath(): string {
+    return join(this.root, "alerts", "policy.yaml");
+  }
+
+  /**
+   * Whether the operator has written a policy at all.
+   *
+   * `readAlertPolicy` deliberately answers a missing file with `EMPTY_POLICY`, which is
+   * the right thing for the poll loop and the wrong thing for a page: "this cluster has
+   * never opted an alert in" and "the file exists and lists nothing" want different
+   * sentences, and only one of them is fixed by writing the file.
+   */
+  async hasAlertPolicy(): Promise<boolean> {
+    return existsSync(this.alertPolicyPath());
   }
 
   private alertRefusalPath(fingerprint: string): string {
