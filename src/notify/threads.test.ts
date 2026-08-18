@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskStatus } from "../domain/task.ts";
-import { threadBindings, ThreadIndex, type ThreadOwner } from "./threads.ts";
+import { threadBindings, ThreadIndex, ThreadRouter, type ThreadOwner } from "./threads.ts";
 
 const THREAD = "1537785980415778816";
 
@@ -120,4 +120,100 @@ test("unbinding takes effect before the next rebuild", () => {
   index.unbind(THREAD);
   assert.equal(index.knows(THREAD), false);
   assert.equal(index.taskFor(THREAD), undefined);
+});
+
+/* ────────────────────── delivery, as distinct from routing (§7) ────────────────────── */
+
+const MAIN = "main-channel";
+
+const buildRouter = (
+  options: {
+    readonly knows?: (channelId: string) => boolean;
+    readonly parentOf?: (channelId: string) => Promise<string | undefined>;
+  } = {},
+): { route: ThreadRouter; lookups: string[] } => {
+  const lookups: string[] = [];
+  const parentOf = options.parentOf ?? ((): Promise<string | undefined> => Promise.resolve(MAIN));
+  return {
+    lookups,
+    route: new ThreadRouter({
+      channelId: MAIN,
+      index: { knows: options.knows ?? ((): boolean => false) },
+      parentOf: (channelId) => {
+        lookups.push(channelId);
+        return parentOf(channelId);
+      },
+    }),
+  };
+};
+
+test("an unbound thread of our channel is deliverable, so it can be answered honestly", async () => {
+  // The case the class exists for: the bot's index arrives over Redis and is legitimately
+  // behind, and a message dropped here is silence where the bridge had an honest answer.
+  const { route } = buildRouter();
+  assert.equal(await route.deliverable(THREAD), true);
+});
+
+test("a thread of some other channel is not deliverable", async () => {
+  const { route } = buildRouter({ parentOf: () => Promise.resolve("someone-elses-channel") });
+  assert.equal(await route.deliverable(THREAD), false);
+});
+
+test("a channel with no parent at all is not deliverable", async () => {
+  const { route } = buildRouter({ parentOf: () => Promise.resolve(undefined) });
+  assert.equal(await route.deliverable(THREAD), false);
+});
+
+test("a failed lookup is read as not ours, never as an exception", async () => {
+  // The gateway calls this for every unknown message; a rejection escaping here would be
+  // one unhandled rejection per message during a Discord outage.
+  const { route } = buildRouter({ parentOf: () => Promise.reject(new Error("429")) });
+  assert.equal(await route.deliverable(THREAD), false);
+});
+
+test("both answers are cached, so an unrelated busy channel costs one lookup", async () => {
+  const yes = buildRouter();
+  await yes.route.deliverable(THREAD);
+  await yes.route.deliverable(THREAD);
+  assert.deepEqual(yes.lookups, [THREAD], "a positive answer is cached");
+
+  const no = buildRouter({ parentOf: () => Promise.resolve("elsewhere") });
+  await no.route.deliverable("noisy");
+  await no.route.deliverable("noisy");
+  assert.deepEqual(no.lookups, ["noisy"], "a negative answer is cached too, or a busy channel floods the API");
+});
+
+test("a burst in one thread is a single lookup, not one per message", async () => {
+  let release: (value: string) => void = () => {};
+  const pending = new Promise<string>((resolve) => {
+    release = resolve;
+  });
+  const { route, lookups } = buildRouter({ parentOf: () => pending });
+
+  const all = Promise.all([
+    route.deliverable(THREAD),
+    route.deliverable(THREAD),
+    route.deliverable(THREAD),
+  ]);
+  release(MAIN);
+
+  assert.deepEqual(await all, [true, true, true]);
+  assert.deepEqual(lookups, [THREAD], "concurrent messages share the in-flight lookup");
+});
+
+test("the main channel and a bound thread need no lookup at all", async () => {
+  const { route, lookups } = buildRouter({ knows: (id) => id === THREAD });
+
+  assert.equal(await route.deliverable(MAIN), true);
+  assert.equal(await route.deliverable(THREAD), true);
+  assert.deepEqual(lookups, [], "the hot path must not touch the REST API");
+});
+
+test("a thread that becomes bound is known synchronously by the router", () => {
+  const index = new ThreadIndex();
+  const route = new ThreadRouter({ channelId: MAIN, index, parentOf: () => Promise.resolve(MAIN) });
+
+  assert.equal(route.knows(THREAD), false);
+  index.bind(THREAD, asTaskId("BS-1"));
+  assert.equal(route.knows(THREAD), true);
 });

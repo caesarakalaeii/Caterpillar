@@ -126,3 +126,87 @@ export class ThreadIndex {
     return this.byThread.size;
   }
 }
+
+/**
+ * Whether the gateway should deliver a message from a channel it does not have bound.
+ *
+ * The gap this closes. The bridge has an honest answer for "a message in a thread I have
+ * no binding for" (`bridge.ts:handleMessage`) — but it was unreachable through the real
+ * wiring, because the gateway dropped exactly those messages first: its filter asked the
+ * SAME index the bridge would ask, so a thread the bridge would call unbound is a thread
+ * the gateway had already discarded. The result was the failure the split exists to
+ * remove, arriving by a different door: on a cold start, before any supervisor has
+ * published, a human typing in a task thread got silence.
+ *
+ * Fixing it needs one fact the payload does not carry — is this channel a thread of OUR
+ * channel? — so it takes a REST lookup (`bot.ts:parentChannel`). That cannot go on the
+ * gateway's synchronous hot path unmemoised, so this caches per channel, permanently and
+ * both ways: a channel's parent never changes, so a "no" is as durable as a "yes", and the
+ * negative cache is what stops an unrelated busy channel costing one lookup per message.
+ *
+ * Bounded, because the id space is not: an attacker-adjacent channel cannot grow this
+ * without limit. On overflow the cache is cleared rather than evicted one-by-one — the
+ * entries are worth microseconds each and re-earning them costs one lookup.
+ */
+export const MAX_ROUTER_CACHE = 1024;
+
+export class ThreadRouter {
+  private readonly channelId: string;
+  private readonly parentOf: (channelId: string) => Promise<string | undefined>;
+  private readonly index: { knows(channelId: string): boolean };
+  /** channel id → is it a thread of ours. Both answers cached; see the docstring. */
+  private readonly ours = new Map<string, boolean>();
+  private readonly inflight = new Map<string, Promise<boolean>>();
+
+  constructor(options: {
+    readonly channelId: string;
+    readonly index: { knows(channelId: string): boolean };
+    readonly parentOf: (channelId: string) => Promise<string | undefined>;
+  }) {
+    this.channelId = options.channelId;
+    this.index = options.index;
+    this.parentOf = options.parentOf;
+  }
+
+  /**
+   * Synchronous fast path, for a channel already known to be ours.
+   *
+   * Keeps the common case — a bound thread, or the main channel — free of any await, which
+   * is what the gateway filter was shaped for.
+   */
+  knows(channelId: string): boolean {
+    return this.index.knows(channelId) || this.ours.get(channelId) === true;
+  }
+
+  /**
+   * Should this message reach the bridge?
+   *
+   * True for the main channel, for any bound thread, and — the point of this class — for an
+   * UNBOUND thread whose parent is our channel, so the bridge can say it does not know the
+   * binding yet instead of the message vanishing.
+   */
+  async deliverable(channelId: string): Promise<boolean> {
+    if (channelId === this.channelId) return true;
+    if (this.knows(channelId)) return true;
+
+    const cached = this.ours.get(channelId);
+    if (cached !== undefined) return cached;
+
+    const pending = this.inflight.get(channelId);
+    if (pending !== undefined) return pending;
+
+    // Shared, so a burst in one thread is one lookup rather than one per message.
+    const lookup = this.parentOf(channelId)
+      .then((parent) => parent === this.channelId)
+      .catch(() => false)
+      .then((isOurs) => {
+        if (this.ours.size >= MAX_ROUTER_CACHE) this.ours.clear();
+        this.ours.set(channelId, isOurs);
+        return isOurs;
+      })
+      .finally(() => this.inflight.delete(channelId));
+
+    this.inflight.set(channelId, lookup);
+    return lookup;
+  }
+}

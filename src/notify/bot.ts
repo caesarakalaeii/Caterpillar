@@ -109,6 +109,33 @@ export class DiscordBot {
       .catch(() => undefined);
   }
 
+  /**
+   * The parent channel of `channelId`, or undefined if it has none or cannot be read.
+   *
+   * `MESSAGE_CREATE` names no parent (see `threads.ts`), so this is the only way to tell
+   * "a reply in a thread of our channel whose binding has not arrived yet" from "a message
+   * in an unrelated channel". The standalone bot needs that distinction to answer honestly
+   * instead of dropping the message — see `ThreadRouter` in `threads.ts`.
+   *
+   * Best-effort: a failure resolves to undefined rather than throwing, because the caller's
+   * fallback (treat it as not ours) is the same as it was before this existed.
+   */
+  async parentChannel(channelId: string): Promise<string | undefined> {
+    const response = await postJson({
+      url: `${this.apiBase}/channels/${channelId}`,
+      body: "",
+      what: "channel lookup",
+      method: "GET",
+      headers: { authorization: `Bot ${this.options.token}` },
+      ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+    }).catch(() => undefined);
+    if (response === undefined) return undefined;
+
+    const body = (await response.json().catch(() => ({}))) as { readonly parent_id?: string | null };
+    return body.parent_id ?? undefined;
+  }
+
   /** Open a public thread on a message. Returns the thread's channel id. */
   async createThread(messageId: string, name: string): Promise<string> {
     const response = await this.post(

@@ -52,8 +52,10 @@ const fakeSocket = (): Fake => {
 };
 
 const build = (
-  onMessage: (content: string, author: string) => Promise<void> = () => Promise.resolve(),
+  onMessage: (content: string, author: string, channelId: string) => Promise<void> = () =>
+    Promise.resolve(),
   presence?: GatewayOptions["presence"],
+  threads?: GatewayOptions["threads"],
 ): { gateway: DiscordGateway; sockets: Fake[]; slept: number[] } => {
   const sockets: Fake[] = [];
   const slept: number[] = [];
@@ -63,6 +65,7 @@ const build = (
     channelId: CHANNEL,
     onMessage,
     ...(presence === undefined ? {} : { presence }),
+    ...(threads === undefined ? {} : { threads }),
     logger: SILENT_LOGGER,
     random: () => 0.5,
     sleep: async (ms) => {
@@ -409,4 +412,86 @@ test("a RESUMED connection is connected again", async () => {
 
   assert.equal(built.gateway.connected(), true);
   await stop();
+});
+
+/* ─────────────────── which channels reach the bridge (§7, §14.3) ─────────────────── */
+
+const THREAD = "thread-77";
+
+/**
+ * Drive a message from `THREAD` through the real socket path and report whether it landed.
+ *
+ * Deliberately NOT a direct `bridge.handleMessage` call. Every existing test of the
+ * unbound-thread reply called the bridge directly, which is exactly why the gap this
+ * covers survived: the branch was reachable in a test and unreachable in production,
+ * because the gateway dropped the message before the bridge could answer.
+ */
+const deliverFromThread = async (
+  threads: GatewayOptions["threads"],
+): Promise<{ delivered: string[] }> => {
+  const delivered: string[] = [];
+  const built = build(
+    (_content, _author, channelId) => {
+      delivered.push(channelId);
+      return Promise.resolve();
+    },
+    undefined,
+    threads,
+  );
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(messageCreate({ channel_id: THREAD }));
+  // The routing decision may be asynchronous (a parent lookup), so let it settle.
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  await stop();
+
+  return { delivered };
+};
+
+test("a message in a bound thread reaches the bridge without any lookup", async () => {
+  let lookups = 0;
+  const { delivered } = await deliverFromThread({
+    knows: (channelId) => channelId === THREAD,
+    deliverable: () => {
+      lookups += 1;
+      return Promise.resolve(true);
+    },
+  });
+
+  assert.deepEqual(delivered, [THREAD]);
+  assert.equal(lookups, 0, "a known thread must stay on the synchronous path");
+});
+
+test("a message in an UNBOUND thread of our channel still reaches the bridge", async () => {
+  // The whole point. The standalone bot's index arrives over Redis and is legitimately
+  // behind, so a thread bound seconds ago — or one no supervisor has published yet — must
+  // still be delivered, or the bridge's honest "I do not know which task this thread
+  // belongs to yet" is dead code and the human gets silence.
+  const { delivered } = await deliverFromThread({
+    knows: () => false,
+    deliverable: () => Promise.resolve(true),
+  });
+
+  assert.deepEqual(delivered, [THREAD], "an unbound thread of ours must be answerable");
+});
+
+test("a message in an unrelated channel is still dropped", async () => {
+  // The filter still has to filter: this bot shares a guild with channels that are none
+  // of its business, and answering in one would be worse than missing a reply.
+  const { delivered } = await deliverFromThread({
+    knows: () => false,
+    deliverable: () => Promise.resolve(false),
+  });
+
+  assert.deepEqual(delivered, [], "a channel that is not ours must never reach the bridge");
+});
+
+test("without a router the filter behaves exactly as it did in-process", async () => {
+  // The supervisor's in-process path supplies a bare `ThreadIndex` with no `deliverable`,
+  // and must keep dropping unknown channels rather than gaining a REST call per message.
+  const { delivered } = await deliverFromThread({ knows: () => false });
+
+  assert.deepEqual(delivered, []);
 });

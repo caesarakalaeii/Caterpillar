@@ -44,8 +44,18 @@ export interface GatewayOptions {
    * A message in a thread arrives with `channel_id` set to the THREAD and no reference to
    * its parent, so there is no way to recognise one without knowing which threads are
    * ours. Optional: without it only the channel itself is read.
+   *
+   * `deliverable` is the standalone bot's addition (`ThreadRouter`). Without it this filter
+   * asked the same index the bridge asks, so a thread the bridge would answer honestly as
+   * unbound was one this had already dropped — and the honest reply was unreachable in
+   * production. When supplied it gets the final say, and may resolve true for a thread the
+   * index does not know, so the bridge can say so. `knows` alone remains the in-process
+   * behaviour exactly.
    */
-  readonly threads?: { knows(channelId: string): boolean };
+  readonly threads?: {
+    knows(channelId: string): boolean;
+    deliverable?(channelId: string): Promise<boolean>;
+  };
   readonly onMessage: (content: string, author: string, channelId: string) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
@@ -386,18 +396,45 @@ export class DiscordGateway {
     const message = payload.d as MessageCreate;
     const from = message.channel_id;
     if (from === undefined) return;
-    if (from !== channelId && this.options.threads?.knows(from) !== true) return;
     // The bridge reads the channel it posts into. Without this it answers its own
-    // question notifications, which end with a literal `!answer` hint.
+    // question notifications, which end with a literal `!answer` hint. Checked BEFORE any
+    // routing lookup, so the bot's own chatter never costs a REST call.
     if (message.author?.bot === true || message.webhook_id !== undefined) return;
 
     const content = message.content ?? "";
     if (content.length === 0) return;
 
-    void onMessage(content, message.author?.username ?? "someone", from).catch((error: unknown) => {
-      logger.error("gateway.handler-failed", {
-        error: error instanceof Error ? error.message : String(error),
+    const deliver = (): void => {
+      void onMessage(content, message.author?.username ?? "someone", from).catch(
+        (error: unknown) => {
+          logger.error("gateway.handler-failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
+    };
+
+    // The synchronous answer first: the main channel and every bound thread take no await,
+    // which is the shape this filter was written for.
+    if (from === channelId || this.options.threads?.knows(from) === true) {
+      deliver();
+      return;
+    }
+
+    const router = this.options.threads?.deliverable?.bind(this.options.threads);
+    if (router === undefined) return;
+
+    // An unknown channel: ask whether it is a thread of ours, and deliver if so, so the
+    // bridge can answer "I do not know which task this thread belongs to yet" rather than
+    // the message vanishing. A failed lookup is a no — `ThreadRouter` swallows it.
+    void router(from)
+      .then((ok) => {
+        if (ok) deliver();
+      })
+      .catch((error: unknown) => {
+        logger.error("gateway.route-failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
-    });
   }
 }

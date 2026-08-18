@@ -53,7 +53,7 @@ import { DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { RedisChatLock } from "./notify/leadership.ts";
-import { ThreadIndex } from "./notify/threads.ts";
+import { ThreadIndex, ThreadRouter } from "./notify/threads.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import type { RedisClient } from "./redis/client.ts";
 import { createEphemeralPlane, type EphemeralPlane } from "./redis/plane.ts";
@@ -140,10 +140,22 @@ const main = async (): Promise<void> => {
     leadership: lock,
   });
 
+  // The index decides ROUTING; the router decides DELIVERY, and they are not the same
+  // question here. The bot's index arrives over Redis and is legitimately behind, so a
+  // thread bound seconds ago — or one this process has never heard of — must still reach
+  // the bridge to be answered honestly. Without this the gateway filter consulted the same
+  // index the bridge would, and dropped precisely the messages the bridge had an answer
+  // for. See `ThreadRouter`.
+  const router = new ThreadRouter({
+    channelId: bot.channelId,
+    index: threads,
+    parentOf: (channelId) => bot.parentChannel(channelId),
+  });
+
   const gateway = new DiscordGateway({
     token: bot.token,
     channelId: bot.channelId,
-    threads,
+    threads: router,
     logger,
     onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
