@@ -711,9 +711,7 @@ export class Supervisor {
     // The poll loop — and with it the inbox drain — is blocked for the whole duration of
     // a session, so a `/cancel` submitted while the agent is working would otherwise sit
     // in the queue until the session it was meant to stop had already ended, with the
-    // operator's Discord reply hanging until then. This watches for that ONE request and
-    // leaves everything else queued: the rest write the state repo, and this session
-    // holds the lease those writes would have to fence against.
+    // operator's Discord reply hanging until then. Both watches below exist for that.
     let cancelled = false;
     const stop = (): void => {
       if (cancelled) return;
