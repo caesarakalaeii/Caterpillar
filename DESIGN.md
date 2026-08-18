@@ -831,31 +831,58 @@ touch git. Two mechanisms, and both are needed:
    durability: a commit message occasionally undersells its contents. That is the right way
    round.
 
-   The flag is backed by a monotonic write counter, because writes deliberately do *not*
-   take the mutex. `commitAndPush` samples the counter before its first `add` and clears
-   the flag only if it has not moved, so a write that lands *during* a commit — after the
-   `add` that would have staged it — leaves the tree marked dirty rather than being lost
-   to the next `pull`. That window is only a few subprocess spawns wide, but a session's
-   `publishArtifact` can fall into it and then go hours before its own commit.
+   The flag is backed by a monotonic write counter. `commitAndPush` samples it before its
+   first `add` and clears the flag only if it has not moved, so a write that lands *during*
+   a commit — after the `add` that would have staged it — leaves the tree marked dirty
+   rather than being lost to the next `pull`; and `pullNow` re-reads it after its `fetch`
+   and abandons the refresh if it moved, reporting `"skipped"`. That second one is the
+   original five-task incident, still reachable after the flag alone was added: it stopped
+   being theoretical the moment the work loop began pulling before each claim, which put a
+   pull in the same instant as a `/brainstorm` creating a task — the spec was written
+   between the fetch and the clean, and the `commitAndPush` immediately after found nothing
+   to commit and reported success. A task acknowledged to a human that existed nowhere.
 
-   The same counter closes the mirror-image window *inside* `pull`, and this is the one
-   that bites. `dirty` is a sample, and `pull` does a network `fetch` — hundreds of
-   milliseconds — before it touches anything. A write landing in that gap is invisible to
-   the check at the top and deleted by the `clean -ffdq` at the bottom, which is the
-   original five-task incident still reachable after the flag was added. `pullNow`
-   therefore re-reads the generation after its fetch and abandons the refresh if it moved,
-   reporting `"skipped"`. It stopped being theoretical the moment the work loop began
-   pulling before each claim: that put a pull in the same instant as a `/brainstorm`
-   creating a task, the spec was written between the fetch and the clean, and the
-   `commitAndPush` immediately after found nothing to commit and reported success — a task
-   acknowledged to a human that existed nowhere. Read it as one rule with two instances:
-   anything that samples `dirty` and then spends time before touching the tree must
-   re-check that nothing was written while it was not looking.
+3. **Writes take the mutex too — one write at a time.** This is the third mechanism, and it
+   exists because the first two are not enough however carefully the counter is placed.
+   `dirty` is a *sample*, and both destructive paths spend several subprocess spawns in the
+   working tree **after the last moment they could check it**: `pullNow` between its
+   post-fetch re-check and its `clean -ffdq`, and `rebaseOnto` between its `reset --hard
+   HEAD` and the end of its salvage. An unlocked write landing in there is deleted having
+   been visible to nothing, and no additional flag can see it — the check would have to
+   happen after the damage.
+
+   It was not found by reasoning about the window. It was found as a **flaky test**: one CI
+   run in three, `an answer from the bridge unparks the task on the REMOTE`. An answer typed
+   in Discord reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work
+   loop's pre-claim pull, and then pushed a `state.json` saying the question had been
+   answered — the answer gone from the one file the next session reads it out of (§4.1),
+   while every status said it had been recorded. The same red job also skipped the image
+   build, so that deploy silently did not happen.
+
+   The objection this design started with — that holding the mutex across a session's
+   minutes-long write-then-commit window is a deadlock waiting to happen — is answered by
+   **scope**: the lock is held for one `writeFile`, never for a write-then-commit unit. What
+   a write can now do is wait out a fetch. Losing it was the alternative.
+
+   The one real deadlock this did introduce is worth writing down, because it hung a test
+   file rather than failing it. `exclusively` exists so that a write and its commit are one
+   unit — so the holder of the tree writing through it deadlocks on its own hold the instant
+   writes acquire. So acquisition is **scoped to the async context that holds the lock**
+   (`AsyncLocalStorage`, in `StateStore.exclusive`): the holder's own write runs immediately,
+   anyone else's queues. `Serial` stays re-entrant-hostile and is not weakened, because the
+   re-entrancy turns on *identity* — a boolean saying "someone holds it" would wave through
+   the very concurrent write the lock exists to order.
+
+   The counter checks stay as the second line rather than the only one: `serial` is
+   injectable, so something else can share the checkout, and a guard whose incident is
+   written down is not one to delete because it has become hard to reach. What the mutex
+   still does not make atomic is a read-then-write — a caller that reads state, decides, and
+   writes it back can have a pull land in the middle. That is what `exclusively` is for.
 
    `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
    needs the two to be one unit. **No production path uses it today** — the supervisor's
-   writes go through `writeState`/`appendJournal` and rely entirely on the dirty flag and
-   its counter, which is what makes sessions safe. It exists because the gap it closes is
+   writes go through `writeState`/`appendJournal`, which now take the mutex individually and
+   are covered by the dirty flag and its counter between them. It exists because the gap it closes is
    real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
    then commits can have its files swept into another writer's commit under the wrong
    message. That costs attribution, not durability, which is precisely why the supervisor
