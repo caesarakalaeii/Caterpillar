@@ -1144,6 +1144,52 @@ eventually-consistent, registration is a full replace so re-running it is a no-o
 is not done at boot because the supervisor restarts on every deploy and would otherwise
 write the identical command set once per pod per rollout.
 
+### 7.2 The presence says what the fleet is working on
+
+`/tasks` and the web view both answer "what is Caterpillar doing" and both have to be
+asked. The bot's Discord presence answers it without being asked, in the member list, which
+is where somebody who is already in the channel is already looking. That is the whole
+feature: **"Watching ALERT-6155db · implementing"**, or **"Watching for work · 4 ready"**,
+or — the one that should change what you do next — **"Watching 1 waiting for you"**.
+
+**It is rendered from the survey, not from the live session.** `obs/live.ts` knows what THIS
+runner is doing and nothing about the other three, so a presence built from it would say
+`idle` on three replicas out of four and race to overwrite whichever one was right. The
+survey is every task's committed state, read out of the state repo, so all four replicas
+render the *same* string — which is what makes it safe for all four to send it.
+
+**Every replica publishes, unlike everything else on Discord.** §7's rule is that every
+replica connects and exactly one *acts*, because four replicas acting on one `!answer` did
+real damage. A presence is not an action: it is idempotent, carries no state, and four
+identical payloads converge on the identical result. Restricting it to the chat holder would
+be strictly worse — the status would go stale for as long as a claim handover takes, and a
+bot advertising `idle` while a session runs is the exact thing this exists to prevent.
+
+**It rides on IDENTIFY, and is re-sent on RESUMED.** Carried in the IDENTIFY rather than as
+a separate opcode 3 so a reconnecting replica is never briefly online with no activity — on
+a fleet that reconnects during every rollout that would be a visible flicker to no purpose.
+A RESUME carries no IDENTIFY, so it gets an explicit re-send; without that, a runner comes
+back from a blip still advertising what it was doing before the blip, and the runners with
+the longest outage are the ones lying hardest. A READY does *not* re-send, because the
+IDENTIFY beside it already did.
+
+**Only changes are sent.** Presence updates are rate-limited per connection and the survey
+runs every housekeeping tick, so an unchanged line is dropped rather than re-sent — a runner
+that sent unconditionally would spend its whole idle life burning the allowance it needs at
+the moment the state actually changes. The `since` timestamp is restamped only on a real
+change, so Discord's elapsed timer measures how long the fleet has been in *this* state
+rather than how long the pod has been up.
+
+**Activity type 3, `Watching`.** Discord renders it as "Watching <name>", so the strings are
+written to read as English after that word. Type 4 (`Custom`) would drop the verb and read
+better, and is deliberately not used: its support for *bots* has changed more than once and
+the failure mode is a status that silently renders as nothing at all.
+
+Published from `survey` (`supervisor/loop.ts`) — the one place in the process that has just
+read every task's state — which since §6.4's split runs on the **housekeeping** loop. That
+matters more than it looks: on the old single loop the presence would have frozen for the
+whole of a session, which is precisely the interval it exists to describe.
+
 ---
 
 ## 8. Machine handoff

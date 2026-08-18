@@ -30,6 +30,7 @@ import {
   type ProviderOutage,
   type SessionOutcome,
   type TaskId,
+  type TaskPhase,
   type TaskSpec,
   type TaskState,
   type TaskStatus,
@@ -275,6 +276,16 @@ export interface SupervisorDeps {
    * Optional: nothing in the loop reads it, and without a bridge nothing needs it.
    */
   readonly snapshot?: SnapshotWriter;
+  /**
+   * What the bot advertises it is doing (DESIGN.md §7.2). Fed from `survey`.
+   *
+   * Optional and write-only from here, like `snapshot` and for the same reason: nothing in
+   * the loop reads it back, and a runner with no bot token has nowhere to publish it. The
+   * narrow structural type keeps `notify/activity.ts` out of the loop's imports.
+   */
+  readonly activity?: {
+    publish(tasks: readonly { id: TaskId; status: TaskStatus; phase: TaskPhase }[]): void;
+  };
   /**
    * Cancel signals reaching a session already in flight (DESIGN.md §21).
    *
@@ -1019,6 +1030,19 @@ export class Supervisor {
           ...(record.state.chat === undefined ? {} : { threadId: record.state.chat.threadId }),
         })),
       ),
+    );
+
+    // What the bot shows in Discord's member list (`notify/activity.ts`). Here rather than
+    // anywhere else for the reason the two calls above are: this is the one place in the
+    // process that has just read EVERY task's committed state, which is what makes the
+    // presence fleet-wide instead of a report on this replica. Synchronous, never throws,
+    // and only sends when the rendered line actually changed — see `FleetActivity.publish`.
+    this.deps.activity?.publish(
+      records.map((record) => ({
+        id: record.id,
+        status: record.state.status,
+        phase: record.state.phase,
+      })),
     );
     return records;
   }
