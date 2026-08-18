@@ -14,6 +14,7 @@
  * one guild.
  */
 import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task.ts";
+import { parseRepo } from "../plan/brainstorm.ts";
 import type { Command } from "./commands.ts";
 import { decodeCustomId } from "./components.ts";
 import {
@@ -96,7 +97,7 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
       },
       {
         name: "repo",
-        description: "owner/name — the repo to read while refining",
+        description: "owner/name — one repo, or several separated by commas or spaces",
         type: OPTION_STRING,
         required: true,
       },
@@ -201,6 +202,19 @@ const taskOption = (interaction: Interaction, name: string): TaskId | string => 
   return isTaskId(trimmed) ? asTaskId(trimmed) : `\`${trimmed}\` is not a task id.`;
 };
 
+/**
+ * The repo list, as typed.
+ *
+ * Commas AND whitespace, because Discord's single-line option box invites both and
+ * neither is wrong. Splitting on either means `owner/a, owner/b` and `owner/a owner/b`
+ * are the same command, which is the only behaviour a human would predict.
+ */
+const splitRepos = (raw: string): readonly string[] =>
+  raw
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
 const fromCommand = (interaction: Interaction): Intent => {
   const name = interaction.data?.name;
 
@@ -238,12 +252,20 @@ const fromCommand = (interaction: Interaction): Intent => {
       const topic = optionValue(interaction, "topic")?.trim() ?? "";
       const repo = optionValue(interaction, "repo")?.trim() ?? "";
       if (topic.length === 0) return malformed("A brainstorm needs a topic.");
-      if (repo.length === 0) {
+      const repos = splitRepos(repo);
+      if (repos.length === 0) {
         // Required rather than inferred: a brainstorm that cannot read the code produces
         // a plan about an imaginary codebase, which is the expensive kind of wrong.
-        return malformed("A brainstorm needs a repo to read — `owner/name`.");
+        return malformed(
+          "A brainstorm needs at least one repo to read — `owner/name`, or several " +
+            "separated by commas or spaces.",
+        );
       }
-      return { kind: "run", command: { kind: "brainstorm", topic, repo } };
+      const bad = repos.find((entry) => parseRepo(entry) === undefined);
+      if (bad !== undefined) {
+        return malformed(`\`${bad}\` is not a repo — use \`owner/name\` or \`host/owner/name\`.`);
+      }
+      return { kind: "run", command: { kind: "brainstorm", topic, repos } };
     }
     default:
       return { kind: "ignored", reason: `unknown command ${name ?? "(none)"}` };

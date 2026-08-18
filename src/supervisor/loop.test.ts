@@ -1563,7 +1563,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   const outcome = await inbox.submit({
     kind: "brainstorm",
     topic: "make the thing faster",
-    repo: "acme/widget",
+    repos: ["acme/widget"],
     threadId: "1538626232302960801",
     author: "caesar",
   });

@@ -38,8 +38,12 @@ export type Command =
    * Carries no task id: it CREATES one, in a thread that does not exist until the bridge
    * has opened it. That is why it is the one command the bridge does IO for before the
    * loop ever sees it.
+   *
+   * `repos` is a list because a brainstorm may span several repos in ONE workspace
+   * (§9.4.1, §14.3) — the plan children then inherit the whole list. Crossing workspaces
+   * is refused by the loop.
    */
-  | { readonly kind: "brainstorm"; readonly topic: string; readonly repo: string }
+  | { readonly kind: "brainstorm"; readonly topic: string; readonly repos: readonly string[] }
   /** Recognised prefix, unusable content — worth replying to rather than ignoring. */
   | { readonly kind: "malformed"; readonly reason: string };
 

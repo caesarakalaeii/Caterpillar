@@ -14,7 +14,7 @@
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
-import type { RunnerConfig } from "../config/types.ts";
+import type { RunnerConfig, WorkspaceProfile } from "../config/types.ts";
 import {
   addUsage,
   asTaskId,
@@ -25,6 +25,7 @@ import {
   isTerminal,
   repoSlug,
   type ProposedPlan,
+  type RepoRef,
   type ProviderOutage,
   type SessionOutcome,
   type TaskId,
@@ -34,7 +35,13 @@ import {
   type UsageTotals,
   type WorkspaceName,
 } from "../domain/task.ts";
-import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "../plan/brainstorm.ts";
+import {
+  brainstormId,
+  brainstormSpec,
+  parseRepo,
+  qualifiedSlug,
+  resolveWorkspace,
+} from "../plan/brainstorm.ts";
 import { layer, materialise, relayer } from "../plan/materialize.ts";
 import type { Maintainer, PlanRevision, PlanSibling } from "../plan/maintain.ts";
 import {
@@ -1656,18 +1663,55 @@ export class Supervisor {
   ): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
-    const repo = parseRepo(request.repo);
-    if (repo === undefined) {
-      return { kind: "refused", reason: `\`${request.repo}\` is not a repo — use \`owner/name\`.` };
+    if (request.repos.length === 0) {
+      return { kind: "refused", reason: "A brainstorm needs at least one repo to read." };
     }
 
-    const profile = resolveWorkspace(config.workspaces, repo);
-    if (profile === undefined) {
+    const repos: RepoRef[] = [];
+    for (const raw of request.repos) {
+      const repo = parseRepo(raw);
+      if (repo === undefined) {
+        return { kind: "refused", reason: `\`${raw}\` is not a repo — use \`owner/name\`.` };
+      }
+      repos.push(repo);
+    }
+
+    // Every repo must land in the SAME workspace. Not a tidiness check: a workspace is one
+    // forge, one owner, one credential bundle (§3.1), and a session holding credentials for
+    // two of them is precisely the blast radius the workspace model exists to bound (§9.1).
+    // A brainstorm that spans two is refused outright rather than narrowed to one, because
+    // silently dropping a repo the human asked for produces a plan about half a system.
+    const resolved: { readonly repo: RepoRef; readonly profile: WorkspaceProfile }[] = [];
+    for (const repo of repos) {
+      const profile = resolveWorkspace(config.workspaces, repo);
+      if (profile === undefined) {
+        return {
+          kind: "refused",
+          reason:
+            `No workspace owns \`${repo.owner}\` on ${repo.host}, and there is more than one ` +
+            `configured, so I cannot guess which credentials to use.`,
+        };
+      }
+      resolved.push({ repo, profile });
+    }
+
+    const profile = (resolved[0] as { readonly profile: WorkspaceProfile }).profile;
+    if (resolved.some((entry) => entry.profile.name !== profile.name)) {
+      const byWorkspace = new Map<string, string[]>();
+      for (const entry of resolved) {
+        const slugs = byWorkspace.get(entry.profile.name) ?? [];
+        slugs.push(qualifiedSlug(entry.repo));
+        byWorkspace.set(entry.profile.name, slugs);
+      }
+      const where = [...byWorkspace]
+        .map(([name, slugs]) => `\`${name}\` (${slugs.join(", ")})`)
+        .join(" and ");
       return {
         kind: "refused",
         reason:
-          `No workspace owns \`${repo.owner}\` on ${repo.host}, and there is more than one ` +
-          `configured, so I cannot guess which credentials to use.`,
+          `Those repos are in different workspaces: ${where}. A workspace is one credential ` +
+          `bundle, and one brainstorm session cannot hold two — run a brainstorm per ` +
+          `workspace instead.`,
       };
     }
 
@@ -1678,7 +1722,7 @@ export class Supervisor {
       id,
       workspace: profile.name,
       topic: request.topic,
-      repo,
+      repos,
       author: request.author,
     });
 
@@ -1701,7 +1745,11 @@ export class Supervisor {
     await store.writeSpec(spec);
     await store.commitAndPush(`chore(${id}): brainstorm started`, "origin", config.stateRepo.branch);
 
-    logger.info("brainstorm.created", { task: id, workspace: profile.name, repo: repoSlug(repo) });
+    logger.info("brainstorm.created", {
+      task: id,
+      workspace: profile.name,
+      repos: spec.repos.map(repoSlug).join(", "),
+    });
     return { kind: "started", task: id };
   }
 

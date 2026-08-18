@@ -86,7 +86,7 @@ test("a brainstorm spec declares no acceptance criteria, and says it is one", ()
     id: brainstormId("42"),
     workspace: asWorkspaceName("caesar"),
     topic: "Make intake accept a Linear issue",
-    repo: { host: "github.com", owner: "acme", name: "widget" },
+    repos: [{ host: "github.com", owner: "acme", name: "widget" }],
     author: "operator",
   });
 
