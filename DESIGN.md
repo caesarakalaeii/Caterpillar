@@ -1004,6 +1004,29 @@ session would find no binding and be swallowed. That is this section's own defec
 through the reader rather than the writer, and it is the reason a read being fast is not
 the same as a read being right.
 
+**The snapshot is sorted, and the order is a correctness property rather than a
+presentation one.** A Discord message is capped at 2000 characters, so a listing is capped
+at 25 lines, so the *order* decides what a human is shown. `survey` builds its records by
+walking `tasks/`, which yields them effectively alphabetically by id — and for ids like
+`BS-<snowflake>` and `BS-<snowflake>-07` that means oldest brainstorm first. At 39 tasks
+`/tasks` showed **23 finished tasks and elided the one that was running**: the command whose
+entire job is to say what the fleet is doing showed everything except that.
+
+`TaskSnapshot.replace` therefore sorts by `updatedAt`, newest first, tie-broken by id.
+Recency and not a status ranking: a status order needs a policy about which status outranks
+which, that policy is wrong for somebody, and recency reaches the same answer without one —
+the task a runner is working is the task whose state is being rewritten, and finished work
+sinks on its own. The tie-break matters because tasks cut from one plan are created in the
+same millisecond, and a listing that shuffled them between two runs of the same command
+reads as a bug.
+
+Sorted **once, in the snapshot**, rather than in each reader, because pagination slices it:
+`/tasks page:2` over a list a reader had re-ordered would repeat some tasks and skip others.
+The listing also states the per-status counts over the whole set, which is the half of the
+answer a capped list cannot give, and names the exact command that shows the next page —
+the previous wording was `…and 14 more.`, which announces that something is missing and
+offers no way to reach it.
+
 **Buttons can only come from the bot.** Discord refuses interactive components from a
 webhook the application does not own, and `webhook-url` is a webhook created in the
 channel's settings. A question notification with an Answer button on it is therefore not

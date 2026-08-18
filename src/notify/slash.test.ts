@@ -106,6 +106,37 @@ test("/tasks filters only on a status that exists", () => {
   );
 });
 
+test("/tasks carries a page, and drops one that is not a number", () => {
+  // The client sends an integer, but `optionValue` stringifies whatever arrived and the
+  // command surface is reachable by anything that can POST an interaction. A malformed page
+  // is not worth refusing a listing over — the default page is the one almost everybody
+  // wants — so it is dropped and `describeList` clamps whatever does get through.
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ data: { name: "tasks", options: [{ name: "page", value: 3 }] } }),
+    ),
+    { kind: "run", command: { kind: "list", page: 3 } },
+  );
+  assert.deepEqual(
+    parseInteraction(
+      interaction({
+        data: { name: "tasks", options: [{ name: "status", value: "done" }, { name: "page", value: 2 }] },
+      }),
+    ),
+    { kind: "run", command: { kind: "list", status: "done", page: 2 } },
+  );
+
+  for (const bad of ["two", "", 0, -1]) {
+    assert.deepEqual(
+      parseInteraction(
+        interaction({ data: { name: "tasks", options: [{ name: "page", value: bad }] } }),
+      ),
+      { kind: "run", command: { kind: "list" } },
+      `page:${JSON.stringify(bad)} must fall back to the first page`,
+    );
+  }
+});
+
 test("/cancel parks", () => {
   assert.deepEqual(
     parseInteraction(interaction({ data: { name: "cancel", options: [{ name: "task", value: TASK }] } })),

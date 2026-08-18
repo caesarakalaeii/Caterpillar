@@ -37,11 +37,40 @@ export const summarise = (state: TaskState): TaskSummary => ({
 /** Suggestions Discord will render at most; more is a 400. */
 const MAX_SUGGESTIONS = 25;
 
+/**
+ * Newest first, by `updatedAt`.
+ *
+ * The order is load-bearing rather than cosmetic, because a listing is CAPPED and the cap
+ * decides what a human sees. `survey` builds its records by walking `tasks/`, so the
+ * incoming order is whatever the filesystem gives — effectively alphabetical by task id,
+ * which for ids like `BS-<snowflake>` and `BS-<snowflake>-07` means *oldest brainstorm
+ * first*. On a fleet with 39 tasks and a 25-line cap that put 23 finished tasks on the
+ * screen and elided the one that was RUNNING: the command that answers "what is it doing"
+ * showed everything except that.
+ *
+ * `updatedAt` and not a status ranking. A status order would need a policy about which
+ * status outranks which, and the policy would be wrong for somebody — where "most recently
+ * touched" needs no policy and gets the same result anyway, because the task a runner is
+ * working is the task whose state is being rewritten. Old finished work sinks on its own.
+ *
+ * Tie-broken by id so the order is total: several tasks cut from one plan are created in
+ * the same tick and share a timestamp to the millisecond, and a listing that shuffled them
+ * between two invocations of the same command reads as a bug.
+ */
+const byRecency = (a: TaskSummary, b: TaskSummary): number =>
+  b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id);
+
 export class TaskSnapshot {
   private tasks: readonly TaskSummary[] = [];
 
+  /**
+   * Sorted here, once per poll, rather than in each reader. `all`, `withStatus` and the
+   * pagination in `notify/replies.ts` must agree about what "the first 25" means — page 2
+   * of a differently-ordered list can repeat or skip a task — and one sorted field is the
+   * cheapest way to make that true by construction.
+   */
   replace(tasks: readonly TaskSummary[]): void {
-    this.tasks = tasks;
+    this.tasks = [...tasks].sort(byRecency);
   }
 
   all(): readonly TaskSummary[] {

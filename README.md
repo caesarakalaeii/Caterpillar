@@ -851,6 +851,24 @@ The bot needs the **MESSAGE_CONTENT** privileged intent enabled in the Discord d
 portal. Without it every message arrives with empty content and no command ever matches —
 a checkbox, not something code can detect or fix.
 
+### Listing tasks
+
+```
+/tasks                       # everything, most recently updated first
+/tasks status:awaiting-human # just the ones waiting on you
+/tasks status:done page:2    # the rest of a long listing
+```
+
+Ordered **newest first**, which is the difference between a useful listing and a decorative
+one: a Discord message caps at 2000 characters so a listing caps at 25 lines, and the order
+is what decides which 25. Sorted by task id — which is what walking `tasks/` gives — a fleet
+of 39 tasks showed 23 finished ones and hid the task that was running.
+
+The header counts every status over the whole set (`1 running · 4 ready · 31 done`), so the
+shape of the backlog is visible without paging to it, and the footer names the exact command
+for the next page. `25` per page; `page:` is clamped, so a page past the end is the last page
+rather than an error.
+
 ## Brainstorming a plan
 
 ```
