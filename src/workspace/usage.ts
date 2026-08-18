@@ -47,7 +47,7 @@
  * memory cost paid on every pass to sharpen a number that is already only a hint.
  */
 import { readdir, stat, statfs } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { UsageConfig } from "../config/types.ts";
 
 /** One directory that was measured — a mirror repo, or a task's worktree. */
@@ -368,14 +368,21 @@ const taskLeaves = async (parent: string, budget: Budget): Promise<readonly stri
  * task clones something, `/nix/store` does not exist on a runner without nix, and both are
  * ordinary configurations rather than faults — reporting them as failures would put a
  * warning in the log of every healthy runner that has not worked a task yet.
+ *
+ * `skip` is compared against `resolve`d paths, never against the strings as configured.
+ * The exclusions come from `paths.mirrors` and `paths.tasks`, which are free-form fields
+ * in a ConfigMap, and `/work/mirrors/` with a trailing slash is a spelling a human writes
+ * without thinking. Compared literally it matches nothing the walk produces, `other`
+ * silently absorbs the mirrors and the tasks a second time, and the categories stop adding
+ * up — a wrong number rather than an error, from a config that looks right.
  */
 const directoryBytes = async (
   path: string,
   budget: Budget,
   skip: readonly string[] = [],
 ): Promise<number> => {
-  const excluded = new Set(skip);
-  const stack: string[] = [path];
+  const excluded = new Set(skip.map((entry) => resolve(entry)));
+  const stack: string[] = [resolve(path)];
   let bytes = 0;
 
   while (stack.length > 0) {
@@ -385,6 +392,8 @@ const directoryBytes = async (
 
     const children = await readdir(current, { withFileTypes: true }).catch(() => []);
     for (const child of children) {
+      // `current` is already resolved and `child.name` is a single component, so this stays
+      // resolved for the whole walk and the `excluded` comparison above holds at any depth.
       const childPath = join(current, child.name);
       if (excluded.has(childPath)) continue;
 

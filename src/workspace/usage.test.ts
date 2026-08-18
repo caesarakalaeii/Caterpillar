@@ -261,3 +261,36 @@ test("an interval of zero turns the measurement off rather than running it const
   assert.equal(await monitor.maybeMeasure(), undefined, "still off a day later");
   assert.equal(monitor.current(), undefined, "and there is nothing for the page to show");
 });
+
+test("a trailing slash in the config does not make `other` absorb everything twice", async () => {
+  // `paths.mirrors` and `paths.tasks` are free-form ConfigMap strings, and `/work/mirrors/`
+  // is how a human writes one without thinking. Compared literally the exclusion matches
+  // nothing the walk produces, so `other` counts the mirrors and the tasks a second time
+  // and the categories stop adding up — a wrong number from a config that looks right.
+  const { root, mirrorsDir, tasksDir } = await workRoot();
+
+  const usage = await measureUsage({
+    workRoot: `${root}/`,
+    mirrorsDir: `${mirrorsDir}/`,
+    tasksDir: `${tasksDir}/`,
+  });
+
+  assert.equal(usage.mirrorBytes, 1300);
+  assert.equal(usage.taskBytes, 5057);
+  assert.equal(usage.otherBytes, 400, "only the state checkout, counted once");
+});
+
+test("a relative work root is resolved before anything is excluded", async () => {
+  // Same failure, arrived at differently: an absolute exclusion never matches a relative
+  // walk, so `other` would swallow both categories again.
+  const { root, mirrorsDir, tasksDir } = await workRoot();
+  const cwd = process.cwd();
+  process.chdir(root);
+
+  try {
+    const usage = await measureUsage({ workRoot: ".", mirrorsDir, tasksDir });
+    assert.equal(usage.otherBytes, 400);
+  } finally {
+    process.chdir(cwd);
+  }
+});
