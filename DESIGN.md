@@ -753,11 +753,21 @@ touch git. Two mechanisms, and both are needed:
    durability: a commit message occasionally undersells its contents. That is the right way
    round.
 
-   For a caller that needs the two halves to be one unit, `StateStore.exclusively` holds
-   the checkout across write *and* commit. That closes a gap the mutex alone leaves even
-   with the dirty flag: `git add -A` stages the whole tree, so a writer that writes,
-   releases, then commits can have its files swept into another writer's commit under the
-   wrong message, without a single interleaved git call.
+   The flag is backed by a monotonic write counter, because writes deliberately do *not*
+   take the mutex. `commitAndPush` samples the counter before its first `add` and clears
+   the flag only if it has not moved, so a write that lands *during* a commit — after the
+   `add` that would have staged it — leaves the tree marked dirty rather than being lost
+   to the next `pull`. That window is only a few subprocess spawns wide, but a session's
+   `publishArtifact` can fall into it and then go hours before its own commit.
+
+   `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
+   needs the two to be one unit. **No production path uses it today** — the supervisor's
+   writes go through `writeState`/`appendJournal` and rely entirely on the dirty flag and
+   its counter, which is what makes sessions safe. It exists because the gap it closes is
+   real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
+   then commits can have its files swept into another writer's commit under the wrong
+   message. That costs attribution, not durability, which is precisely why the supervisor
+   accepts it rather than restructuring every session write into a held-lock unit.
 
 **`/cancel` keeps its own interval, and it is not redundant.** Housekeeping drains the
 inbox during a session now, which is what `CANCEL_POLL_MS` was built to work around — but

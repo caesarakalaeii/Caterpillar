@@ -1028,3 +1028,60 @@ test("a pull will not reset over state a session has written but not committed",
   assert.equal(await subject.pull("origin", "main"), "pulled");
   assert.equal((await subject.readState(task)).sessions, 3);
 });
+
+test("a write that races a commit is not marked clean by it", async () => {
+  // The narrow window the write GENERATION closes, as opposed to the minutes-wide one the
+  // `dirty` flag closes on its own.
+  //
+  // Store writes are plain `writeFile` + `touched()` and deliberately do NOT take the
+  // mutex — holding it from a session's `writeState` to its `commitAndPush` is the deadlock
+  // `exclusively` exists to avoid. So a write can land INSIDE `stageCommitPush`: after the
+  // `add -A tasks` that would have staged it, before the flag is cleared. It is then in
+  // neither the commit nor the flag, `pull` believes the tree is clean, and `clean -ffdq`
+  // over `tasks/` destroys it — the same five-task incident, reached through a hole two
+  // hundred milliseconds wide instead of two minutes.
+  //
+  // In production the racing writer is a session's `publishArtifact` or `appendJournal`,
+  // which may then run for hours before its own commit. That is what makes a window this
+  // small worth closing: the loss is taken instantly and noticed much later.
+  const { store: subject, other } = await sharedStateRepo();
+  const session = asTaskId("RACE-SESSION");
+  const housekeeping = asTaskId("RACE-HOUSEKEEPING");
+
+  // Something for a pull to reset onto, so a pull that runs is visibly destructive.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  // Housekeeping commits its own work — and the session writes while that is in flight.
+  await subject.writeHandoff(housekeeping, "a /resume served while the session ran");
+  const committing = subject.commitAndPush(`chore(${housekeeping}): resumed`, "origin", "main");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await subject.appendJournal(session, 1, "written while housekeeping was committing");
+  await committing;
+
+  // The commit may or may not have caught that journal shard — it depends on where in the
+  // subprocess sequence the write landed, which is exactly why this cannot be reasoned
+  // about per-call. What must hold either way is that the flag does not claim otherwise.
+  assert.equal(
+    subject.hasUncommittedState,
+    true,
+    "a write racing the commit must leave the tree marked dirty, not silently unstaged",
+  );
+  assert.equal(
+    await subject.pull("origin", "main"),
+    "skipped",
+    "and the pull that would have destroyed it must therefore decline",
+  );
+  assert.match(
+    (await subject.readJournal(session)) ?? "",
+    /while housekeeping was committing/,
+    "the racing write must survive",
+  );
+
+  // Deferred, not dropped: the next commit carries it and the pull runs again.
+  await subject.commitAndPush(`chore(${session}): session 1`, "origin", "main");
+  assert.equal(subject.hasUncommittedState, false);
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(session)) ?? "", /while housekeeping was committing/);
+});

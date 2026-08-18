@@ -1,14 +1,17 @@
 /**
- * The queue between an inbound chat message and the supervisor's poll loop.
+ * The queue between an inbound chat message and the supervisor's housekeeping loop.
  *
- * The loop OWNS the state repo: it pulls, writes, commits and pushes on one thread of
- * control. A websocket event handler doing the same thing concurrently would interleave
- * two git invocations in one working copy — `index.lock` at best, a half-staged commit
- * at worst. So the bridge does not touch git at all. It submits, the loop drains, and
- * the submitter is told what happened.
+ * The supervisor's loops OWN the state repo: they pull, write, commit and push, and every
+ * git invocation among them is serialised by `Serial` (see `StateStore`). A websocket event
+ * handler doing the same thing concurrently would be outside that discipline entirely and
+ * would interleave two git invocations in one working copy — `index.lock` at best, a
+ * half-staged commit at worst. So the bridge does not touch git at all. It submits, the
+ * housekeeping loop drains, and the submitter is told what happened.
  *
- * That also means a request lands at a defined point in the cycle: before claiming, so
- * a task unparked by an answer is claimable on the same pass rather than the next one.
+ * That also means a request lands at a defined point in the cycle. Since housekeeping runs
+ * on its own timer (DESIGN.md §6.4) that point no longer waits for a session to end: a
+ * `/resume` or `/answer` submitted mid-session is drained on the next housekeeping tick,
+ * and the work loop finds the task claimable when it next looks.
  *
  * Nothing that can be served WITHOUT git comes through here. Listing tasks and showing
  * one are answered from the snapshot (`snapshot.ts`) inside Discord's 3-second
@@ -123,16 +126,14 @@ export class ChatInbox {
   /**
    * Take just the requests matching `select`, leaving the rest queued.
    *
-   * Exists for exactly one caller: the supervisor watching for a `/cancel` while a
-   * session is in flight. The normal `drain` runs in the poll loop, which is BLOCKED for
-   * the whole duration of a session — so a cancel submitted while the agent is working
-   * sat in the queue until the session it was meant to stop had already finished, and
-   * the operator's Discord reply hung until then too.
+   * Exists for exactly one caller: the supervisor watching for a `/cancel` naming the task
+   * THIS runner is currently running.
    *
-   * Deliberately not a general "process requests during a session": everything else in
-   * the queue writes the state repo, and the running session holds the lease those
-   * writes would have to fence against. A cancel is safe because it writes nothing — it
-   * aborts, and the write happens on the poll that follows.
+   * Everything else is now drained by the housekeeping loop, which runs on its own timer
+   * and no longer waits for a session (DESIGN.md §6.4). This one request cannot be, and the
+   * reason is structural rather than about timing: parking a task takes its lease, and the
+   * in-flight session already holds it. Only code inside the session can honour a cancel
+   * for its own task — it aborts, and the write happens on the tick that follows.
    */
   takeWhere(select: (request: ChatRequest) => boolean): readonly ChatRequest[] {
     const taken = this.queue.filter(select);

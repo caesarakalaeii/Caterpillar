@@ -9,7 +9,8 @@
  * because "the end of the window" is a commit rather than "now".
  *
  * Nothing here reaches the network and nothing here writes. The state checkout is already
- * up to date when this runs: the poll loop pulls before anything else.
+ * up to date when this runs: the housekeeping loop pulls at the top of the same pass that
+ * reaches the digest.
  *
  * Tolerant by construction. A malformed `spec.md` costs a title, a missing `state.json`
  * costs one task, and neither fails the day — the digest exists to report a fleet that

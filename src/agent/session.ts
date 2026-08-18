@@ -70,10 +70,10 @@ export interface SessionOptions {
    * Required, and that is the point. It was the supervisor's job, applied around the
    * agent's session and nowhere else — but the council, the plan maintainer and the
    * digest summariser all run sessions too, and all three ran them with no signal
-   * whatsoever. A provider request that never returned therefore wedged the whole
-   * single-threaded runner: the poll loop, the chat drain, intake and claiming all sit
+   * whatsoever. A provider request that never returns wedges the work loop: claiming sits
    * behind it, the heartbeat keeps renewing the lease, and /healthz keeps answering 200.
-   * One did exactly that for 7h20m inside `council.start`, with zero restarts.
+   * One did exactly that for 7h20m inside `council.start`, with zero restarts — back when
+   * the chat drain and intake sat behind it as well (§6.4 has since split those out).
    *
    * Making it a required field rather than an optional one is the whole fix. A caller
    * may add a signal of its own — shutdown, a lost lease, a `/cancel` — but it cannot

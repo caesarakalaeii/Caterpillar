@@ -246,8 +246,9 @@ export interface SupervisorDeps {
    *
    * Optional, and its absence is not a loss of function: the in-process path through
    * `inbox.takeWhere` still works, and that is the whole mechanism on a single-replica
-   * runner. This exists so a cancel typed at a SEPARATE bot process reaches the session
-   * without waiting for the poll loop — which is blocked for the session's whole duration.
+   * runner. This exists so a cancel typed at a SEPARATE bot process reaches the session at
+   * all: that process has no path into this one's inbox, and the task's own lease is held
+   * here, so no amount of housekeeping in this runner can serve it (§6.4).
    */
   readonly cancels?: CancelSignals;
   /**
@@ -494,7 +495,13 @@ export class Supervisor {
 
     if (await this.coolingDown(signal)) return;
 
-    const claimed = await this.claimNext(await this.survey());
+    // `claimNext` sets `inFlightTask` as it wins a lease (see there). If it throws after
+    // that point the flag would otherwise outlive the attempt, and every subsequent
+    // `/cancel` for that task would be left queued for a session that never started.
+    const claimed = await this.claimNext(await this.survey()).catch((error: unknown) => {
+      this.inFlightTask = undefined;
+      throw error;
+    });
     if (claimed === undefined) {
       // Idle-only, and left on the WORK loop rather than moved to housekeeping with the
       // nix collection. It spends its time inside THIS process — a `stat` per file over a
@@ -516,6 +523,9 @@ export class Supervisor {
       // threw would stop this runner ever collecting the nix store again, and the symptom
       // would be a full volume weeks later with nothing in the logs pointing here.
       this.sessionInFlight = true;
+      // `inFlightTask` is already this task — `claimNext` sets it as it wins the lease, so
+      // the cancel-exclusion window covers the claim itself. Reasserted rather than
+      // assumed, because the `finally` below clears it unconditionally.
       this.inFlightTask = claimed.spec.id;
       await this.workTask(claimed.lease, claimed.spec, signal);
     } catch (error) {
@@ -819,6 +829,16 @@ export class Supervisor {
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
+      // Marked as ours the INSTANT the lease is won, not when `workOnce` gets the result
+      // back. Several awaits follow before that (the reclaim journal, the mirror), and
+      // housekeeping drains chat throughout them: a `/cancel` naming this task arriving in
+      // that window would be taken by the drain rather than left for the in-session
+      // watcher, fail `leases.claim` against the lease just taken here, and answer the
+      // human "not-parkable: running" about a task this very process is about to start —
+      // the exact reply `applyChatRequests` excludes the request to avoid. Recoverable by
+      // retrying, but it reads as a bug to the person typing it.
+      this.inFlightTask = id;
+
       // The CAS is what established this was safe to take, so by here the previous
       // holder is gone. Say so: a reclaim is a pod that died mid-task, and the whole
       // failure used to be invisible — the task simply stopped, with no line anywhere
@@ -848,6 +868,12 @@ export class Supervisor {
       await this.mirror(spec, { kind: "claimed", runner: lease.runner });
       return { lease, spec };
     }
+    // Nothing claimed, so nothing is in flight. This also undoes the optimistic set above
+    // for a candidate whose lease was won but whose journal or mirror then threw: the
+    // throw leaves `claimNext` without reaching `workOnce`'s `finally`, and a stale id
+    // here would silently swallow every later `/cancel` for that task — the drain would
+    // keep leaving it for an in-session watcher that does not exist.
+    this.inFlightTask = undefined;
     return undefined;
   }
 
@@ -2096,11 +2122,13 @@ export class Supervisor {
   /**
    * Park a task on request — `/cancel`.
    *
-   * A task running ON THIS RUNNER never reaches here: `workTask` intercepts its own
-   * task's park requests while the session is in flight and aborts it, because the poll
-   * loop — and with it this drain — is blocked for the whole duration of a session. That
-   * path used to refuse outright, which left deleting the pod as the only way to stop a
-   * session, and that in turn stranded the task (§6.2).
+   * A task running ON THIS RUNNER never reaches here: `workTask` intercepts its own task's
+   * park requests while the session is in flight and aborts it. Housekeeping drains during
+   * a session now (§6.4), so this is no longer about the drain being blocked — it is that
+   * parking takes the lease the session itself holds, so only in-session code can serve it.
+   * `applyChatRequests` excludes exactly that request for this reason. The in-session path
+   * used to refuse outright, which left deleting the pod as the only way to stop a session,
+   * and that in turn stranded the task (§6.2).
    *
    * A task running on ANOTHER runner IS refused here. Nothing in this process can reach
    * into that one, and pretending to cancel would leave the task running with the human
