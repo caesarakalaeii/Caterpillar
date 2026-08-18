@@ -32,7 +32,7 @@ const manager = (root: string): WorktreeManager =>
     mirrorsDir: join(root, "mirrors"),
     tasksDir: join(root, "tasks"),
     helperPath: "/usr/local/bin/caterpillar-cred",
-    socketPath: "/run/caterpillar/cred.sock",
+    socketDir: "/run/caterpillar/cred",
     identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   });
 
@@ -101,18 +101,20 @@ test("the mirror clone carries the credential helper, not just the repo config",
     mirrorsDir: join(root, "mirrors"),
     tasksDir: join(root, "tasks"),
     helperPath: "/usr/local/bin/caterpillar-cred",
-    socketPath: "/run/caterpillar/cred.sock",
+    socketDir: "/run/caterpillar/cred",
     identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   });
 
-  await subject.syncMirror(REPO).catch(() => undefined);
+  await subject.syncMirror(REPO, asTaskId("T-1")).catch(() => undefined);
 
   const clone = invocations.find((args) => args.includes("clone"));
   assert.ok(clone !== undefined, "syncMirror must clone when no mirror exists");
 
   const joined = clone.join(" ");
   assert.match(joined, /credential\.helper=!\/usr\/local\/bin\/caterpillar-cred/);
-  assert.match(joined, /--socket \/run\/caterpillar\/cred\.sock/);
+  // The socket is the CLONING TASK's, not a shared one: the clone happens under a task
+  // and must resolve that task's credential and no other's.
+  assert.match(joined, /--socket \/run\/caterpillar\/cred\/T-1\.sock/);
   assert.match(joined, /credential\.useHttpPath=true/);
 
   // The overrides must precede the subcommand — `git clone -c ...` is not valid.
@@ -155,7 +157,7 @@ test("the mirror clone does not inherit the supervisor's own credential", async 
     mirrorsDir: join(root, "mirrors"),
     tasksDir: join(root, "tasks"),
     helperPath: "/usr/local/bin/caterpillar-cred",
-    socketPath: "/run/caterpillar/cred.sock",
+    socketDir: "/run/caterpillar/cred",
     identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   });
 
@@ -685,4 +687,185 @@ test("a task id that escapes tasksDir is refused rather than obeyed", async () =
     /refusing to remove/,
   );
   assert.ok(existsSync(join(outside, "mirrors-live-here")), "and it must still be there");
+});
+
+test("two worktrees of the SAME mirror get DIFFERENT credential helpers", async () => {
+  // The failure mode `configure`'s own comment warns about, and the one that would have
+  // silently defeated per-task credential keying.
+  //
+  // `git config` inside a linked worktree writes to the repository's COMMON config,
+  // shared by the mirror and every other worktree of it. So a per-task socket path
+  // written that way is not per-task at all: the second task to configure overwrites the
+  // first, every worktree resolves to the LAST task's socket, and task A's push asks for
+  // — and gets — task B's credential. Keying the service by task would then buy nothing,
+  // because git would name the wrong task.
+  //
+  // The fix is `git config --worktree`, which needs `extensions.worktreeConfig`. This
+  // test asserts on what git actually resolves in each checkout, not on which file was
+  // written, because the file is an implementation detail and the resolution is the bug.
+  const root = await scratch();
+  const origin = join(root, "origin.git");
+  const hermetic = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "caterpillar",
+    GIT_AUTHOR_EMAIL: "caterpillar@example.invalid",
+    GIT_COMMITTER_NAME: "caterpillar",
+    GIT_COMMITTER_EMAIL: "caterpillar@example.invalid",
+  };
+  const plain = new Git(root, hermetic);
+
+  await plain.run("init", "--bare", "--initial-branch=main", origin);
+  const seed = join(root, "seed");
+  await plain.run("clone", origin, seed);
+  const seedGit = new Git(seed, hermetic);
+  await writeFile(join(seed, "f"), "one\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "one");
+  await seedGit.run("push", "origin", "HEAD:main");
+
+  // A mirror as `syncMirror` would have left it, pointed at the local origin so the rest
+  // runs without a network or a credential.
+  const mirror = mirrorDir(root);
+  await mkdir(join(mirror, ".."), { recursive: true });
+  await plain.run("clone", "--mirror", origin, mirror);
+
+  const subject = manager(root);
+  const first = await subject.ensureWorktree(REPO, asTaskId("T-1"));
+  const second = await subject.ensureWorktree(REPO, asTaskId("T-2"));
+
+  const helperIn = async (worktree: string): Promise<string> =>
+    (await new Git(worktree, hermetic).run("config", "credential.helper")).trim();
+
+  assert.equal(
+    await helperIn(first),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-1.sock",
+  );
+  assert.equal(
+    await helperIn(second),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-2.sock",
+  );
+
+  // Re-configuring the second must not disturb the first. `ensureWorktree` runs on every
+  // create AND reuse, so a resumed session re-enters this path while a sibling task is
+  // live — which is exactly when the shared-config version overwrote its neighbour.
+  await subject.ensureWorktree(REPO, asTaskId("T-2"));
+  assert.equal(
+    await helperIn(first),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-1.sock",
+    "reusing one task's worktree must not repoint another task's",
+  );
+
+  // Nothing shared may name a socket: a leftover there is dormant (worktree scope wins)
+  // but it is the setting a later reader would believe.
+  const shared = await new Git(mirror, hermetic).tryRun(
+    "config",
+    "--file",
+    join(mirror, "config"),
+    "--get",
+    "credential.helper",
+  );
+  assert.notEqual(shared.code, 0, "the common config must not carry a per-task socket path");
+
+  // And the mirror must still be bare while its worktrees are not — the `core.bare`
+  // relocation `extensions.worktreeConfig` forces. Get this wrong and every command
+  // needing a working tree dies with "this operation must be run in a work tree", so the
+  // agent could not so much as run `git status` in its own checkout.
+  assert.equal(
+    (await new Git(mirror, hermetic).run("rev-parse", "--is-bare-repository")).trim(),
+    "true",
+  );
+  assert.equal(
+    (await new Git(first, hermetic).run("rev-parse", "--is-bare-repository")).trim(),
+    "false",
+  );
+  const status = await new Git(first, hermetic).tryRun("status", "--porcelain");
+  assert.equal(status.code, 0, `a task worktree must have a working tree: ${status.stderr}`);
+});
+
+test("a mirror and worktree left by the OLD shared-socket scheme are migrated in place", async () => {
+  // The upgrade path, which has no other test: PVCs already hold mirrors whose common
+  // config names the single shared `cred.sock`, and worktrees created before
+  // `extensions.worktreeConfig` existed. A runner that only got this right on a fresh
+  // clone would keep serving every one of those worktrees the old shared helper, so the
+  // fix would appear to work on a new deployment and change nothing on a real one.
+  const root = await scratch();
+  const hermetic = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "caterpillar",
+    GIT_AUTHOR_EMAIL: "caterpillar@example.invalid",
+    GIT_COMMITTER_NAME: "caterpillar",
+    GIT_COMMITTER_EMAIL: "caterpillar@example.invalid",
+  };
+  const plain = new Git(root, hermetic);
+
+  const origin = join(root, "origin.git");
+  await plain.run("init", "--bare", "--initial-branch=main", origin);
+  const seed = join(root, "seed");
+  await plain.run("clone", origin, seed);
+  const seedGit = new Git(seed, hermetic);
+  await writeFile(join(seed, "f"), "one\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "one");
+  await seedGit.run("push", "origin", "HEAD:main");
+
+  const mirror = mirrorDir(root);
+  await mkdir(join(mirror, ".."), { recursive: true });
+  await plain.run("clone", "--mirror", origin, mirror);
+
+  // Exactly what the previous code left behind: one shared helper in the common config,
+  // and a worktree whose repository has no `extensions.worktreeConfig` at all.
+  const mirrorGit = new Git(mirror, hermetic);
+  await mirrorGit.run(
+    "config",
+    "credential.helper",
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred.sock",
+  );
+  const existing = join(root, "tasks", "T-OLD", REPO.name);
+  await mkdir(join(existing, ".."), { recursive: true });
+  await mirrorGit.run("worktree", "add", "-b", "agent/T-OLD", existing, "main");
+
+  const subject = manager(root);
+  assert.equal(await subject.ensureWorktree(REPO, asTaskId("T-OLD")), existing);
+
+  const helperIn = async (worktree: string): Promise<string> =>
+    (await new Git(worktree, hermetic).run("config", "credential.helper")).trim();
+
+  assert.equal(
+    await helperIn(existing),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-OLD.sock",
+    "reusing a pre-existing worktree must repoint it at its own task's socket",
+  );
+
+  // The migration must leave the checkout usable, not merely correctly configured.
+  const status = await new Git(existing, hermetic).tryRun("status", "--porcelain");
+  assert.equal(status.code, 0, `the migrated worktree must still work: ${status.stderr}`);
+  assert.equal(
+    (await mirrorGit.run("rev-parse", "--is-bare-repository")).trim(),
+    "true",
+    "the mirror must stay bare across the migration",
+  );
+
+  // And a NEW task on that same migrated mirror is independent of the old one.
+  const fresh = await subject.ensureWorktree(REPO, asTaskId("T-NEW"));
+  assert.equal(
+    await helperIn(fresh),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-NEW.sock",
+  );
+  assert.equal(
+    await helperIn(existing),
+    "!/usr/local/bin/caterpillar-cred --socket /run/caterpillar/cred/T-OLD.sock",
+  );
+
+  // Idempotent: the migration runs on every create and reuse, so a second pass must be
+  // a no-op rather than moving `core.bare` a second time.
+  await subject.ensureWorktree(REPO, asTaskId("T-OLD"));
+  assert.equal((await mirrorGit.run("rev-parse", "--is-bare-repository")).trim(), "true");
+  assert.equal(
+    (await new Git(existing, hermetic).run("rev-parse", "--is-bare-repository")).trim(),
+    "false",
+  );
 });

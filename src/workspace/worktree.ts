@@ -11,6 +11,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Git } from "../state/git.ts";
 import type { CommitIdentity, WorktreeReapConfig } from "../config/types.ts";
 import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
+import { taskSocketPath } from "../credential/service.ts";
 
 /**
  * Defaults for worktree reaping, and the reasoning behind each number.
@@ -64,8 +65,14 @@ export interface WorktreeOptions {
   readonly tasksDir: string;
   /** Path to the credential helper executable. */
   readonly helperPath: string;
-  /** Unix socket the helper talks to. */
-  readonly socketPath: string;
+  /**
+   * Directory the credential service opens its PER-TASK sockets in.
+   *
+   * A directory rather than a socket path, because the credential a helper gets back is
+   * decided by WHICH socket it connected to (`credential/service.ts`). The manager only
+   * needs to be able to name a task's socket; it never holds a credential itself.
+   */
+  readonly socketDir: string;
   readonly identity: CommitIdentity;
   /**
    * When finished worktrees are thrown away. Optional, defaulting to
@@ -159,7 +166,7 @@ export class WorktreeManager {
    * "not a git repository" — a message that describes the symptom and hides the cause.
    * A partial mirror is discarded and re-cloned instead.
    */
-  async syncMirror(repo: RepoRef): Promise<string> {
+  async syncMirror(repo: RepoRef, task?: TaskId): Promise<string> {
     const path = mirrorPath(this.options.mirrorsDir, repo);
 
     if (!existsSync(join(path, "HEAD"))) {
@@ -177,7 +184,7 @@ export class WorktreeManager {
         // "could not read Username". The token still never touches argv: `-c` carries
         // the helper's path, and the helper resolves the credential over the socket.
         await this.git.run(
-          ...this.credentialArgs(),
+          ...this.credentialArgs(task),
           "clone",
           "--mirror",
           cloneUrl(repo),
@@ -188,7 +195,8 @@ export class WorktreeManager {
         throw error;
       }
 
-      await this.configure(path);
+      await this.enableWorktreeConfig(path);
+      await this.configureShared(path);
       return path;
     }
 
@@ -248,15 +256,26 @@ export class WorktreeManager {
    *
    * Needed for any git invocation that runs BEFORE a repo exists to hold config —
    * currently the mirror clone. Everything afterwards reads the same settings from the
-   * repo config that `configure` writes.
+   * config `configureShared` and `configureTask` write.
+   *
+   * Without a task there is no socket to name, so the helper is left off entirely rather
+   * than pointed at some other task's. A clone with no helper is anonymous, which is
+   * exactly right for the callers that have no task in hand — and for a private repo it
+   * fails with git's own "could not read Username", not with a stranger's token.
    */
-  private credentialArgs(): readonly string[] {
+  private credentialArgs(task: TaskId | undefined): readonly string[] {
+    if (task === undefined) return [];
     return [
       "-c",
-      `credential.helper=!${this.options.helperPath} --socket ${this.options.socketPath}`,
+      `credential.helper=${this.helperFor(task)}`,
       "-c",
       "credential.useHttpPath=true",
     ];
+  }
+
+  /** The `credential.helper` value that reaches THIS task's socket, and no other's. */
+  private helperFor(task: TaskId): string {
+    return `!${this.options.helperPath} --socket ${taskSocketPath(this.options.socketDir, task)}`;
   }
 
   /**
@@ -283,11 +302,16 @@ export class WorktreeManager {
     // a private repo an unnecessary fetch fails and takes the whole post-session path
     // down with it — verification never runs and the task cannot complete.
     if (existsSync(path)) {
-      await this.configure(path);
+      await this.enableWorktreeConfig(await this.commonDir(path));
+      await this.configureShared(path);
+      await this.configureTask(path, task);
       return;
     }
 
-    const mirror = await this.syncMirror(repo);
+    const mirror = await this.syncMirror(repo, task);
+    // Before the worktree exists, so the very first `worktree add` already lands in a
+    // mirror whose linked checkouts will not be born bare.
+    await this.enableWorktreeConfig(mirror);
     await mkdir(join(path, ".."), { recursive: true });
     const git = this.git.at(mirror);
 
@@ -299,7 +323,8 @@ export class WorktreeManager {
       await git.run("worktree", "add", path, branch);
     }
 
-    await this.configure(path);
+    await this.configureShared(path);
+    await this.configureTask(path, task);
   }
 
   /**
@@ -629,26 +654,33 @@ export class WorktreeManager {
   }
 
   /**
-   * Point this checkout at the credential helper, and make its pushes narrow.
+   * Point this checkout at THIS TASK's credential socket, and make its pushes narrow.
+   *
+   * Split in two on purpose, because the two halves must land in different files.
+   *
+   * NOTE: `git config` inside a worktree writes to the repository's COMMON config,
+   * shared by the mirror and every other worktree of it. That is fine — and wanted —
+   * for identity and the push rules, which are identical for every task on a repo, and
+   * it is why we must NOT touch `remote.origin.url` here: doing so would rewrite the
+   * mirror's fetch URL from a per-task code path. The mirror is cloned from the HTTPS
+   * URL already, so pushes reach the credential helper without any rewriting.
+   *
+   * It is NOT fine for `credential.helper`, which now names a per-task socket. Writing
+   * that to the common config would point every worktree of the mirror at whichever
+   * task configured last — the exact cross-task leak this keying exists to remove, just
+   * relocated from the service into git's config resolution. So it goes to
+   * `config.worktree` instead; see `configureTask`.
    *
    * `credential.useHttpPath` is REQUIRED: without it git omits `path` from the
    * credential request, every repo on a host looks identical to the helper, and
-   * per-repo token selection silently degrades to "first token wins".
+   * per-repo token selection silently degrades to "first token wins". It is the same for
+   * every task, so it stays shared.
    */
-  private async configure(path: string): Promise<void> {
+  private async configureShared(path: string): Promise<void> {
     const git = this.git.at(path);
-    const helper = `!${this.options.helperPath} --socket ${this.options.socketPath}`;
 
     await this.disarmMirrorPush(git, path);
 
-    // NOTE: `git config` inside a worktree writes to the repository's COMMON config,
-    // shared by the mirror and every other worktree of it. That is fine — and wanted —
-    // for the helper and identity, which are identical for every task on a repo.
-    //
-    // It is why we must NOT touch `remote.origin.url` here: doing so would rewrite the
-    // mirror's fetch URL from a per-task code path. The mirror is cloned from the HTTPS
-    // URL already, so pushes reach the credential helper without any rewriting.
-    await git.run("config", "credential.helper", helper);
     await git.run("config", "credential.useHttpPath", "true");
     await git.run("config", "user.name", this.options.identity.name);
     await git.run("config", "user.email", this.options.identity.email);
@@ -657,6 +689,83 @@ export class WorktreeManager {
     // those inherit the operator's global `commit.gpgsign`. The bot identity has no
     // signing key, and signing agent work with the operator's key would be a lie.
     await git.run("config", "commit.gpgsign", "false");
+  }
+
+  /**
+   * Write this worktree's OWN `credential.helper`, reaching only this task's socket.
+   *
+   * `git config --worktree` is the only writable scope that is per-worktree rather than
+   * per-repository, and it requires `extensions.worktreeConfig` on the mirror — see
+   * `enableWorktreeConfig`, which is why this is called after it and never before.
+   *
+   * Also stripped from the common config, unconditionally: a mirror that predates this
+   * change carries a shared `credential.helper` there, and git resolves the worktree
+   * scope over the local one, so a leftover would be dormant rather than harmful — but a
+   * dormant setting naming a socket path is exactly the thing someone reads later and
+   * believes. `--unset-all` exits 5 when the key is absent, the steady state after the
+   * first call.
+   */
+  private async configureTask(path: string, task: TaskId): Promise<void> {
+    const git = this.git.at(path);
+
+    const unset = await git.tryRun("config", "--local", "--unset-all", "credential.helper");
+    if (unset.code !== 0 && unset.code !== 5) {
+      throw new Error(`could not unset the shared credential.helper in ${path}: ${unset.stderr}`);
+    }
+
+    await git.run("config", "--worktree", "credential.helper", this.helperFor(task));
+  }
+
+  /**
+   * Turn on `extensions.worktreeConfig` for a mirror, moving `core.bare` out of the way.
+   *
+   * The move is not optional and it is not tidiness. With the extension enabled git
+   * applies the common config's `core.bare = true` — which `clone --mirror` writes — to
+   * every LINKED worktree as well, and every command that needs a working tree then dies
+   * with
+   *
+   *   fatal: this operation must be run in a work tree
+   *
+   * i.e. the agent could not run `git status` in its own checkout. Relocating `core.bare`
+   * into the MAIN worktree's `config.worktree` keeps the mirror bare and leaves the
+   * linked worktrees non-bare, which is what git's own worktree documentation prescribes.
+   *
+   * Run against the MIRROR, never a linked worktree: `--worktree` writes to whichever
+   * worktree it is invoked from, so doing this from a task checkout would mark THAT
+   * checkout bare and un-bare the mirror — a repository broken in both directions at once.
+   *
+   * Idempotent, and deliberately reads the common config FILE rather than asking git: in
+   * the main worktree `git config core.bare` also sees the `--worktree` value, so the
+   * obvious check reports "still there" forever and the migration would run every time.
+   * Mirrors already on a PVC are migrated the first time a task touches them, which is
+   * why this is called from `ensureWorktree` and not only from the clone path.
+   */
+  private async enableWorktreeConfig(mirror: string): Promise<void> {
+    const git = this.git.at(mirror);
+    const commonConfig = join(await this.commonDir(mirror), "config");
+
+    const bare = await git.tryRun("config", "--file", commonConfig, "--get", "core.bare");
+    const enabled = await git.tryRun(
+      "config",
+      "--file",
+      commonConfig,
+      "--get",
+      "extensions.worktreeConfig",
+    );
+    if (enabled.stdout.trim() === "true" && bare.code !== 0) return;
+
+    // The extension first: `--worktree` is refused outright while it is off, so the
+    // opposite order leaves `core.bare` in the common config with the extension already
+    // enabled — the broken state above, reached deliberately.
+    await git.run("config", "extensions.worktreeConfig", "true");
+
+    if (bare.code === 0) {
+      await git.run("config", "--worktree", "core.bare", bare.stdout.trim());
+      const removed = await git.tryRun("config", "--file", commonConfig, "--unset", "core.bare");
+      if (removed.code !== 0 && removed.code !== 5) {
+        throw new Error(`could not relocate core.bare out of ${commonConfig}: ${removed.stderr}`);
+      }
+    }
   }
 
   /**
@@ -681,8 +790,9 @@ export class WorktreeManager {
    * cannot move a branch it is not standing on, whatever it types.
    *
    * Both live in the mirror's shared config, which is what we want: the rule is a property
-   * of every task on the repo, not of one task. And because `configure` runs on every
-   * worktree create AND reuse — unlike the fetch refspec, which is why THAT one is passed
+   * of every task on the repo, not of one task — unlike `credential.helper`, which is why
+   * that one moved to worktree scope and this one did not. And because `configureShared`
+   * runs on every worktree create AND reuse — unlike the fetch refspec, which is why THAT one is passed
    * per invocation — mirrors already on a PVC are healed the next time a task touches them.
    */
   private async disarmMirrorPush(git: Git, path: string): Promise<void> {

@@ -123,7 +123,7 @@ const probeFor = (root: string): GitProgressProbe =>
       mirrorsDir: join(root, "mirrors"),
       tasksDir: join(root, "tasks"),
       helperPath: "/usr/local/bin/caterpillar-cred",
-      socketPath: "/run/caterpillar/cred.sock",
+      socketDir: "/run/caterpillar/cred",
       identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
     }),
   });

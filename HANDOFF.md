@@ -624,10 +624,23 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
   credential fill` reproduces the real invocation offline.
 - **`at()` drops the credential, but only if you call it.** Enforce "this object must not
   travel" at the boundary that RECEIVES it.
-- **Anything the supervisor does AFTER `clearActive()` cannot use a task credential**, so
-  post-session code (probe, verifier) must not need the network.
+- **Anything the supervisor does AFTER the session's credential lease closes cannot use a
+  task credential**, so post-session code (probe, verifier) must not need the network.
+- **The credential service is keyed by TASK, one socket each** (§9.2). A single `active`
+  slot served whichever task registered last, so two concurrent sessions crossed
+  credentials by accident; a single global clear let a finishing task revoke a running
+  one. Set and clear are now one lease taken in the session runner's `finally`.
 - **Never set `remote.origin.url` from a worktree** — worktrees share the mirror's config.
   Use **`--git-common-dir`, not `--git-dir`**, for `info/exclude` and shared refs.
+- **`git config` in a worktree writes the mirror's COMMON config**, so anything per-task
+  written that way is per-*mirror* in practice — which is how a per-task socket path would
+  have silently re-created the leak it was fixing. `git config --worktree` is the only
+  per-worktree writable scope, it needs `extensions.worktreeConfig`, and enabling that on
+  a bare mirror makes the common `core.bare = true` apply to every linked worktree unless
+  you relocate it into the main worktree's own config — otherwise every checkout answers
+  `fatal: this operation must be run in a work tree`. Do the relocation IN THE MIRROR:
+  `--worktree` writes wherever it is invoked, so doing it from a task checkout marks that
+  checkout bare and un-bares the mirror.
 - **A worktree of a `--mirror` clone inherits `remote.origin.mirror`**, so a bare `git push`
   there force-pushes *every* ref. Sharing the mirror's config cuts both ways: it is the
   delivery mechanism for the credential helper AND for a footgun. Pin

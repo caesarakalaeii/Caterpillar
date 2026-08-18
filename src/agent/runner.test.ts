@@ -191,7 +191,13 @@ for (let i = 0; i < JOURNAL_REPEATS; i += 1) {
   );
 }
 
+// Started, not merely constructed: the runner opens this task's socket in it. One
+// service for the file, because the runner closes only the lease it opened.
+const credentials = new CredentialService();
+await credentials.start(join(root, "cred"));
+
 after(async () => {
+  await credentials.stop();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -202,7 +208,7 @@ const worktrees = new WorktreeManager({
   mirrorsDir: mirrors,
   tasksDir: tasks,
   helperPath: "/nonexistent/caterpillar-cred",
-  socketPath: join(root, "cred.sock"),
+  socketDir: join(root, "cred"),
   identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
 });
 
@@ -264,7 +270,7 @@ const buildRunner = (
     store,
     logger: SILENT_LOGGER,
     worktrees,
-    credentials: new CredentialService(),
+    credentials,
     llm: { models, model },
     bindings,
     metrics: new AgentMetrics(),
