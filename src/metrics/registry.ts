@@ -5,6 +5,7 @@
  * and this keeps the dependency surface (and therefore the supply-chain review
  * burden) down. Scraped by a ServiceMonitor.
  */
+import type { WorkspaceUsage } from "../workspace/usage.ts";
 export type LabelValues = Readonly<Record<string, string>>;
 
 interface Sample {
@@ -36,6 +37,19 @@ class Metric {
 
   set(labels: LabelValues, value: number): void {
     this.samples.set(this.key(labels), { labels, value });
+  }
+
+  /**
+   * Forget every sample. Only ever right for a gauge whose LABEL SET is derived from the
+   * world rather than fixed — today that is the per-task and per-mirror breakdown, where
+   * a task that has dropped out of the top N would otherwise keep reporting the size it
+   * had when it last made the cut, forever, because nothing here expires.
+   *
+   * Never call this on a counter: a counter that goes back to zero reads to Prometheus as
+   * a process restart, and every `rate()` over it produces a spike that did not happen.
+   */
+  clear(): void {
+    this.samples.clear();
   }
 
   inc(labels: LabelValues, delta = 1): void {
@@ -184,6 +198,99 @@ export class AgentMetrics {
     "caterpillar_alerts_received_total",
     "Alertmanager deliveries by alertname and outcome",
   );
+
+  /**
+   * Bytes on the work volume, by what is using them (`workspace/usage.ts`).
+   *
+   * The series the complaint that started this asked for: "the scaling mechanisms use so
+   * much disk space" was, until this existed, unanswerable from anything the supervisor
+   * emitted. `category` is `mirrors|tasks|nix|other` and the four are disjoint, so they
+   * sum to what this runner is accountable for — which is NOT the same as what the volume
+   * holds, because another process can be on it. `caterpillar_work_fs_bytes` is the
+   * arbiter there.
+   */
+  readonly workBytes = this.registry.gauge(
+    "caterpillar_work_bytes",
+    "bytes on the work volume by category — mirrors, tasks, nix, other",
+  );
+
+  /**
+   * What the filesystem says about itself: `kind="total"` and `kind="free"`.
+   *
+   * Separate from `caterpillar_work_bytes` because it is a different KIND of measurement —
+   * one `statfs` rather than a walk — and because it is the only one that stays correct
+   * when the walk is `partial`. Alert on this one; use the categories to find out who.
+   */
+  readonly workFsBytes = this.registry.gauge(
+    "caterpillar_work_fs_bytes",
+    "total and free bytes of the filesystem holding the work root",
+  );
+
+  /**
+   * The largest tasks and mirrors individually, so a graph can name the culprit.
+   *
+   * CAPPED at `TOP_N` of each by `workspace/usage.ts`, with the remainder in a single
+   * `name="other"` series. The cap is not tidiness: `name` is a task id, the fleet creates
+   * tasks continuously, worktrees survive the sessions that made them, and this registry
+   * has no expiry — so an uncapped breakdown grows one series per task the runner has ever
+   * worked and never drops one.
+   */
+  readonly workEntryBytes = this.registry.gauge(
+    "caterpillar_work_entry_bytes",
+    "bytes for the largest individual tasks and mirrors, remainder bucketed as `other`",
+  );
+
+  /**
+   * 1 when the last measurement ran out of time before it saw everything.
+   *
+   * Its own series rather than a label on the byte gauges, because a label that changes
+   * value starts a NEW time series: a walk that goes partial would break the continuity of
+   * every byte graph at exactly the moment the volume got interesting enough to be slow.
+   */
+  readonly workPartial = this.registry.gauge(
+    "caterpillar_work_partial",
+    "1 when the last work-volume measurement hit its deadline before finishing",
+  );
+
+  /** Unix seconds of the last measurement. `time() - this` is how stale the bytes are. */
+  readonly workMeasuredAt = this.registry.gauge(
+    "caterpillar_work_measured_timestamp_seconds",
+    "unix time of the last work-volume measurement",
+  );
+
+  /**
+   * Publish one measurement. Called from the supervisor's idle branch, nowhere else.
+   *
+   * Here rather than at the call site so the label vocabulary is decided once: `category`
+   * and `kind` are strings a dashboard hard-codes, and two call sites spelling them
+   * differently is a dashboard that silently shows half the fleet.
+   *
+   * Every series is SET rather than incremented, including on a partial pass. A partial
+   * pass under-counts, which is visible in `caterpillar_work_partial`; leaving the previous
+   * value in place instead would be a number that looks fresh and is not.
+   */
+  recordUsage(runner: string, usage: WorkspaceUsage): void {
+    this.workFsBytes.set({ runner, kind: "total" }, usage.fs.totalBytes);
+    this.workFsBytes.set({ runner, kind: "free" }, usage.fs.freeBytes);
+
+    this.workBytes.set({ runner, category: "mirrors" }, usage.mirrorBytes);
+    this.workBytes.set({ runner, category: "tasks" }, usage.taskBytes);
+    this.workBytes.set({ runner, category: "nix" }, usage.nixBytes);
+    this.workBytes.set({ runner, category: "other" }, usage.otherBytes);
+
+    // Cleared, not overwritten: the top N is recomputed every pass, and a task that has
+    // dropped out of it must stop reporting rather than freeze at the last size it had.
+    this.workEntryBytes.clear();
+    for (const entry of usage.mirrors) {
+      this.workEntryBytes.set({ runner, category: "mirrors", name: entry.name }, entry.bytes);
+    }
+    for (const entry of usage.tasks) {
+      this.workEntryBytes.set({ runner, category: "tasks", name: entry.name }, entry.bytes);
+    }
+
+    this.workPartial.set({ runner }, usage.partial ? 1 : 0);
+    this.workMeasuredAt.set({ runner }, Math.floor(Date.parse(usage.measuredAt) / 1000));
+  }
 
   render(): string {
     return this.registry.render();
