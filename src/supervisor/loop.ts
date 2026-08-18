@@ -67,6 +67,7 @@ import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
 import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
+import type { ThreadBindingWriter } from "../redis/threads.ts";
 import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
@@ -330,6 +331,15 @@ export interface SupervisorDeps {
    * restart heals it for free — there is no separate durable index to fall out of step.
    */
   readonly threads?: ThreadIndex;
+  /**
+   * Where the thread↔task bindings are PUBLISHED for a standalone bot (§7).
+   *
+   * Optional and write-only, like `snapshot` and for the same reason. With the bot in
+   * this process the local `threads` index is the whole truth and this is an in-memory
+   * store nobody reads; with the bot split out it is the only way the binding can reach
+   * it, because that process has no state repo to rebuild an index from.
+   */
+  readonly threadBindings?: ThreadBindingWriter;
   /**
    * Activity signal while a session runs (§7.1). Optional, and purely cosmetic: the
    * channel is silent between a question and its answer, so a task thinking for forty
@@ -1022,14 +1032,21 @@ export class Supervisor {
     // finished conversation bound means an abandoned thread silently swallows whatever
     // is typed into it. `threadBindings` also settles who owns a thread several tasks
     // share — a plan's children inherit their brainstorm's.
-    this.deps.threads?.replace(
-      threadBindings(
-        records.map((record) => ({
-          id: record.id,
-          status: record.state.status,
-          ...(record.state.chat === undefined ? {} : { threadId: record.state.chat.threadId }),
-        })),
-      ),
+    const bindings = threadBindings(
+      records.map((record) => ({
+        id: record.id,
+        status: record.state.status,
+        ...(record.state.chat === undefined ? {} : { threadId: record.state.chat.threadId }),
+      })),
+    );
+    this.deps.threads?.replace(bindings);
+
+    // And out to the ephemeral plane, for a bot that is not in this process (§7). Awaited
+    // and never throwing, exactly like the snapshot write above: a binding that arrives a
+    // poll late means an `!answer` in a new thread finds nothing to route to, and the
+    // human is told so rather than answered.
+    await this.deps.threadBindings?.publish(
+      bindings.map(([threadId, task]) => ({ threadId, task })),
     );
 
     // What the bot shows in Discord's member list (`notify/activity.ts`). Here rather than

@@ -350,10 +350,13 @@ const main = async (): Promise<void> => {
   // survey outlives every socket, and a socket is replaced on every reconnect — so neither
   // can own the other and both hold this.
   //
-  // Only when there IS a bot: the presence travels over the gateway connection, and without
-  // a token there is no gateway. Leaving it undefined is what makes the supervisor's
-  // `activity` call a no-op on a webhook-only runner rather than a wasted render per poll.
-  const activity = discord.bot === undefined ? undefined : new FleetActivity();
+  // Only when there IS a bot AND this process holds the gateway: the presence is sent as an
+  // opcode 3 on that socket, so a supervisor whose bot is split out has nothing to send it
+  // over. Leaving it undefined is what makes the supervisor's `activity` call a no-op on a
+  // webhook-only runner rather than a wasted render per poll — and the same is now true of
+  // an external-bot runner, where the standalone process advertises the presence instead.
+  const activity =
+    discord.bot === undefined || discord.gateway === false ? undefined : new FleetActivity();
 
   const supervisor = new Supervisor({
     config,
@@ -455,7 +458,7 @@ const main = async (): Promise<void> => {
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
   const bridge =
-    discord.bot === undefined
+    discord.bot === undefined || discord.gateway === false
       ? Promise.resolve()
       : runBridge(
           discord.bot,
@@ -778,11 +781,45 @@ const hydrateThreads = async (
 const loadDiscord = async (
   secretsDir: string,
   logger: Logger,
-): Promise<{ readonly bot?: DiscordBot; readonly notifier: Notifier }> => {
+  external = false,
+): Promise<{
+  readonly bot?: DiscordBot;
+  readonly notifier: Notifier;
+  /** Whether THIS process should connect to the gateway. False when the bot is split out. */
+  readonly gateway?: boolean;
+}> => {
   const bundle = new SecretBundle(secretsDir, "caterpillar-discord");
   const token = await bundle.readOptional("bot-token").catch(() => undefined);
   const channelId = await bundle.readOptional("channel-id").catch(() => undefined);
   const webhookUrl = await bundle.readOptional("webhook-url").catch(() => undefined);
+
+  // A separate process owns the gateway (§7), so this one must not connect: two processes
+  // acting on one channel is the duplicate-acting failure the arrangement exists to
+  // prevent.
+  //
+  // Only the BRIDGE is skipped, and the notifier is still built. It is what posts a
+  // question with an Answer button on it, and that comes from whichever process noticed
+  // the task change — this one. Reading the channel and writing to it are separable, and
+  // only reading has to be exclusive: `bot` is left undefined, which is exactly what the
+  // caller already keys the gateway off.
+  if (external) {
+    logger.info("bridge.external", {
+      reason: "bot.mode is external — a separate process owns the gateway",
+    });
+    if (token !== undefined && channelId !== undefined) {
+      const bot = new DiscordBot({ token, channelId });
+      // `gateway: false` is the whole difference. The bot object is kept, because
+      // everything it does OUTBOUND still belongs to this process: the notification with
+      // the Answer button on it, the typing indicator while a session runs, and closing a
+      // cancelled task's thread. Only reading the channel has to be exclusive, and that is
+      // the one thing this flag turns off.
+      return { bot, notifier: new BotNotifier(bot), gateway: false };
+    }
+    return {
+      notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
+      gateway: false,
+    };
+  }
 
   if (token === undefined || channelId === undefined) {
     logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });

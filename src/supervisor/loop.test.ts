@@ -38,6 +38,7 @@ import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
 import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
+import { InMemoryThreadBindings } from "../redis/threads.ts";
 import { type ChatOutcome, type ChatRequest } from "./inbox.ts";
 import { FleetActivity } from "../notify/activity.ts";
 import { TaskSnapshot } from "./snapshot.ts";
@@ -3227,4 +3228,75 @@ test("the Discord presence keeps up with a session it is describing", async () =
   );
 
   await seedTask(BUSY, { status: "done" });
+});
+
+test("the survey publishes thread bindings for a bot that is not in this process", async () => {
+  // The channel the split depends on (DESIGN.md §7). The standalone bot has no state repo,
+  // so unless the supervisor puts the thread↔task mapping on the ephemeral plane, a reply
+  // typed in a task's thread reaches a process that cannot tell which task it belongs to.
+  const BOUND = asTaskId("SMOKE-THREAD-1");
+  const FINISHED = asTaskId("SMOKE-THREAD-2");
+  await seedTask(BOUND);
+  await seedTask(FINISHED);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.writeState({
+    ...seed,
+    id: BOUND,
+    status: "awaiting-human",
+    chat: { threadId: "1537785980415778816" },
+  } as TaskState);
+  await store.writeState({
+    ...seed,
+    id: FINISHED,
+    status: "done",
+    chat: { threadId: "1537785980415778999" },
+  } as TaskState);
+  await store.commitAndPush("chore: threads", "origin", "main");
+
+  const published = new InMemoryThreadBindings();
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox: new InMemoryChatQueue(),
+    threadBindings: published,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  for (let attempt = 0; attempt < 100 && (await published.read()).length === 0; attempt += 1) {
+    await sleep(10);
+  }
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const bindings = await published.read();
+  assert.deepEqual(
+    bindings.find((binding) => binding.task === BOUND),
+    { threadId: "1537785980415778816", task: BOUND },
+  );
+  // A terminal task's thread is NOT published. Every message in a bound thread is read as
+  // an answer, so leaving a finished conversation bound means the bot silently swallows
+  // whatever is typed into it.
+  assert.equal(
+    bindings.some((binding) => binding.task === FINISHED),
+    false,
+    "a done task's thread must not stay bound",
+  );
 });
