@@ -175,6 +175,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/web/transcript.ts` | A pi transcript → renderable turns. Pure, no IO (§18). |
 | `src/web/pages.ts` | The pages. Given a view model, returns HTML (§18). |
 | `src/web/server.ts` | Routing, security headers, and the `GET`/`HEAD`-only gate (§18). |
+| `src/view/discovery.ts` | Which runners exist, from the headless Service's SRV record. No kube API (§18). |
+| `src/view/fanout.ts` | One GET per runner, forwarding the identity, reporting the failures (§18). |
+| `src/view/aggregate.ts` | Four runners' answers merged into one page (§18). |
+| `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
 | `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
@@ -292,11 +296,21 @@ awkward, the change is probably wrong.
 ## The web view
 
 A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Authelia —
-what is running where, the runner's own log, the messages of the session in flight, every
+what is running where, the fleet's logs, the messages of the sessions in flight, every
 stored transcript, and each task's spec, journal, questions, council verdicts and
-artifacts. It runs inside the supervisor process, on its own port, because the two things
-it exists for — this process's log and this process's live session — are in memory and not
-in git until later (§18).
+artifacts. `/intake` is where a **refusal** shows up: a labelled item that could not become
+a task, an alert that fired with no policy entry, and whether the alert receiver is
+listening at all.
+
+Every runner serves it on its own port, in-cluster. In front of them sits
+**`caterpillar-view`** — the same image with a different command — which discovers the ready
+pods through the headless Service and **aggregates**: task data from the first healthy
+responder, because the state repo is identical everywhere, and the live sessions and log
+rings unioned across all of them, because those exist in one process's memory each. A
+replica that does not answer is rendered as unreachable next to its name rather than
+dropped, since a missing runner reads as an idle one. It holds no credential, no volume and
+no ServiceAccount token, and it forwards the `Remote-User` header it received rather than
+asking the runners to relax their own check (§18).
 
 It is off unless a runner is told otherwise:
 
@@ -310,6 +324,13 @@ header — it is a fail-closed check on an Ingress whose forward-auth annotation
 dropped, which would otherwise publish every transcript and look like a working deployment.
 
 Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
+
+The viewer, locally, against runners you name yourself:
+
+```sh
+VIEW_RUNNERS=one=http://localhost:8080 VIEW_REQUIRE_FORWARDED_USER=false \
+  VIEW_PORT=8090 npm run start:view
+```
 
 ## Where the disk went
 
