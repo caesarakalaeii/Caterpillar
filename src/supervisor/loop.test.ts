@@ -17,6 +17,7 @@ import {
   asTaskId,
   asWorkspaceName,
   EMPTY_USAGE,
+  type RunnerId,
   type SessionOutcome,
   type TaskId,
   type TaskState,
@@ -32,8 +33,11 @@ import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
+import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
-import { ChatInbox, type ChatOutcome } from "./inbox.ts";
+import { InMemoryCancelSignals } from "../redis/cancel.ts";
+import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { type ChatOutcome } from "./inbox.ts";
 import {
   Supervisor,
   type ProgressProbe,
@@ -119,7 +123,8 @@ const config: RunnerConfig = {
   identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
-  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
+  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks"), root },
+  usage: DEFAULT_USAGE_CONFIG,
   workspace: { reap: DEFAULT_REAP_CONFIG },
   // A heartbeat long enough never to fire: this test is about the failure path, and a
   // renewal landing mid-park would muddy which CAS was under test.
@@ -153,6 +158,12 @@ const config: RunnerConfig = {
     maxLogLines: 2000,
   },
   remediation: { enabled: false, port: 8081 },
+  redis: {
+    enabled: false,
+    url: "redis://localhost:6379",
+    commandTimeoutMs: 1000,
+    keyPrefix: "caterpillar:",
+  },
   web: {
     enabled: false,
     port: 8080,
@@ -190,6 +201,28 @@ const pushedState = async (task: TaskId = TASK): Promise<TaskState | undefined> 
   const result = await new Git(origin).tryRun("show", `main:tasks/${task}/state.json`);
   if (result.code !== 0) return undefined;
   return JSON.parse(result.stdout) as TaskState;
+};
+
+/**
+ * The journal as it exists ON THE REMOTE, every shard concatenated.
+ *
+ * The journal is one file per entry (§4.1), so "was the entry pushed" is a question
+ * about a directory rather than about a blob. Empty string when nothing was written,
+ * which is what lets a caller assert that a session which never ran wrote no history.
+ */
+const pushedJournal = async (task: TaskId): Promise<string> => {
+  const git = new Git(origin);
+  const listed = await git.tryRun("ls-tree", "-r", "--name-only", "main", `tasks/${task}/journal/`);
+  if (listed.code !== 0) return "";
+
+  const names = listed.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").sort();
+
+  const bodies: string[] = [];
+  for (const name of names) {
+    const shard = await git.tryRun("show", `main:${name}`);
+    if (shard.code === 0) bodies.push(shard.stdout);
+  }
+  return bodies.join("\n");
 };
 
 test("a task whose session throws is parked on the REMOTE, not just locally", async () => {
@@ -356,7 +389,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
   await store.writeState(parked);
   await store.commitAndPush(`chore(${ANSWERED}): awaiting human`, "origin", "main");
 
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const runner: SessionRunner = {
     // Claiming it is proof enough that the answer took effect; the session itself is
     // not what this test is about.
@@ -410,7 +443,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
 });
 
 test("an answer for a task that is not waiting is refused, not written", async () => {
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const store = new StateStore(statePath, stateGit);
   const supervisor = new Supervisor({
     config,
@@ -841,10 +874,11 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
  */
 const resumeSupervisor = (
   store: StateStore,
-  inbox: ChatInbox,
+  inbox: InMemoryChatQueue,
+  over: Partial<RunnerConfig> = {},
 ): Supervisor =>
   new Supervisor({
-    config,
+    config: { ...config, ...over },
     store,
     leases: new LeaseManager({
       git: stateGit,
@@ -869,10 +903,11 @@ const resumeSupervisor = (
 /** Run one inbox request against a live supervisor and stop it again. */
 const throughInbox = async (
   store: StateStore,
-  intent: Parameters<ChatInbox["submit"]>[0],
+  intent: Parameters<InMemoryChatQueue["submit"]>[0],
+  over: Partial<RunnerConfig> = {},
 ): Promise<ChatOutcome> => {
-  const inbox = new ChatInbox();
-  const supervisor = resumeSupervisor(store, inbox);
+  const inbox = new InMemoryChatQueue();
+  const supervisor = resumeSupervisor(store, inbox, over);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
   const outcome = await inbox.submit(intent);
@@ -893,9 +928,9 @@ test("/resume puts a parked task back on the REMOTE, not just locally", async ()
   const pushed = await pushedState(RESUMED);
   assert.equal(pushed?.status, "ready", "a resumed task must be `ready` on the remote");
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${RESUMED}/journal.md`);
-  assert.equal(journal.code, 0, "the journal entry must be pushed, not just written");
-  assert.match(journal.stdout, /Resumed/);
+  const journal = await pushedJournal(RESUMED);
+  assert.notEqual(journal, "", "the journal entry must be pushed, not just written");
+  assert.match(journal, /Resumed/);
 });
 
 test("/resume refuses a task that is not parked, and writes nothing", async () => {
@@ -1023,9 +1058,9 @@ test("a provider outage releases the task and stops the runner claiming the next
     "one message per incident, not one per attempt",
   );
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${OUTAGE}/journal.md`);
+  const journal = await pushedJournal(OUTAGE);
   assert.doesNotMatch(
-    journal.stdout,
+    journal,
     /Interrupted|Exit:/,
     "a session that never ran writes no history",
   );
@@ -1083,10 +1118,10 @@ test("a session interrupted mid-work keeps its tokens and its history", async ()
   assert.equal(pushed?.usage.costUsd, 1.25, "spend is charged to the task that spent it");
   assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is the agent's, not the provider's");
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${WORKED}/journal.md`);
-  assert.match(journal.stdout, /Interrupted/);
+  const journal = await pushedJournal(WORKED);
+  assert.match(journal, /Interrupted/);
   assert.doesNotMatch(
-    journal.stdout,
+    journal,
     /Parked/,
     "an outage never parks a task — a park needs a human to undo",
   );
@@ -1328,7 +1363,7 @@ test("a git failure in the poll loop is logged and retried, not fatal", async ()
   );
 });
 
-test("/cancel stops a session running on this runner instead of refusing it", async () => {
+test("/cancel stops a session running on this runner instead of refusing it", async (t) => {
   // `applyPark` used to refuse a running task outright, so the only way to stop a
   // session was deleting the pod — which then stranded the task, because an interrupted
   // task is pushed as `running` and nothing moved it back (§6.2). The two bugs made
@@ -1337,7 +1372,7 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   await seedTask(CANCELLED);
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // A session that runs until something aborts it — a hung `bash` call, in effect.
   //
@@ -1351,11 +1386,24 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   // ends the test with "Promise resolution is still pending" before the cancel is ever
   // answered. That is the stub being unfaithful to a hang, not the supervisor misbehaving
   // — it failed on node 22 and passed on 26.
+  //
+  // It is cleared from `t.after` as well as on abort, and THAT is not decoration either.
+  // Clearing it only on abort means the one run where the abort never arrives leaves a
+  // live interval behind: the assertions below fail, and then node cannot exit, so the
+  // whole suite HANGS after reporting the failure instead of finishing. That is not
+  // hypothetical — it is what wedged a review council reviewer for 2h42m in the cluster
+  // (DESIGN.md §6.4), because the reviewer ran `npm test` and this interval outlived the
+  // failure. A test that fails must fail, not hang.
+  let keepalive: NodeJS.Timeout | undefined;
+  t.after(() => {
+    if (keepalive !== undefined) clearInterval(keepalive);
+  });
+
   let sawAbort = false;
   const runner: SessionRunner = {
     run: (_spec, _state, signal) =>
       new Promise<SessionOutcome>((resolve) => {
-        const keepalive = setInterval(() => {}, 1_000);
+        keepalive = setInterval(() => {}, 1_000);
         signal.addEventListener("abort", () => {
           clearInterval(keepalive);
           sawAbort = true;
@@ -1429,6 +1477,146 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   assert.ok(parked !== undefined, "a cancelled task must end up parked, not re-claimed");
 });
 
+test("a cancel from another process reaches a session in flight, without the queue", async () => {
+  // The cross-process half of the test above (DESIGN.md §21). Nothing is submitted to the
+  // inbox at all — the standalone bot is not this process and has no reference to it — so
+  // the ONLY path to the abort is the signal. `takeWhere` returns nothing throughout,
+  // which is exactly what the supervisor sees when a bot on another pod typed the command.
+  const CANCELLED = asTaskId("SMOKE-CANCEL-SIGNAL");
+  await seedTask(CANCELLED);
+
+  const store = new StateStore(statePath, stateGit);
+  const cancels = new InMemoryCancelSignals();
+
+  // See the test above for why `keepalive` is load-bearing: a promise waiting on an abort
+  // event holds nothing open, and every timer the supervisor arms for a session is unref'd.
+  let sawAbort = false;
+  const runner: SessionRunner = {
+    run: (_spec, _state, signal) =>
+      new Promise<SessionOutcome>((resolve) => {
+        const keepalive = setInterval(() => {}, 1_000);
+        signal.addEventListener("abort", () => {
+          clearInterval(keepalive);
+          sawAbort = true;
+          resolve({
+            reason: "interrupted",
+            usage: EMPTY_USAGE,
+            contextTokens: 0,
+            summary: "stopped from another process",
+          });
+        });
+      }),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    cancels,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const started = Date.now() + 30_000;
+  while (Date.now() < started) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "running") break;
+    await sleep(50);
+  }
+
+  assert.equal(await cancels.request(CANCELLED), true);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !sawAbort) await sleep(50);
+
+  // Parked, not merely interrupted. An interrupted task is left `running`, which is
+  // claimable, so the very next poll would start the session it was meant to stop again.
+  let parked = false;
+  const settled = Date.now() + 30_000;
+  while (Date.now() < settled) {
+    if ((await store.tryReadState(CANCELLED))?.status === "parked") {
+      parked = true;
+      break;
+    }
+    await sleep(50);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(sawAbort, "the signal must reach the session, not only the key");
+  assert.ok(parked, "a cancelled task must end up parked, not re-claimed");
+  // And the signal is CLEARED, so a task cancelled and then resumed inside the TTL does
+  // not immediately cancel itself again on the session that resumes it.
+  assert.equal(await cancels.requested(CANCELLED), false);
+});
+
+test("the poll advertises this runner, and a presence failure never reaches the loop", async () => {
+  // Presence is advisory (§21). What is asserted is that it happens once a poll and that
+  // a registry which throws cannot stop the runner — a DISPLAY must never be able to take
+  // down the thing it displays.
+  const heartbeats: string[] = [];
+  const registry = {
+    heartbeat: (runner: RunnerId): Promise<void> => {
+      heartbeats.push(runner);
+      // Every call rejects. `RedisGuard` sits between a real registry and the loop, so
+      // this is the harsher version: nothing between it and `pollOnce`.
+      return Promise.reject(new Error("redis is unreachable"));
+    },
+    alive: () => Promise.resolve([]),
+    depart: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    runners: registry,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && heartbeats.length === 0) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(heartbeats.slice(0, 1), [config.runnerId]);
+});
+
 test("a digest that is due is published from the poll loop, and a failing one is not fatal", async () => {
   // The digest runs on the poll loop (§19), which is the only clock the supervisor has.
   // That puts it on the same thread as claiming, so the two properties that matter are
@@ -1498,7 +1686,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // Hands off forever: without a yield this task never gives the runner back.
   let sessions = 0;
@@ -1571,7 +1759,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   const outcome = await inbox.submit({
     kind: "brainstorm",
     topic: "make the thing faster",
-    repo: "acme/widget",
+    repos: ["acme/widget"],
     threadId: "1538626232302960801",
     author: "caesar",
   });
@@ -1602,6 +1790,153 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   await seedTask(BRAINSTORM, { status: "done" });
 });
 
+/**
+ * A brainstorm may read several repos, as long as they are all in ONE workspace.
+ *
+ * The payoff is downstream: `materialise` passes `defaultRepos: spec.repos` to every
+ * child, so a two-repo brainstorm cuts two-repo tasks. The bound is the containment one
+ * (§3.1/§9.1) — a workspace is one credential bundle, and a session holding two is the
+ * blast-radius expansion the workspace model exists to prevent.
+ */
+const workspace = (name: string, host: string, owner: string) => ({
+  name: asWorkspaceName(name),
+  forge: {
+    kind: (host === "codeberg.org" ? "forgejo" : "github") as "github" | "forgejo",
+    host,
+    owner,
+    apiBase: `https://${host}`,
+  },
+  secretRef: `caterpillar-${name}`,
+});
+
+const TWO_WORKSPACES: Partial<RunnerConfig> = {
+  workspaces: new Map(
+    [workspace("caesar", "github.com", "acme"), workspace("boogaloo", "codeberg.org", "eb")].map(
+      (profile) => [profile.name, profile],
+    ),
+  ),
+};
+
+test("a brainstorm over several repos in one workspace carries all of them", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "split the client out of the server",
+      repos: ["acme/widget", "acme/api", "acme/widget"],
+      threadId: "1538626232302960802",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  const BRAINSTORM = asTaskId("BS-1538626232302960802");
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+
+  const spec = await store.readSpec(BRAINSTORM);
+  assert.deepEqual(
+    spec.repos,
+    [
+      { host: "github.com", owner: "acme", name: "widget" },
+      { host: "github.com", owner: "acme", name: "api" },
+    ],
+    "both repos, in the order typed, and the duplicate collapsed",
+  );
+  assert.equal(spec.workspace, "caesar");
+  assert.match(spec.goal, /acme\/api/, "the agent is told what it may read");
+
+  await retire(BRAINSTORM);
+});
+
+test("a brainstorm that spans two workspaces is refused, and says which went where", async () => {
+  // Not narrowed to one workspace and not silently truncated: one session with
+  // credentials for two bundles is exactly what §9.1 bounds, and dropping a repo the
+  // human asked for produces a plan about half a system without saying so.
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "port the client to the other forge",
+      repos: ["acme/widget", "codeberg.org/eb/api"],
+      threadId: "1538626232302960803",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  const reason = outcome.kind === "refused" ? outcome.reason : "";
+  assert.match(reason, /caesar/);
+  assert.match(reason, /boogaloo/);
+  assert.match(reason, /acme\/widget/);
+  assert.match(reason, /codeberg\.org\/eb\/api/);
+
+  assert.equal(
+    await store.hasTask(asTaskId("BS-1538626232302960803")),
+    false,
+    "a refused brainstorm must not leave a task behind",
+  );
+});
+
+test("a brainstorm naming a repo no workspace owns is refused, not guessed at", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read someone else's code",
+      repos: ["acme/widget", "stranger/thing"],
+      threadId: "1538626232302960804",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /stranger/);
+});
+
+test("a brainstorm with no repos at all is refused by the loop too", async () => {
+  // The slash layer already refuses it, but the inbox is a public seam — anything that
+  // can submit a request can submit an empty list, and creating a brainstorm with nothing
+  // to read produces a plan about an imaginary codebase.
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read nothing",
+      repos: [],
+      threadId: "1538626232302960806",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /at least one repo/);
+});
+
+test("a brainstorm with an unparseable repo is refused by name", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read the code",
+      repos: ["acme/widget", "widget"],
+      threadId: "1538626232302960805",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /`widget`/);
+});
+
 test("/resume brings back a task that FAILED, not only one that parked", async () => {
   // The gap this closes, found the hard way. `applyResume` accepted `parked` and nothing
   // else, so `failed` was terminal with no route back from chat at all — the only way
@@ -1626,7 +1961,7 @@ test("/resume brings back a task that FAILED, not only one that parked", async (
   assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is forgiven, as it is for a park");
   assert.equal(pushed?.progress.lastProgressSession, 1, "history is not");
 
-  const journal = await new Git(origin).run("show", `main:tasks/${BROKEN}/journal.md`);
+  const journal = await pushedJournal(BROKEN);
   assert.match(journal, /Resumed/);
 
   await retire(BROKEN);
@@ -1722,6 +2057,122 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
   await running.catch(() => undefined);
 
   assert.deepEqual(passes, [1, 1], "every tick with a queued alert must produce exactly one pass");
+});
+
+test("the usage measurement runs on the idle branch, and a failing one is not fatal", async () => {
+  // Same argument as the digest above, one notch stronger: this is OBSERVABILITY, so the
+  // moment it is most likely to fail — a filesystem answering `stat` with an error — is
+  // exactly the moment somebody is looking at it. A monitor that could take the poll loop
+  // with it would fail first and loudest during the incident it was installed to explain.
+  //
+  // It is also reached only from the IDLE branch, next to `maybeCollectGarbage` and for
+  // the same reason: the walk is one `stat` per file over a tree with a `node_modules`
+  // per task, on the single thread that claims work. There is always another idle poll.
+  const calls: number[] = [];
+  const usage = {
+    maybeMeasure: (): Promise<WorkspaceUsage | undefined> => {
+      calls.push(Date.now());
+      return Promise.reject(new Error("statfs: EIO"));
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    usage,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && calls.length < 2) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    calls.length >= 2,
+    `the loop must keep polling after the measurement throws — it called it ${calls.length} time(s)`,
+  );
+});
+
+test("a measurement that comes back is published to the metrics the scrape reads", async () => {
+  // The whole point of the walk is the series. A snapshot that reached the loop and never
+  // reached the registry would be a measurement nobody can graph, which is the state this
+  // work exists to end.
+  const measured: WorkspaceUsage = {
+    measuredAt: "2026-08-18T09:00:00.000Z",
+    durationMs: 12,
+    partial: true,
+    fs: { totalBytes: 1000, freeBytes: 400 },
+    mirrorBytes: 100,
+    taskBytes: 300,
+    nixBytes: 50,
+    otherBytes: 25,
+    mirrors: [{ name: "acme/widget", bytes: 100 }],
+    tasks: [{ name: "TASK-BIG", bytes: 300 }],
+  };
+
+  let served = 0;
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    // Once, then nothing — the real monitor's own rate limit does the same.
+    usage: { maybeMeasure: () => Promise.resolve(served++ === 0 ? measured : undefined) },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !metrics.render().includes("caterpillar_work_bytes")) {
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const rendered = metrics.render();
+  assert.match(rendered, /caterpillar_work_bytes\{.*category="tasks".*\} 300/);
+  assert.match(rendered, /caterpillar_work_fs_bytes\{.*kind="free".*\} 400/);
+  assert.match(rendered, /caterpillar_work_entry_bytes\{.*name="TASK-BIG".*\} 300/);
+  // Its own series rather than a label on the bytes: a label that changed value would
+  // start a new time series and break every byte graph at the moment it went partial.
+  assert.match(rendered, /caterpillar_work_partial\{[^}]*\} 1/);
 });
 
 /**

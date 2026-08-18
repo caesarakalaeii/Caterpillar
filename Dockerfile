@@ -98,5 +98,11 @@ EXPOSE 9090
 
 # tini reaps the processes the agent's bash tool spawns; without it a long-running
 # supervisor accumulates zombies from every session.
+#
+# The aggregating viewer (DESIGN.md §18) is the SAME image with a different command:
+#   command: ["node", "/app/dist/cli/view.js"]
+# `dist/` is copied whole, so it costs a Deployment manifest and no second build. That
+# process holds no credential, no volume and no ServiceAccount token — it reads the
+# runners' `/api/*` routes and nothing else.
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "/app/dist/index.js"]

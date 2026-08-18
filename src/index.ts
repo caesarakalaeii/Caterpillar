@@ -18,7 +18,8 @@ import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
-import { Ingester } from "./intake/ingest.ts";
+import { Ingester, type IntakeObserver } from "./intake/ingest.ts";
+import { IntakeStatus } from "./intake/status.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { HOLDER_TOKEN_ENV, HttpCredentialStore } from "./llm/credential-client.ts";
 import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
@@ -31,8 +32,9 @@ import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.t
 import { DiscordGateway } from "./notify/gateway.ts";
 import { AlertProcessor, AlertQueue } from "./remediation/queue.ts";
 import { startRemediationReceiver, type AlertObserver } from "./remediation/receiver.ts";
-import { ChatInbox } from "./supervisor/inbox.ts";
-import { TaskSnapshot } from "./supervisor/snapshot.ts";
+import type { ChatSubmitter } from "./redis/inbox.ts";
+import { createEphemeralPlane } from "./redis/plane.ts";
+import type { SnapshotReader } from "./redis/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import { LiveSession } from "./obs/live.ts";
 import { LogRing } from "./obs/ring.ts";
@@ -56,6 +58,7 @@ import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
 import { ToolchainResolver } from "./workspace/toolchain.ts";
+import { nixStoreDir, UsageMonitor } from "./workspace/usage.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
 /** Where state-repo installation tokens are minted. Not a workspace forge. */
@@ -146,6 +149,11 @@ const main = async (): Promise<void> => {
   // web view, and empty at every other moment (DESIGN.md §18).
   const live = new LiveSession();
 
+  // When intake last ran here and what it found (§14, §18). In memory, like `live`: a
+  // pass that mattered is already durable as a task or a refusal record, and a heartbeat
+  // committed every interval is the runner registry §18 rejected twice.
+  const intakeStatus = new IntakeStatus();
+
   // ONE resolver for the whole process. The agent's shell, the council's, the plan
   // maintainer's and the acceptance gate's must be the same environment or the gate grades
   // work against a shell the agent never saw (see workspace/toolchain.ts).
@@ -167,6 +175,22 @@ const main = async (): Promise<void> => {
     capabilities: await toolchain.capabilities(loaded.capabilities),
   };
 
+  // How much of the work volume this runner is using, measured on its own slow schedule
+  // from the poll loop's idle branch and read by the web view. ONE instance: the loop
+  // writes the snapshot and the page reads it, and two would have the page showing a
+  // measurement nobody ever refreshes.
+  const usage = new UsageMonitor({
+    workRoot: config.paths.root,
+    mirrorsDir: config.paths.mirrors,
+    tasksDir: config.paths.tasks,
+    // Only when this runner actually has nix. Without it there is no store to walk, and
+    // pointing the walk at `/nix/store` anyway would spend a `readdir` per pass learning
+    // that for the life of the pod.
+    ...(config.capabilities.includes("nix") ? { nixStoreDir: nixStoreDir() } : {}),
+    intervalHours: config.usage.intervalHours,
+    deadlineMs: config.usage.deadlineSeconds * 1000,
+  });
+
   // The state repo's own credential: minted from the App, never served over the
   // credential socket, and never inherited by task worktrees (DESIGN.md §9.3).
   const stateCredentials = await loadStateCredentials(
@@ -181,17 +205,29 @@ const main = async (): Promise<void> => {
     identity: config.identity,
     ...(stateCredentials !== undefined ? { envProvider: stateCredentials.gitEnv } : {}),
   });
-  // The salvage hook is how a runner says it had to set its own commits aside. At `error`
-  // deliberately: it means two runners recorded the same task and one of them lost, which
-  // is never routine — but the runner keeps working, so nothing else would raise it.
-  const store = new StateStore(config.stateRepo.path, git, (salvaged) => {
-    logger.error("state.salvaged", {
-      ref: salvaged.ref,
-      commit: salvaged.commit,
-      detail: salvaged.detail,
-    });
-  });
   const metrics = new AgentMetrics();
+
+  // The salvage hook is how a runner says it had to set its own commits aside. At `error`
+  // deliberately, and counted: the runner recovers and carries on, so nothing else would
+  // raise it. Its one known cause — two runners appending to a single `journal.md` — no
+  // longer exists now the journal is one file per entry, so a line here today is a
+  // conflict class the fleet has not met before and wants looking at (§4.1, §4.3).
+  //
+  // The runner id goes into the store because it names every journal shard this runner
+  // writes; that is what makes two runners' journal commits commute rather than collide.
+  const store = new StateStore(
+    config.stateRepo.path,
+    git,
+    (salvaged) => {
+      metrics.salvagedCommits.inc({ runner: config.runnerId });
+      logger.error("state.salvaged", {
+        ref: salvaged.ref,
+        commit: salvaged.commit,
+        detail: salvaged.detail,
+      });
+    },
+    config.runnerId,
+  );
 
   // Parsed once: every workspace's scope excludes the same state repo, and a task
   // credential that could reach it would make the audit trail agent-writable (§9.3).
@@ -245,12 +281,23 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
-  const inbox = new ChatInbox();
+  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels
+  // (DESIGN.md §21). With `redis.enabled` false, which is the default, this is the four
+  // in-process objects the supervisor has always used and the behaviour is unchanged.
+  // With it on, the same four interfaces are served from Redis so a SEPARATE bot process
+  // can submit and read them. Leases and task state are not in it and never will be: they
+  // are what makes a task survive a pod restart, and they stay on git refs (§5).
+  const plane = await createEphemeralPlane({
+    config: config.redis,
+    secretsDir: config.secretsDir,
+    logger,
+  });
+  const inbox = plane.chat;
+  const snapshot = plane.snapshot;
   // Filled by the webhook receiver when one is running, drained by the loop (§20). Built
   // unconditionally and cheap: an empty queue costs one array swap a poll, and building it
   // here keeps the receiver's own startup a single decision about the port and the secret.
   const alertQueue = new AlertQueue();
-  const snapshot = new TaskSnapshot();
   const threads = new ThreadIndex();
   const discord = await loadDiscord(config.secretsDir, logger);
 
@@ -308,6 +355,7 @@ const main = async (): Promise<void> => {
     // The same manager every other consumer holds, but only the loop is given it under a
     // name that can delete: it owns the one moment a worktree is safe to remove (§2).
     worktrees,
+    usage,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
@@ -325,6 +373,8 @@ const main = async (): Promise<void> => {
     credentials,
     inbox,
     snapshot,
+    cancels: plane.cancels,
+    runners: plane.runners,
     metrics,
     logger,
     trackers,
@@ -335,8 +385,10 @@ const main = async (): Promise<void> => {
       trackers,
       scopes,
       logger,
+      metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
     }),
+    intakeStatus,
     // The fifth intake path (§20). Present whether or not the receiver is listening: the
     // drain is a no-op on an empty queue, and wiring it conditionally would mean an alert
     // accepted by a receiver started later had nowhere to go.
@@ -353,7 +405,7 @@ const main = async (): Promise<void> => {
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
-  const stopWeb = startWebView({ config, store, live, ring, logger });
+  const stopWeb = startWebView({ config, store, live, ring, logger, usage, intakeStatus });
   const stopReceiver = await startAlertReceiver({
     config,
     sink: alertQueue,
@@ -401,6 +453,14 @@ const main = async (): Promise<void> => {
     stopReceiver();
     await credentials.stop();
     await bridge;
+    // Leave the display before closing the connection, so a rollout does not show a
+    // runner that has already gone for the whole presence TTL. Advisory either way (§21):
+    // a runner that dies without departing ages out on its heartbeat score.
+    await plane.runners.depart(asRunnerId(config.runnerId));
+    // Last: the bridge submits through it, so closing the plane first would leave a
+    // request in flight with no way back. Never throws — shutdown must not be the path
+    // that hangs (`IoRedisClient.close`).
+    await plane.close().catch((error: unknown) => logger.warn("redis.close-failed", errorFields(error)));
   }
 };
 
@@ -527,6 +587,8 @@ const startWebView = (options: {
   readonly live: LiveSession;
   readonly ring: LogRing;
   readonly logger: Logger;
+  readonly usage: UsageMonitor;
+  readonly intakeStatus: IntakeStatus;
 }): (() => void) => {
   const { web } = options.config;
   if (!web.enabled) {
@@ -629,6 +691,18 @@ const alertObserver = (metrics: AgentMetrics): AlertObserver => ({
 });
 
 /**
+ * The intake counters, as `Ingester` sees them.
+ *
+ * The same adapter shape as `alertObserver` directly above, deliberately: the two intake
+ * paths that are not a human committing a spec should report themselves the same way, and
+ * neither ingester should have to know that a counter is a `Map` keyed on sorted labels.
+ */
+const intakeObserver = (metrics: AgentMetrics): IntakeObserver => ({
+  observe: (workspace, outcome) => metrics.intake.inc({ workspace, outcome }),
+  items: (workspace, seen) => metrics.intakeItems.set({ workspace }, seen),
+});
+
+/**
  * Rebuild the thread index from the state repo.
  *
  * The durable copy is `state.chat.threadId`; this is a derived lookup, so it is rebuilt
@@ -700,8 +774,8 @@ const loadDiscord = async (
  */
 const runBridge = (
   bot: DiscordBot,
-  inbox: ChatInbox,
-  snapshot: TaskSnapshot,
+  inbox: ChatSubmitter,
+  snapshot: SnapshotReader,
   threads: ThreadIndex,
   logger: Logger,
   signal: AbortSignal,

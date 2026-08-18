@@ -264,3 +264,123 @@ test("both reaping numbers can be set, and nonsense in either is refused", async
       error instanceof ConfigError && /workspace\.reap\.intervalHours/.test(error.message),
   );
 });
+
+test("a store quota with no hysteresis is refused rather than corrected", async () => {
+  // `max-free` at or below `min-free` means nix has already met its target the moment it
+  // starts collecting, so it collects on EVERY build and frees almost nothing each time.
+  // From outside that reads as "the quota is on and not working", which is the worst of
+  // the three possible states. Either number could be the typo, so neither is guessed at.
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 20 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 5 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: -1 } }), ConfigError);
+});
+
+test("the store quota defaults on, and 0 is the off switch", async () => {
+  // On by default unlike the caches: an unbounded store is how a runner fills the node it
+  // shares with every other pod, and that is not a cluster-only hazard.
+  const defaults = await load({});
+  assert.equal(defaults.toolchain.minFreeGb, 5);
+  assert.equal(defaults.toolchain.maxFreeGb, 20);
+
+  // 0 disables it, and the pair check must not fire on the way past — off means neither
+  // number applies, so an untouched maxFreeGb is not a misconfiguration.
+  const off = await load({ toolchain: { minFreeGb: 0 } });
+  assert.equal(off.toolchain.minFreeGb, 0);
+});
+
+test("a config written before the usage measurement existed still loads", async () => {
+  // `paths.root` is new and every deployed ConfigMap omits it. Requiring it would refuse
+  // to load a config that was correct the day before this shipped.
+  const config = await load({});
+
+  assert.equal(config.paths.root, "/work", "the parent both mirrors and tasks live under");
+  assert.equal(config.usage.intervalHours, 1);
+  assert.equal(config.usage.deadlineSeconds, 120);
+});
+
+test("the work root and the measurement interval can both be set", async () => {
+  const config = await load({
+    paths: { mirrors: "/vol/m", tasks: "/vol/t", root: "/vol" },
+    usage: { intervalHours: 6, deadlineSeconds: 30 },
+  });
+
+  assert.equal(config.paths.root, "/vol");
+  assert.equal(config.usage.intervalHours, 6);
+  assert.equal(config.usage.deadlineSeconds, 30);
+});
+
+test("a work root with no common parent falls back to the tasks directory, never to /", async () => {
+  // Measuring `/` inside a container reports the IMAGE's free space as the work volume's,
+  // which is wrong in the reassuring direction — the graph looks healthy as the PVC fills.
+  const config = await load({ paths: { mirrors: "/a/mirrors", tasks: "/b/c/tasks" } });
+
+  assert.equal(config.paths.root, "/b/c/tasks");
+});
+
+test("a non-numeric interval is refused rather than coerced", async () => {
+  await assert.rejects(() => load({ usage: { intervalHours: "hourly" } }), ConfigError);
+  await assert.rejects(() => load({ usage: { deadlineSeconds: null } }), ConfigError);
+});
+
+/**
+ * The `redis` block (DESIGN.md §21).
+ *
+ * Its default matters for a different reason from the four above: turning it ON does
+ * nothing outward-facing at all — it moves four ephemeral structures out of this process
+ * so a separate one can see them. What matters is that turning it off, or leaving it off,
+ * yields exactly the runner that has always worked. So the assertions here are mostly
+ * about the shape being validated whether it is used or not, which is `digestConfig`'s
+ * argument: a typo in a field nobody is using is otherwise discovered the day someone
+ * enables it, in the cluster, by a supervisor that throws at boot.
+ */
+test("a config that says nothing about redis keeps everything in this process", async () => {
+  const config = await load({});
+
+  assert.equal(config.redis.enabled, false);
+  assert.equal(config.redis.url, "redis://localhost:6379");
+  assert.equal(config.redis.commandTimeoutMs, 1000);
+  assert.equal(config.redis.keyPrefix, "caterpillar:");
+  // No credential in config, ever. The password is a secret and lives under `secretRef`.
+  assert.equal(config.redis.secretRef, undefined);
+  assert.equal("password" in (config.redis as unknown as Record<string, unknown>), false);
+});
+
+test("an enabled redis carries its url, prefix and secret reference", async () => {
+  const config = await load({
+    redis: {
+      enabled: true,
+      url: "rediss://redis-ha.all-chat.svc.cluster.local:6379",
+      secretRef: "caterpillar-redis",
+      commandTimeoutMs: 250,
+      keyPrefix: "fleet-a:",
+    },
+  });
+
+  assert.equal(config.redis.enabled, true);
+  assert.equal(config.redis.url, "rediss://redis-ha.all-chat.svc.cluster.local:6379");
+  assert.equal(config.redis.secretRef, "caterpillar-redis");
+  assert.equal(config.redis.commandTimeoutMs, 250);
+  assert.equal(config.redis.keyPrefix, "fleet-a:");
+});
+
+test("a url with the wrong scheme is refused, even with redis disabled", async () => {
+  // Not a connection that fails once: an `http://` here is a client retrying a nonsense
+  // endpoint forever while every read on the plane quietly times out and degrades, which
+  // in the logs looks exactly like a Redis that is merely down.
+  await assert.rejects(() => load({ redis: { url: "http://redis:6379" } }), ConfigError);
+  await assert.rejects(() => load({ redis: { url: "redis-ha:6379" } }), ConfigError);
+  await assert.rejects(() => load({ redis: { enabled: true, url: "" } }), ConfigError);
+
+  const tls = await load({ redis: { url: "rediss://redis:6380" } });
+  assert.equal(tls.redis.url, "rediss://redis:6380");
+});
+
+test("the timeout and the enabled flag are validated rather than coerced", async () => {
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: 0 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: -5 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: 1.5 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: "fast" } }), ConfigError);
+  // `"false"` is truthy in JavaScript and false in intent. Refusing the string is the
+  // only reading that cannot silently mean the opposite of what was written.
+  await assert.rejects(() => load({ redis: { enabled: "false" } }), ConfigError);
+});

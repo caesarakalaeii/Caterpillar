@@ -32,6 +32,7 @@ import {
   digestsPage,
   errorPage,
   fleetPage,
+  intakePage,
   layout,
   logsPage,
   runnerPage,
@@ -41,7 +42,22 @@ import {
   type Page,
 } from "./pages.ts";
 import { parseTranscript } from "./transcript.ts";
-import { digests, digestView, fleet, runnerExport, taskDetail } from "./view.ts";
+import { digests, digestView, diskView, fleet, intakeView, runnerExport, taskDetail } from "./view.ts";
+import type { IntakeStatusView } from "../intake/status.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
+
+/**
+ * The last work-volume measurement, if one has been taken. Implemented by `UsageMonitor`.
+ *
+ * A reader rather than the monitor itself, so the server depends on "something that can
+ * tell me the last snapshot" and cannot reach the method that STARTS a walk. A web request
+ * must never be able to trigger the expensive thing: it is idle-only for a reason, and a
+ * route that could kick it off would be a way for anyone with the page open to take the
+ * poll loop away from the fleet.
+ */
+export interface UsageSnapshotReader {
+  current(): WorkspaceUsage | undefined;
+}
 
 export interface WebServerOptions {
   readonly config: RunnerConfig;
@@ -49,6 +65,16 @@ export interface WebServerOptions {
   readonly live: LiveSession;
   readonly ring: LogRing;
   readonly logger: Logger;
+  /** Absent on a runner with the measurement disabled; the page then says so. */
+  readonly usage?: UsageSnapshotReader;
+  /**
+   * The last intake pass, for `/intake` and the fleet page's one-line summary (§14).
+   *
+   * A READER, for the same reason `usage` is one: a web request must never be able to
+   * trigger a pass. Intake is rate-limited to protect a forge's installation budget, and a
+   * route that could start one would hand that budget to anyone with the page open.
+   */
+  readonly intake?: { current(): IntakeStatusView | undefined };
 }
 
 interface Reply {
@@ -147,16 +173,27 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return { status: 200, type: "text/javascript; charset=utf-8", body: SCRIPT };
   }
 
-  const { config, store, live, ring } = options;
+  const { config, store, ring } = options;
 
   if (path === "/") {
-    return page(options, "fleet", "fleet", fleetPage(await fleet({ store, live, runnerId: config.runnerId })), 200, user);
+    return page(options, "fleet", "fleet", fleetPage(await fleetView(options)), 200, user);
+  }
+  if (path === "/intake") {
+    return page(options, "intake", "intake", intakePage(await intakeOf(options)), 200, user);
   }
   if (path === "/logs") {
     return page(options, "logs", "logs", logsPage(ring.records(), config.web.logCapacity), 200, user);
   }
   if (path === "/runner") {
-    return page(options, "runner", config.runnerId, runnerPage(runnerExport(config)), 200, user);
+    const disk = options.usage?.current();
+    return page(
+      options,
+      "runner",
+      config.runnerId,
+      runnerPage(runnerExport(config), disk === undefined ? undefined : diskView(disk)),
+      200,
+      user,
+    );
   }
 
   // `/digests` and `/digests/<date>`. The date is validated by the store before it ever
@@ -170,7 +207,8 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return page(options, "digests", `digest ${view.date}`, digestPage(view), 200, user);
   }
 
-  if (path === "/api/fleet") return json(200, await fleet({ store, live, runnerId: config.runnerId }));
+  if (path === "/api/fleet") return json(200, await fleetView(options));
+  if (path === "/api/intake") return json(200, await intakeOf(options));
   if (path === "/api/digests") return json(200, { dates: await digests(store) });
   if (path.startsWith("/api/digests/")) {
     const view = await digestView(store, path.slice("/api/digests/".length));
@@ -178,7 +216,16 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
       ? notFound(options, user)
       : json(200, { date: view.date, body: view.body });
   }
-  if (path === "/api/runner") return json(200, runnerExport(config));
+  if (path === "/api/runner") {
+    // The disk is a sibling key rather than folded into the export: `runnerExport` is a
+    // pure function of the ConfigMap and stays that way, while this is a measurement that
+    // may simply not exist yet.
+    const disk = options.usage?.current();
+    return json(200, {
+      ...runnerExport(config),
+      ...(disk === undefined ? {} : { disk: diskView(disk) }),
+    });
+  }
   if (path === "/api/logs") return json(200, { records: ring.records() });
 
   const task = taskRoute(path);
@@ -186,6 +233,23 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
 
   return notFound(options, user);
 };
+
+/** The fleet, assembled the same way for the page and for `/api/fleet`. */
+const fleetView = (options: WebServerOptions): ReturnType<typeof fleet> =>
+  fleet({
+    store: options.store,
+    live: options.live,
+    runnerId: options.config.runnerId,
+    ...(options.intake === undefined ? {} : { intake: options.intake }),
+  });
+
+/** `/intake` and `/api/intake`, likewise from one place. */
+const intakeOf = (options: WebServerOptions): ReturnType<typeof intakeView> =>
+  intakeView({
+    store: options.store,
+    config: options.config,
+    ...(options.intake === undefined ? {} : { intake: options.intake }),
+  });
 
 /** The parts of a `/tasks/...` or `/api/tasks/...` path, once the id has been validated. */
 interface TaskRoute {

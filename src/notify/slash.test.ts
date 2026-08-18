@@ -141,6 +141,95 @@ test("only OUR label is unwrapped — a suffix that is not a status stays refuse
   }
 });
 
+const brainstorm = (topic: string, repo: string): Interaction =>
+  interaction({
+    data: {
+      name: "brainstorm",
+      options: [
+        { name: "topic", value: topic },
+        { name: "repo", value: repo },
+      ],
+    },
+  });
+
+test("/brainstorm still takes one repo", () => {
+  // The regression that matters most: the option kept its name and its single-repo
+  // meaning, so nobody's muscle memory broke when it learned to take a list.
+  assert.deepEqual(parseInteraction(brainstorm("make it faster", "acme/widget")), {
+    kind: "run",
+    command: { kind: "brainstorm", topic: "make it faster", repos: ["acme/widget"] },
+  });
+});
+
+test("/brainstorm takes several repos, separated by commas or by spaces", () => {
+  // Both, because Discord's single-line option box invites both and neither is wrong.
+  // A human who types one and gets a refusal learns nothing except to distrust it.
+  for (const typed of [
+    "acme/widget, acme/api",
+    "acme/widget acme/api",
+    "acme/widget,acme/api",
+    "  acme/widget ,  acme/api  ",
+  ]) {
+    assert.deepEqual(
+      parseInteraction(brainstorm("make it faster", typed)),
+      {
+        kind: "run",
+        command: {
+          kind: "brainstorm",
+          topic: "make it faster",
+          repos: ["acme/widget", "acme/api"],
+        },
+      },
+      typed,
+    );
+  }
+});
+
+test("/brainstorm keeps a fully qualified repo qualified", () => {
+  assert.deepEqual(parseInteraction(brainstorm("port it", "acme/widget, codeberg.org/eb/api")), {
+    kind: "run",
+    command: {
+      kind: "brainstorm",
+      topic: "port it",
+      repos: ["acme/widget", "codeberg.org/eb/api"],
+    },
+  });
+});
+
+test("/brainstorm with no repo at all is still refused", () => {
+  // A brainstorm that cannot read the code produces a plan about an imaginary codebase,
+  // which is the expensive kind of wrong.
+  for (const typed of ["", "   ", " , , "]) {
+    const intent = parseInteraction(brainstorm("make it faster", typed));
+    assert.equal(intent.kind, "run");
+    const command = intent.kind === "run" ? intent.command : undefined;
+    assert.equal(command?.kind, "malformed", JSON.stringify(typed));
+    assert.match(
+      command?.kind === "malformed" ? command.reason : "",
+      /owner\/name/,
+      "the refusal must show the shape it wanted",
+    );
+  }
+});
+
+test("one unparseable entry refuses the whole command, and names the offender", () => {
+  // Not a partial accept: dropping the entry that did not parse produces a plan about
+  // half a system, and the human is not told which half went missing.
+  const intent = parseInteraction(brainstorm("make it faster", "acme/widget, widget, acme/api"));
+
+  assert.equal(intent.kind, "run");
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+  assert.match(command?.kind === "malformed" ? command.reason : "", /`widget`/);
+});
+
+test("/brainstorm without a topic is refused before its repos are read", () => {
+  const intent = parseInteraction(brainstorm("  ", "acme/widget"));
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+  assert.match(command?.kind === "malformed" ? command.reason : "", /topic/);
+});
+
 test("autocomplete reports what is being typed", () => {
   assert.deepEqual(
     parseInteraction(
@@ -182,5 +271,17 @@ test("registered commands stay inside Discord's naming rules", () => {
     const description = String(command["description"]);
     assert.match(name, /^[a-z][a-z0-9-]{0,31}$/, name);
     assert.ok(description.length > 0 && description.length <= 100, description);
+
+    // Options have the same 100-character ceiling, and Discord rejects the WHOLE
+    // registration if one exceeds it — so a description that grew to explain a list
+    // takes every command down with it, silently, at deploy time.
+    for (const option of (command["options"] as readonly Record<string, unknown>[]) ?? []) {
+      const optionDescription = String(option["description"]);
+      assert.match(String(option["name"]), /^[a-z][a-z0-9-]{0,31}$/, String(option["name"]));
+      assert.ok(
+        optionDescription.length > 0 && optionDescription.length <= 100,
+        `${name}.${String(option["name"])}: ${optionDescription}`,
+      );
+    }
   }
 });

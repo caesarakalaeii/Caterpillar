@@ -12,7 +12,7 @@ branch without a human touching it**. What is left is mostly a toolchain gap own
 
 Overwrite this file rather than appending to it — an append-forever handoff eventually
 consumes the context it exists to preserve (the same reason `handoff.md` is overwritten and
-`journal.md` appends, DESIGN.md §4.1).
+the journal appends, DESIGN.md §4.1).
 
 ## Orientation
 
@@ -94,6 +94,8 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | Thread chat + typing indicator | deployed; thread answering exercised (3 answers) |
 | Artifact channel, small path (§17) | merged; **never used** |
 | Runner installer (§8) | merged; **no second runner exists yet** |
+| **Web view (§18)** | implemented and deployed — fleet, task, session, logs, runner, digests, and **`/intake`**: what intake and the alert receiver refused, and when intake last ran |
+| **Aggregating viewer (§18)** | implemented and tested; **needs `caesar-deployment`**: a `caterpillar-view` Deployment (same image, `command: ["node", "/app/dist/cli/view.js"]`, no PVC, no secrets, `automountServiceAccountToken: false`) plus a Service, and `caterpillar-ingress` repointed at it with the Authelia annotations byte for byte. Until that lands, the Ingress balances across four pods and the live panel and `/logs` are one replica at random |
 | **Daily digest (§19)** | implemented and tested; **off until the ConfigMap enables it** — nothing is published yet |
 | Container image + CI | built and pushed by CI on every push to `main` |
 | Deployment | **LIVE** |
@@ -261,7 +263,8 @@ Three paths (§14):
 
 1. **Label a tracker item `agent`** with an `agent` block in the body. Within ~5 minutes
    intake renders a spec and the supervisor claims it.
-2. **`/brainstorm topic:… repo:owner/name`** in Discord (§14.3) — opens a thread, refines the
+2. **`/brainstorm topic:… repo:owner/name`** in Discord (§14.3), or several repos in one
+   workspace as `repo:owner/a, owner/b` — opens a thread, refines the
    idea one question at a time, and ends in a plan the council reviews and cuts into
    wave-tagged tasks. **Proven end to end.** This is the path that produces acceptance
    criteria rather than demanding them up front.
@@ -282,6 +285,16 @@ acceptance:             # REQUIRED — at least one command that must exit 0
 An item without acceptance criteria is **refused** and commented on **once**, because a task
 with no machine-checkable criteria can never satisfy §12. Refusals are recorded at
 `intake/<task-id>.json`, keyed by a digest of title and body; editing the item re-opens it.
+
+**A refusal shows up on `/intake`.** That is where to look when a labelled item produced
+nothing: the page renders every record under `intake/` with a link back to the item, the
+alert ledger (`alerts/refusals/`, which records the success path too, not only refusals),
+which alertnames `alerts/policy.yaml` opts in — or that the file is absent — and whether the
+alert receiver is listening at all. The fleet page carries one line saying when intake last
+ran on that runner and what it saw. On a fleet of four, three runners report "another runner
+served this interval" per interval; that is the design (one runner wins `refs/intake/<bucket>`)
+and not a fault. Grafana has the same facts in `caterpillar_intake_total{workspace,outcome}`
+and `caterpillar_intake_items{workspace}`.
 **In Vikunja the `agent` marker must be the first line INSIDE a code block** — TipTap cannot
 put text on the fence line.
 
@@ -330,9 +343,10 @@ scripts this session used, which is strictly better than a commit per file.
 | Context | **`default`** in `~/.kube/config` |
 | ArgoCD app | `caterpillar`, `Synced` / `Healthy`, sync wave 6 |
 | Fleet | `StatefulSet/caterpillar`, `RollingUpdate`, `/healthz` + `/metrics` on 9090 |
+| Viewer | **not deployed yet** — `caterpillar-view` Deployment (1 replica, no volumes, no secrets), discovering runners through `_web._tcp.caterpillar-headless.caterpillar.svc.cluster.local`. Nothing is removed from the fleet: the runners' `web` port stays, in-cluster only |
 | Volumes | `work-caterpillar-N` (10Gi) + `nix-caterpillar-N` (15Gi), one pair per replica |
 | Singletons | `caterpillar-credentials` (1Gi) and `caterpillar-nix-cache` (50Gi), **1 replica each, never more** |
-| Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, retained until the credential is migrated |
+| Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, credential already migrated off; **safe to prune** |
 | Image | `ghcr.io/caesarakalaeii/caterpillar:main`, rolled by Keel (`policy: force`, `trigger: poll`) |
 
 Deploy = merge to `main`. CI builds and pushes, Keel notices within ~45–90s and rolls the
@@ -405,11 +419,18 @@ Full commands in `caesar-deployment/apps/workloads/caterpillar/README.md`, prere
 - **Do not scale the holder past 1.** A second replica is a second writer, which is the
   condition it exists to make impossible.
 
-**MIGRATION, not yet done:** the live `caterpillar-work` PVC still holds the credential
-from the single-replica era. It is deliberately still in `kustomization.yaml` so ArgoCD's
-`prune` does not delete it — copy the file onto the holder, verify
-`llm.credential-source source=holder` in a runner's logs, and only then remove `pvc.yaml`.
-The order is written out in that file's own header.
+**MIGRATION: done and verified.** The credential has been on the holder since
+2026-08-18 04:03, and all four runners log
+`llm.credential-source source=holder url=http://caterpillar-credentials:8081`.
+
+**What is left is a prune, not a migration.** `caterpillar-work` (20Gi) and
+`caterpillar-nix` (30Gi) are still bound on caesar3 and mounted by nothing, because
+`pvc.yaml` is still listed in `kustomization.yaml`. Removing that file lets ArgoCD prune
+both and returns 50Gi to the node.
+
+Note what the old volume is NOT: a backup. The copy of `anthropic.json` still on it is a
+token the provider has already invalidated — the holder has been refreshing since 04:03,
+and every refresh rotates the refresh token. Keeping it buys nothing and costs 50Gi.
 
 ### Discord: every half is LIVE
 

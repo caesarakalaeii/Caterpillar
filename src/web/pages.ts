@@ -12,9 +12,19 @@
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, safeUrl, type Html } from "./html.ts";
 import type { TranscriptEntry } from "./transcript.ts";
-import type { DigestView, FleetView, RunnerExport, TaskDetail, TaskRow } from "./view.ts";
+import type {
+  DigestView,
+  DiskEntry,
+  DiskView,
+  FleetView,
+  IntakeView,
+  RunnerExport,
+  TaskDetail,
+  TaskOrigin,
+  TaskRow,
+} from "./view.ts";
 
-export type Page = "fleet" | "digests" | "logs" | "runner";
+export type Page = "fleet" | "intake" | "digests" | "logs" | "runner";
 
 export interface Chrome {
   readonly runnerId: string;
@@ -48,6 +58,7 @@ export const layout = (chrome: Chrome, body: Html): string => {
     </div>
     <nav>
       <a href="/"${chrome.current === "fleet" ? raw(' aria-current="page"') : raw("")}>fleet</a>
+      <a href="/intake"${chrome.current === "intake" ? raw(' aria-current="page"') : raw("")}>intake</a>
       <a href="/digests"${chrome.current === "digests" ? raw(' aria-current="page"') : raw("")}>digests</a>
       <a href="/logs"${chrome.current === "logs" ? raw(' aria-current="page"') : raw("")}>logs</a>
       <a href="/runner"${chrome.current === "runner" ? raw(' aria-current="page"') : raw("")}>runner</a>
@@ -86,18 +97,20 @@ export const fleetPage = (view: FleetView): Html => html`<main>
     <p class="sub">Every task the state repo knows about, and which runner is holding it.</p>
   </div>
 
-  ${
-    view.live === undefined
-      ? raw("")
-      : html`<div class="banner">
-          <span class="status" data-status="running"><span>session ${view.live.session}</span></span>
-          <span>
-            <a href="/tasks/${view.live.task}">${view.live.task}</a> is running here on
-            ${view.live.model} · ${view.live.messages} messages · started
-            <time datetime="${view.live.startedAt}">${view.live.startedAt}</time>
-          </span>
-        </div>`
-  }
+  ${view.live.map(
+    (live) => html`<div class="banner">
+      <span class="status" data-status="running"><span>session ${live.session}</span></span>
+      <span>
+        <a href="/tasks/${live.task}">${live.task}</a> is running on ${live.runner}
+        (${live.model}) · ${live.messages} messages · started
+        <time datetime="${live.startedAt}">${live.startedAt}</time>
+      </span>
+    </div>`,
+  )}
+
+  <section>
+    ${intakeLine(view)}
+  </section>
 
   <section>
     <div class="counts">
@@ -146,7 +159,7 @@ export const fleetPage = (view: FleetView): Html => html`<main>
         : html`<table class="ledger">
             <thead>
               <tr>
-                <th>task</th><th>status</th><th>phase</th><th>sessions</th>
+                <th>task</th><th>from</th><th>status</th><th>phase</th><th>sessions</th>
                 <th class="num">cost</th><th>runner</th><th class="num">updated</th>
               </tr>
             </thead>
@@ -161,6 +174,7 @@ const taskRow = (task: TaskRow): Html => html`<tr data-status="${task.status}">
     <a href="/tasks/${task.id}">${task.title}</a>
     <div class="id">${task.id}${task.wave === undefined ? raw("") : html` · wave ${task.wave}`}</div>
   </td>
+  <td>${originCell(task.origin)}</td>
   <td>${statusCell(task.status)}</td>
   <td><span class="id">${task.phase}</span></td>
   <td>${instar(task.sessions, task.maxSessions)}</td>
@@ -183,6 +197,65 @@ const statusCell = (status: string): Html =>
   html`<span class="status" data-status="${status}"><span>${status}</span></span>`;
 
 /**
+ * One line saying when intake last ran here and what it found (§14, §18).
+ *
+ * On the page an operator opens FIRST, because the question this answers — "I labelled an
+ * issue and nothing happened" — is asked while looking at an empty fleet, and until this
+ * existed the only evidence intake was alive at all was a line in one pod's stdout.
+ *
+ * Three distinct sentences rather than one with blanks in it, because the three states are
+ * different facts: this runner ingested, another replica did (three of four, every
+ * interval, by design — see `intakeRef`), or the pass threw and the counts would be a lie.
+ */
+const intakeLine = (view: FleetView): Html => {
+  const pass = view.intake;
+  if (pass === undefined) {
+    return html`<p class="crumb">
+      intake · no pass on this runner yet · <a href="/intake">what intake has refused</a>
+    </p>`;
+  }
+
+  if (pass.outcome === "claimed-elsewhere") {
+    return html`<p class="crumb">
+      intake · ${timeTag(pass.at)} · another runner served this interval
+      (<span class="id">${pass.ref}</span>) · <a href="/intake">what intake has refused</a>
+    </p>`;
+  }
+
+  if (pass.outcome === "failed") {
+    return html`<p class="crumb" data-status="failed">
+      intake · ${timeTag(pass.at)} · failed: ${pass.error ?? "no detail"} ·
+      <a href="/intake">what intake has refused</a>
+    </p>`;
+  }
+
+  return html`<p class="crumb">
+    intake · ${timeTag(pass.at)} · ${pass.seen ?? 0} seen · ${pass.created ?? 0} created ·
+    ${pass.rejected ?? 0} refused${pass.failed === undefined || pass.failed === 0
+      ? raw("")
+      : html` · ${pass.failed} tracker(s) unreachable`} · by ${pass.runner} ·
+    <a href="/intake">what intake has refused</a>
+  </p>`;
+};
+
+/**
+ * Where a task came from, as one cell.
+ *
+ * A CHIP rather than prose: the fleet table is scanned, and the fact worth scanning for is
+ * that a row is a `remediation` task nobody asked for by hand. `safeUrl` gates the link
+ * because the URL was recovered from a goal, which is agent-adjacent text (§18).
+ */
+const originCell = (origin: TaskOrigin | undefined): Html => {
+  if (origin === undefined) return html`<span class="id">—</span>`;
+  const url = safeUrl(origin.url);
+  const label = html`<span class="chip" data-origin="${origin.kind}">${origin.kind}</span>`;
+
+  return url === undefined
+    ? html`<span title="${origin.label}">${label}</span>`
+    : html`<a href="${url}" rel="noreferrer noopener" title="${origin.label}">${label}</a>`;
+};
+
+/**
  * Sessions spent against the limit, as segments.
  *
  * Capped at a readable number of marks: the limit is configurable and a task with a
@@ -201,6 +274,255 @@ const instar = (spent: number, limit: number): Html => {
 };
 
 const timeTag = (iso: string): Html => html`<time datetime="${iso}">${iso}</time>`;
+
+/**
+ * The source of one task, spelled out.
+ *
+ * `spec.tracker` has been on every ingested task since intake shipped and no page rendered
+ * it: the goal's prose said "Tracker item: …" and that was the whole of it. For an alert
+ * task the alertname comes from `alerts/refusals/`, because `ALERT-<fingerprint>` is a hash
+ * and does not carry one.
+ */
+const originDetail = (origin: TaskOrigin | undefined): Html => {
+  if (origin === undefined) return raw("—");
+  const url = safeUrl(origin.url);
+
+  return html`<span class="chip" data-origin="${origin.kind}">${origin.kind}</span>
+    ${url === undefined
+      ? html`<span class="id">${origin.label}</span>`
+      : html`<a href="${url}" rel="noreferrer noopener">${origin.label}</a>`}`;
+};
+
+/* ------------------------------------------------------------------- intake */
+
+/**
+ * The fourth and fifth intake paths, on one page (DESIGN.md §14, §20).
+ *
+ * The page exists because a REFUSAL was invisible: a warn line in one pod's stdout, a JSON
+ * file in the state repo, and a comment on a tracker item nobody is watching. A fleet whose
+ * only labelled issue was refused looked exactly like a fleet nobody had given work to, and
+ * that is how the issue behind this page was reported — "I have never seen an agent pick up
+ * an issue".
+ *
+ * Every string on it is untrusted in the §18 sense and then some: a refusal reason quotes a
+ * tracker item written by anyone with an account, and an alert annotation is whatever a
+ * Prometheus rule's template produced. `html.ts` escapes all of it; nothing here calls
+ * `raw` on anything but a literal.
+ */
+export const intakePage = (view: IntakeView): Html => html`<main>
+  <div class="page-head">
+    <div class="eyebrow">state repo · intake/ and alerts/</div>
+    <h1>Intake</h1>
+    <p class="sub">
+      What the tracker and the alert receiver have been asked to turn into tasks, and what
+      they refused. A refusal is durable: it is a file in the state repo and a comment on
+      the item, and it is what stops the same item being commented on every poll.
+    </p>
+  </div>
+
+  <section>
+    <h2>Last pass on this runner</h2>
+    ${passPanel(view)}
+    <p class="crumb">
+      Held in memory, not in git. One runner serves each interval — the others contend for
+      the same ref and skip — so a runner reporting nothing here is the normal case on a
+      fleet, not a broken one.
+    </p>
+  </section>
+
+  <section>
+    <h2>Refused tracker items</h2>
+    ${
+      view.rejections.length === 0
+        ? html`<p class="empty">
+            Nothing refused. An item is recorded here when it is labelled for the agent and
+            cannot be turned into a task — usually a missing <code>agent</code> block.
+          </p>`
+        : html`<table class="ledger">
+            <thead><tr><th>item</th><th>workspace</th><th>reason</th><th class="num">at</th></tr></thead>
+            <tbody>${view.rejections.map(rejectionRow)}</tbody>
+          </table>`
+    }
+  </section>
+
+  <section>
+    <h2>Alert ledger</h2>
+    ${
+      view.alerts.length === 0
+        ? html`<p class="empty">
+            No alert has reached this fleet. Every decision about one is recorded — including
+            the ones that became tasks — so an empty ledger means nothing was delivered.
+          </p>`
+        : html`<table class="ledger">
+            <thead><tr><th>alertname</th><th>outcome</th><th>task</th><th class="num">at</th></tr></thead>
+            <tbody>${view.alerts.map(alertRow)}</tbody>
+          </table>`
+    }
+    <p class="crumb">
+      Filed under <code>alerts/refusals/&lt;fingerprint&gt;.json</code>, which is a record of
+      every decision rather than only the refusals — the success path writes one too.
+    </p>
+  </section>
+
+  <section>
+    <h2>Which alerts are opted in</h2>
+    ${policyPanel(view)}
+  </section>
+
+  <section>
+    <h2>Is anything listening</h2>
+    <dl class="grid">
+      <div>
+        <dt>alert receiver</dt>
+        <dd>${
+          view.receiver.enabled
+            ? html`<span class="chip on">listening</span> on port ${view.receiver.port}`
+            : html`<span class="chip">disabled</span> · <code>remediation.enabled</code> is false`
+        }</dd>
+      </div>
+      <div>
+        <dt>cluster reads</dt>
+        <dd>${
+          view.receiver.clusterEnabled
+            ? html`<span class="chip on">enabled</span>`
+            : html`<span class="chip">disabled</span>`
+        }</dd>
+      </div>
+      <div>
+        <dt>namespaces</dt>
+        <dd>${
+          view.receiver.namespaces.length === 0
+            ? html`<span class="id">none — every cluster read is refused</span>`
+            : html`<div class="chips">${view.receiver.namespaces.map(
+                (namespace) => html`<span class="chip">${namespace}</span>`,
+              )}</div>`
+        }</dd>
+      </div>
+    </dl>
+    <p class="crumb">
+      A receiver that is not listening is the most likely reason a firing alert produced
+      nothing at all. It refuses to start without its webhook token, and that refusal is an
+      error line in this runner's log.
+    </p>
+  </section>
+</main>`;
+
+const passPanel = (view: IntakeView): Html => {
+  const pass = view.pass;
+  if (pass === undefined) {
+    return html`<p class="empty">
+      Intake has not completed a pass on this runner since it started.
+    </p>`;
+  }
+
+  if (pass.outcome !== "ingested") {
+    return html`<div class="panel" data-status="${pass.outcome === "failed" ? "failed" : "ready"}">
+      <h3>${pass.outcome === "failed" ? "the last pass failed" : "another runner served this interval"}</h3>
+      <p>
+        ${timeTag(pass.at)} · <span class="id">${pass.ref}</span>
+        ${pass.error === undefined ? raw("") : html` · ${pass.error}`}
+      </p>
+    </div>`;
+  }
+
+  return html`<dl class="grid">
+    <div><dt>ran</dt><dd>${timeTag(pass.at)}</dd></div>
+    <div><dt>by</dt><dd>${pass.runner}</dd></div>
+    <div><dt>seen</dt><dd>${pass.seen ?? 0}</dd></div>
+    <div><dt>created</dt><dd>${pass.created ?? 0}</dd></div>
+    <div><dt>refused</dt><dd>${pass.rejected ?? 0}</dd></div>
+    <div><dt>trackers unreachable</dt><dd>${pass.failed ?? 0}</dd></div>
+  </dl>`;
+};
+
+const rejectionRow = (record: IntakeView["rejections"][number]): Html => {
+  const url = safeUrl(record.url);
+  return html`<tr data-status="awaiting-human">
+    <td class="title">
+      ${
+        url === undefined
+          ? html`${record.title ?? record.task}`
+          : html`<a href="${url}" rel="noreferrer noopener">${record.title ?? record.task}</a>`
+      }
+      <div class="id">${record.task}</div>
+    </td>
+    <td><span class="id">${record.workspace ?? "—"}</span></td>
+    <td><div class="prose">${record.reason}</div></td>
+    <td class="num">${record.at === undefined ? raw("—") : timeTag(record.at)}</td>
+  </tr>`;
+};
+
+const alertRow = (record: IntakeView["alerts"][number]): Html => html`<tr
+  data-status="${record.task === undefined ? "parked" : "running"}"
+>
+  <td class="title">
+    ${record.alertname}
+    <div class="id">${record.fingerprint}</div>
+  </td>
+  <td><div class="prose">${record.reason}</div></td>
+  <td>${
+    record.task === undefined
+      ? html`<span class="id">none</span>`
+      : html`<a href="/tasks/${record.task}">${record.task}</a>`
+  }</td>
+  <td class="num">${record.at === undefined ? raw("—") : timeTag(record.at)}</td>
+</tr>`;
+
+/**
+ * The opt-in list, or the sentence that explains its absence.
+ *
+ * A missing `alerts/policy.yaml` is rendered as a statement with the runbook next to it,
+ * not as an empty table: "the alert fired and nobody had listed it" is the refusal an
+ * operator is least likely to guess, and an empty table reads as "nothing has happened".
+ */
+const policyPanel = (view: IntakeView): Html => {
+  if (view.policyError !== undefined) {
+    return html`<div class="panel" data-status="failed">
+      <h3>alerts/policy.yaml does not parse</h3>
+      <p>${view.policyError}</p>
+      <p class="crumb">
+        Every alert is refused until this is fixed, and the supervisor logs it once per poll.
+      </p>
+    </div>`;
+  }
+
+  if (view.policyMissing) {
+    return html`<p class="empty">
+      There is no <code>alerts/policy.yaml</code> in the state repo, so no alert is opted in
+      and every delivery is refused with <code>refused-no-policy</code>. Adding one is a
+      commit to the state repo, not a redeploy — see <code>docs/remediation-runbook.md</code>.
+    </p>`;
+  }
+
+  if (view.policy.length === 0) {
+    return html`<p class="empty">
+      <code>alerts/policy.yaml</code> exists and lists no alerts, so every delivery is
+      refused with <code>refused-no-policy</code>.
+    </p>`;
+  }
+
+  return html`<table class="ledger">
+    <thead>
+      <tr><th>alertname</th><th>workspace</th><th>repos</th><th class="num">max open</th><th>runbook</th></tr>
+    </thead>
+    <tbody>
+      ${view.policy.map((entry) => {
+        const runbook = safeUrl(entry.runbook);
+        return html`<tr>
+          <td class="title">${entry.alertname}</td>
+          <td><span class="id">${entry.workspace}</span></td>
+          <td><span class="id">${entry.repos.map((r) => `${r.host}/${r.owner}/${r.name}`).join(", ")}</span></td>
+          <td class="num">${entry.maxOpenTasks}</td>
+          <td>${
+            runbook === undefined
+              ? html`<span class="id">—</span>`
+              : html`<a href="${runbook}" rel="noreferrer noopener">runbook</a>`
+          }</td>
+        </tr>`;
+      })}
+    </tbody>
+  </table>`;
+};
 
 /* --------------------------------------------------------------------- task */
 
@@ -249,6 +571,10 @@ export const taskPage = (detail: TaskDetail): Html => {
         <div>
           <dt>pull request</dt>
           <dd>${pr === undefined ? raw("—") : html`<a href="${pr}" rel="noreferrer noopener">#${state.pr?.number}</a>`}</dd>
+        </div>
+        <div>
+          <dt>came from</dt>
+          <dd>${originDetail(detail.origin)}</dd>
         </div>
         ${
           state.review === undefined
@@ -391,7 +717,7 @@ export const taskPage = (detail: TaskDetail): Html => {
         </div>
       </details>
       <details>
-        <summary>journal.md — append-only, the audit trail</summary>
+        <summary>journal/ — append-only, the audit trail</summary>
         <div class="body">
           ${detail.journal === undefined ? html`<p class="empty">none</p>` : html`<div class="prose">${detail.journal}</div>`}
         </div>
@@ -515,7 +841,92 @@ const logLine = (record: LogRecord): Html => html`<div class="logline" data-leve
 
 /* ------------------------------------------------------------------- runner */
 
-export const runnerPage = (exported: RunnerExport): Html => html`<main>
+/**
+ * Bytes as a human reads them, in binary units — `1.4 GiB`, not `1.5 GB`.
+ *
+ * Binary because that is what `df`, the PVC request and every Kubernetes quantity in this
+ * repo mean by `Gi`, and a page that disagreed with the manifest by 7% would have somebody
+ * chasing a discrepancy that does not exist. One decimal place from MiB up: the walk is
+ * apparent size and hourly, so a third significant figure would be precision the number
+ * does not have.
+ */
+export const bytes = (value: number): string => {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${unit <= 1 ? Math.round(scaled) : scaled.toFixed(1)} ${units[unit]}`;
+};
+
+/** One `name — size` row of the mirror or task breakdown. */
+const diskRow = (entry: DiskEntry): Html =>
+  html`<tr><td>${entry.name}</td><td class="num">${bytes(entry.bytes)}</td></tr>`;
+
+const diskTable = (caption: string, entries: readonly DiskEntry[]): Html =>
+  entries.length === 0
+    ? html`<p class="empty">No ${caption} measured.</p>`
+    : html`<table class="ledger">
+        <thead><tr><th>${caption}</th><th class="num">size</th></tr></thead>
+        <tbody>${entries.map(diskRow)}</tbody>
+      </table>`;
+
+/**
+ * What is on the work volume, and when anyone last looked.
+ *
+ * `measuredAt` is rendered as prominently as the bytes on purpose. This measurement is
+ * idle-only and hourly (`workspace/usage.ts`), so on a busy runner the newest answer can
+ * be an hour old — and a disk figure with no timestamp is one somebody will act on as if
+ * it were live, which for the one number that says "is the volume about to fill" is the
+ * expensive mistake.
+ */
+const diskSection = (exported: RunnerExport, disk: DiskView | undefined): Html => html`<section>
+  <h2>Disk</h2>
+  ${
+    disk === undefined
+      ? html`<p class="empty">
+          Not measured yet. The walk runs only when this runner is idle, at most every
+          ${exported.usage.intervalHours}h.
+        </p>`
+      : html`<p class="crumb">
+            Measured ${timeTag(disk.measuredAt)}, in ${Math.round(disk.durationMs)}ms, at most
+            every ${exported.usage.intervalHours}h while idle. Apparent size, read-only.
+            ${
+              disk.partial
+                ? html`<strong
+                    >Partial: the ${exported.usage.deadlineSeconds}s deadline stopped the walk,
+                    so every figure below is a floor.</strong
+                  >`
+                : raw("")
+            }
+          </p>
+          <dl class="grid">
+            <div><dt>volume</dt><dd>${exported.paths.root}</dd></div>
+            <div><dt>capacity</dt><dd>${bytes(disk.totalBytes)}</dd></div>
+            <div><dt>used</dt><dd>${bytes(disk.usedBytes)}</dd></div>
+            <div><dt>free</dt><dd>${bytes(disk.freeBytes)}</dd></div>
+          </dl>
+          <table class="ledger">
+            <thead><tr><th>category</th><th class="num">size</th><th class="num">of volume</th></tr></thead>
+            <tbody>
+              ${disk.categories.map(
+                (category) => html`<tr>
+                  <td>${category.name}</td>
+                  <td class="num">${bytes(category.bytes)}</td>
+                  <td class="num">${(category.fraction * 100).toFixed(1)}%</td>
+                </tr>`,
+              )}
+            </tbody>
+          </table>
+          ${diskTable("largest tasks", disk.tasks)} ${diskTable("largest mirrors", disk.mirrors)}`
+  }
+</section>`;
+
+export const runnerPage = (exported: RunnerExport, disk?: DiskView): Html => html`<main>
   <div class="page-head">
     <div class="eyebrow">configuration · no credentials</div>
     <h1>${exported.runnerId}</h1>
@@ -564,11 +975,17 @@ export const runnerPage = (exported: RunnerExport): Html => html`<main>
       <div><dt>nixpkgs</dt><dd>${exported.toolchain.nixpkgs}</dd></div>
       <div><dt>resolve timeout</dt><dd>${exported.toolchain.timeoutSeconds}s</dd></div>
       <div><dt>store gc</dt><dd>every ${exported.toolchain.gcIntervalHours}h, keep ${exported.toolchain.gcKeepDays}d</dd></div>
-      <div><dt>worktree reap</dt><dd>every ${exported.workspace.reap.intervalHours}h, keep ${exported.workspace.reap.keepHours}h</dd></div>
+      <div><dt>worktree reap</dt><dd>${
+        exported.workspace === undefined
+          ? "—"
+          : `every ${exported.workspace.reap.intervalHours}h, keep ${exported.workspace.reap.keepHours}h`
+      }</dd></div>
       <div><dt>mirrors</dt><dd>${exported.paths.mirrors}</dd></div>
       <div><dt>worktrees</dt><dd>${exported.paths.tasks}</dd></div>
     </dl>
   </section>
+
+  ${diskSection(exported, disk)}
 
   <section>
     <h2>State repo</h2>
@@ -577,6 +994,43 @@ export const runnerPage = (exported: RunnerExport): Html => html`<main>
       <div><dt>branch</dt><dd>${exported.stateRepo.branch}</dd></div>
       <div><dt>checkout</dt><dd>${exported.stateRepo.path}</dd></div>
     </dl>
+  </section>
+
+  <section>
+    <h2>Alerts</h2>
+    <dl class="grid">
+      <div>
+        <dt>receiver</dt>
+        <dd>${
+          exported.remediation.enabled
+            ? html`<span class="chip on">listening</span> on port ${exported.remediation.port}`
+            : html`<span class="chip">disabled</span>`
+        }</dd>
+      </div>
+      <div>
+        <dt>cluster reads</dt>
+        <dd>${
+          exported.cluster.enabled
+            ? html`<span class="chip on">enabled</span>`
+            : html`<span class="chip">disabled</span>`
+        }</dd>
+      </div>
+      <div>
+        <dt>namespaces</dt>
+        <dd>${
+          exported.cluster.namespaces.length === 0
+            ? html`<span class="id">none — every read refused</span>`
+            : html`<div class="chips">${exported.cluster.namespaces.map(
+                (namespace) => html`<span class="chip">${namespace}</span>`,
+              )}</div>`
+        }</dd>
+      </div>
+      <div><dt>log lines per read</dt><dd>${exported.cluster.maxLogLines}</dd></div>
+    </dl>
+    <p class="crumb">
+      What the receiver has actually decided is on <a href="/intake">intake</a>. A disabled
+      receiver is the most likely reason a firing alert produced no task at all.
+    </p>
   </section>
 
   <section>

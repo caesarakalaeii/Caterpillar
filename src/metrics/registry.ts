@@ -5,6 +5,7 @@
  * and this keeps the dependency surface (and therefore the supply-chain review
  * burden) down. Scraped by a ServiceMonitor.
  */
+import type { WorkspaceUsage } from "../workspace/usage.ts";
 export type LabelValues = Readonly<Record<string, string>>;
 
 interface Sample {
@@ -13,6 +14,24 @@ interface Sample {
 }
 
 type MetricKind = "counter" | "gauge";
+
+/**
+ * A label value, escaped the way the text exposition format requires.
+ *
+ * All THREE of the format's escapes, in this order — backslash first, or the escapes
+ * escape each other, exactly as in `web/html.ts`. It used to be `"` alone, which was
+ * enough while every label value was a task id (a validated `[A-Za-z0-9._-]+`) or a
+ * literal from this file.
+ *
+ * It stopped being enough when `caterpillar_work_bytes` started taking label values from
+ * the FILESYSTEM: a directory under `tasks/` is whatever is on the disk, and a name
+ * containing a newline would end the sample line early and hand the scraper a line of the
+ * exporter's own choosing. Escaping here rather than at the call site because this is the
+ * only place that knows it is writing exposition format, and a second producer of
+ * world-derived labels must not have to remember.
+ */
+const escapeLabel = (value: string): string =>
+  value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 
 class Metric {
   private readonly samples = new Map<string, Sample>();
@@ -38,6 +57,19 @@ class Metric {
     this.samples.set(this.key(labels), { labels, value });
   }
 
+  /**
+   * Forget every sample. Only ever right for a gauge whose LABEL SET is derived from the
+   * world rather than fixed — today that is the per-task and per-mirror breakdown, where
+   * a task that has dropped out of the top N would otherwise keep reporting the size it
+   * had when it last made the cut, forever, because nothing here expires.
+   *
+   * Never call this on a counter: a counter that goes back to zero reads to Prometheus as
+   * a process restart, and every `rate()` over it produces a spike that did not happen.
+   */
+  clear(): void {
+    this.samples.clear();
+  }
+
   inc(labels: LabelValues, delta = 1): void {
     const key = this.key(labels);
     const existing = this.samples.get(key);
@@ -49,7 +81,7 @@ class Metric {
     const lines = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} ${this.kind}`];
     for (const sample of this.samples.values()) {
       const labels = Object.entries(sample.labels)
-        .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
+        .map(([k, v]) => `${k}="${escapeLabel(v)}"`)
         .join(",");
       lines.push(labels.length > 0 ? `${this.name}{${labels}} ${sample.value}` : `${this.name} ${sample.value}`);
     }
@@ -124,6 +156,23 @@ export class AgentMetrics {
   readonly providerCooldown = this.registry.gauge(
     "caterpillar_provider_cooldown_seconds",
     "seconds until this runner will start a session again — 0 when healthy",
+  );
+
+  /**
+   * Local commits this runner could not rebase and had to move to `refs/salvaged/`
+   * (DESIGN.md §4.3).
+   *
+   * **This series must stay at zero.** It used to have one cause — two runners appending
+   * to the same single-file `journal.md` — and that cause has been eliminated by giving
+   * the journal one file per entry (§4.1), so anything it counts now is a conflict the
+   * fleet has never seen before: a hand-edited file, a `state.json` two runners wrote, a
+   * format that forgot the lesson. The salvage itself is the backstop and stays; this is
+   * how an operator finds out it fired, because the runner recovers and carries on and
+   * nothing else would raise it.
+   */
+  readonly salvagedCommits = this.registry.counter(
+    "caterpillar_salvaged_commits_total",
+    "local state commits set aside because they could not rebase — must stay 0",
   );
 
   /**
@@ -216,6 +265,140 @@ export class AgentMetrics {
     "caterpillar_worktree_bytes_reaped_total",
     "approximate bytes reclaimed by removing task worktrees",
   );
+
+  /**
+   * What intake did with each item it saw, by workspace (DESIGN.md §14).
+   *
+   * Intake had no metric at all until this existed, which made the fourth intake path the
+   * only one Grafana could not answer a question about: an alert delivery has
+   * `caterpillar_alerts_received_total`, a session has `caterpillar_sessions_total`, and a
+   * labelled issue that never became a task had a warn line in one pod's stdout.
+   *
+   * `outcome` is `created|rejected|skipped` — the three answers `Ingester.ingestItem`
+   * returns, verbatim, rather than a collapsed ok/error. `skipped` is overwhelmingly the
+   * normal case (the item is already a task) and `rejected` is the one that needs a human,
+   * so merging them would hide the series this was added for.
+   *
+   * `workspace` rather than `tracker`, because the workspace is the unit an operator
+   * configures and the unit a repo bound is set on; two workspaces on the same tracker
+   * kind are two different questions.
+   */
+  readonly intake = this.registry.counter(
+    "caterpillar_intake_total",
+    "tracker items by workspace and what intake did with them",
+  );
+
+  /**
+   * Items the trackers returned in the last pass, before any were skipped or refused.
+   *
+   * A GAUGE and not a counter, and the distinction is the whole point of the series:
+   * `caterpillar_intake_total` counts decisions and only ever grows, so a fleet whose
+   * tracker has gone quiet looks identical to one nobody is polling. This is the standing
+   * size of the labelled backlog — `seen` from `IntakePass` — and it goes back to zero
+   * when the last labelled item becomes a task, which is exactly the transition an
+   * operator wants a graph of.
+   *
+   * Set only by the runner that WON the interval's claim (`intakeRef`), so on a fleet of
+   * four this is published by whichever pod ingested and stays stale on the other three
+   * until their turn. Aggregate it with `max` rather than `sum`.
+   */
+  readonly intakeItems = this.registry.gauge(
+    "caterpillar_intake_items",
+    "items the trackers returned in the last intake pass, by workspace",
+  );
+
+  /**
+   * Bytes on the work volume, by what is using them (`workspace/usage.ts`).
+   *
+   * The series the complaint that started this asked for: "the scaling mechanisms use so
+   * much disk space" was, until this existed, unanswerable from anything the supervisor
+   * emitted. `category` is `mirrors|tasks|nix|other` and the four are disjoint, so they
+   * sum to what this runner is accountable for — which is NOT the same as what the volume
+   * holds, because another process can be on it. `caterpillar_work_fs_bytes` is the
+   * arbiter there.
+   */
+  readonly workBytes = this.registry.gauge(
+    "caterpillar_work_bytes",
+    "bytes on the work volume by category — mirrors, tasks, nix, other",
+  );
+
+  /**
+   * What the filesystem says about itself: `kind="total"` and `kind="free"`.
+   *
+   * Separate from `caterpillar_work_bytes` because it is a different KIND of measurement —
+   * one `statfs` rather than a walk — and because it is the only one that stays correct
+   * when the walk is `partial`. Alert on this one; use the categories to find out who.
+   */
+  readonly workFsBytes = this.registry.gauge(
+    "caterpillar_work_fs_bytes",
+    "total and free bytes of the filesystem holding the work root",
+  );
+
+  /**
+   * The largest tasks and mirrors individually, so a graph can name the culprit.
+   *
+   * CAPPED at `TOP_N` of each by `workspace/usage.ts`, with the remainder in a single
+   * `name="other"` series. The cap is not tidiness: `name` is a task id, the fleet creates
+   * tasks continuously, worktrees survive the sessions that made them, and this registry
+   * has no expiry — so an uncapped breakdown grows one series per task the runner has ever
+   * worked and never drops one.
+   */
+  readonly workEntryBytes = this.registry.gauge(
+    "caterpillar_work_entry_bytes",
+    "bytes for the largest individual tasks and mirrors, remainder bucketed as `other`",
+  );
+
+  /**
+   * 1 when the last measurement ran out of time before it saw everything.
+   *
+   * Its own series rather than a label on the byte gauges, because a label that changes
+   * value starts a NEW time series: a walk that goes partial would break the continuity of
+   * every byte graph at exactly the moment the volume got interesting enough to be slow.
+   */
+  readonly workPartial = this.registry.gauge(
+    "caterpillar_work_partial",
+    "1 when the last work-volume measurement hit its deadline before finishing",
+  );
+
+  /** Unix seconds of the last measurement. `time() - this` is how stale the bytes are. */
+  readonly workMeasuredAt = this.registry.gauge(
+    "caterpillar_work_measured_timestamp_seconds",
+    "unix time of the last work-volume measurement",
+  );
+
+  /**
+   * Publish one measurement. Called from the supervisor's idle branch, nowhere else.
+   *
+   * Here rather than at the call site so the label vocabulary is decided once: `category`
+   * and `kind` are strings a dashboard hard-codes, and two call sites spelling them
+   * differently is a dashboard that silently shows half the fleet.
+   *
+   * Every series is SET rather than incremented, including on a partial pass. A partial
+   * pass under-counts, which is visible in `caterpillar_work_partial`; leaving the previous
+   * value in place instead would be a number that looks fresh and is not.
+   */
+  recordUsage(runner: string, usage: WorkspaceUsage): void {
+    this.workFsBytes.set({ runner, kind: "total" }, usage.fs.totalBytes);
+    this.workFsBytes.set({ runner, kind: "free" }, usage.fs.freeBytes);
+
+    this.workBytes.set({ runner, category: "mirrors" }, usage.mirrorBytes);
+    this.workBytes.set({ runner, category: "tasks" }, usage.taskBytes);
+    this.workBytes.set({ runner, category: "nix" }, usage.nixBytes);
+    this.workBytes.set({ runner, category: "other" }, usage.otherBytes);
+
+    // Cleared, not overwritten: the top N is recomputed every pass, and a task that has
+    // dropped out of it must stop reporting rather than freeze at the last size it had.
+    this.workEntryBytes.clear();
+    for (const entry of usage.mirrors) {
+      this.workEntryBytes.set({ runner, category: "mirrors", name: entry.name }, entry.bytes);
+    }
+    for (const entry of usage.tasks) {
+      this.workEntryBytes.set({ runner, category: "tasks", name: entry.name }, entry.bytes);
+    }
+
+    this.workPartial.set({ runner }, usage.partial ? 1 : 0);
+    this.workMeasuredAt.set({ runner }, Math.floor(Date.parse(usage.measuredAt) / 1000));
+  }
 
   render(): string {
     return this.registry.render();

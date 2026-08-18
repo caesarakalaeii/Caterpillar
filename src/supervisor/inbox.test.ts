@@ -61,7 +61,7 @@ test("the queue can be asked what it holds without consuming it", () => {
   void inbox.submit({
     kind: "brainstorm",
     topic: "make the thing faster",
-    repo: "acme/widget",
+    repos: ["acme/widget"],
     threadId: "1538626232302960801",
     author: "caesar",
   });
