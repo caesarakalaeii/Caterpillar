@@ -19,6 +19,7 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import { LogRing } from "../obs/ring.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
 import { createWebServer } from "./server.ts";
 
 const roots: string[] = [];
@@ -47,7 +48,8 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     path: "/work/state",
     secretRef: "caterpillar-github-app",
   },
-  paths: { mirrors: "/work/mirrors", tasks: "/work/tasks" },
+  paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+  usage: { intervalHours: 1, deadlineSeconds: 120 },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
   limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 14_400, commandTimeoutSeconds: 900 },
@@ -146,14 +148,26 @@ interface Harness {
   readonly ring: LogRing;
 }
 
-const serve = async (over: Partial<RunnerConfig["web"]> = {}): Promise<Harness> => {
+const serve = async (
+  over: Partial<RunnerConfig["web"]> = {},
+  usage?: WorkspaceUsage,
+): Promise<Harness> => {
   const root = await mkdtemp(join(tmpdir(), "caterpillar-web-"));
   roots.push(root);
 
   const store = new StateStore(root, new Git(root));
   const live = new LiveSession();
   const ring = new LogRing(500);
-  const server = createWebServer({ config: config(over), store, live, ring, logger: SILENT_LOGGER });
+  const server = createWebServer({
+    config: config(over),
+    store,
+    live,
+    ring,
+    logger: SILENT_LOGGER,
+    // Only `current()`: the server is given a reader, never the monitor, so no request can
+    // start a walk. The measurement is idle-only for a reason.
+    usage: { current: () => usage },
+  });
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
@@ -422,4 +436,43 @@ test("the digests page is there before any digest is", async () => {
   const list = await (await fetch(`${harness.url}/digests`)).text();
 
   assert.match(list, /No digest has been published yet/);
+});
+
+test("the runner page shows the work volume once it has been measured", async () => {
+  const harness = await serve(
+    {},
+    {
+      measuredAt: "2026-08-18T09:00:00.000Z",
+      durationMs: 4200,
+      partial: false,
+      fs: { totalBytes: 100 * 1024 ** 3, freeBytes: 40 * 1024 ** 3 },
+      mirrorBytes: 5 * 1024 ** 3,
+      taskBytes: 30 * 1024 ** 3,
+      nixBytes: 20 * 1024 ** 3,
+      otherBytes: 0,
+      mirrors: [{ name: "acme/widget", bytes: 5 * 1024 ** 3 }],
+      tasks: [{ name: "TASK-BIG", bytes: 30 * 1024 ** 3 }],
+    },
+  );
+
+  const page = await (await fetch(`${harness.url}/runner`)).text();
+  assert.match(page, /<h2>Disk<\/h2>/);
+  assert.match(page, /TASK-BIG/);
+  assert.match(page, /40\.0 GiB/);
+
+  const json = (await (await fetch(`${harness.url}/api/runner`)).json()) as {
+    disk?: { usedBytes: number; tasks: { name: string }[] };
+  };
+  assert.equal(json.disk?.usedBytes, 60 * 1024 ** 3);
+  assert.equal(json.disk?.tasks[0]?.name, "TASK-BIG");
+});
+
+test("before the first measurement the runner json simply has no disk key", async () => {
+  // Absent rather than zeroed: "nobody has walked the volume yet" and "the volume is
+  // empty" are different facts, and only one of them is ever true here.
+  const harness = await serve();
+
+  const json = (await (await fetch(`${harness.url}/api/runner`)).json()) as { disk?: unknown };
+  assert.equal(json.disk, undefined);
+  assert.match(await (await fetch(`${harness.url}/runner`)).text(), /Not measured yet/);
 });

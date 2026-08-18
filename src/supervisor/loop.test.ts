@@ -32,6 +32,7 @@ import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
+import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { ChatInbox, type ChatOutcome } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
@@ -112,7 +113,8 @@ const config: RunnerConfig = {
   identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
-  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
+  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks"), root },
+  usage: DEFAULT_USAGE_CONFIG,
   // A heartbeat long enough never to fire: this test is about the failure path, and a
   // renewal landing mid-park would muddy which CAS was under test.
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
@@ -1863,4 +1865,120 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
   await running.catch(() => undefined);
 
   assert.deepEqual(passes, [1, 1], "every tick with a queued alert must produce exactly one pass");
+});
+
+test("the usage measurement runs on the idle branch, and a failing one is not fatal", async () => {
+  // Same argument as the digest above, one notch stronger: this is OBSERVABILITY, so the
+  // moment it is most likely to fail — a filesystem answering `stat` with an error — is
+  // exactly the moment somebody is looking at it. A monitor that could take the poll loop
+  // with it would fail first and loudest during the incident it was installed to explain.
+  //
+  // It is also reached only from the IDLE branch, next to `maybeCollectGarbage` and for
+  // the same reason: the walk is one `stat` per file over a tree with a `node_modules`
+  // per task, on the single thread that claims work. There is always another idle poll.
+  const calls: number[] = [];
+  const usage = {
+    maybeMeasure: (): Promise<WorkspaceUsage | undefined> => {
+      calls.push(Date.now());
+      return Promise.reject(new Error("statfs: EIO"));
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    usage,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && calls.length < 2) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    calls.length >= 2,
+    `the loop must keep polling after the measurement throws — it called it ${calls.length} time(s)`,
+  );
+});
+
+test("a measurement that comes back is published to the metrics the scrape reads", async () => {
+  // The whole point of the walk is the series. A snapshot that reached the loop and never
+  // reached the registry would be a measurement nobody can graph, which is the state this
+  // work exists to end.
+  const measured: WorkspaceUsage = {
+    measuredAt: "2026-08-18T09:00:00.000Z",
+    durationMs: 12,
+    partial: true,
+    fs: { totalBytes: 1000, freeBytes: 400 },
+    mirrorBytes: 100,
+    taskBytes: 300,
+    nixBytes: 50,
+    otherBytes: 25,
+    mirrors: [{ name: "acme/widget", bytes: 100 }],
+    tasks: [{ name: "TASK-BIG", bytes: 300 }],
+  };
+
+  let served = 0;
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    // Once, then nothing — the real monitor's own rate limit does the same.
+    usage: { maybeMeasure: () => Promise.resolve(served++ === 0 ? measured : undefined) },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !metrics.render().includes("caterpillar_work_bytes")) {
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const rendered = metrics.render();
+  assert.match(rendered, /caterpillar_work_bytes\{.*category="tasks".*\} 300/);
+  assert.match(rendered, /caterpillar_work_fs_bytes\{.*kind="free".*\} 400/);
+  assert.match(rendered, /caterpillar_work_entry_bytes\{.*name="TASK-BIG".*\} 300/);
+  // Its own series rather than a label on the bytes: a label that changed value would
+  // start a new time series and break every byte graph at the moment it went partial.
+  assert.match(rendered, /caterpillar_work_partial\{[^}]*\} 1/);
 });

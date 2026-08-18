@@ -231,3 +231,37 @@ test("the remediation port is validated even with the receiver off", async () =>
   assert.equal(config.remediation.enabled, true);
   assert.equal(config.remediation.port, 9101);
 });
+
+test("a config written before the usage measurement existed still loads", async () => {
+  // `paths.root` is new and every deployed ConfigMap omits it. Requiring it would refuse
+  // to load a config that was correct the day before this shipped.
+  const config = await load({});
+
+  assert.equal(config.paths.root, "/work", "the parent both mirrors and tasks live under");
+  assert.equal(config.usage.intervalHours, 1);
+  assert.equal(config.usage.deadlineSeconds, 120);
+});
+
+test("the work root and the measurement interval can both be set", async () => {
+  const config = await load({
+    paths: { mirrors: "/vol/m", tasks: "/vol/t", root: "/vol" },
+    usage: { intervalHours: 6, deadlineSeconds: 30 },
+  });
+
+  assert.equal(config.paths.root, "/vol");
+  assert.equal(config.usage.intervalHours, 6);
+  assert.equal(config.usage.deadlineSeconds, 30);
+});
+
+test("a work root with no common parent falls back to the tasks directory, never to /", async () => {
+  // Measuring `/` inside a container reports the IMAGE's free space as the work volume's,
+  // which is wrong in the reassuring direction — the graph looks healthy as the PVC fills.
+  const config = await load({ paths: { mirrors: "/a/mirrors", tasks: "/b/c/tasks" } });
+
+  assert.equal(config.paths.root, "/b/c/tasks");
+});
+
+test("a non-numeric interval is refused rather than coerced", async () => {
+  await assert.rejects(() => load({ usage: { intervalHours: "hourly" } }), ConfigError);
+  await assert.rejects(() => load({ usage: { deadlineSeconds: null } }), ConfigError);
+});

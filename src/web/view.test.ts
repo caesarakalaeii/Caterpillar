@@ -8,7 +8,8 @@ import { asRunnerId, asTaskId, asWorkspaceName, type TaskSpec, type TaskState } 
 import { LiveSession } from "../obs/live.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
-import { fleet, runnerExport, taskDetail } from "./view.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
+import { diskView, fleet, runnerExport, taskDetail } from "./view.ts";
 
 const roots: string[] = [];
 
@@ -64,7 +65,8 @@ const CONFIG: RunnerConfig = {
     path: "/work/state",
     secretRef: "caterpillar-github-app",
   },
-  paths: { mirrors: "/work/mirrors", tasks: "/work/tasks" },
+  paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+  usage: { intervalHours: 1, deadlineSeconds: 120 },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
   limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 14_400, commandTimeoutSeconds: 900 },
@@ -281,4 +283,83 @@ test("a finished task's owner is reported as history, not as a hold", async () =
     ["pod-7f3a"],
     "a runner is only listed as holding what it is actually running",
   );
+});
+
+/* --------------------------------------------------------------------- disk */
+
+const USAGE: WorkspaceUsage = {
+  measuredAt: "2026-08-18T09:00:00.000Z",
+  durationMs: 4200,
+  partial: false,
+  fs: { totalBytes: 1000, freeBytes: 400 },
+  mirrorBytes: 100,
+  taskBytes: 300,
+  nixBytes: 50,
+  otherBytes: 25,
+  mirrors: [{ name: "acme/widget", bytes: 100 }],
+  tasks: [
+    { name: "TASK-1", bytes: 250 },
+    { name: "TASK-2", bytes: 50 },
+  ],
+};
+
+test("the disk view orders the categories by size, because the question is who is biggest", async () => {
+  const view = diskView(USAGE);
+
+  assert.deepEqual(
+    view.categories.map((category) => category.name),
+    ["tasks", "mirrors", "nix", "other"],
+  );
+  assert.equal(view.categories[0]?.bytes, 300);
+  // Of the volume's total, not of the categories: 300 of 1000.
+  assert.equal(view.categories[0]?.fraction, 0.3);
+});
+
+test("used bytes come from statfs, not from summing what this runner can account for", async () => {
+  // The categories add to 475 here and the filesystem says 600 are gone. The gap is
+  // another process on the same volume, and it is exactly the thing a page that summed
+  // the categories would hide while the disk filled.
+  const view = diskView(USAGE);
+
+  assert.equal(view.usedBytes, 600);
+  assert.equal(view.freeBytes, 400);
+  assert.equal(view.totalBytes, 1000);
+});
+
+test("a filesystem that would not answer gives zeroes rather than a negative used", async () => {
+  const view = diskView({ ...USAGE, fs: { totalBytes: 0, freeBytes: 0 } });
+
+  assert.equal(view.usedBytes, 0);
+  for (const category of view.categories) {
+    assert.equal(category.fraction, 0, "a share of nothing is 0, not NaN or Infinity");
+  }
+});
+
+test("a partial measurement is carried through rather than dropped", async () => {
+  // An under-count with a flag on it still names the task that is growing. Hiding it
+  // would leave the operator with nothing at the moment the volume is most full.
+  const view = diskView({ ...USAGE, partial: true });
+
+  assert.equal(view.partial, true);
+  assert.equal(view.measuredAt, "2026-08-18T09:00:00.000Z");
+  assert.equal(view.durationMs, 4200);
+});
+
+test("the breakdowns are passed through in the order the walk capped them", async () => {
+  const view = diskView(USAGE);
+
+  assert.deepEqual(view.tasks, [
+    { name: "TASK-1", bytes: 250 },
+    { name: "TASK-2", bytes: 50 },
+  ]);
+  assert.deepEqual(view.mirrors, [{ name: "acme/widget", bytes: 100 }]);
+});
+
+test("the export says how often the disk numbers are refreshed", async () => {
+  // Without the interval, an hourly measurement's staleness reads as a bug on the page.
+  const exported = runnerExport(CONFIG);
+
+  assert.equal(exported.usage.intervalHours, 1);
+  assert.equal(exported.usage.deadlineSeconds, 120);
+  assert.equal(exported.paths.root, "/work");
 });

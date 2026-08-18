@@ -53,6 +53,7 @@ import {
   startHeartbeat,
 } from "../state/lease.ts";
 import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
@@ -132,6 +133,12 @@ export interface AlertIngester {
   ): Promise<AlertPass>;
 }
 
+/** The idle-time work-volume measurement (§11). Implemented by `UsageMonitor`. */
+export interface UsageReporter {
+  /** Measures if the interval has elapsed; returns the fresh snapshot, or nothing. */
+  maybeMeasure(): Promise<WorkspaceUsage | undefined>;
+}
+
 export interface Digester {
   /**
    * Publish the day's digest if one is due, and if this runner wins the claim for it
@@ -159,6 +166,15 @@ export interface SupervisorDeps {
    * runner has no task in flight.
    */
   readonly toolchain: ToolchainResolver;
+  /**
+   * Measures the work volume (`workspace/usage.ts`). Optional: without one the supervisor
+   * behaves exactly as it did before this existed, which is what the tests build.
+   *
+   * Here for the same reason `toolchain` is: the loop owns the only moment it is safe to
+   * walk hundreds of thousands of inodes on a single-threaded process, which is when this
+   * runner has no task in flight.
+   */
+  readonly usage?: UsageReporter;
   /**
    * The credential service, so a lost lease can revoke the task's credential at the
    * moment it is lost rather than when the session eventually returns. Optional because
@@ -339,6 +355,13 @@ export class Supervisor {
         // another idle poll.
         await this.deps.toolchain.maybeCollectGarbage();
 
+      // Idle-only for the same reason, and throttled harder still. The collection above
+      // spends its time inside nix; this spends it inside THIS process — a `stat` per file
+      // over a tree with one `node_modules` per task — and the loop is single-threaded, so
+      // every millisecond here is a millisecond no task is claimed in. There is always
+      // another idle poll, and disk fills over hours rather than seconds.
+      await this.maybeMeasureUsage();
+
       // Debug, not info: at the default poll interval this is the single noisiest
       // line the supervisor could emit, and an idle runner is not news.
       logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
@@ -434,6 +457,42 @@ export class Supervisor {
       logger.info("intake.pass", { ...(await intake.ingest("origin", config.stateRepo.branch)) });
     } catch (error) {
       logger.warn("intake.failed", { ...errorFields(error) });
+    }
+  }
+
+  /**
+   * Measure the work volume, if it is time, and publish what came back.
+   *
+   * Never throws, and that is a requirement rather than caution. This is observability:
+   * the whole point of it is to be running when something is wrong, which is exactly when
+   * a filesystem is most likely to answer a `stat` with an error. A measurement that could
+   * take down a poll would be a monitor that fails first and loudest during the incident
+   * it was installed to explain — so the failure mode is a warning and a stale gauge.
+   *
+   * The rate limit lives in `UsageMonitor` rather than here, next to the numbers it
+   * throttles, exactly as `maybeCollectGarbage` keeps its own.
+   */
+  private async maybeMeasureUsage(): Promise<void> {
+    const { usage, metrics, config, logger } = this.deps;
+    if (usage === undefined) return;
+
+    try {
+      const measured = await usage.maybeMeasure();
+      if (measured === undefined) return;
+
+      metrics.recordUsage(config.runnerId, measured);
+      logger.info("workspace.usage", {
+        mirrorBytes: measured.mirrorBytes,
+        taskBytes: measured.taskBytes,
+        nixBytes: measured.nixBytes,
+        otherBytes: measured.otherBytes,
+        freeBytes: measured.fs.freeBytes,
+        totalBytes: measured.fs.totalBytes,
+        durationMs: measured.durationMs,
+        partial: measured.partial,
+      });
+    } catch (error) {
+      logger.warn("workspace.usage-failed", { ...errorFields(error) });
     }
   }
 

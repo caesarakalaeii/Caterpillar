@@ -1550,6 +1550,25 @@ journal entry so the next session sees it at all.
 | `caterpillar_provider_outage_total{kind}` | counter | sessions the provider refused — §6.3 |
 | `caterpillar_provider_cooldown_seconds{runner}` | gauge | >0 means idle **on purpose** — §6.3 |
 | `caterpillar_alerts_received_total{alertname,outcome}` | counter | Alertmanager deliveries — §20 |
+| `caterpillar_work_fs_bytes{runner,kind}` | gauge | `total`/`free` of the work volume, from `statfs` |
+| `caterpillar_work_bytes{runner,category}` | gauge | `mirrors`/`tasks`/`nix`/`other`, apparent size |
+| `caterpillar_work_entry_bytes{runner,category,name}` | gauge | the largest few tasks and mirrors, capped |
+| `caterpillar_work_partial{runner}` | gauge | 1 when the walk hit its deadline |
+| `caterpillar_work_measured_timestamp_seconds{runner}` | gauge | how stale the four above are |
+
+The `work_*` family answers the one question the supervisor could not previously answer
+about itself: where the disk went. It is produced by a directory walk
+(`workspace/usage.ts`) that is READ-ONLY, runs only from the poll loop's idle branch beside
+the nix store collection, and is rate-limited to `usage.intervalHours` — one `stat` per
+file over a tree carrying a `node_modules` per task is not something to do on the thread
+that claims work. It is bounded by `usage.deadlineSeconds` and reports what it has with
+`caterpillar_work_partial` set rather than blocking the loop or throwing the pass away.
+
+`category` is disjoint and sums to what THIS runner can account for, which is not the same
+as what the volume holds — another process on the same disk makes `work_fs_bytes` the only
+honest arbiter. `name` is capped at the top N by size with the remainder in a single
+`other` series, because a task id is an unbounded label value in a registry with no expiry
+and the alternative is one series per task the runner has ever worked, forever.
 
 `outcome` is one of `created`, `duplicate`, `refused-no-policy`, `refused-max-open`,
 `malformed`, `unauthorized`, and it is deliberately not collapsed into ok/error. The failure
@@ -1569,6 +1588,9 @@ a stranger choose a label value.
   exactly like an idle one.
 - task in `awaiting-human` > 24h — you forgot
 - `caterpillar_cost_usd_total` over per-task budget
+- `caterpillar_work_fs_bytes{kind="free"}` under a floor — the volume is filling. Alert on
+  this rather than on the category sum: the sum is what the supervisor can attribute, and a
+  disk filled by something else would leave it flat while writes start failing.
 
 The first four of those are the natural first entries in `alerts/policy.yaml` (§20), because
 each of them is about the fleet's own code and each has a repo whose tests would demonstrate
