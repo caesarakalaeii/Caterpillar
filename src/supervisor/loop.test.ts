@@ -35,9 +35,9 @@ import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { InMemoryCancelSignals } from "../redis/cancel.ts";
-import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
-import { type ChatOutcome } from "./inbox.ts";
+import { type ChatOutcome, type ChatRequest } from "./inbox.ts";
 import { TaskSnapshot } from "./snapshot.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
@@ -2585,4 +2585,170 @@ test("two concurrent store writes are serialised, not interleaved", async () => 
 
   await seedTask(A, { status: "done" });
   await seedTask(B, { status: "done" });
+});
+
+/**
+ * A queue whose `takeWhere`/`some` are stubs, exactly as `RedisChatQueue`'s are.
+ *
+ * The in-memory queue every other test here uses CAN take selectively, and that is what
+ * let a real outage through CI: `applyChatRequests` routed the whole drain through
+ * `takeWhere` whenever a session was in flight, which against the Redis queue returns
+ * empty unconditionally. So on a Redis-backed fleet nothing at all was drained for the
+ * duration of every session — the exact defect the housekeeping split exists to remove,
+ * on the multi-replica path it was aimed at. Reproducing the stub locally is what stops
+ * that being invisible again; it deliberately does not use Redis, because the property
+ * under test is `selective`, not the transport.
+ */
+class NonSelectiveChatQueue implements ChatDrainer {
+  readonly selective = false;
+
+  private readonly inner: InMemoryChatQueue;
+
+  constructor(inner: InMemoryChatQueue) {
+    this.inner = inner;
+  }
+
+  drain(): Promise<readonly ChatRequest[]> {
+    return this.inner.drain();
+  }
+
+  takeWhere(): Promise<readonly ChatRequest[]> {
+    return Promise.resolve([]);
+  }
+
+  some(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+}
+
+test("a queue with no selective take is still drained during a session", async () => {
+  // The Redis case. `takeWhere` is a stub there, so a drain routed through it returns
+  // nothing — and it was routed through it for precisely as long as a session was in
+  // flight. `/resume`, `/answer`, `/merge` and `/brainstorm` all went unserved for hours,
+  // silently, with DESIGN.md and three docstrings asserting the opposite.
+  const BUSY = asTaskId("HK-NOSEL-1");
+  const WAITING = asTaskId("HK-NOSEL-2");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+  await seedTask(WAITING, { status: "parked", sessions: 2 });
+
+  const store = new StateStore(statePath, stateGit);
+  const submitter = new InMemoryChatQueue();
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner, {
+    inbox: new NonSelectiveChatQueue(submitter),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  // Never settles if the drain went through the stub — which is how this failed before.
+  const outcome = await submitter.submit({ kind: "resume", task: WAITING });
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(outcome, { kind: "resumed", from: "parked" });
+  assert.equal(
+    (await pushedState(WAITING))?.status,
+    "ready",
+    "and pushed, not merely answered",
+  );
+
+  await seedTask(BUSY, { status: "done" });
+  await seedTask(WAITING, { status: "done" });
+});
+
+test("a /cancel for the running task is served even when the queue cannot take selectively", async () => {
+  // The other half of the same defect, and the worse half. On a selective queue this
+  // request is left queued for the in-session `CANCEL_POLL_MS` watcher. That watcher polls
+  // `takeWhere`, which is the very method a Redis queue stubs out — and nothing in the
+  // process calls `CancelSignals.request` — so a `/cancel` for the in-flight task had NO
+  // path at all: not the drain, not the watcher. Deleting the pod was the only way to stop
+  // a session, which strands the task (DESIGN.md §6.2).
+  //
+  // So housekeeping drains it and routes it to the session directly. `cancelling` rather
+  // than `parked`, because the session unwinds at a turn boundary and the park lands after.
+  const BUSY = asTaskId("HK-NOSEL-3");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const submitter = new InMemoryChatQueue();
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner, {
+    inbox: new NonSelectiveChatQueue(submitter),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  const outcome = await submitter.submit({ kind: "park", task: BUSY });
+
+  // `cancelling`, and NOT `not-parkable: running` — that answer is the symptom of the
+  // request having reached `applyPark`, which cannot claim the lease its own session holds.
+  assert.deepEqual(outcome, { kind: "cancelling" }, "the human must be told it is stopping");
+
+  // And it must actually stop, rather than merely being told so: the session's signal is
+  // what `stop` aborts, so the hanging fixture resolves without the controller being
+  // touched.
+  const stopped = Date.now() + 30_000;
+  while (Date.now() < stopped && (await pushedState(BUSY))?.status === "running") await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  await seedTask(BUSY, { status: "done" });
+});
+
+test("the work loop refreshes the checkout before it decides what to claim", async () => {
+  // Splitting the loops silently broke an ordering the single loop had for free. `pollOnce`
+  // did pull -> claim in one pass, so a claim was always decided from a checkout refreshed
+  // moments earlier. Afterwards the only pull was on the housekeeping loop — and `pull`
+  // declines while the tree is dirty, which it is for the WHOLE of a session. So the first
+  // claim after every session was made from a view of `tasks/` predating that session.
+  //
+  // `isClaimable` is a filter over local state and says so; only the lease CAS is
+  // exclusive, and the CAS succeeds freely once another runner has released. A task
+  // finished and released elsewhere therefore looked ready and claimable, and this runner
+  // would open a session on already-merged work — §6.2's worst outcome.
+  //
+  // Pinned on a task that exists ONLY on the remote: nothing local can see it, so a claim
+  // proves a pull happened first.
+  const REMOTE_ONLY = asTaskId("WL-PULL-1");
+
+  const store = new StateStore(statePath, stateGit);
+  const claimed: TaskId[] = [];
+  const supervisor = busySupervisor(store, {
+    run: (spec) => {
+      claimed.push(spec.id);
+      return Promise.reject(new Error("session not under test"));
+    },
+  });
+
+  // Created after the store exists and never pulled into it by this test — the supervisor
+  // has to do that itself, on the work loop, on its way to claiming.
+  await seedTask(REMOTE_ONLY);
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !claimed.includes(REMOTE_ONLY)) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    claimed.includes(REMOTE_ONLY),
+    "a claim must be decided from a freshly pulled checkout, not a stale one",
+  );
+
+  await seedTask(REMOTE_ONLY, { status: "done" });
 });

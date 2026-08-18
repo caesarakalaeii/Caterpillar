@@ -334,21 +334,40 @@ export class Supervisor {
   /**
    * Whether `workTask` is running right now.
    *
-   * Set by the work loop, read only by housekeeping, and only for the two things that
-   * genuinely must not happen beside a session: collecting the nix store, and logging
-   * "idle". It is deliberately NOT a lock — housekeeping is supposed to run during a
-   * session; that is the whole point of it existing separately.
+   * Set by the work loop, read only by housekeeping, and only for the one thing that
+   * genuinely must not happen beside a session: collecting the nix store. It is
+   * deliberately NOT a lock — housekeeping is supposed to run during a session; that is
+   * the whole point of it existing separately.
    */
   private sessionInFlight = false;
 
   /**
    * The task the work loop is running right now, if any.
    *
-   * Read by `applyChatRequests` for one narrow purpose: leaving that task's `/cancel`
-   * requests in the queue for the in-session watcher, which is the only code that can
-   * actually stop a session. See `CANCEL_POLL_MS`.
+   * Read by `applyChatRequests` for one narrow purpose: that task's `/cancel` requests
+   * must not go to `applyPark`, which would claim-and-fail against the session's own
+   * lease. See `CANCEL_POLL_MS` and `cancelInFlight`.
    */
   private inFlightTask: TaskId | undefined;
+
+  /**
+   * Stop the in-flight session, for a `/cancel` that housekeeping drained.
+   *
+   * Installed by `workTask` for the duration of the session and cleared in its `finally`,
+   * so it is defined exactly when `inFlightTask` is a task that has actually started. It
+   * aborts the session and settles the request `cancelling` — the same two things the
+   * `CANCEL_POLL_MS` watcher does, because it is the same function.
+   *
+   * It exists because a queue may not be able to take selectively (`ChatDrainer.
+   * selective`). Against such a queue the watcher's `takeWhere` returns empty forever, so
+   * the drain is the ONLY path a cancel can arrive by, and having drained it housekeeping
+   * cannot hand it back — the request is off the list and the submitter is waiting. So it
+   * calls this instead of `applyPark`.
+   *
+   * Not a substitute for the watcher on a selective queue: see `CANCEL_POLL_MS` for why
+   * that one keeps its own tighter interval.
+   */
+  private cancelInFlight: (() => void) | undefined;
 
   constructor(deps: SupervisorDeps) {
     this.deps = deps;
@@ -491,9 +510,28 @@ export class Supervisor {
 
   /** One iteration of the work loop. Throws only what the caller should log and retry. */
   private async workOnce(signal: AbortSignal): Promise<void> {
-    const { config, logger } = this.deps;
+    const { config, logger, store } = this.deps;
 
     if (await this.coolingDown(signal)) return;
+
+    // BEFORE the claim, and not left to the housekeeping loop, even though housekeeping
+    // pulls on its own timer. The old single loop did pull-then-claim in one pass, so a
+    // claim was always decided from a checkout refreshed moments earlier; splitting the
+    // loops broke that, because `pull` declines for as long as the tree is dirty and the
+    // tree is dirty from `transition(running)` right through to `recordSession`. That is
+    // the whole of a session. So at the instant a session ended, the very next claim was
+    // decided from a view of `tasks/` that predated it — potentially hours old.
+    //
+    // The lease CAS does not save us there. `isClaimable` is a filter over local state and
+    // says so in its own docstring; the CAS is only exclusive against a lease still HELD.
+    // A task another runner finished and released hours ago is CAS-claimable and looks
+    // ready in a stale `state.json`, so this runner would open a session on already-merged
+    // work — which §6.2 names as the worst outcome the system has.
+    //
+    // Cheap where it is a no-op: mid-session the tree is dirty and this returns "skipped"
+    // without running git. It is only ever a real pull when the tree is clean, which is
+    // exactly when a claim is about to be made.
+    await store.pull("origin", config.stateRepo.branch);
 
     // `claimNext` sets `inFlightTask` as it wins a lease (see there). If it throws after
     // that point the flag would otherwise outlive the attempt, and every subsequent
@@ -907,13 +945,23 @@ export class Supervisor {
       interrupt.abort();
     };
 
-    // Two paths to the same abort, because a cancel can arrive from two places.
+    // THREE paths to the same abort, because a cancel can arrive from three places.
     //
-    // The interval is the original one and covers a cancel submitted IN THIS PROCESS: the
-    // request is sitting in the in-process queue, and `takeWhere` is what pulls out that
-    // ONE request while leaving everything else — which writes the state repo this session
-    // holds the lease for — queued. It settles `cancelling` rather than `parked`, because
-    // the session unwinds at a turn boundary and the park lands on the poll after that.
+    // The handler is for a cancel that HOUSEKEEPING drained. It has to exist because a
+    // queue may have no selective take (`ChatDrainer.selective`), in which case the drain
+    // takes every request including this one, and having taken it off the list it cannot
+    // leave it for the interval below. `applyChatRequests` calls this and settles the
+    // request itself. Cleared in the `finally` at the end of the session, so a stale
+    // closure cannot abort the NEXT session on a cancel for the last one.
+    this.cancelInFlight = stop;
+
+    // The interval is the original one and covers a cancel submitted IN THIS PROCESS to a
+    // queue that CAN take selectively: the request is sitting in the in-process queue, and
+    // `takeWhere` pulls out that ONE request while leaving everything else — which writes
+    // the state repo this session holds the lease for — queued. It settles `cancelling`
+    // rather than `parked`, because the session unwinds at a turn boundary and the park
+    // lands on the poll after that. Against a non-selective queue this yields nothing and
+    // the handler above is what serves the cancel; it is harmless either way.
     const watchCancels = setInterval(() => {
       void (async (): Promise<void> => {
         const requests =
@@ -1092,6 +1140,10 @@ export class Supervisor {
     } finally {
       heartbeat.stop();
       clearInterval(watchCancels);
+      // Before anything that can throw or await: housekeeping runs concurrently, and a
+      // handler outliving its session would abort the NEXT one on a `/cancel` naming the
+      // task that just ended.
+      this.cancelInFlight = undefined;
       // Or a long-lived supervisor accumulates one subscriber connection per task it has
       // ever run. Swallowed, because a failure to unsubscribe from a socket that is
       // already gone must not be the thing that fails a finished session.
@@ -1936,21 +1988,41 @@ export class Supervisor {
     const { logger, inbox } = this.deps;
     if (inbox === undefined) return;
 
-    // Everything EXCEPT a `/cancel` for the task this runner is running right now. That
-    // one is left queued for the in-session watcher, which is the only code that can stop
-    // a session; serving it here would claim-and-fail against the session's own lease and
-    // tell the human "not-parkable: running" about a task this very process is running.
-    // See `CANCEL_POLL_MS`.
+    // A `/cancel` for the task this runner is running right now must not reach
+    // `applyPark`: parking claims the lease, the session is holding it, and the human
+    // would be told "not-parkable: running" about a task this very process is running.
+    // Only in-session code can stop a session. There are two ways to keep that request
+    // away from `applyPark`, and which one applies depends on the queue.
     const mine = this.inFlightTask;
+    const isMyCancel = (request: ChatRequest): boolean =>
+      request.kind === "park" && mine !== undefined && request.task === mine;
+
+    // LEAVE IT QUEUED, when the queue can take selectively: the `CANCEL_POLL_MS` watcher
+    // inside the session picks it up on its own tighter interval.
+    //
+    // DRAIN IT AND ROUTE IT HERE otherwise. `ChatDrainer.selective` is `false` for the
+    // Redis queue, whose `takeWhere` returns empty unconditionally — using it there would
+    // drain nothing at all for the whole of a session, which is the exact defect the
+    // housekeeping split exists to remove, and would additionally strand the cancel,
+    // since the in-session watcher polls that same empty `takeWhere`. So on a
+    // non-selective queue the drain takes everything and `cancelInFlight` stops the
+    // session directly. See `redis/inbox.ts`.
     const taken =
-      mine === undefined
-        ? await inbox.drain()
-        : await inbox.takeWhere(
-            (request) => !(request.kind === "park" && request.task === mine),
-          );
+      mine !== undefined && inbox.selective
+        ? await inbox.takeWhere((request) => !isMyCancel(request))
+        : await inbox.drain();
 
     for (const request of taken) {
       try {
+        // Off the list already, so it cannot be handed back to the watcher. Settled
+        // `cancelling` rather than `parked` for the watcher's reason: the session unwinds
+        // at a turn boundary and the park lands after that.
+        if (isMyCancel(request) && this.cancelInFlight !== undefined) {
+          logger.info("chat.cancel-routed", { task: mine });
+          this.cancelInFlight();
+          request.settle({ kind: "cancelling" });
+          continue;
+        }
         request.settle(await this.applyChatRequest(request));
       } catch (error) {
         // Never fatal: a state repo that rejects one request must not stop the runner

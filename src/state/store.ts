@@ -287,6 +287,29 @@ export interface ExclusiveTree {
  * `dirty` only if it has not moved. A write that raced the commit leaves the flag set, the
  * next `pull` declines, and the next commit carries the file. Erring towards "dirty" costs
  * an interval; erring the other way costs a task.
+ *
+ * The same counter closes the mirror-image window inside `pull` itself, and for the same
+ * reason: `dirty` is a sample, and `pull` does a network `fetch` before it does anything
+ * destructive. A write landing in that gap was invisible to the check at the top and
+ * deleted by the `clean` at the bottom — the original incident, still reachable after the
+ * flag was added. `pullNow` therefore re-reads the generation after its fetch and declines
+ * the reset if it moved. Read it as one rule with two instances rather than two tricks:
+ * anything that samples `dirty` and then spends time before touching the tree must
+ * re-check that nothing was written while it was not looking.
+ *
+ * `pull` is NOT the only destructive reset in this file, and the `dirty` gate protects
+ * only that one. `rebaseOnto` — reached from `push` when the remote has moved — opens with
+ * `reset --hard HEAD`, and its salvage path resets to the remote outright. Both run under
+ * the mutex, so no other GIT command interleaves, but a session's plain `writeFile` is not
+ * under the mutex and a write landing in that window is reverted with everything else.
+ * Three things keep it acceptable rather than merely unnoticed. It is far narrower than
+ * the pull window — microseconds inside one already-running git command, against the
+ * minutes between a `writeState` and its commit. It only happens on a rejected push, which
+ * needs another runner to have written the branch in the same instant. And it is not new:
+ * `reset --hard` was what the old code did on EVERY pull, and this is the residue of that
+ * after the dangerous case was removed. Closing it properly means writes taking the mutex,
+ * which is what `exclusively` is for — so if a session is ever seen losing a write here,
+ * that is the fix, not another flag.
  */
 export class StateStore {
   private readonly root: string;
@@ -360,8 +383,15 @@ export class StateStore {
    * it. What protects sessions is `dirty` plus its write counter: a session writes without
    * the lock, `pull` declines while anything is uncommitted, and the cost of that route is
    * attribution (another writer's commit may carry these files) rather than durability.
-   * This exists for a caller that cannot accept even that cost. Keep it only while that is
-   * a real prospect; an affordance with no caller and no plan is one to delete.
+   * This exists for a caller that cannot accept even that cost, and there is one concrete
+   * prospect rather than a hypothetical: the `reset --hard` inside `rebaseOnto` is the one
+   * destructive path the `dirty` gate does NOT cover, because it fires between an `add` and
+   * a commit that the writing session is not party to. The class docstring argues why that
+   * window is tolerable today — microseconds wide, only on a rejected push. If it ever
+   * stops being tolerable, routing session writes through here is the fix, and that is the
+   * plan this method is being kept against. If the window is closed some other way, or a
+   * year passes with no caller, delete it: an affordance with no caller and no plan is one
+   * to delete.
    *
    * It is the atomic form for anything that writes and then persists:
    * the mutex on its own only says no other writer is inside a `git add`, and a caller that
@@ -1195,6 +1225,13 @@ export class StateStore {
    * failure it recovers from. Discarding uncommitted changes is also exactly what the old
    * `reset --hard <remote>` did, so nothing is lost here that survived before: the point
    * of this method is protecting local COMMITS, which that reset destroyed.
+   *
+   * Since housekeeping and a session now run concurrently, be clear about who that
+   * discard can hit. The caller holds the mutex, so no other git command interleaves — but
+   * a session's `writeFile` does not take the mutex, and one landing between the `add -A`
+   * above and this reset is reverted. The window is microseconds wide and only opens on a
+   * rejected push; the class docstring says why that is accepted rather than patched, and
+   * what the real fix would be.
    */
   private async rebaseOnto(remote: string, branch: string): Promise<void> {
     await this.git.run("reset", "--hard", "HEAD");
@@ -1272,14 +1309,41 @@ export class StateStore {
       // check and the fetch, write, and be reset over by a pull that had already decided
       // the tree was clean.
       if (this.dirty) return "skipped";
-      await this.pullNow(remote, branch);
-      return "pulled";
+      return (await this.pullNow(remote, branch)) ? "pulled" : "skipped";
     });
   }
 
-  /** The body of `pull`, assuming the caller already holds the mutex and the tree is clean. */
-  private async pullNow(remote: string, branch: string): Promise<void> {
+  /**
+   * The body of `pull`. Returns whether it actually refreshed anything.
+   *
+   * Holding the mutex and having seen a clean tree is NOT enough, and this is the subtlest
+   * corner of the whole invariant. Store writes deliberately do not take the mutex, so
+   * `dirty` is only a sample of the instant it was read — and the `fetch` below is a
+   * network round trip, hundreds of milliseconds during which a write can land. The
+   * destructive part comes AFTER that, so a `writeSpec` arriving mid-fetch is deleted by
+   * the `clean -ffdq tasks` at the bottom having never been visible to the check at the
+   * top.
+   *
+   * That is not hypothetical: it is the five-destroyed-tasks incident, and it was still
+   * reachable after the `dirty` gate was added. It surfaced the moment the work loop began
+   * pulling before each claim, which put a pull in the same instant as a `/brainstorm`
+   * creating a task — the spec was written between this method's `fetch` and its `clean`,
+   * and vanished before the `commitAndPush` three lines later could stage it. The commit
+   * then found nothing to commit and reported success.
+   *
+   * So the generation is re-read after the fetch and before anything destructive, exactly
+   * as `stageCommitPush` re-reads it after its `add`. A write that raced us leaves the
+   * fetch's work in place (it is only a ref update, and harmless) and declines the reset:
+   * the tree is now genuinely dirty, so `pull`'s own gate would have refused had it been
+   * asked a moment later. Deferring a refresh costs one housekeeping interval; taking it
+   * costs a task.
+   */
+  private async pullNow(remote: string, branch: string): Promise<boolean> {
+    const before = this.writeGeneration;
     await this.git.run("fetch", remote, branch);
+    // The window the `dirty` check at the top could not see. Everything below this line
+    // reverts or deletes working-tree files.
+    if (this.writeGeneration !== before || this.dirty) return false;
 
     const ahead = await this.git.tryRun("rev-list", "--count", `${remote}/${branch}..HEAD`);
     const unpushed = ahead.code === 0 && ahead.stdout.trim() !== "0";
@@ -1304,6 +1368,7 @@ export class StateStore {
     for (const path of ["tasks", "intake", "alerts"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }
+    return true;
   }
 }
 

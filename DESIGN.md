@@ -709,10 +709,23 @@ So the timing is split in two, in `src/supervisor/loop.ts`:
   `applyChatRequests`, `maybeIngest`, `drainAlerts`, `maybeDigest`, and
   `toolchain.maybeCollectGarbage()` when idle. It runs whether or not a session is in
   flight.
-- **The work loop**, on `pollSeconds`: `coolingDown` → `claimNext` → `workTask`. It blocks
-  for the session, as it always did. `pollSeconds` is now a claim *backoff* — how long an
-  idle runner waits before looking for work again — and nothing a human waits on depends
-  on it. `housekeepingSeconds` defaults to `pollSeconds` and is clamped to it.
+- **The work loop**, on `pollSeconds`: `store.pull` → `coolingDown` → `claimNext` →
+  `workTask`. It blocks for the session, as it always did. `pollSeconds` is now a claim
+  *backoff* — how long an idle runner waits before looking for work again — and nothing a
+  human waits on depends on it. `housekeepingSeconds` defaults to `pollSeconds` and is
+  clamped to it.
+
+  The work loop pulls too, and that is not redundant with housekeeping's pull. The single
+  loop did pull-then-claim in one pass, so a claim was always decided from a checkout
+  refreshed moments earlier; splitting the loops broke that silently, because `pull`
+  declines while the tree is dirty and the tree is dirty for the *whole* of a session. The
+  first claim after every session would then be decided from a view of `tasks/` predating
+  it. The lease CAS does not cover that gap — `isClaimable` is a filter over local state,
+  and the CAS succeeds freely once another runner has released — so a task finished
+  elsewhere hours ago looks ready and claimable, and this runner opens a session on
+  already-merged work, which §6.2 names as the worst outcome the system has. Mid-session
+  the call is a no-op `"skipped"`; it is only ever a real pull when the tree is clean,
+  which is exactly when a claim is about to be made.
 
 This is **not** task concurrency, and §6's one-session-at-a-time rule is unchanged: there
 is one work loop, so there is one `workTask`. What is concurrent is housekeeping against a
@@ -760,6 +773,20 @@ touch git. Two mechanisms, and both are needed:
    to the next `pull`. That window is only a few subprocess spawns wide, but a session's
    `publishArtifact` can fall into it and then go hours before its own commit.
 
+   The same counter closes the mirror-image window *inside* `pull`, and this is the one
+   that bites. `dirty` is a sample, and `pull` does a network `fetch` — hundreds of
+   milliseconds — before it touches anything. A write landing in that gap is invisible to
+   the check at the top and deleted by the `clean -ffdq` at the bottom, which is the
+   original five-task incident still reachable after the flag was added. `pullNow`
+   therefore re-reads the generation after its fetch and abandons the refresh if it moved,
+   reporting `"skipped"`. It stopped being theoretical the moment the work loop began
+   pulling before each claim: that put a pull in the same instant as a `/brainstorm`
+   creating a task, the spec was written between the fetch and the clean, and the
+   `commitAndPush` immediately after found nothing to commit and reported success — a task
+   acknowledged to a human that existed nowhere. Read it as one rule with two instances:
+   anything that samples `dirty` and then spends time before touching the tree must
+   re-check that nothing was written while it was not looking.
+
    `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
    needs the two to be one unit. **No production path uses it today** — the supervisor's
    writes go through `writeState`/`appendJournal` and rely entirely on the dirty flag and
@@ -781,6 +808,24 @@ turn boundary to unwind and the human is waiting on a Discord interaction.
 
 The watcher also wants a tighter interval than housekeeping does: it is an in-memory queue
 check, where housekeeping's interval is tuned against a git fetch and a Discord round trip.
+
+**That split depends on the queue being able to take selectively, and one cannot.**
+`RedisChatQueue.takeWhere` is a stub returning empty — a selective pop from a shared list
+is a Lua script, and it was never needed while the only caller was the in-session watcher
+(§21). Routing the whole housekeeping drain through `takeWhere` therefore drained *nothing*
+on a Redis-backed fleet for the duration of every session: `/resume`, `/answer`, `/merge`
+and `/brainstorm` all unserved, silently, on exactly the multi-replica path the split was
+aimed at. Worse, the in-session watcher polls that same stub, so an in-flight `/cancel` had
+no path at all and deleting the pod was the only way to stop a session — which strands the
+task (§6.2).
+
+So `ChatDrainer` carries an explicit `selective` flag and the loop branches on it. Where it
+is true, the behaviour above stands. Where it is false, housekeeping drains *everything*
+and routes a park naming the in-flight task to the session directly, through a handler
+`workTask` installs for its own duration and clears in its `finally`. The handler settles
+`cancelling` and aborts the session — the same two things the watcher does, because it is
+the same function. A queue that cannot take selectively must say so rather than answering
+"nothing matched" to every question.
 
 Stopping the session is **not** cancelling the task, and the difference is easy to miss:
 an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
@@ -2971,5 +3016,16 @@ the intake pass stay in-process for the reason they were put there: they write t
 repo, and the loop owns the state repo working copy.
 
 **No `takeWhere` over Redis.** Selectively removing one entry from a shared list is a Lua
-script racing every other drainer, and the one caller that needed it — a session watching
-for a cancel — has a channel now.
+script racing every other drainer, so `RedisChatQueue.takeWhere` and `some` return empty.
+
+That absence is only safe because it is **declared**, and it was not declared once. A queue
+that answers "nothing matched" to every question is indistinguishable from an empty one,
+and the housekeeping split briefly routed its entire drain through `takeWhere` while a
+session was in flight — so a Redis-backed runner served no chat request at all for the
+duration of every session, and an in-flight `/cancel` had no path whatsoever, because the
+in-session watcher polls the same stub and nothing in the process calls
+`CancelSignals.request`. `ChatDrainer.selective` exists so that a caller must decide what
+to do about it rather than silently receiving nothing; `applyChatRequests` reads it and
+drains everything, routing an in-flight cancel to the session in process (§6.4). If a real
+selective pop is ever written, that flag flips and the branch disappears — but the flag
+must never be flipped without it.

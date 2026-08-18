@@ -24,12 +24,22 @@
  * timeout — and its TTL is what stops a bot that died mid-request from leaving a reply
  * behind forever.
  *
- * `takeWhere` and `some` are NOT here. Read `ChatInbox.takeWhere`: it exists so a session
- * in flight can see a `/cancel` without draining requests that would write the state repo.
- * Over Redis that selective take is a Lua script over a list, and it is unnecessary —
- * cancels have their own channel (`cancel.ts`), which is faster and cannot take an intent
- * with it. The interface below therefore keeps them as an in-process concern of whatever
- * is holding the queue, and the Redis inbox serves the drain half.
+ * `takeWhere` and `some` are NOT served here. Read `ChatInbox.takeWhere`: it exists so a
+ * session in flight can see a `/cancel` without draining requests that would write the
+ * state repo. A selective take over a Redis list is a Lua script, and implementing one
+ * would buy nothing that `drain` plus `ChatDrainer.selective` does not already buy — so
+ * both return empty and `selective` is `false`, which is the flag every caller checks.
+ *
+ * `selective` is load-bearing rather than informational, and the reason is an incident.
+ * The housekeeping split made `applyChatRequests` route through `takeWhere` whenever a
+ * session was in flight, so that a `/cancel` for the running task was left for the
+ * in-session watcher. Against this queue `takeWhere` returned empty, so on a Redis-backed
+ * fleet the drain returned NOTHING for the whole of every session — `/resume`, `/answer`,
+ * `/merge` and `/brainstorm` all unserved, silently, on exactly the multi-replica path the
+ * split existed to fix. Worse, the in-session `CANCEL_POLL_MS` watcher polls the same
+ * empty `takeWhere`, and nothing else in the process calls `CancelSignals.request`, so an
+ * in-flight `/cancel` had no path at all. A queue that cannot take selectively must SAY
+ * so, and the loop drains everything and routes the one request itself.
  */
 import { asTaskId, type TaskId } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
@@ -78,6 +88,14 @@ export interface ChatSubmitter {
 
 /** The half the poll loop needs. Deliberately identical to `ChatInbox`'s shape. */
 export interface ChatDrainer {
+  /**
+   * Whether `takeWhere` and `some` actually select, or are stubs returning empty.
+   *
+   * Must be checked before relying on either. It is `false` for the Redis queue, whose
+   * list has no selective pop, and a caller that assumes otherwise silently gets "nothing
+   * matched" for every query — see the module docstring for what that cost.
+   */
+  readonly selective: boolean;
   drain(): Promise<readonly ChatRequest[]>;
   takeWhere(select: (request: ChatRequest) => boolean): Promise<readonly ChatRequest[]>;
   some(select: (request: ChatRequest) => boolean): Promise<boolean>;
@@ -93,6 +111,9 @@ export type ChatQueue = ChatSubmitter & ChatDrainer;
  * signatures gain a promise, which the loop was already awaiting.
  */
 export class InMemoryChatQueue implements ChatQueue {
+  /** A real array filter over a real array. */
+  readonly selective = true;
+
   private readonly inbox: ChatInbox;
 
   constructor(inbox: ChatInbox = new ChatInbox()) {
@@ -135,6 +156,15 @@ export interface RedisChatQueueOptions {
 }
 
 export class RedisChatQueue implements ChatQueue {
+  /**
+   * `takeWhere` and `some` are stubs here — see the module docstring.
+   *
+   * The loop reads this and drains unconditionally instead, handling in-session cancels
+   * itself. Flipping it to `true` without implementing a real selective pop would restore
+   * the outage described above.
+   */
+  readonly selective = false;
+
   private readonly redis: RedisClient;
   private readonly guard: RedisGuard;
   private readonly logger: Logger;
@@ -268,20 +298,20 @@ export class RedisChatQueue implements ChatQueue {
   }
 
   /**
-   * Not served over Redis — see the module docstring.
+   * Not served over Redis — see the module docstring, and `selective` above.
    *
-   * A session in flight watches `cancel.ts` instead, which reaches it in milliseconds
-   * over pub/sub rather than at the next 2-second poll of a list, and cannot accidentally
-   * remove an intent that writes the state repo. Returning empty is the honest answer:
-   * this queue has no selective take.
+   * Returning empty is the honest answer for a list with no selective pop, but it is only
+   * SAFE because `selective` is `false` and every caller checks it first. The supervisor
+   * drains the whole list and routes an in-flight `/cancel` to the running session in
+   * process; nothing depends on this method doing anything.
    */
   takeWhere(): Promise<readonly ChatRequest[]> {
     return Promise.resolve([]);
   }
 
   /**
-   * Likewise not served: peeking without consuming means reading the whole list and
-   * putting it back, which races every other drainer.
+   * Likewise not served (`selective` is `false`): peeking without consuming means reading
+   * the whole list and putting it back, which races every other drainer.
    *
    * Its one caller — a session yielding to a waiting brainstorm — degrades to "no
    * brainstorm is waiting", which costs the human one extra poll interval and is exactly

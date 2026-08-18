@@ -1085,3 +1085,53 @@ test("a write that races a commit is not marked clean by it", async () => {
   assert.equal(await subject.pull("origin", "main"), "pulled");
   assert.match((await subject.readJournal(session)) ?? "", /while housekeeping was committing/);
 });
+
+test("a write that races a pull is not destroyed by it", async () => {
+  // The mirror image of the test above, and the one that cost real work to find.
+  //
+  // `pull` checks `dirty` inside the mutex and then does a network `fetch` before anything
+  // destructive. `dirty` is only a SAMPLE — store writes do not take the mutex — so a write
+  // landing during that fetch is invisible to the check at the top and deleted by the
+  // `clean -ffdq tasks` at the bottom. The gate looked sufficient and was not: this is the
+  // five-destroyed-tasks incident, still reachable after the flag was added.
+  //
+  // It stopped being theoretical when the work loop began pulling before each claim, which
+  // put a pull in the same instant as a `/brainstorm` creating a task. The spec was written
+  // between the fetch and the clean, vanished, and the `commitAndPush` immediately after
+  // found nothing to commit and reported success — a task acknowledged to the human that
+  // existed nowhere.
+  const { store: subject, other } = await sharedStateRepo();
+  const created = asTaskId("PULL-RACE-1");
+
+  // The remote must have moved, or the pull has nothing to reset onto and the test proves
+  // nothing about a destructive refresh.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  // Clean at the instant the pull starts — which is what makes the `dirty` check pass and
+  // the window open.
+  assert.equal(subject.hasUncommittedState, false);
+
+  // The write lands while the pull is inside its fetch. Not awaited first: the whole point
+  // is that it happens after the gate was checked and before the tree is touched.
+  const pulling = subject.pull("origin", "main");
+  await subject.appendJournal(created, 1, "written while the pull was fetching");
+  const outcome = await pulling;
+
+  assert.match(
+    (await subject.readJournal(created)) ?? "",
+    /while the pull was fetching/,
+    "a pull must not delete a write that landed after it sampled the dirty flag",
+  );
+  assert.equal(
+    outcome,
+    "skipped",
+    "and it must report that it declined, rather than claiming a refresh it abandoned",
+  );
+
+  // Deferred, not dropped: committing clears the flag and the next pull runs normally.
+  await subject.commitAndPush(`chore(${created}): created`, "origin", "main");
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(created)) ?? "", /while the pull was fetching/);
+});
