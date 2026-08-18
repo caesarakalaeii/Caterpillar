@@ -24,6 +24,7 @@ import type {
   DigestConfig,
   LlmConfig,
   RedisConfig,
+  BotConfig,
   RemediationConfig,
   RunnerConfig,
   WebConfig,
@@ -90,6 +91,7 @@ interface RawConfig {
   readonly cluster?: Record<string, unknown>;
   readonly remediation?: Record<string, unknown>;
   readonly redis?: Record<string, unknown>;
+  readonly bot?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -479,6 +481,26 @@ const redisConfig = (redis: Record<string, unknown>): RedisConfig => {
   };
 };
 
+/**
+ * Validate the `bot` block (DESIGN.md §7).
+ *
+ * The mode is validated as an enum rather than coerced, because the failure of a typo is
+ * invisible: `mode: "extrenal"` silently falling back to in-process gives a fleet where
+ * the supervisor AND the standalone bot are both connected to Discord and both acting,
+ * which is the duplicate-acting failure the whole arrangement exists to prevent. A boot
+ * failure naming the field is the only honest answer.
+ */
+const botConfig = (bot: Record<string, unknown>): BotConfig => {
+  const mode = str(bot["mode"], "bot.mode", "in-process");
+  if (mode !== "in-process" && mode !== "external") {
+    throw new ConfigError(
+      `bot.mode must be "in-process" or "external" (got '${mode}')`,
+    );
+  }
+
+  return { mode, port: port(bot["port"], "bot.port", 9091) };
+};
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -614,5 +636,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     cluster: clusterConfig(raw.cluster ?? {}),
     remediation: remediationConfig(raw.remediation ?? {}),
     redis: redisConfig(raw.redis ?? {}),
+    bot: botConfig(raw.bot ?? {}),
   };
 };

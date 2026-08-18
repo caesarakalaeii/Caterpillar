@@ -114,6 +114,7 @@ const CONFIG: RunnerConfig = {
     commandTimeoutMs: 1000,
     keyPrefix: "caterpillar:",
   },
+  bot: { mode: "in-process" as const, port: 9091 },
   web: {
     enabled: true,
     port: 8080,

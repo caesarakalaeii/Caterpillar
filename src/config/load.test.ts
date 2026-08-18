@@ -411,3 +411,35 @@ test("housekeeping defaults to the poll interval and is never slower than it", a
 
   await assert.rejects(() => load({ housekeepingSeconds: "often" }), ConfigError);
 });
+
+/**
+ * The `bot` block (DESIGN.md §7).
+ *
+ * The default is the whole point: a config that says nothing about the bot must produce
+ * exactly the runner that has always existed, connecting to Discord itself. Every other
+ * assertion here is about the one mistake that is silent — a mode nobody validated.
+ */
+test("a config that says nothing about the bot runs it in-process, as it always has", async () => {
+  const config = await load({});
+
+  assert.equal(config.bot.mode, "in-process");
+  assert.equal(config.bot.port, 9091);
+});
+
+test("an external bot is carried through with its own port", async () => {
+  const config = await load({ bot: { mode: "external", port: 9092 } });
+
+  assert.equal(config.bot.mode, "external");
+  // Its own port, not the supervisor's: the two run in one namespace and one number
+  // meaning both is an EADDRINUSE in whichever pod loses.
+  assert.equal(config.bot.port, 9092);
+});
+
+test("a misspelled mode fails the boot rather than quietly connecting twice", async () => {
+  // The failure this prevents is invisible otherwise: `extrenal` falling back to
+  // in-process gives a supervisor AND a standalone bot both connected to Discord and both
+  // acting, which is the duplicate-acting failure the split exists to prevent.
+  await assert.rejects(() => load({ bot: { mode: "extrenal" } }), ConfigError);
+  await assert.rejects(() => load({ bot: { mode: "" } }), ConfigError);
+  await assert.rejects(() => load({ bot: { port: "9091" } }), ConfigError);
+});
