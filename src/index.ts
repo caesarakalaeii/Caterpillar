@@ -7,6 +7,7 @@
  */
 import { createServer } from "node:http";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
@@ -786,7 +787,7 @@ const hydrateThreads = async (
  * always was: the gateway drops `author.bot` messages (`gateway.ts`), a guard that was
  * written for the webhook's `!answer` hint and now carries the bot's own output too.
  */
-const loadDiscord = async (
+export const loadDiscord = async (
   secretsDir: string,
   logger: Logger,
   external = false,
@@ -802,42 +803,29 @@ const loadDiscord = async (
   const webhookUrl = await bundle.readOptional("webhook-url").catch(() => undefined);
 
   // A separate process owns the gateway (§7), so this one must not connect: two processes
-  // acting on one channel is the duplicate-acting failure the arrangement exists to
-  // prevent.
+  // reading one channel is the duplicate-acting failure the arrangement exists to prevent.
   //
-  // Only the BRIDGE is skipped, and the notifier is still built. It is what posts a
-  // question with an Answer button on it, and that comes from whichever process noticed
-  // the task change — this one. Reading the channel and writing to it are separable, and
-  // only reading has to be exclusive: `bot` is left undefined, which is exactly what the
-  // caller already keys the gateway off.
+  // `gateway` is the WHOLE difference, which is why it rides on the ordinary returns below
+  // rather than a branch that restates them. Only the bridge is skipped: everything the
+  // bot does OUTBOUND still belongs to this process — the notification with the Answer
+  // button, the typing indicator while a session runs, closing a cancelled task's thread —
+  // because only READING the channel has to be exclusive.
   if (external) {
     logger.info("bridge.external", {
       reason: "bot.mode is external — a separate process owns the gateway",
     });
-    if (token !== undefined && channelId !== undefined) {
-      const bot = new DiscordBot({ token, channelId });
-      // `gateway: false` is the whole difference. The bot object is kept, because
-      // everything it does OUTBOUND still belongs to this process: the notification with
-      // the Answer button on it, the typing indicator while a session runs, and closing a
-      // cancelled task's thread. Only reading the channel has to be exclusive, and that is
-      // the one thing this flag turns off.
-      return { bot, notifier: new BotNotifier(bot), gateway: false };
-    }
-    return {
-      notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
-      gateway: false,
-    };
   }
 
   if (token === undefined || channelId === undefined) {
-    logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
+    if (!external) logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
     return {
       notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
+      gateway: !external,
     };
   }
 
   const bot = new DiscordBot({ token, channelId });
-  return { bot, notifier: new BotNotifier(bot) };
+  return { bot, notifier: new BotNotifier(bot), gateway: !external };
 };
 
 /**
@@ -894,18 +882,30 @@ const die = (event: string, error: unknown): never => {
   process.exit(1);
 };
 
-process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
-process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
+/**
+ * Only when this file is the program, never when it is imported.
+ *
+ * `bot.ts` carries the same guard and explains why: without it, a test importing anything
+ * from this module boots a whole supervisor — it reads `/etc/caterpillar/config.json`,
+ * fails, and calls `process.exit`, which kills the test RUNNER mid-suite and reports every
+ * file that never ran as passing. This module had no such guard because nothing imported
+ * it; `loadDiscord` is now exported so the split's gate can be tested at its own seam,
+ * which is precisely the moment the guard stops being optional.
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
+  process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
 
-main().then(
-  () => {
-    // A clean return means the signal aborted and shutdown completed.
-    process.exit(0);
-  },
-  (error: unknown) => {
-    // A failure here can predate `loadConfig`, so this logger takes the default level
-    // rather than the configured one — a boot failure must never be the thing that gets
-    // filtered out.
-    die("supervisor.boot-failed", error);
-  },
-);
+  main().then(
+    () => {
+      // A clean return means the signal aborted and shutdown completed.
+      process.exit(0);
+    },
+    (error: unknown) => {
+      // A failure here can predate `loadConfig`, so this logger takes the default level
+      // rather than the configured one — a boot failure must never be the thing that gets
+      // filtered out.
+      die("supervisor.boot-failed", error);
+    },
+  );
+}

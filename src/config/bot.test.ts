@@ -12,11 +12,12 @@
  * that changes shape cannot leave this passing against a config nobody could write.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import type { LogFields, Logger } from "../obs/log.ts";
+import { SILENT_LOGGER, type LogFields, type Logger } from "../obs/log.ts";
+import { loadDiscord } from "../index.ts";
 import { externalBot } from "./bot.ts";
 import { loadConfig } from "./load.ts";
 
@@ -123,4 +124,52 @@ test("in-process with Redis still keeps the gateway", async () => {
 
   assert.equal(externalBot(config, logger), false);
   assert.deepEqual(warnings, []);
+});
+
+/* ─────────────────── what the gate actually does to the connection ─────────────────── */
+
+/**
+ * `loadDiscord`'s return, over a real secrets directory.
+ *
+ * The other half of the seam. `externalBot` decides the flag and this decides what the
+ * flag does, and the bug the review found lived precisely between two things that were
+ * each correct: the mode parsed, the flag was honoured, and nothing joined them. Both are
+ * now covered from the outside.
+ */
+const secretsWith = async (files: Record<string, string>): Promise<string> => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-secrets-"));
+  roots.push(root);
+  const dir = join(root, "caterpillar-discord");
+  await mkdir(dir, { recursive: true });
+  for (const [name, value] of Object.entries(files)) await writeFile(join(dir, name), value);
+  return root;
+};
+
+test("an external bot means this process does not connect to the gateway", async () => {
+  const secrets = await secretsWith({ "bot-token": "t", "channel-id": "c" });
+  const discord = await loadDiscord(secrets, SILENT_LOGGER, true);
+
+  assert.equal(discord.gateway, false, "the supervisor must not read the channel too");
+  // The bot object survives, because everything OUTBOUND is still this process's job: the
+  // question notification with its Answer button, the typing indicator, closing a thread.
+  // Only reading the channel has to be exclusive.
+  assert.notEqual(discord.bot, undefined, "outbound notification stays with the supervisor");
+});
+
+test("without the gate the supervisor connects exactly as it always did", async () => {
+  const secrets = await secretsWith({ "bot-token": "t", "channel-id": "c" });
+  const discord = await loadDiscord(secrets, SILENT_LOGGER, false);
+
+  assert.notEqual(discord.gateway, false);
+  assert.notEqual(discord.bot, undefined);
+});
+
+test("an external bot with no discord secret still declines the gateway", async () => {
+  // The branch that used to be a second copy of the ordinary return. A supervisor with no
+  // token has no gateway anyway, but it must not report one it would never open.
+  const discord = await loadDiscord(await secretsWith({}), SILENT_LOGGER, true);
+
+  assert.equal(discord.gateway, false);
+  assert.equal(discord.bot, undefined);
+  assert.notEqual(discord.notifier, undefined, "a webhook-less fleet still gets a notifier");
 });

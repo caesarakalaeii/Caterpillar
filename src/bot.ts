@@ -73,19 +73,6 @@ const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json"
  */
 const THREAD_REFRESH_MS = 5_000;
 
-/**
- * Everything the process wants torn down, in the order it wants it.
- *
- * Collected rather than closed over, because the failure this prevents is the one
- * `index.ts` records: a shutdown path that leaves a websocket open holds the event loop
- * and the process never exits, so the restart never happens.
- */
-interface Runtime {
-  readonly stopHealth: () => void;
-  readonly plane: EphemeralPlane;
-  readonly lock: RedisChatLock;
-}
-
 const main = async (): Promise<void> => {
   const config = await loadConfig(CONFIG_PATH);
   const logger = new JsonLogger({ level: config.log.level });
@@ -164,11 +151,13 @@ const main = async (): Promise<void> => {
   // Health BEFORE the gateway dials, so a bot that cannot reach Discord is visibly
   // unready rather than absent — an unready pod is a fact an operator can see, and a pod
   // that never bound its port looks like a scheduling problem.
-  const runtime: Runtime = {
-    stopHealth: startHealthServer({ config, metrics, gateway, redis: redisOf(plane), logger }),
-    plane,
-    lock,
-  };
+  const stopHealth = startHealthServer({
+    config,
+    metrics,
+    gateway,
+    redis: redisOf(plane),
+    logger,
+  });
 
   await lock.start();
 
@@ -190,13 +179,13 @@ const main = async (): Promise<void> => {
     await gateway.run(controller.signal);
   } finally {
     clearInterval(refresh);
-    runtime.stopHealth();
+    stopHealth();
     // Hand the lock back explicitly rather than waiting out its TTL: without this the
     // incoming pod of a rolling update is connected but declining to act for up to
     // CHAT_LOCK_TTL_SECONDS, which is the bot being online and answering nothing — the
     // exact failure this whole split was built to remove.
-    await runtime.lock.stop();
-    await runtime.plane
+    await lock.stop();
+    await plane
       .close()
       .catch((error: unknown) => logger.warn("redis.close-failed", errorFields(error)));
   }
