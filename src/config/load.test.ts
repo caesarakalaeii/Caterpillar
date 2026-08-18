@@ -265,3 +265,66 @@ test("a non-numeric interval is refused rather than coerced", async () => {
   await assert.rejects(() => load({ usage: { intervalHours: "hourly" } }), ConfigError);
   await assert.rejects(() => load({ usage: { deadlineSeconds: null } }), ConfigError);
 });
+
+/**
+ * The `redis` block (DESIGN.md §21).
+ *
+ * Its default matters for a different reason from the four above: turning it ON does
+ * nothing outward-facing at all — it moves four ephemeral structures out of this process
+ * so a separate one can see them. What matters is that turning it off, or leaving it off,
+ * yields exactly the runner that has always worked. So the assertions here are mostly
+ * about the shape being validated whether it is used or not, which is `digestConfig`'s
+ * argument: a typo in a field nobody is using is otherwise discovered the day someone
+ * enables it, in the cluster, by a supervisor that throws at boot.
+ */
+test("a config that says nothing about redis keeps everything in this process", async () => {
+  const config = await load({});
+
+  assert.equal(config.redis.enabled, false);
+  assert.equal(config.redis.url, "redis://localhost:6379");
+  assert.equal(config.redis.commandTimeoutMs, 1000);
+  assert.equal(config.redis.keyPrefix, "caterpillar:");
+  // No credential in config, ever. The password is a secret and lives under `secretRef`.
+  assert.equal(config.redis.secretRef, undefined);
+  assert.equal("password" in (config.redis as unknown as Record<string, unknown>), false);
+});
+
+test("an enabled redis carries its url, prefix and secret reference", async () => {
+  const config = await load({
+    redis: {
+      enabled: true,
+      url: "rediss://redis-ha.all-chat.svc.cluster.local:6379",
+      secretRef: "caterpillar-redis",
+      commandTimeoutMs: 250,
+      keyPrefix: "fleet-a:",
+    },
+  });
+
+  assert.equal(config.redis.enabled, true);
+  assert.equal(config.redis.url, "rediss://redis-ha.all-chat.svc.cluster.local:6379");
+  assert.equal(config.redis.secretRef, "caterpillar-redis");
+  assert.equal(config.redis.commandTimeoutMs, 250);
+  assert.equal(config.redis.keyPrefix, "fleet-a:");
+});
+
+test("a url with the wrong scheme is refused, even with redis disabled", async () => {
+  // Not a connection that fails once: an `http://` here is a client retrying a nonsense
+  // endpoint forever while every read on the plane quietly times out and degrades, which
+  // in the logs looks exactly like a Redis that is merely down.
+  await assert.rejects(() => load({ redis: { url: "http://redis:6379" } }), ConfigError);
+  await assert.rejects(() => load({ redis: { url: "redis-ha:6379" } }), ConfigError);
+  await assert.rejects(() => load({ redis: { enabled: true, url: "" } }), ConfigError);
+
+  const tls = await load({ redis: { url: "rediss://redis:6380" } });
+  assert.equal(tls.redis.url, "rediss://redis:6380");
+});
+
+test("the timeout and the enabled flag are validated rather than coerced", async () => {
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: 0 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: -5 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: 1.5 } }), ConfigError);
+  await assert.rejects(() => load({ redis: { commandTimeoutMs: "fast" } }), ConfigError);
+  // `"false"` is truthy in JavaScript and false in intent. Refusing the string is the
+  // only reading that cannot silently mean the opposite of what was written.
+  await assert.rejects(() => load({ redis: { enabled: "false" } }), ConfigError);
+});

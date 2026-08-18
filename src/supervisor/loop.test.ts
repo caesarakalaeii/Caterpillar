@@ -17,6 +17,7 @@ import {
   asTaskId,
   asWorkspaceName,
   EMPTY_USAGE,
+  type RunnerId,
   type SessionOutcome,
   type TaskId,
   type TaskState,
@@ -33,7 +34,9 @@ import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
-import { ChatInbox, type ChatOutcome } from "./inbox.ts";
+import { InMemoryCancelSignals } from "../redis/cancel.ts";
+import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { type ChatOutcome } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -147,6 +150,12 @@ const config: RunnerConfig = {
     maxLogLines: 2000,
   },
   remediation: { enabled: false, port: 8081 },
+  redis: {
+    enabled: false,
+    url: "redis://localhost:6379",
+    commandTimeoutMs: 1000,
+    keyPrefix: "caterpillar:",
+  },
   web: {
     enabled: false,
     port: 8080,
@@ -372,7 +381,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
   await store.writeState(parked);
   await store.commitAndPush(`chore(${ANSWERED}): awaiting human`, "origin", "main");
 
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const runner: SessionRunner = {
     // Claiming it is proof enough that the answer took effect; the session itself is
     // not what this test is about.
@@ -426,7 +435,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
 });
 
 test("an answer for a task that is not waiting is refused, not written", async () => {
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const store = new StateStore(statePath, stateGit);
   const supervisor = new Supervisor({
     config,
@@ -857,7 +866,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
  */
 const resumeSupervisor = (
   store: StateStore,
-  inbox: ChatInbox,
+  inbox: InMemoryChatQueue,
   over: Partial<RunnerConfig> = {},
 ): Supervisor =>
   new Supervisor({
@@ -886,10 +895,10 @@ const resumeSupervisor = (
 /** Run one inbox request against a live supervisor and stop it again. */
 const throughInbox = async (
   store: StateStore,
-  intent: Parameters<ChatInbox["submit"]>[0],
+  intent: Parameters<InMemoryChatQueue["submit"]>[0],
   over: Partial<RunnerConfig> = {},
 ): Promise<ChatOutcome> => {
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const supervisor = resumeSupervisor(store, inbox, over);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
@@ -1355,7 +1364,7 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   await seedTask(CANCELLED);
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // A session that runs until something aborts it — a hung `bash` call, in effect.
   //
@@ -1447,6 +1456,146 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   assert.ok(parked !== undefined, "a cancelled task must end up parked, not re-claimed");
 });
 
+test("a cancel from another process reaches a session in flight, without the queue", async () => {
+  // The cross-process half of the test above (DESIGN.md §21). Nothing is submitted to the
+  // inbox at all — the standalone bot is not this process and has no reference to it — so
+  // the ONLY path to the abort is the signal. `takeWhere` returns nothing throughout,
+  // which is exactly what the supervisor sees when a bot on another pod typed the command.
+  const CANCELLED = asTaskId("SMOKE-CANCEL-SIGNAL");
+  await seedTask(CANCELLED);
+
+  const store = new StateStore(statePath, stateGit);
+  const cancels = new InMemoryCancelSignals();
+
+  // See the test above for why `keepalive` is load-bearing: a promise waiting on an abort
+  // event holds nothing open, and every timer the supervisor arms for a session is unref'd.
+  let sawAbort = false;
+  const runner: SessionRunner = {
+    run: (_spec, _state, signal) =>
+      new Promise<SessionOutcome>((resolve) => {
+        const keepalive = setInterval(() => {}, 1_000);
+        signal.addEventListener("abort", () => {
+          clearInterval(keepalive);
+          sawAbort = true;
+          resolve({
+            reason: "interrupted",
+            usage: EMPTY_USAGE,
+            contextTokens: 0,
+            summary: "stopped from another process",
+          });
+        });
+      }),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    cancels,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const started = Date.now() + 30_000;
+  while (Date.now() < started) {
+    const state = await store.tryReadState(CANCELLED);
+    if (state?.status === "running") break;
+    await sleep(50);
+  }
+
+  assert.equal(await cancels.request(CANCELLED), true);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !sawAbort) await sleep(50);
+
+  // Parked, not merely interrupted. An interrupted task is left `running`, which is
+  // claimable, so the very next poll would start the session it was meant to stop again.
+  let parked = false;
+  const settled = Date.now() + 30_000;
+  while (Date.now() < settled) {
+    if ((await store.tryReadState(CANCELLED))?.status === "parked") {
+      parked = true;
+      break;
+    }
+    await sleep(50);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(sawAbort, "the signal must reach the session, not only the key");
+  assert.ok(parked, "a cancelled task must end up parked, not re-claimed");
+  // And the signal is CLEARED, so a task cancelled and then resumed inside the TTL does
+  // not immediately cancel itself again on the session that resumes it.
+  assert.equal(await cancels.requested(CANCELLED), false);
+});
+
+test("the poll advertises this runner, and a presence failure never reaches the loop", async () => {
+  // Presence is advisory (§21). What is asserted is that it happens once a poll and that
+  // a registry which throws cannot stop the runner — a DISPLAY must never be able to take
+  // down the thing it displays.
+  const heartbeats: string[] = [];
+  const registry = {
+    heartbeat: (runner: RunnerId): Promise<void> => {
+      heartbeats.push(runner);
+      // Every call rejects. `RedisGuard` sits between a real registry and the loop, so
+      // this is the harsher version: nothing between it and `pollOnce`.
+      return Promise.reject(new Error("redis is unreachable"));
+    },
+    alive: () => Promise.resolve([]),
+    depart: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    runners: registry,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && heartbeats.length === 0) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(heartbeats.slice(0, 1), [config.runnerId]);
+});
+
 test("a digest that is due is published from the poll loop, and a failing one is not fatal", async () => {
   // The digest runs on the poll loop (§19), which is the only clock the supervisor has.
   // That puts it on the same thread as claiming, so the two properties that matter are
@@ -1516,7 +1665,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // Hands off forever: without a yield this task never gives the runner back.
   let sessions = 0;

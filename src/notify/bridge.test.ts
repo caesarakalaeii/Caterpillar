@@ -14,8 +14,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskState } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
-import { ChatInbox, type ChatOutcome } from "../supervisor/inbox.ts";
-import { summarise, TaskSnapshot } from "../supervisor/snapshot.ts";
+import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { InMemorySnapshotStore } from "../redis/snapshot.ts";
+import { type ChatOutcome } from "../supervisor/inbox.ts";
+import { summarise } from "../supervisor/snapshot.ts";
 import { DiscordBot } from "./bot.ts";
 import { DiscordBridge } from "./bridge.ts";
 import { encodeCustomId } from "./components.ts";
@@ -55,7 +57,7 @@ const harness = (
   } = {},
 ): {
   readonly bridge: DiscordBridge;
-  readonly inbox: ChatInbox;
+  readonly inbox: InMemoryChatQueue;
   readonly calls: Call[];
 } => {
   const calls: Call[] = [];
@@ -68,10 +70,10 @@ const harness = (
     return Promise.resolve(new Response(JSON.stringify({ id: "999" }), { status: 200 }));
   };
 
-  const snapshot = new TaskSnapshot();
-  snapshot.replace([summarise(state()), summarise(state({ id: asTaskId("GH-acme-widget-7"), status: "ready" }))]);
+  const snapshot = new InMemorySnapshotStore();
+  void snapshot.replace([summarise(state()), summarise(state({ id: asTaskId("GH-acme-widget-7"), status: "ready" }))]);
 
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const bridge = new DiscordBridge({
     bot: new DiscordBot({ token: "bot-token", channelId: CHANNEL, fetch, apiBase: API }),
     inbox,
@@ -98,10 +100,10 @@ const interaction = (over: Partial<Interaction>): Interaction => ({
 const flush = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 /** Stand in for the poll loop: wait for the request to be queued, then settle it. */
-const settleQueued = async (inbox: ChatInbox, outcome: ChatOutcome): Promise<void> => {
+const settleQueued = async (inbox: InMemoryChatQueue, outcome: ChatOutcome): Promise<void> => {
   for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
   assert.notEqual(inbox.size, 0, "nothing was queued for the loop");
-  for (const request of inbox.drain()) request.settle(outcome);
+  for (const request of await inbox.drain()) request.settle(outcome);
 };
 
 const callback = (calls: readonly Call[]): Call => {
@@ -219,7 +221,7 @@ test("a submitted modal answers the task the button came from", async () => {
   );
 
   for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
-  const queued = inbox.drain();
+  const queued = await inbox.drain();
   assert.deepEqual(
     queued.map((request) => ({
       kind: request.kind,
@@ -382,7 +384,7 @@ test("a brainstorm thread starts talking before the loop has settled anything", 
     "an idea typed into the thread before the loop catches up must not be dropped",
   );
 
-  for (const request of inbox.drain()) request.settle({ kind: "started", task: asTaskId("BS-999") });
+  for (const request of await inbox.drain()) request.settle({ kind: "started", task: asTaskId("BS-999") });
   await handled;
 });
 

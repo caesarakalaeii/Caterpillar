@@ -17,6 +17,7 @@ import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig, WorkspaceProfile } from "../config/types.ts";
 import {
   addUsage,
+  asRunnerId,
   asTaskId,
   capabilitiesSatisfy,
   claimOrder,
@@ -68,9 +69,13 @@ import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
-import type { ChatInbox, ChatOutcome, ChatRequest } from "./inbox.ts";
+import type { CancelSignals } from "../redis/cancel.ts";
+import type { ChatDrainer } from "../redis/inbox.ts";
+import type { PresenceRegistry } from "../redis/presence.ts";
+import type { SnapshotWriter } from "../redis/snapshot.ts";
+import type { ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
-import { summarise, type TaskSnapshot } from "./snapshot.ts";
+import { summarise } from "./snapshot.ts";
 
 /**
  * How often a running session checks for a `/cancel`.
@@ -204,7 +209,7 @@ export interface SupervisorDeps {
    * Requests arriving from the inbound Discord bridge (§7). Optional: without a bridge
    * a question is answered by committing the file by hand.
    */
-  readonly inbox?: ChatInbox;
+  readonly inbox?: ChatDrainer;
   /**
    * Which replica acts on Discord (DESIGN.md §7). Refreshed here rather than on a timer
    * of its own: a timer would keep renewing the claim while a session blocked the loop,
@@ -215,7 +220,21 @@ export interface SupervisorDeps {
    * In-memory view of every task, refreshed once per poll for the chat interface.
    * Optional: nothing in the loop reads it, and without a bridge nothing needs it.
    */
-  readonly snapshot?: TaskSnapshot;
+  readonly snapshot?: SnapshotWriter;
+  /**
+   * Cancel signals reaching a session already in flight (DESIGN.md §21).
+   *
+   * Optional, and its absence is not a loss of function: the in-process path through
+   * `inbox.takeWhere` still works, and that is the whole mechanism on a single-replica
+   * runner. This exists so a cancel typed at a SEPARATE bot process reaches the session
+   * without waiting for the poll loop — which is blocked for the session's whole duration.
+   */
+  readonly cancels?: CancelSignals;
+  /**
+   * Advisory display of which runners are alive (DESIGN.md §21). Optional and, crucially,
+   * never load-bearing: routing and claiming stay on leases in git (§5).
+   */
+  readonly runners?: PresenceRegistry;
   /**
    * Trackers to mirror lifecycle changes into, by workspace (DESIGN.md §9.5).
    * Optional: a workspace without a tracker is a supported configuration.
@@ -330,6 +349,13 @@ export class Supervisor {
     const { config, store, logger } = this.deps;
 
     await store.pull("origin", config.stateRepo.branch);
+
+    // Advertise that this runner is alive (DESIGN.md §21). Here rather than on a timer,
+    // for `ChatLeadership.refresh`'s reason: a timer would keep announcing presence while
+    // a session blocked the loop, which is the one case where "alive" and "able to do
+    // anything" come apart. ADVISORY — nothing routes or claims from it, and it never
+    // throws (`redis/presence.ts`, `redis/guarded.ts`).
+    await this.deps.runners?.heartbeat(asRunnerId(config.runnerId));
 
     // Both before claiming, so a task unparked by either is claimable on this same
     // iteration rather than sitting idle until the next poll. Both also run DURING a
@@ -568,7 +594,10 @@ export class Supervisor {
       records.push({ id, state });
     }
 
-    snapshot?.replace(records.map((record) => summarise(record.state)));
+    // Awaited: with Redis configured this is a write over the network, and a floating
+    // promise here would let the poll finish before the bot could see the new list.
+    // Never throws — `RedisSnapshotStore` degrades — so it cannot fail the survey.
+    await snapshot?.replace(records.map((record) => summarise(record.state)));
     // Terminal tasks drop out: a message in a bound thread is an ANSWER, so leaving a
     // finished conversation bound means an abandoned thread silently swallows whatever
     // is typed into it. `threadBindings` also settles who owns a thread several tasks
@@ -682,25 +711,41 @@ export class Supervisor {
     // The poll loop — and with it the inbox drain — is blocked for the whole duration of
     // a session, so a `/cancel` submitted while the agent is working would otherwise sit
     // in the queue until the session it was meant to stop had already ended, with the
-    // operator's Discord reply hanging until then. This watches for that ONE request and
-    // leaves everything else queued: the rest write the state repo, and this session
-    // holds the lease those writes would have to fence against.
+    // operator's Discord reply hanging until then. Both watches below exist for that.
     let cancelled = false;
-    const watchCancels = setInterval(() => {
-      const requests = this.deps.inbox?.takeWhere(
-        (request) => request.kind === "park" && request.task === spec.id,
-      );
-      if (requests === undefined || requests.length === 0) return;
-
+    const stop = (): void => {
+      if (cancelled) return;
       logger.info("task.cancel-requested", { task: spec.id });
       cancelled = true;
       interrupt.abort();
-      // Settled now rather than after the park, because the human is waiting on a
-      // Discord interaction and the session may take a turn boundary to unwind.
-      // `cancelling` says exactly that, and the park follows below.
-      for (const request of requests) request.settle({ kind: "cancelling" });
+    };
+
+    // Two paths to the same abort, because a cancel can arrive from two places.
+    //
+    // The interval is the original one and covers a cancel submitted IN THIS PROCESS: the
+    // request is sitting in the in-process queue, and `takeWhere` is what pulls out that
+    // ONE request while leaving everything else — which writes the state repo this session
+    // holds the lease for — queued. It settles `cancelling` rather than `parked`, because
+    // the session unwinds at a turn boundary and the park lands on the poll after that.
+    const watchCancels = setInterval(() => {
+      void (async (): Promise<void> => {
+        const requests =
+          (await this.deps.inbox?.takeWhere(
+            (request) => request.kind === "park" && request.task === spec.id,
+          )) ?? [];
+        if (requests.length === 0) return;
+        stop();
+        for (const request of requests) request.settle({ kind: "cancelling" });
+      })().catch((error: unknown) => logger.warn("task.cancel-poll-failed", errorFields(error)));
     }, CANCEL_POLL_MS);
     watchCancels.unref();
+
+    // The signal path covers a cancel submitted by ANOTHER process — the standalone bot
+    // (DESIGN.md §21). `watch` delivers it over pub/sub within a round trip and also
+    // checks the durable key once on subscribe, so a cancel published in the gap between
+    // this session starting and the subscription being established is not lost. Without
+    // Redis this is the in-process implementation and costs nothing.
+    const cancelWatch = await this.deps.cancels?.watch(spec.id, stop);
 
     let lost: LeaseLostError | undefined;
     const heartbeat = startHeartbeat(
@@ -806,6 +851,10 @@ export class Supervisor {
           // Only when the lease is still ours: a cancel that raced a lost lease has no
           // standing to write, and `park` fences anyway.
           if (cancelled && lost === undefined) {
+            // Cleared before the park, so a task cancelled and then resumed inside the
+            // signal TTL does not immediately cancel itself again on the session that
+            // resumes it. Never throws — see `redis/guarded.ts`.
+            await this.deps.cancels?.clear(spec.id);
             await this.park(heartbeat, spec, state, "cancelled from chat");
           }
           return;
@@ -856,6 +905,10 @@ export class Supervisor {
     } finally {
       heartbeat.stop();
       clearInterval(watchCancels);
+      // Or a long-lived supervisor accumulates one subscriber connection per task it has
+      // ever run. Swallowed, because a failure to unsubscribe from a socket that is
+      // already gone must not be the thing that fails a finished session.
+      await cancelWatch?.close().catch(() => undefined);
       signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
@@ -891,7 +944,8 @@ export class Supervisor {
     state: TaskState,
   ): Promise<boolean> {
     const { inbox, logger } = this.deps;
-    if (inbox?.some((request) => request.kind === "brainstorm") !== true) return false;
+    if (inbox === undefined) return false;
+    if (!(await inbox.some((request) => request.kind === "brainstorm"))) return false;
 
     logger.info("task.yielded", { task: spec.id, sessions: state.sessions, to: "brainstorm" });
     await this.transition(lease, state, "ready");
@@ -1677,7 +1731,7 @@ export class Supervisor {
     const { logger, inbox } = this.deps;
     if (inbox === undefined) return;
 
-    for (const request of inbox.drain()) {
+    for (const request of await inbox.drain()) {
       try {
         request.settle(await this.applyChatRequest(request));
       } catch (error) {

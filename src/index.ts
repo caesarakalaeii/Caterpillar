@@ -31,8 +31,9 @@ import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.t
 import { DiscordGateway } from "./notify/gateway.ts";
 import { AlertProcessor, AlertQueue } from "./remediation/queue.ts";
 import { startRemediationReceiver, type AlertObserver } from "./remediation/receiver.ts";
-import { ChatInbox } from "./supervisor/inbox.ts";
-import { TaskSnapshot } from "./supervisor/snapshot.ts";
+import type { ChatSubmitter } from "./redis/inbox.ts";
+import { createEphemeralPlane } from "./redis/plane.ts";
+import type { SnapshotReader } from "./redis/snapshot.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import { LiveSession } from "./obs/live.ts";
 import { LogRing } from "./obs/ring.ts";
@@ -273,12 +274,23 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
-  const inbox = new ChatInbox();
+  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels
+  // (DESIGN.md §21). With `redis.enabled` false, which is the default, this is the four
+  // in-process objects the supervisor has always used and the behaviour is unchanged.
+  // With it on, the same four interfaces are served from Redis so a SEPARATE bot process
+  // can submit and read them. Leases and task state are not in it and never will be: they
+  // are what makes a task survive a pod restart, and they stay on git refs (§5).
+  const plane = await createEphemeralPlane({
+    config: config.redis,
+    secretsDir: config.secretsDir,
+    logger,
+  });
+  const inbox = plane.chat;
+  const snapshot = plane.snapshot;
   // Filled by the webhook receiver when one is running, drained by the loop (§20). Built
   // unconditionally and cheap: an empty queue costs one array swap a poll, and building it
   // here keeps the receiver's own startup a single decision about the port and the secret.
   const alertQueue = new AlertQueue();
-  const snapshot = new TaskSnapshot();
   const threads = new ThreadIndex();
   const discord = await loadDiscord(config.secretsDir, logger);
 
@@ -351,6 +363,8 @@ const main = async (): Promise<void> => {
     credentials,
     inbox,
     snapshot,
+    cancels: plane.cancels,
+    runners: plane.runners,
     metrics,
     logger,
     trackers,
@@ -427,6 +441,14 @@ const main = async (): Promise<void> => {
     stopReceiver();
     await credentials.stop();
     await bridge;
+    // Leave the display before closing the connection, so a rollout does not show a
+    // runner that has already gone for the whole presence TTL. Advisory either way (§21):
+    // a runner that dies without departing ages out on its heartbeat score.
+    await plane.runners.depart(asRunnerId(config.runnerId));
+    // Last: the bridge submits through it, so closing the plane first would leave a
+    // request in flight with no way back. Never throws — shutdown must not be the path
+    // that hangs (`IoRedisClient.close`).
+    await plane.close().catch((error: unknown) => logger.warn("redis.close-failed", errorFields(error)));
   }
 };
 
@@ -727,8 +749,8 @@ const loadDiscord = async (
  */
 const runBridge = (
   bot: DiscordBot,
-  inbox: ChatInbox,
-  snapshot: TaskSnapshot,
+  inbox: ChatSubmitter,
+  snapshot: SnapshotReader,
   threads: ThreadIndex,
   logger: Logger,
   signal: AbortSignal,
