@@ -2944,6 +2944,36 @@ because the probe runs after the session's credential lease is closed, and the c
 service then refuses to answer for that task by design (§9.2) — anything touching the
 network fails.
 
+**The detector measures sessions; it cannot tell you whether the session should have
+run.** `BS-…-07` parked on 2026-08-18 with a streak of 3, and the probe was right about
+every one of those sessions — none committed anything. The defects were upstream, and
+both produced a session that could only fail:
+
+- **A pending CI run was reported as a failed gate.** `verifier.ts` returned
+  `passed: false` for a check that had not finished, which is indistinguishable from red
+  CI at the call site. The supervisor journalled a REJECTED completion claim, sent the
+  task back to `ready`, and started a fresh session — against a branch nobody was going
+  to change, whose acceptance commands had already passed. Three of those in a row parked
+  finished work behind an open PR. A pending run now carries `pending: true`, the gate
+  waits it out in the same session slot (`limits.ciSettleSeconds`, default 20 minutes,
+  polling every `limits.ciPollSeconds`) the way `ProviderCooldown` waits out a provider,
+  and past that budget the task is *released without a session* rather than rejected. The
+  wait is bounded on purpose: a check that never settles is a real problem an agent
+  should be told about, not a reason to pin the runner forever.
+- **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
+  image sets it (correctly — that image installed with `--omit=dev`), but it is
+  process-wide and every agent session and acceptance command is a child of the
+  supervisor. npm honours it by skipping devDependencies, so a task whose acceptance list
+  begins `npm ci` installed no `typescript` and the next command died with
+  `tsc: command not found`, exit 127. Nothing in the repo was wrong and no agent could
+  fix it: the acceptance list was unsatisfiable inside the container. `ToolchainResolver`
+  now strips exactly that value on the way in — a repo that genuinely wants a production
+  install still says so in its own acceptance command.
+
+The rule both share: **when a task parks for no progress, suspect the sessions before the
+detector.** Widening the streak limit here would have hidden both defects and parked the
+work later instead of sooner.
+
 ### 11.2 The Discord webhook
 
 **Amended when the notifier stopped being a stub.** §10 lists a `discord-bridge`
