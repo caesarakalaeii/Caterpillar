@@ -84,8 +84,8 @@ export class Aggregator {
     });
 
     const unreachable = failures(replies);
-    const answered = replies.filter((reply) => reply.ok);
-    const first = answered[0];
+    const first = replies.find((reply) => reply.ok);
+    const pass = lastIntakePass(replies);
 
     const tasks: readonly TaskRow[] = first?.ok === true ? first.value.tasks : [];
     const counts = first?.ok === true ? first.value.counts : {};
@@ -105,9 +105,7 @@ export class Aggregator {
         counts,
         runners: rows(runners, tasks, live),
         live: live.sort((a, b) => a.runner.localeCompare(b.runner)),
-        ...(first?.ok === true && first.value.intake !== undefined
-          ? { intake: first.value.intake }
-          : {}),
+        ...(pass === undefined ? {} : { intake: pass }),
       },
       unreachable,
       ...(first === undefined ? {} : { source: first.runner.name }),
@@ -176,6 +174,28 @@ export class Aggregator {
     return this.options.fanout.bytes(await this.runners(), request);
   }
 }
+
+/**
+ * The most recent intake pass ANY runner remembers.
+ *
+ * One runner serves each interval and the other three record that they skipped it, so
+ * taking the first responder's copy would report "another runner served this interval" on
+ * three refreshes out of four — true of that pod, and useless as a statement about the
+ * fleet. The newest `ingested` pass is what an operator is asking for; a fleet where every
+ * runner has only ever skipped falls back to the newest record of any kind, which is how a
+ * fleet that has not ingested since boot still says something.
+ */
+const lastIntakePass = (
+  replies: readonly RunnerReply<FleetView>[],
+): FleetView["intake"] => {
+  const passes = replies
+    .filter((reply): reply is Extract<RunnerReply<FleetView>, { ok: true }> => reply.ok)
+    .map((reply) => reply.value.intake)
+    .filter((pass): pass is NonNullable<FleetView["intake"]> => pass !== undefined)
+    .sort((a, b) => b.at.localeCompare(a.at));
+
+  return passes.find((pass) => pass.outcome === "ingested") ?? passes[0];
+};
 
 const failures = <T>(replies: readonly RunnerReply<T>[]): readonly Unreachable[] =>
   replies

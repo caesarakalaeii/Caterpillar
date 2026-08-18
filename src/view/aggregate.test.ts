@@ -271,3 +271,61 @@ test("a fleet where nobody answers is empty and says which runners were tried", 
   // at all would read as a fleet that has been scaled to zero.
   assert.equal(merged.view.runners.length, 4);
 });
+
+test("the intake line reports the runner that actually ingested, not the first responder", async () => {
+  // One runner serves each interval and the others record that they skipped it. Taking the
+  // first responder's copy would say "another runner served this interval" on three
+  // refreshes in four — true of that pod, useless as a statement about the fleet.
+  const skipped = {
+    at: "2026-08-18T09:05:00.000Z",
+    ref: "refs/intake/5555",
+    runner: "self",
+    outcome: "claimed-elsewhere" as const,
+  };
+  const ingested = {
+    at: "2026-08-18T09:00:00.000Z",
+    ref: "refs/intake/5555",
+    runner: "caterpillar-3",
+    outcome: "ingested" as const,
+    seen: 3,
+    created: 0,
+    rejected: 1,
+    failed: 0,
+  };
+
+  const answers = new Map<string, unknown>([
+    ["http://caterpillar-0:8080/api/fleet", { ...fleetOf([]), intake: skipped }],
+    ["http://caterpillar-1:8080/api/fleet", { ...fleetOf([]), intake: skipped }],
+    ["http://caterpillar-2:8080/api/fleet", { ...fleetOf([]), intake: skipped }],
+    ["http://caterpillar-3:8080/api/fleet", { ...fleetOf([]), intake: ingested }],
+  ]);
+
+  const merged = await aggregatorWith(fetcherFor(answers)).fleet({ path: "/api/fleet" });
+  assert.equal(merged.view.intake?.outcome, "ingested");
+  assert.equal(merged.view.intake?.seen, 3);
+  assert.equal(merged.view.intake?.runner, "caterpillar-3");
+});
+
+test("a fleet where every runner has only skipped still says something", async () => {
+  const skipped = (at: string, runner: string) => ({
+    at,
+    ref: "refs/intake/5555",
+    runner,
+    outcome: "claimed-elsewhere" as const,
+  });
+  const answers = new Map<string, unknown>([
+    [
+      "http://caterpillar-0:8080/api/fleet",
+      { ...fleetOf([]), intake: skipped("2026-08-18T09:00:00.000Z", "caterpillar-0") },
+    ],
+    [
+      "http://caterpillar-1:8080/api/fleet",
+      { ...fleetOf([]), intake: skipped("2026-08-18T09:05:00.000Z", "caterpillar-1") },
+    ],
+    ["http://caterpillar-2:8080/api/fleet", fleetOf([])],
+    ["http://caterpillar-3:8080/api/fleet", fleetOf([])],
+  ]);
+
+  const merged = await aggregatorWith(fetcherFor(answers)).fleet({ path: "/api/fleet" });
+  assert.equal(merged.view.intake?.runner, "caterpillar-1", "the newest record of any kind");
+});
