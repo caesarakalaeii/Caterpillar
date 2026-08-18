@@ -18,6 +18,8 @@ import { MirrorChangeReader } from "./digest/changes.ts";
 import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
+import { mergedCatalog } from "./forge/catalog.ts";
+import type { RepoCatalog } from "./forge/reach.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester, type IntakeObserver } from "./intake/ingest.ts";
 import { IntakeStatus } from "./intake/status.ts";
@@ -385,6 +387,11 @@ const main = async (): Promise<void> => {
     council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
+    // The workspaces' forge factories, for the one question the loop asks of them: can this
+    // credential reach the repo somebody just named (§9.1.1)? The same map the session runner
+    // holds — a repo checked at the `/brainstorm` door and again before a session, so the
+    // answer never has to come from a failing `git clone`.
+    forges,
     threads,
     ...(discord.bot === undefined
       ? {}
@@ -408,6 +415,7 @@ const main = async (): Promise<void> => {
       store,
       trackers,
       scopes,
+      forges,
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
@@ -457,16 +465,19 @@ const main = async (): Promise<void> => {
   const bridge =
     discord.bot === undefined
       ? Promise.resolve()
-      : runBridge(
-          discord.bot,
+      : runBridge({
+          bot: discord.bot,
           inbox,
           snapshot,
           threads,
           logger,
-          controller.signal,
-          chat,
-          activity,
-        ).catch((error: unknown) => {
+          signal: controller.signal,
+          leadership: chat,
+          // One catalogue over every workspace, because `/brainstorm` does not name one —
+          // the loop derives the workspace from the repo (§14.3, §9.1.1).
+          repos: mergedCatalog({ catalogs: [...forges.values()], logger }),
+          ...(activity === undefined ? {} : { activity }),
+        }).catch((error: unknown) => {
           logger.error("bridge.failed", errorFields(error));
         });
 
@@ -803,19 +814,22 @@ const loadDiscord = async (
  * the only thing that touches the state repo, and answers reads from the snapshot, which
  * touches nothing at all.
  */
-const runBridge = (
-  bot: DiscordBot,
-  inbox: ChatSubmitter,
-  snapshot: SnapshotReader,
-  threads: ThreadIndex,
-  logger: Logger,
-  signal: AbortSignal,
-  leadership: ChatLeadership,
-  activity?: FleetActivity,
-): Promise<void> => {
+const runBridge = (deps: {
+  readonly bot: DiscordBot;
+  readonly inbox: ChatSubmitter;
+  readonly snapshot: SnapshotReader;
+  readonly threads: ThreadIndex;
+  readonly logger: Logger;
+  readonly signal: AbortSignal;
+  readonly leadership: ChatLeadership;
+  /** The repos `/brainstorm repo:` completes from (§9.1.1). */
+  readonly repos: RepoCatalog;
+  readonly activity?: FleetActivity;
+}): Promise<void> => {
+  const { bot, inbox, snapshot, threads, logger, leadership, repos, activity } = deps;
   // Every replica connects; one acts (§7). The connection is what keeps the bot online
   // through a rollout, and it costs nothing — it is acting four times that broke things.
-  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership });
+  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership, repos });
 
   return new DiscordGateway({
     token: bot.token,
@@ -829,7 +843,7 @@ const runBridge = (
     // state — so four senders converge where four ACTORS conflicted (§7.2). Holder-only
     // would make the status go stale for the length of a claim handover instead.
     ...(activity === undefined ? {} : { presence: activity }),
-  }).run(signal);
+  }).run(deps.signal);
 };
 
 /**

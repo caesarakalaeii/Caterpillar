@@ -25,6 +25,7 @@ import {
 } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
 import type { StateStore } from "../state/store.ts";
+import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { WorkspaceScope } from "../forge/types.ts";
 import type { Tracker, TrackerItem } from "../tracker/types.ts";
 import { renderSpec, taskIdFor, type IngestResult } from "./spec.ts";
@@ -122,6 +123,19 @@ export interface IngesterDeps {
   readonly maxSessionsPerTask: number;
   /** Optional: without one intake behaves exactly as it did before it had a metric. */
   readonly metrics?: IntakeObserver;
+  /**
+   * Whether the repos an item names are ones the workspace's credential can reach
+   * (DESIGN.md §9.1.1), narrowed to that one question.
+   *
+   * An `agent` block's `repos` list is free text, and `scopes` only bounds where a repo may
+   * be — not whether it is there. A task built from a repo nothing can clone dies in its
+   * first session on a git exit code, and on this path nobody is watching for it: the human
+   * labelled an issue and walked away. Refusing at intake puts the answer in a comment on
+   * the item instead.
+   *
+   * Optional, and it fails open on a throw — see the refusal site for why.
+   */
+  readonly forges?: ReadonlyMap<WorkspaceName, RepoReach>;
 }
 
 /**
@@ -211,6 +225,95 @@ export class Ingester {
     return { seen, created, rejected, failed };
   }
 
+  /**
+   * A refusal for an item whose repos the workspace's credential cannot reach, or
+   * undefined — which also covers "the forge could not be asked".
+   *
+   * Those two are the same answer on purpose. Intake is best-effort and runs unattended
+   * every five minutes; a `/installation/repositories` behind a 500 is not evidence that an
+   * App was uninstalled, and turning it into one would comment a refusal onto every open
+   * item in the backlog and suppress it durably (§14.2). A repo that is genuinely
+   * unreachable is refused on the next pass instead.
+   */
+  private async unreachableReason(
+    workspace: WorkspaceName,
+    repos: readonly RepoRef[],
+  ): Promise<string | undefined> {
+    const reach = this.deps.forges?.get(workspace);
+    if (reach === undefined) return undefined;
+
+    try {
+      const unreachable = await reach.unreachable(repos);
+      if (unreachable.length === 0) return undefined;
+      return (
+        `${unreachableSummary(unreachable)}\n\nFix the \`repos\` list, or install the ` +
+        `App on the repository, and the next intake pass will pick this up.`
+      );
+    } catch (error) {
+      this.deps.logger.warn("intake.reach-unknown", {
+        workspace,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Record a refusal, and comment on the item ONCE.
+   *
+   * Extracted because there are now two reasons an item cannot become a task — its body
+   * (`renderSpec`) and its repos (`unreachableReason`) — and both must be suppressed the
+   * same way. `listAgentItems` filters on the label alone, so an un-suppressed refusal
+   * comments on every pass forever (§14.2).
+   */
+  private async refuse(
+    workspace: WorkspaceName,
+    tracker: Tracker,
+    item: TrackerItem,
+    reason: string,
+  ): Promise<IntakeOutcome> {
+    const { store, logger } = this.deps;
+    const id = taskIdFor(item.ref);
+    const digest = digestOf(item);
+
+    const previous = await store.readIntakeRejection(id);
+    if (previous?.digest === digest) {
+      // Already refused, and the human has not touched it since. Say nothing.
+      logger.debug("intake.still-rejected", { task: id, url: item.url });
+      return "skipped";
+    }
+
+    logger.warn("intake.rejected", { task: id, tracker: tracker.kind, url: item.url, reason });
+    // `url`, `title` and `workspace` are written alongside the suppression key so the
+    // `/intake` page can link to the item being refused. The DIGEST is unchanged by
+    // their presence — it covers the item's title and body, not the record — so a
+    // record written before these fields existed still suppresses, and the first poll
+    // after this build ships does not re-comment on every open refusal.
+    await store.writeIntakeRejection(id, {
+      digest,
+      reason,
+      url: item.url,
+      title: item.title,
+      workspace,
+    });
+
+    // The record is written BEFORE the comment. If commenting fails, the refusal is
+    // still suppressed next pass — a human who has to be told twice is a smaller
+    // problem than a tracker item accumulating one comment per poll forever.
+    try {
+      await tracker.comment(
+        item.ref,
+        `This item is labelled for the agent but cannot be turned into a task yet.\n\n${reason}`,
+      );
+    } catch (error) {
+      logger.warn("intake.comment-failed", {
+        task: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return "rejected";
+  }
+
   private async ingestItem(
     workspace: WorkspaceName,
     tracker: Tracker,
@@ -255,48 +358,16 @@ export class Ingester {
         };
 
     if (rendered.kind === "rejected") {
-      const digest = digestOf(item);
-      const previous = await store.readIntakeRejection(id);
-      if (previous?.digest === digest) {
-        // Already refused, and the human has not touched it since. Say nothing.
-        logger.debug("intake.still-rejected", { task: id, url: item.url });
-        return "skipped";
-      }
+      return this.refuse(workspace, tracker, item, rendered.reason);
+    }
 
-      logger.warn("intake.rejected", {
-        task: id,
-        tracker: tracker.kind,
-        url: item.url,
-        reason: rendered.reason,
-      });
-      // `url`, `title` and `workspace` are written alongside the suppression key so the
-      // `/intake` page can link to the item being refused. The DIGEST is unchanged by
-      // their presence — it covers the item's title and body, not the record — so a
-      // record written before these fields existed still suppresses, and the first poll
-      // after this build ships does not re-comment on every open refusal.
-      await store.writeIntakeRejection(id, {
-        digest,
-        reason: rendered.reason,
-        url: item.url,
-        title: item.title,
-        workspace,
-      });
-
-      // The record is written BEFORE the comment. If commenting fails, the refusal is
-      // still suppressed next pass — a human who has to be told twice is a smaller
-      // problem than a tracker item accumulating one comment per poll forever.
-      try {
-        await tracker.comment(
-          item.ref,
-          `This item is labelled for the agent but cannot be turned into a task yet.\n\n${rendered.reason}`,
-        );
-      } catch (error) {
-        logger.warn("intake.comment-failed", {
-          task: id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      return "rejected";
+    // The item is executable; the question left is whether the repos it names are ones this
+    // workspace's credential can reach at all (§9.1.1). Refused through the SAME path as any
+    // other intake refusal — recorded, suppressed, commented once — because "this repo does
+    // not exist" is exactly as much a thing the author has to fix as a missing `acceptance`.
+    const unreachable = await this.unreachableReason(workspace, rendered.spec.repos);
+    if (unreachable !== undefined) {
+      return this.refuse(workspace, tracker, item, unreachable);
     }
 
     const now = new Date().toISOString();

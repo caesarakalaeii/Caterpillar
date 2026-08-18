@@ -17,6 +17,7 @@ import {
   asTaskId,
   asWorkspaceName,
   EMPTY_USAGE,
+  type RepoRef,
   type RunnerId,
   type SessionOutcome,
   type TaskId,
@@ -45,6 +46,7 @@ import {
   Supervisor,
   type ProgressProbe,
   type SessionRunner,
+  type SupervisorDeps,
   type Verifier,
   type WorktreeReaper,
 } from "./loop.ts";
@@ -652,7 +654,18 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
           ]),
         }),
     },
-    reviewers: new Map([[asWorkspaceName("test"), { forTask: () => Promise.resolve(reviewerForge) }]]),
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        // The reviewer identity never checks anything out, so reachability is not its
+        // question — it approves and merges through the API alone (§12.1).
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
@@ -880,6 +893,7 @@ const resumeSupervisor = (
   store: StateStore,
   inbox: InMemoryChatQueue,
   over: Partial<RunnerConfig> = {},
+  extra: Partial<SupervisorDeps> = {},
 ): Supervisor =>
   new Supervisor({
     config: { ...config, ...over },
@@ -902,6 +916,7 @@ const resumeSupervisor = (
     logger: SILENT_LOGGER,
     toolchain: TEST_TOOLCHAIN,
     inbox,
+    ...extra,
   });
 
 /** Run one inbox request against a live supervisor and stop it again. */
@@ -909,9 +924,10 @@ const throughInbox = async (
   store: StateStore,
   intent: Parameters<InMemoryChatQueue["submit"]>[0],
   over: Partial<RunnerConfig> = {},
+  extra: Partial<SupervisorDeps> = {},
 ): Promise<ChatOutcome> => {
   const inbox = new InMemoryChatQueue();
-  const supervisor = resumeSupervisor(store, inbox, over);
+  const supervisor = resumeSupervisor(store, inbox, over, extra);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
   const outcome = await inbox.submit(intent);
@@ -1900,6 +1916,109 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
 
   assert.equal(outcome.kind, "refused");
   assert.match(outcome.kind === "refused" ? outcome.reason : "", /stranger/);
+});
+
+/**
+ * A repo nobody can reach is refused at the door (DESIGN.md §9.1).
+ *
+ * 2026-08-18: `/brainstorm caesarakalaeii/allchat` — for a repo called `all-chat` — was
+ * accepted, claimed, and spent its session reaching `git clone --mirror`, where the App's
+ * 422 became `fatal: could not read Username`. The name was one dash out and nothing on
+ * the way in had asked the only question that would have caught it.
+ */
+const reachStub = (unreachable: readonly string[]): Partial<SupervisorDeps> => ({
+  forges: new Map([
+    [
+      asWorkspaceName("caesar"),
+      {
+        unreachable: (repos: readonly RepoRef[]) =>
+          Promise.resolve(
+            repos
+              .filter((repo) => unreachable.includes(`${repo.owner}/${repo.name}`))
+              .map((repo) => ({
+                repo,
+                reason: `\`${repo.owner}/${repo.name}\` is not one of the 65 repositories this workspace's GitHub App can see. Did you mean \`acme/widget\`?`,
+              })),
+          ),
+      },
+    ],
+  ]),
+});
+
+test("a brainstorm naming a repo the credential cannot reach is refused with the near miss", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widgit"],
+      threadId: "1539331435477860432",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    reachStub(["acme/widgit"]),
+  );
+
+  assert.equal(outcome.kind, "refused");
+  const reason = outcome.kind === "refused" ? outcome.reason : "";
+  assert.match(reason, /acme\/widgit/, "the refusal names what was typed");
+  assert.match(reason, /acme\/widget/, "and what to type instead");
+
+  assert.equal(
+    await store.hasTask(asTaskId("BS-1539331435477860432")),
+    false,
+    "a brainstorm nothing can clone must not become a task",
+  );
+});
+
+test("a reachable brainstorm is unaffected by the check", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const BRAINSTORM = asTaskId("BS-1539331435477860433");
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widget"],
+      threadId: "1539331435477860433",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    reachStub(["acme/widgit"]),
+  );
+
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+  await retire(BRAINSTORM);
+});
+
+test("a forge that cannot answer lets the brainstorm through rather than refusing it", async () => {
+  // Fail OPEN, deliberately. A 500 from GitHub is not evidence about an installation, and
+  // refusing work because the forge hiccuped is worse than the clone failure this avoids.
+  const store = new StateStore(statePath, stateGit);
+  const BRAINSTORM = asTaskId("BS-1539331435477860434");
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widget"],
+      threadId: "1539331435477860434",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    {
+      forges: new Map([
+        [
+          asWorkspaceName("caesar"),
+          { unreachable: () => Promise.reject(new Error("GitHub /installation/repositories failed with 500")) },
+        ],
+      ]),
+    },
+  );
+
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+  await retire(BRAINSTORM);
 });
 
 test("a brainstorm with no repos at all is refused by the loop too", async () => {

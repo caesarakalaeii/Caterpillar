@@ -8,14 +8,18 @@
  *   1. the PEM signs a valid App JWT
  *   2. GitHub accepts it and reports the App identity
  *   3. the App is installed, and on which account (prints the installation id)
- *   4. an installation token can be minted SCOPED to just the named repo
- *   5. the minted token's permissions are what we asked for
+ *   4. the installation can actually REACH the named repo — the same check the fleet runs
+ *      at every door (§9.1.1), against the live installation
+ *   5. an installation token can be minted SCOPED to just the named repo
+ *   6. the minted token's permissions are what we asked for
  *
  * Run this before deploying. A silent misconfiguration here surfaces as a task
  * failing at hour six instead.
  */
 import { readFile } from "node:fs/promises";
-import { signAppJwt } from "../forge/github-app.ts";
+import { parseRepoRef } from "../domain/task.ts";
+import { GitHubAppForgeFactory, signAppJwt } from "../forge/github-app.ts";
+import { unreachableSummary } from "../forge/reach.ts";
 
 const API_BASE = "https://api.github.com";
 
@@ -98,6 +102,25 @@ const main = async (): Promise<void> => {
 
   const installationId =
     args.installationId ?? String(installations[0]?.id ?? "");
+
+  // 4: reachability, through the very code the fleet uses. Before the mint, deliberately —
+  // a mistyped `--repo` answers the mint with a bare 422 that names the installation, and
+  // this is the check that names the repo and offers the near miss instead. `allchat` for
+  // `all-chat` cost a brainstorm its whole session before this existed.
+  const repo = parseRepoRef(args.repo);
+  if (repo === undefined) throw new Error("--repo must be owner/name");
+
+  const factory = new GitHubAppForgeFactory(
+    { appId: args.appId, installationId, privateKeyPem: pem, apiBase: API_BASE },
+    { host: "github.com" },
+  );
+  const unreachable = await factory.unreachable([repo]);
+  if (unreachable.length > 0) {
+    console.error(`✗ ${unreachableSummary(unreachable)}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`✓ the installation can reach ${args.repo}`);
 
   const minted = await gh<{
     readonly expires_at: string;

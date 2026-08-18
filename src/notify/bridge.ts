@@ -18,7 +18,8 @@
  * snapshot, inside the acknowledgement budget, because going through the loop for a
  * listing would mean waiting on a session to end before finding out what it is doing.
  */
-import type { Logger } from "../obs/log.ts";
+import type { RepoCatalog } from "../forge/reach.ts";
+import { errorFields, type Logger } from "../obs/log.ts";
 import { brainstormId } from "../plan/brainstorm.ts";
 import type { ChatSubmitter } from "../redis/inbox.ts";
 import type { SnapshotReader } from "../redis/snapshot.ts";
@@ -34,11 +35,12 @@ import {
   reply,
   respond,
   updateMessage,
+  type AutocompleteChoice,
   type Interaction,
   type InteractionResponse,
 } from "./interactions.ts";
 import { describeList, describeOutcome, describeTask, queued } from "./replies.ts";
-import { ANSWER_FIELD, parseInteraction } from "./slash.ts";
+import { ANSWER_FIELD, parseInteraction, repoChoices } from "./slash.ts";
 import type { ThreadIndex } from "./threads.ts";
 
 export interface BridgeDeps {
@@ -73,6 +75,15 @@ export interface BridgeDeps {
    * up holding a commit that can never rebase.
    */
   readonly leadership?: { readonly held: () => boolean };
+  /**
+   * The repos this runner can reach, for the `/brainstorm repo:` box (DESIGN.md §9.1.1).
+   *
+   * Optional, and absent is a supported shape rather than a degraded one: a standalone bot
+   * process holds no forge credential at all, and without this the box is the free-text
+   * field it has always been — the door checks are what stop an unreachable repo either
+   * way. The autocomplete only removes the need to be told.
+   */
+  readonly repos?: RepoCatalog;
   readonly fetch?: FetchLike;
 }
 
@@ -135,6 +146,27 @@ export class DiscordBridge {
     await this.say(await this.execute(command, author), channelId);
   }
 
+  /**
+   * Completions for `/brainstorm repo:`, or none.
+   *
+   * Never throws. An autocomplete accepts exactly one response and no other kind, so a
+   * forge that is refusing has to produce an empty box — an unanswered interaction is a
+   * spinner that never resolves, which is worse than no suggestions. The catalogue is
+   * already bounded and failure-isolated per workspace (`mergedCatalog`); this is the
+   * belt to that braces, and covers a runner with no catalogue at all.
+   */
+  private async suggestRepos(typed: string): Promise<readonly AutocompleteChoice[]> {
+    const catalog = this.deps.repos;
+    if (catalog === undefined) return [];
+
+    try {
+      return repoChoices(typed, await catalog.reachable());
+    } catch (error) {
+      this.deps.logger.warn("bridge.repo-suggest-failed", errorFields(error));
+      return [];
+    }
+  }
+
   /** A slash command, button click or modal submission. */
   async handleInteraction(interaction: Interaction): Promise<void> {
     if (!this.acts()) return;
@@ -146,15 +178,17 @@ export class DiscordBridge {
     if (interaction.type === INTERACTION.autocomplete) {
       const intent = parseInteraction(interaction);
       const query = intent.kind === "autocomplete" ? intent.query : "";
-      await this.answer(
-        interaction,
-        autocomplete(
-          (await this.deps.snapshot.suggest(query)).map((task) => ({
-            name: `${task.id} — ${task.status}`,
-            value: task.id,
-          })),
-        ),
-      );
+      // Two boxes, two sources: a task id comes from the in-memory snapshot, a repo from
+      // the workspaces' forges (§9.1.1). Neither may reach the state repo — an autocomplete
+      // fires per keystroke.
+      const choices =
+        intent.kind === "autocomplete" && intent.field === "repo"
+          ? await this.suggestRepos(query)
+          : (await this.deps.snapshot.suggest(query)).map((task) => ({
+              name: `${task.id} — ${task.status}`,
+              value: task.id,
+            }));
+      await this.answer(interaction, autocomplete(choices));
       return;
     }
 

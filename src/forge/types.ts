@@ -10,6 +10,7 @@
  * to git, so a token in argv becomes a token in git history (DESIGN.md §9.2).
  */
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
+import type { RepoCatalog, RepoReach } from "./reach.ts";
 
 /** Credentials for one repo, shaped for git's credential helper protocol. */
 export interface GitCredential {
@@ -97,8 +98,16 @@ export interface Forge {
  *
  * Scoping happens here, not at call sites: a Forge handed a repo outside
  * `spec.repos` must throw rather than mint (DESIGN.md §9.1).
+ *
+ * It also answers `RepoReach` — whether a repo a human just named is one this workspace's
+ * credential can reach at all — and `RepoCatalog`, the same question asked forwards so the
+ * name can be autocompleted instead of typed. Both REQUIRED rather than optional, because
+ * the paths that ask (the `/brainstorm` door and its autocomplete, intake, the claim loop)
+ * all fall back to letting the task through when nobody can answer, and an implementation
+ * that quietly declined to answer would restore exactly the failure this exists to remove:
+ * a mid-session `git clone` that dies on a repo nobody could have reached.
  */
-export interface ForgeFactory {
+export interface ForgeFactory extends RepoReach, RepoCatalog {
   forTask(spec: TaskSpec): Promise<Forge>;
 }
 
