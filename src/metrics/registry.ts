@@ -15,6 +15,24 @@ interface Sample {
 
 type MetricKind = "counter" | "gauge";
 
+/**
+ * A label value, escaped the way the text exposition format requires.
+ *
+ * All THREE of the format's escapes, in this order — backslash first, or the escapes
+ * escape each other, exactly as in `web/html.ts`. It used to be `"` alone, which was
+ * enough while every label value was a task id (a validated `[A-Za-z0-9._-]+`) or a
+ * literal from this file.
+ *
+ * It stopped being enough when `caterpillar_work_bytes` started taking label values from
+ * the FILESYSTEM: a directory under `tasks/` is whatever is on the disk, and a name
+ * containing a newline would end the sample line early and hand the scraper a line of the
+ * exporter's own choosing. Escaping here rather than at the call site because this is the
+ * only place that knows it is writing exposition format, and a second producer of
+ * world-derived labels must not have to remember.
+ */
+const escapeLabel = (value: string): string =>
+  value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+
 class Metric {
   private readonly samples = new Map<string, Sample>();
 
@@ -63,7 +81,7 @@ class Metric {
     const lines = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} ${this.kind}`];
     for (const sample of this.samples.values()) {
       const labels = Object.entries(sample.labels)
-        .map(([k, v]) => `${k}="${v.replace(/"/g, '\\"')}"`)
+        .map(([k, v]) => `${k}="${escapeLabel(v)}"`)
         .join(",");
       lines.push(labels.length > 0 ? `${this.name}{${labels}} ${sample.value}` : `${this.name} ${sample.value}`);
     }
