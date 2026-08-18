@@ -25,6 +25,7 @@ import { LeaseManager } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG } from "../workspace/usage.ts";
+import { DEFAULT_REAP_CONFIG } from "../workspace/worktree.ts";
 import { Supervisor, type Intake, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const roots: string[] = [];
@@ -61,6 +62,7 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
   toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
   paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks"), root },
+  workspace: { reap: DEFAULT_REAP_CONFIG },
   usage: DEFAULT_USAGE_CONFIG,
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },

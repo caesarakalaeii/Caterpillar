@@ -30,7 +30,7 @@ and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment
 | Mutual exclusion | **Atomic git ref CAS** on `refs/leases/<TASK>`, heartbeat + steal-on-stale |
 | Multi-machine | **Capability-matched runner daemons** that poll and claim |
 | K8s shape | **StatefulSet** of supervisor loops, one task at a time per replica (§10) |
-| Workspace | **Per-replica PVC** bare mirrors + one **git worktree** per task |
+| Workspace | **Per-replica PVC** bare mirrors + one **git worktree** per task, reaped when the task ends |
 | LLM access | All runners → **in-cluster credential holder**; the traffic is direct (§9.6) |
 | Git credentials | **GitHub App**, supervisor-minted, scoped per task; repo-scoped tokens on Codeberg |
 | Commit identity | The author App's **own bot account**, configured per deployment (§9.7) |
@@ -232,6 +232,71 @@ Unlike the fetch refspec above, this **is** written into the shared config — t
 property of every task on the repo, not of one invocation — and because `configure` runs on
 every worktree create *and* reuse, mirrors already on a PVC are healed the next time a task
 touches them.
+
+#### Worktrees are reaped, because they are what actually grows
+
+A mirror is fetched incrementally and its size tracks the repository's history. A worktree
+is a full checkout plus everything a session puts in it — `node_modules`, a `target/`, a
+`.venv`, a build output tree — once per repo the task declares, and it lives at
+`<tasksDir>/<TASK-ID>/<repo>` on a **20Gi ReadWriteOnce volume, per replica**. Nothing ever
+removed one. The nix store next to it had a collector on a timer (§8.1); the directory that
+grows per task had nothing at all, and `removeWorktree` existed with no caller outside its
+own test.
+
+So there are two removals, with different triggers, and the split is the whole design:
+
+- **Targeted**, the moment a task reaches a state it will not resume from *in place*. The
+  supervisor calls it on `done`, on `failed`, and when it loses the lease mid-session.
+  It removes every repo's worktree — including the siblings at `<root>/repos/<name>`, which
+  are worktrees of their **own** mirrors — then the `<tasksDir>/<TASK-ID>` directory
+  wholesale, which git would never remove because git does not know it exists.
+- **A periodic sweep** from the idle branch of the poll loop, next to
+  `maybeCollectGarbage` and for the identical stated reason: only when this runner has no
+  task in flight, because a collection racing a session is a risk with no upside and there
+  is always another idle poll. It is the backstop for the case the targeted removal cannot
+  cover — a pod killed mid-session, a node evicted, a roll landing between the merge and
+  the removal — where the task moves to another replica and the directory here is orphaned
+  with nothing that will ever name it again.
+
+**What is deliberately NOT reaped is the more interesting half.** A handoff, and a park
+awaiting a human, both resume against this very checkout: `ensureWorktree` reuses one
+precisely so session N+1 does not pay for a clone and a dependency install. Reaping there
+would trade a few gigabytes for both, on every handoff, which is the opposite of the trade
+this is making. `failed` *is* reaped despite being resumable, and for a reason a park does
+not share: a task fails because a session raised an error the supervisor could not
+attribute, and the checkout that produced it is as likely to be the cause as the cure —
+`/resume` re-creates it from the mirror and the branch on the remote, which is every byte
+of the work and none of the wreckage.
+
+Two properties are load-bearing and neither is obvious:
+
+- **The live task set is passed in, never inferred.** Deleting the worktree of a session
+  that is running right now is the worst thing this code can do — uncommitted work, index
+  and resolved environment go at once, mid-turn, and what the agent reports afterwards is a
+  git error about a directory that vanished. The supervisor knows which tasks the state
+  repo considers unfinished; the workspace layer would have to guess from mtimes and lock
+  files, and a guess is not a safety property.
+- **Nothing outside `tasksDir` can be removed, and the check is on the resolved path.** Task
+  ids arrive from directory names on a volume and from a state repo that intake writes, and
+  `join(tasksDir, "..")` is the parent of every mirror on the PVC. One `..` reaching the
+  delete unchecked would take the mirrors, the nix store's GC roots and the state checkout,
+  on a timer, and log that it had reclaimed a lot of disk. The containment test uses
+  `relative()` rather than a prefix comparison, because `/work/tasks-old` starts with
+  `/work/tasks`.
+
+Both removals finish with `git worktree prune` on the mirrors involved. That is not
+tidiness: `rm -rf` leaves the mirror's `worktrees/<name>` administrative record behind, and
+an unpruned record still **holds its branch** as far as `worktree list --porcelain` is
+concerned — which is exactly what the fetch refspec above is derived from. A mirror that is
+never pruned therefore accumulates one permanent exclusion per finished task and slowly
+stops tracking upstream at all.
+
+Configured as `workspace.reap.intervalHours` and `workspace.reap.keepHours`, mirroring
+`toolchain.gcIntervalHours` / `gcKeepDays`, and shown next to them in the web view. The
+keep-age is hours where the store's is days, because a store path is shared by every task
+that resolved the same environment and a worktree belongs to exactly one; the default
+comfortably outlives a weekend, which is the realistic gap between a task parking for a
+human on Friday and being answered.
 
 ## 4. State model
 
@@ -1684,11 +1749,20 @@ journal entry so the next session sees it at all.
 | `caterpillar_provider_outage_total{kind}` | counter | sessions the provider refused — §6.3 |
 | `caterpillar_provider_cooldown_seconds{runner}` | gauge | >0 means idle **on purpose** — §6.3 |
 | `caterpillar_alerts_received_total{alertname,outcome}` | counter | Alertmanager deliveries — §20 |
+| `caterpillar_worktrees_reaped_total{kind}` | counter | `targeted` vs `swept` — §3.1 |
+| `caterpillar_worktree_bytes_reaped_total{kind}` | counter | approximate bytes returned to the PVC |
 | `caterpillar_work_fs_bytes{runner,kind}` | gauge | `total`/`free` of the work volume, from `statfs` |
 | `caterpillar_work_bytes{runner,category}` | gauge | `mirrors`/`tasks`/`nix`/`other`, apparent size |
 | `caterpillar_work_entry_bytes{runner,category,name}` | gauge | the largest few tasks and mirrors, capped |
 | `caterpillar_work_partial{runner}` | gauge | 1 when the walk hit its deadline |
 | `caterpillar_work_measured_timestamp_seconds{runner}` | gauge | how stale the four above are |
+
+`kind` on the reaping pair is the label that earns them their place. A healthy runner reaps
+almost everything `targeted`, so a `swept` series that keeps climbing says the supervisor's
+terminal paths are not reaching the removal — pods being killed mid-session, or a branch
+nobody wired up — and the volume is only staying under its limit because a timer is
+cleaning up after a bug. The bytes counter is what answers "is reaping worth anything" at
+all, and divided by the first it says what one task actually costs on disk.
 
 The `work_*` family answers the one question the supervisor could not previously answer
 about itself: where the disk went. It is produced by a directory walk

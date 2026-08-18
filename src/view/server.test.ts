@@ -348,6 +348,10 @@ test("a task, its session and a digest are proxied from the runner that has them
       stateRepo: { url: "https://example.invalid/state.git", branch: "main", path: "/work/state" },
       paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
       usage: { intervalHours: 1, deadlineSeconds: 120 },
+      // No `workspace` key, deliberately: this is a runner of the PREVIOUS vintage, which
+      // is what the viewer proxies for as long as a rollout takes. The page must render it
+      // rather than throw, or the viewer answers with an error page for every pod the
+      // rollout has not reached yet. `pages.test.ts` covers the current shape.
       intake: { intervalSeconds: 300 },
       remediation: { enabled: true, port: 8081 },
       cluster: { enabled: true, namespaces: ["caterpillar"], maxLogLines: 500 },

@@ -178,6 +178,44 @@ export interface UsageConfig {
 }
 
 /**
+ * When this runner throws a finished task's worktree away — DESIGN.md §3.1, and the
+ * `Workspace` row of §2.
+ *
+ * The mirror of `ToolchainConfig.gcIntervalHours` / `gcKeepDays`, and it exists because
+ * the store had a collector and the worktrees did not. A worktree is the thing that
+ * actually grows per task — a checkout plus `node_modules` plus build output, per repo the
+ * task declares — and every task ever run left one behind on a 20Gi ReadWriteOnce volume,
+ * per replica, forever. The nix store was being collected daily next to a directory nobody
+ * ever swept.
+ *
+ * Two knobs rather than one because there are two removals with different triggers. The
+ * targeted one fires the moment a task reaches a state it will not resume from in place
+ * and needs no configuration at all. `keepHours` governs only the SWEEP — the safety net
+ * for the pod that was killed before the targeted removal could run — and it is an age
+ * bound for the same reason `--delete-older-than` is: the thing worth keeping is whatever
+ * a task touched recently, and that is what an age expresses.
+ */
+export interface WorktreeReapConfig {
+  /** Hours between sweeps of `paths.tasks`. Only ever runs on an idle poll. */
+  readonly intervalHours: number;
+  /**
+   * Hours a worktree directory survives after its last modification with no live task
+   * claiming it.
+   *
+   * Generous by default, and deliberately not zero: a task that parked awaiting a human
+   * keeps its worktree so the session that answers the question does not re-clone and
+   * re-install, and a runner that crashed mid-session may re-claim the same task within
+   * minutes. The sweep is a backstop against leaks, not a second scheduler.
+   */
+  readonly keepHours: number;
+}
+
+/** How this runner manages the per-task checkouts on its PVC. */
+export interface WorkspaceConfig {
+  readonly reap: WorktreeReapConfig;
+}
+
+/**
  * How the runner authenticates to the model provider (DESIGN.md §9.6).
  *
  * `proxy` — the in-cluster proxy holds the provider credential.
@@ -382,6 +420,7 @@ export interface RunnerConfig {
   readonly toolchain: ToolchainConfig;
   readonly stateRepo: StateRepoConfig;
   readonly paths: WorkspacePathsConfig;
+  readonly workspace: WorkspaceConfig;
   readonly usage: UsageConfig;
   readonly lease: LeaseConfig;
   readonly handoff: HandoffConfig;

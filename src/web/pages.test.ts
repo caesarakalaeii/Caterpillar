@@ -41,6 +41,7 @@ const EXPORT: RunnerExport = {
   },
   stateRepo: { url: "https://github.com/acme/state.git", branch: "main", path: "/work/state" },
   paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+  workspace: { reap: { intervalHours: 24, keepHours: 72 } },
   usage: { intervalHours: 1, deadlineSeconds: 120 },
   intake: { intervalSeconds: 300 },
   remediation: { enabled: false, port: 8081 },

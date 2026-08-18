@@ -68,6 +68,7 @@ const CONFIG: RunnerConfig = {
     secretRef: "caterpillar-github-app",
   },
   paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+  workspace: { reap: { intervalHours: 24, keepHours: 72 } },
   usage: { intervalHours: 1, deadlineSeconds: 120 },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
@@ -145,6 +146,15 @@ test("the runner export carries what an operator actually needs", async () => {
   assert.equal(exported.llm.auth, "subscription");
   assert.equal(exported.limits.maxSessionsPerTask, 20);
   assert.equal(exported.toolchain.nixpkgs, "github:NixOS/nixpkgs/abc");
+  // Exported for the same reason the store's gc numbers are: an operator looking at a full
+  // volume needs both halves of the janitor without knowing which one they are after.
+  //
+  // The field is optional on the TYPE so the viewer can render a runner of the previous
+  // vintage (`view.ts`), which makes this assertion the one that pins the other half: an
+  // export taken from a live config here always carries it.
+  assert.notEqual(exported.workspace, undefined, "a local export always states its reaping");
+  assert.equal(exported.workspace?.reap.intervalHours, 24);
+  assert.equal(exported.workspace?.reap.keepHours, 72);
   assert.equal(exported.stateRepo.branch, "main");
   assert.deepEqual(exported.workspaces[0]?.forge, {
     kind: "github",
