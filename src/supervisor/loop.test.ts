@@ -3280,13 +3280,18 @@ test("the survey publishes thread bindings for a bot that is not in this process
 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
-  for (let attempt = 0; attempt < 100 && (await published.read()).length === 0; attempt += 1) {
+  // Generous, and generous on purpose: the first survey is behind a git fetch against a
+  // real remote, and this file runs alongside every other suite. A tight budget here fails
+  // as "the binding was never published" when the truth is "the machine was busy", which is
+  // the least useful failure a test can produce.
+  for (let attempt = 0; attempt < 1000 && (await published.read()).length === 0; attempt += 1) {
     await sleep(10);
   }
   controller.abort();
   await running.catch(() => undefined);
 
   const bindings = await published.read();
+  assert.notEqual(bindings.length, 0, "the survey never published any thread binding");
   assert.deepEqual(
     bindings.find((binding) => binding.task === BOUND),
     { threadId: "1537785980415778816", task: BOUND },
