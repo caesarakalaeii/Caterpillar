@@ -104,12 +104,26 @@ export interface LiveSummary {
   readonly messages: number;
 }
 
+/** A live session, tagged with the process that is running it. */
+export interface RunnerLive extends LiveSummary {
+  readonly runner: string;
+}
+
 export interface FleetView {
   readonly tasks: readonly TaskRow[];
   readonly counts: Readonly<Partial<Record<TaskStatus, number>>>;
   readonly runners: readonly RunnerRow[];
-  /** What this runner is doing right now, if anything. */
-  readonly live?: LiveSummary;
+  /**
+   * Sessions in flight, one entry per process that is running one.
+   *
+   * A LIST, and that is the shape change the fleet of four forced. `live?: LiveSummary`
+   * was correct while the view ran inside the one supervisor that could answer for itself;
+   * behind a load-balancing Service it became "whichever pod answered this request", and a
+   * refresh showed a different one. An aggregating viewer asks every replica, so the
+   * honest answer is N sessions rather than one at random — and a single runner serving
+   * this from its own memory simply reports a list of at most one.
+   */
+  readonly live: readonly RunnerLive[];
   /**
    * When intake last ran HERE and what it found (§14, §18).
    *
@@ -314,17 +328,19 @@ export const fleet = async (options: FleetOptions): Promise<FleetView> => {
     counts,
     runners: runnerRows(rows, runnerId),
     ...(pass === undefined ? {} : { intake: pass }),
-    ...(current === undefined
-      ? {}
-      : {
-          live: {
-            task: current.task,
-            session: current.session,
-            model: current.model,
-            startedAt: current.startedAt,
-            messages: current.messages.length,
-          },
-        }),
+    live:
+      current === undefined
+        ? []
+        : [
+            {
+              runner: runnerId,
+              task: current.task,
+              session: current.session,
+              model: current.model,
+              startedAt: current.startedAt,
+              messages: current.messages.length,
+            },
+          ],
   };
 };
 

@@ -238,7 +238,7 @@ test("the intake page says whether anything is listening for an alert at all", a
 });
 
 test("the fleet page carries one line saying when intake last ran", async () => {
-  const base: FleetView = { tasks: [], counts: {}, runners: [] };
+  const base: FleetView = { tasks: [], counts: {}, runners: [], live: [] };
 
   assert.match(render(fleetPage(base)), /no pass on this runner yet/);
 

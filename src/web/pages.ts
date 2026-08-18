@@ -97,18 +97,16 @@ export const fleetPage = (view: FleetView): Html => html`<main>
     <p class="sub">Every task the state repo knows about, and which runner is holding it.</p>
   </div>
 
-  ${
-    view.live === undefined
-      ? raw("")
-      : html`<div class="banner">
-          <span class="status" data-status="running"><span>session ${view.live.session}</span></span>
-          <span>
-            <a href="/tasks/${view.live.task}">${view.live.task}</a> is running here on
-            ${view.live.model} · ${view.live.messages} messages · started
-            <time datetime="${view.live.startedAt}">${view.live.startedAt}</time>
-          </span>
-        </div>`
-  }
+  ${view.live.map(
+    (live) => html`<div class="banner">
+      <span class="status" data-status="running"><span>session ${live.session}</span></span>
+      <span>
+        <a href="/tasks/${live.task}">${live.task}</a> is running on ${live.runner}
+        (${live.model}) · ${live.messages} messages · started
+        <time datetime="${live.startedAt}">${live.startedAt}</time>
+      </span>
+    </div>`,
+  )}
 
   <section>
     ${intakeLine(view)}

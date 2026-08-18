@@ -225,7 +225,12 @@ test("the live session is attached to the task it belongs to", async () => {
   live.record({ role: "user", content: "go", timestamp: 0 });
 
   const view = await fleet({ store: subject, live, runnerId: "pod-7f3a" });
-  assert.equal(view.live?.task, "TASK-1");
+  // A LIST since the fleet grew past one replica: a single runner answering for itself
+  // reports at most one entry, and the aggregating viewer unions them across replicas.
+  assert.deepEqual(
+    view.live.map((entry) => `${entry.runner}:${entry.task}`),
+    ["pod-7f3a:TASK-1"],
+  );
 
   const detail = await taskDetail(subject, asTaskId("TASK-1"), live);
   assert.equal(detail?.live?.entries.length, 1, "the in-flight messages render like a stored one");
