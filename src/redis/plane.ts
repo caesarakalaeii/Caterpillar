@@ -74,6 +74,17 @@ export interface EphemeralPlane {
   readonly threads: ThreadBindingStore;
   /** True when a Redis client is behind the structures above. For logs and the web view. */
   readonly backed: boolean;
+  /**
+   * The client itself, present only when `backed`.
+   *
+   * Deliberately the LAST resort and not a general escape hatch. It exists for the
+   * standalone bot's chat lock (`notify/leadership.ts`), which needs the compare-and-swap
+   * trio — those are properties of the connection rather than of any structure, so there
+   * is no structure to put them behind. Anything that fits one of the five above must use
+   * that instead: reaching for a raw client is how the narrow interface stops being
+   * narrow, and with it goes the property that the whole suite runs with nothing on 6379.
+   */
+  readonly client?: RedisClient;
   /** Present only when NOT `backed` — there is no Redis equivalent to hand back. */
   readonly inbox?: ChatInbox;
   readonly tasks?: TaskSnapshot;
@@ -118,6 +129,7 @@ export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane =
   cancels: new RedisCancelSignals({ redis, logger }),
   threads: new RedisThreadBindings({ redis, logger }),
   backed: true,
+  client: redis,
   close: (): Promise<void> => redis.close(),
 });
 
