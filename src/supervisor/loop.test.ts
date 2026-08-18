@@ -17,6 +17,7 @@ import {
   asTaskId,
   asWorkspaceName,
   EMPTY_USAGE,
+  isTerminal,
   type RunnerId,
   type SessionOutcome,
   type TaskId,
@@ -359,7 +360,14 @@ test("a notification that fails does not undo a task that finished", async () =>
   while (Date.now() < deadline) {
     const state = await pushedState(DONE_TASK);
     const held = await new Git(origin).tryRun("show-ref", "--verify", leaseRef(DONE_TASK));
-    if (state !== undefined && state.status !== "ready" && held.code !== 0) {
+    // TERMINAL, not merely "no longer ready". `running` is pushed on the way in, and the
+    // lease ref is absent for a moment before the claim creates it as well as after the
+    // session drops it — so "not ready and unleased" also describes the instant before
+    // the session starts. Under load the poll lands in that window, settles on `running`,
+    // and the assertion below fails 3s into a 30s budget: an early observation, not a
+    // timeout. Waiting for a terminal status is what the surrounding comment already
+    // means by "after every write the supervisor is going to make".
+    if (state !== undefined && isTerminal(state.status) && held.code !== 0) {
       settled = state;
       break;
     }
@@ -498,6 +506,7 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
   await seedTask(STUBBORN, { pr: { number: 9, url: "https://example.invalid/pr/9" } });
 
   let convened = 0;
+  let convenedWhenParked: number | undefined;
   const council: Council = {
     reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
     review: () => {
@@ -559,6 +568,14 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
     const state = await pushedState(STUBBORN);
     if (state?.status === "parked") {
       settled = state;
+      // Sampled WITH the state, not read after the loop stops. `convened` is a live
+      // counter and `settled` is a snapshot, so reading them at different moments lets
+      // them describe different instants: `abort()` is only a request — `workLoop` tests
+      // the signal between iterations, so a pass already inside `workOnce` runs on. Under
+      // load that pass can convene the council again between the observation here and the
+      // assertions below, which is why this failed as `4 !== 2` while the two assertions
+      // about `settled` — taken from the snapshot — still passed.
+      convenedWhenParked = convened;
       break;
     }
     await sleep(100);
@@ -569,7 +586,7 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
 
   assert.equal(settled?.status, "parked", "a task the council keeps rejecting must not run forever");
   assert.equal(settled?.review?.rounds, 2, "the round cap is what stops it");
-  assert.equal(convened, 2, "the council must be convened once per completion claim");
+  assert.equal(convenedWhenParked, 2, "the council must be convened once per completion claim");
 
   // The verdict is a document, not just a log line: the next session reads the journal,
   // and a human reads the file.
@@ -773,6 +790,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
   await seedTask(SLOW, { pr: { number: 11, url: "https://example.invalid/pr/11" } });
 
   let convened = 0;
+  let convenedWhenDone: number | undefined;
   const council: Council = {
     reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
     review: async () => {
@@ -835,6 +853,13 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
     const state = await pushedState(SLOW);
     if (state?.status === "done") {
       settled = state;
+      // Sampled WITH the state. `abort()` only asks the loop to stop between iterations,
+      // so a pass already inside `workOnce` runs on and can convene the council again
+      // after `done` was observed — reading this live after `await running` measured a
+      // later instant than `settled` did. The regression this test guards still fails
+      // it: a push lost during the review re-claims the task and convenes a second
+      // council BEFORE `done` ever appears, so the count is already 2 when sampled here.
+      convenedWhenDone = convened;
       break;
     }
     await sleep(100);
@@ -851,7 +876,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
   );
   assert.equal(settled?.review?.last, "pass", "the council's own state write must survive");
   assert.equal(
-    convened,
+    convenedWhenDone,
     1,
     "one completion claim convenes one council — re-convening means the push was lost and " +
       "the task got re-claimed",
@@ -1198,7 +1223,22 @@ test("the runner says when the provider came back, once", async () => {
 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
-  await sleep(5_000);
+
+  // Waiting for the SECOND provider notification rather than for a fixed five seconds.
+  // The sequence under test costs a session, a cooldown and a second session, and a
+  // fixed budget has to guess how long that takes on the busiest machine that will ever
+  // run it — guess low and the recovery has simply not been announced yet, which failed
+  // here as `['provider-unavailable']` against the expected pair. Polling for the
+  // condition ends as soon as it holds, so the fast path stays fast, and a recovery that
+  // never comes still fails the assertion below rather than hanging.
+  const deadline = Date.now() + 30_000;
+  while (
+    Date.now() < deadline &&
+    notifications.filter((kind) => kind.startsWith("provider-")).length < 2
+  ) {
+    await sleep(50);
+  }
+
   controller.abort();
   await running.catch(() => undefined);
 
@@ -2270,7 +2310,18 @@ test("a task that is done has its worktree reaped", async () => {
   controller.abort();
   await running.catch(() => undefined);
 
-  assert.deepEqual(reaped, [REAPED], "a finished task's worktree must be thrown away");
+  // WHICH task was reaped, not how many times. The reap of a terminal task runs from the
+  // idle branch of every poll, and `recordingReaper` only records — unlike the real
+  // reaper it never removes the directory, so the task stays reapable and a second idle
+  // poll records it again. `abort()` does not close that window either: `workLoop` tests
+  // the signal between iterations, so a pass already inside `workOnce` runs to
+  // completion. An exact-length assertion therefore encodes the poll timing rather than
+  // the behaviour, and fails under load for a reason that says nothing about the code.
+  assert.deepEqual(
+    [...new Set(reaped)],
+    [REAPED],
+    "a finished task's worktree must be thrown away, and no other task's",
+  );
 });
 
 test("a handoff keeps its worktree — the next session resumes in it", async () => {
