@@ -57,6 +57,7 @@ import type { WorkspaceUsage } from "../workspace/usage.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
+import type { IntakeStatus } from "../intake/status.ts";
 import type { AlertPass } from "../remediation/queue.ts";
 import type { FiringAlert } from "../remediation/receiver.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
@@ -186,6 +187,12 @@ export interface SupervisorDeps {
    * fed only by hand-committed specs (§14.4), does not need it.
    */
   readonly intake?: Intake;
+  /**
+   * Where the last pass's counts are remembered for the web view (§18). Optional and
+   * purely observational — nothing in the loop reads it back, and a runner without one
+   * ingests exactly as it did before this existed.
+   */
+  readonly intakeStatus?: IntakeStatus;
   /**
    * The daily digest (§19). Optional, and off by default: a digest is published to a
    * shared channel and a shared repo, so a runner has to be told to publish one.
@@ -445,6 +452,15 @@ export class Supervisor {
 
     if (claimed === undefined) {
       logger.debug("intake.claimed-elsewhere", { ref });
+      // Recorded, not silently dropped. With four replicas three of them lose the claim
+      // every interval, and a page that showed nothing for them would say "intake has
+      // never run here" about a fleet ingesting perfectly well.
+      this.deps.intakeStatus?.record({
+        at: new Date().toISOString(),
+        ref,
+        runner: config.runnerId,
+        outcome: "claimed-elsewhere",
+      });
       return;
     }
 
@@ -454,9 +470,27 @@ export class Supervisor {
       // so hiding it makes a working intake and a broken one look identical from the logs.
       // `seen` is what separates them — it distinguishes "nobody labelled anything" from
       // "the tracker returned items and none became tasks".
-      logger.info("intake.pass", { ...(await intake.ingest("origin", config.stateRepo.branch)) });
+      const pass = await intake.ingest("origin", config.stateRepo.branch);
+      logger.info("intake.pass", { ...pass });
+      this.deps.intakeStatus?.record({
+        ...pass,
+        at: new Date().toISOString(),
+        ref,
+        runner: config.runnerId,
+        outcome: "ingested",
+      });
     } catch (error) {
       logger.warn("intake.failed", { ...errorFields(error) });
+      // No counts on a failure, rather than zeroes: a pass that threw part-way through
+      // knows neither how many items it saw nor how many it would have refused, and
+      // zeroes would render as "the tracker had nothing to say".
+      this.deps.intakeStatus?.record({
+        at: new Date().toISOString(),
+        ref,
+        runner: config.runnerId,
+        outcome: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 

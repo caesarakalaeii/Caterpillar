@@ -34,6 +34,7 @@ import { GitError, type Git } from "./git.ts";
 import {
   asTaskId,
   asWorkspaceName,
+  isTaskId,
   isTerminal,
   parseRepoRef,
   type Capability,
@@ -69,6 +70,38 @@ export interface AlertRefusal {
   readonly task?: TaskId;
   /** Stamped by the writer, for an operator wondering how long this has been so. */
   readonly at?: string;
+}
+
+/**
+ * Why intake refused one tracker item (DESIGN.md §14.2).
+ *
+ * `digest` is the suppression key and the ONLY field whose meaning is load-bearing: a
+ * record whose digest still matches the item means "already told them, say nothing".
+ * Everything else is decoration for a human reading `/intake`, and every one of those
+ * fields is OPTIONAL — records written before they existed have none, and a reader that
+ * required them would treat every one of them as unreadable and re-comment on the first
+ * poll after a deploy. That is the exact tracker spam §14.2 exists to prevent, so the
+ * shape widens and never narrows.
+ *
+ * `url`, `title` and `workspace` are here because the task id cannot be turned back into
+ * any of them: `GH-caesarakalaeii-all-chat-724` does not say where the owner ends and the
+ * repo begins, so a page keyed on these records could otherwise show a reason and no link
+ * to the thing being refused.
+ */
+export interface IntakeRejection {
+  readonly digest: string;
+  readonly reason: string;
+  /** Stamped by the writer. Absent on records written before it was stamped. */
+  readonly at?: string;
+  /** The tracker item's web URL, for a page that wants to link to what was refused. */
+  readonly url?: string;
+  readonly title?: string;
+  readonly workspace?: string;
+}
+
+/** A rejection record together with the task id its file name encodes. */
+export interface IntakeRejectionRecord extends IntakeRejection {
+  readonly task: TaskId;
 }
 
 const FRONT_MATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
@@ -391,21 +424,45 @@ export class StateStore {
    * tracker, and Keel rolls the pod on every push to main. An in-memory set would
    * re-comment on every deploy for every malformed item.
    */
-  async readIntakeRejection(
-    task: TaskId,
-  ): Promise<{ readonly digest: string; readonly reason: string } | undefined> {
+  async readIntakeRejection(task: TaskId): Promise<IntakeRejection | undefined> {
     const path = this.intakePath(task);
     if (!existsSync(path)) return undefined;
-    return JSON.parse(await readFile(path, "utf8")) as {
-      readonly digest: string;
-      readonly reason: string;
-    };
+    return JSON.parse(await readFile(path, "utf8")) as IntakeRejection;
   }
 
-  async writeIntakeRejection(
-    task: TaskId,
-    record: { readonly digest: string; readonly reason: string },
-  ): Promise<void> {
+  /**
+   * Every intake refusal on disk, newest-looking last, for the `/intake` page.
+   *
+   * The mirror of `listAlertRefusals`, and defensive in the same way and for the same
+   * reason: one unreadable record must not cost the whole listing. Here the stakes are
+   * lower — this feeds a page rather than a rate limit — but the failure mode is worse to
+   * diagnose, because a page that renders nothing looks exactly like a fleet nobody has
+   * given work to.
+   *
+   * The task id comes from the FILE NAME and is validated before it is trusted: these
+   * files are written by this process, but a page that turned any string on disk into a
+   * `/tasks/<id>` link would be one bad file away from a path it should not build.
+   */
+  async listIntakeRejections(): Promise<readonly IntakeRejectionRecord[]> {
+    const dir = join(this.root, "intake");
+    if (!existsSync(dir)) return [];
+
+    const out: IntakeRejectionRecord[] = [];
+    for (const name of (await readdir(dir)).sort()) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      if (!isTaskId(id)) continue;
+      try {
+        const record = JSON.parse(await readFile(join(dir, name), "utf8")) as IntakeRejection;
+        out.push({ ...record, task: asTaskId(id) });
+      } catch {
+        continue;
+      }
+    }
+    return out;
+  }
+
+  async writeIntakeRejection(task: TaskId, record: IntakeRejection): Promise<void> {
     await mkdir(join(this.root, "intake"), { recursive: true });
     await writeFile(
       this.intakePath(task),
