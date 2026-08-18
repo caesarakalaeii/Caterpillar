@@ -18,7 +18,8 @@ import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
-import { Ingester } from "./intake/ingest.ts";
+import { Ingester, type IntakeObserver } from "./intake/ingest.ts";
+import { IntakeStatus } from "./intake/status.ts";
 import { FileCredentialStore } from "./llm/credentials.ts";
 import { HOLDER_TOKEN_ENV, HttpCredentialStore } from "./llm/credential-client.ts";
 import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
@@ -148,6 +149,11 @@ const main = async (): Promise<void> => {
   // web view, and empty at every other moment (DESIGN.md §18).
   const live = new LiveSession();
 
+  // When intake last ran here and what it found (§14, §18). In memory, like `live`: a
+  // pass that mattered is already durable as a task or a refusal record, and a heartbeat
+  // committed every interval is the runner registry §18 rejected twice.
+  const intakeStatus = new IntakeStatus();
+
   // ONE resolver for the whole process. The agent's shell, the council's, the plan
   // maintainer's and the acceptance gate's must be the same environment or the gate grades
   // work against a shell the agent never saw (see workspace/toolchain.ts).
@@ -262,6 +268,7 @@ const main = async (): Promise<void> => {
     helperPath: CRED_HELPER,
     socketPath: CRED_SOCKET,
     identity: config.identity,
+    reap: config.workspace.reap,
   });
 
   const credentials = new CredentialService();
@@ -345,6 +352,9 @@ const main = async (): Promise<void> => {
       ...(cluster === undefined ? {} : { cluster }),
     }),
     toolchain,
+    // The same manager every other consumer holds, but only the loop is given it under a
+    // name that can delete: it owns the one moment a worktree is safe to remove (§2).
+    worktrees,
     usage,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
@@ -375,8 +385,10 @@ const main = async (): Promise<void> => {
       trackers,
       scopes,
       logger,
+      metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
     }),
+    intakeStatus,
     // The fifth intake path (§20). Present whether or not the receiver is listening: the
     // drain is a no-op on an empty queue, and wiring it conditionally would mean an alert
     // accepted by a receiver started later had nowhere to go.
@@ -393,7 +405,7 @@ const main = async (): Promise<void> => {
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
-  const stopWeb = startWebView({ config, store, live, ring, logger, usage });
+  const stopWeb = startWebView({ config, store, live, ring, logger, usage, intakeStatus });
   const stopReceiver = await startAlertReceiver({
     config,
     sink: alertQueue,
@@ -576,6 +588,7 @@ const startWebView = (options: {
   readonly ring: LogRing;
   readonly logger: Logger;
   readonly usage: UsageMonitor;
+  readonly intakeStatus: IntakeStatus;
 }): (() => void) => {
   const { web } = options.config;
   if (!web.enabled) {
@@ -675,6 +688,18 @@ const startAlertReceiver = async (options: {
  */
 const alertObserver = (metrics: AgentMetrics): AlertObserver => ({
   observe: (alertname, outcome) => metrics.alerts.inc({ alertname, outcome }),
+});
+
+/**
+ * The intake counters, as `Ingester` sees them.
+ *
+ * The same adapter shape as `alertObserver` directly above, deliberately: the two intake
+ * paths that are not a human committing a spec should report themselves the same way, and
+ * neither ingester should have to know that a counter is a `Map` keyed on sorted labels.
+ */
+const intakeObserver = (metrics: AgentMetrics): IntakeObserver => ({
+  observe: (workspace, outcome) => metrics.intake.inc({ workspace, outcome }),
+  items: (workspace, seen) => metrics.intakeItems.set({ workspace }, seen),
 });
 
 /**

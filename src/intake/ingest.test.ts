@@ -7,11 +7,12 @@
  * TWICE and asserts on what the second pass did.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { asWorkspaceName, type TaskId, type TrackerRef, type WorkspaceName } from "../domain/task.ts";
+import { asTaskId, asWorkspaceName, type TaskId, type TrackerRef, type WorkspaceName } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
@@ -385,4 +386,74 @@ test("the intake ref lives under refs/intake, away from leases and digests", () 
   // Shares the compare-and-swap with them but must not share a namespace: a bucket number
   // colliding with a task id would make one silently claim the other.
   assert.match(intakeRef(1_700_000_000_000, 300), /^refs\/intake\/\d+$/);
+});
+
+test("a refusal record carries what a page needs to link to the item", async () => {
+  // `GH-acme-widget-12` cannot be turned back into a URL: it does not say where the owner
+  // ends and the repo begins. Without these fields `/intake` shows a reason and no link to
+  // the thing being refused.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item("Please just fix it.")]);
+  await ingesterFor(store, new Map([[WORKSPACE, tracker]])).ingest("origin", "main");
+
+  const record = await store.readIntakeRejection(asTaskId("GH-acme-widget-12"));
+  assert.equal(record?.url, "https://github.com/acme/widget/issues/12");
+  assert.equal(record?.title, "Fix the widget");
+  assert.equal(record?.workspace, "caesar");
+});
+
+test("adding the page's fields does not re-comment on an item already refused", async () => {
+  // The reason those fields are OPTIONAL rather than required. The digest is the
+  // suppression key and covers the item's title and body — not the record's shape — so a
+  // record written by the previous build must still silence the item on the first pass
+  // after a deploy. Keel rolls the pod on every push to main, so "the first pass after a
+  // deploy" is every push.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item("Please just fix it.")]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
+
+  // Exactly what the shipped writer produced: digest, reason, at. Nothing else.
+  const digest = createHash("sha256")
+    .update(`${item("Please just fix it.").title}\n\n${"Please just fix it."}`)
+    .digest("hex");
+  await store.writeIntakeRejection(asTaskId("GH-acme-widget-12"), {
+    digest,
+    reason: "written by an older build",
+  });
+
+  const pass = await subject.ingest("origin", "main");
+  assert.equal(pass.rejected, 0, "an unchanged item is still suppressed");
+  assert.deepEqual(tracker.comments, []);
+});
+
+test("every decision reaches the observer, so Grafana can count them", async () => {
+  // Intake had no metric at all: a labelled issue that never became a task was a warn line
+  // in one pod's stdout while every other path had a counter.
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID, "12"), item("Please just fix it.", "13")]);
+  const observed: string[] = [];
+  const items: number[] = [];
+
+  const subject = new Ingester({
+    store,
+    trackers: new Map([[WORKSPACE, tracker]]),
+    scopes: new Map([[WORKSPACE, { host: "github.com" }]]),
+    logger: SILENT_LOGGER,
+    maxSessionsPerTask: 20,
+    metrics: {
+      observe: (workspace, outcome) => observed.push(`${workspace}:${outcome}`),
+      items: (_workspace, seen) => items.push(seen),
+    },
+  });
+
+  await subject.ingest("origin", "main");
+  assert.deepEqual(observed.sort(), ["caesar:created", "caesar:rejected"]);
+  assert.deepEqual(items, [2]);
+
+  // The second pass is the normal case: the created task is skipped and the refused one is
+  // suppressed, and `skipped` must be its own outcome rather than folded into either.
+  observed.length = 0;
+  await subject.ingest("origin", "main");
+  assert.deepEqual(observed, ["caesar:skipped", "caesar:skipped"]);
+  assert.deepEqual(items, [2, 2], "the gauge is published even when nothing changes");
 });

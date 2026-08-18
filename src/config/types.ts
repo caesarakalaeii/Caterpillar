@@ -180,6 +180,44 @@ export interface UsageConfig {
 }
 
 /**
+ * When this runner throws a finished task's worktree away — DESIGN.md §3.1, and the
+ * `Workspace` row of §2.
+ *
+ * The mirror of `ToolchainConfig.gcIntervalHours` / `gcKeepDays`, and it exists because
+ * the store had a collector and the worktrees did not. A worktree is the thing that
+ * actually grows per task — a checkout plus `node_modules` plus build output, per repo the
+ * task declares — and every task ever run left one behind on a 20Gi ReadWriteOnce volume,
+ * per replica, forever. The nix store was being collected daily next to a directory nobody
+ * ever swept.
+ *
+ * Two knobs rather than one because there are two removals with different triggers. The
+ * targeted one fires the moment a task reaches a state it will not resume from in place
+ * and needs no configuration at all. `keepHours` governs only the SWEEP — the safety net
+ * for the pod that was killed before the targeted removal could run — and it is an age
+ * bound for the same reason `--delete-older-than` is: the thing worth keeping is whatever
+ * a task touched recently, and that is what an age expresses.
+ */
+export interface WorktreeReapConfig {
+  /** Hours between sweeps of `paths.tasks`. Only ever runs on an idle poll. */
+  readonly intervalHours: number;
+  /**
+   * Hours a worktree directory survives after its last modification with no live task
+   * claiming it.
+   *
+   * Generous by default, and deliberately not zero: a task that parked awaiting a human
+   * keeps its worktree so the session that answers the question does not re-clone and
+   * re-install, and a runner that crashed mid-session may re-claim the same task within
+   * minutes. The sweep is a backstop against leaks, not a second scheduler.
+   */
+  readonly keepHours: number;
+}
+
+/** How this runner manages the per-task checkouts on its PVC. */
+export interface WorkspaceConfig {
+  readonly reap: WorktreeReapConfig;
+}
+
+/**
  * How the runner authenticates to the model provider (DESIGN.md §9.6).
  *
  * `proxy` — the in-cluster proxy holds the provider credential.
@@ -290,6 +328,31 @@ export interface ToolchainConfig {
    * editing a string is exactly the accident worth preventing.
    */
   readonly trustedPublicKeys: readonly string[];
+  /**
+   * Free space on the store's filesystem, in GiB, below which nix collects MID-BUILD
+   * until `maxFreeGb` is available again. 0 disables it. DESIGN.md §8.1.
+   *
+   * **This is the store's only real quota, and it has to be, because the manifests look
+   * like they say otherwise.** A `volumeClaimTemplate` requesting 15Gi under `local-path`
+   * is a scheduling request and not a limit: the provisioner hands out a directory on the
+   * node's own filesystem and enforces nothing. A store that grows to 60Gi fills the node
+   * and takes every other pod on it down with it. No storage class here would enforce it,
+   * and `ephemeral-storage` limits do not cover a PersistentVolume.
+   *
+   * Measured against the NODE rather than the volume, deliberately: four replicas' volumes
+   * share one disk with everything else scheduled there, so per-store ceilings that are
+   * each individually fine still add up to a full node.
+   */
+  readonly minFreeGb: number;
+  /**
+   * How much free space an automatic collection aims to leave, in GiB. Must exceed
+   * `minFreeGb` or nix collects on every build.
+   *
+   * The gap between the two is the hysteresis. Too narrow and a big substitution
+   * re-triggers a collection it just paid for; this is why it is a separate number rather
+   * than a multiple of `minFreeGb`.
+   */
+  readonly maxFreeGb: number;
 }
 
 /**
@@ -359,6 +422,7 @@ export interface RunnerConfig {
   readonly toolchain: ToolchainConfig;
   readonly stateRepo: StateRepoConfig;
   readonly paths: WorkspacePathsConfig;
+  readonly workspace: WorkspaceConfig;
   readonly usage: UsageConfig;
   readonly lease: LeaseConfig;
   readonly handoff: HandoffConfig;

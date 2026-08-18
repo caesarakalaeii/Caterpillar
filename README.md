@@ -128,7 +128,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
-| `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
+| `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees, and reaping the finished ones (§3.1). |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
 | `src/workspace/usage.ts` | What is on the work volume, by category. Read-only, idle-only (§11). |
 | `src/llm/credentials.ts` | The rotating OAuth credential as a locked file (§9.6). |
@@ -175,6 +175,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/web/transcript.ts` | A pi transcript → renderable turns. Pure, no IO (§18). |
 | `src/web/pages.ts` | The pages. Given a view model, returns HTML (§18). |
 | `src/web/server.ts` | Routing, security headers, and the `GET`/`HEAD`-only gate (§18). |
+| `src/view/discovery.ts` | Which runners exist, from the headless Service's SRV record. No kube API (§18). |
+| `src/view/fanout.ts` | One GET per runner, forwarding the identity, reporting the failures (§18). |
+| `src/view/aggregate.ts` | Four runners' answers merged into one page (§18). |
+| `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
 | `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
@@ -292,11 +296,21 @@ awkward, the change is probably wrong.
 ## The web view
 
 A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Authelia —
-what is running where, the runner's own log, the messages of the session in flight, every
+what is running where, the fleet's logs, the messages of the sessions in flight, every
 stored transcript, and each task's spec, journal, questions, council verdicts and
-artifacts. It runs inside the supervisor process, on its own port, because the two things
-it exists for — this process's log and this process's live session — are in memory and not
-in git until later (§18).
+artifacts. `/intake` is where a **refusal** shows up: a labelled item that could not become
+a task, an alert that fired with no policy entry, and whether the alert receiver is
+listening at all.
+
+Every runner serves it on its own port, in-cluster. In front of them sits
+**`caterpillar-view`** — the same image with a different command — which discovers the ready
+pods through the headless Service and **aggregates**: task data from the first healthy
+responder, because the state repo is identical everywhere, and the live sessions and log
+rings unioned across all of them, because those exist in one process's memory each. A
+replica that does not answer is rendered as unreachable next to its name rather than
+dropped, since a missing runner reads as an idle one. It holds no credential, no volume and
+no ServiceAccount token, and it forwards the `Remote-User` header it received rather than
+asking the runners to relax their own check (§18).
 
 It is off unless a runner is told otherwise:
 
@@ -310,6 +324,13 @@ header — it is a fail-closed check on an Ingress whose forward-auth annotation
 dropped, which would otherwise publish every transcript and look like a working deployment.
 
 Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
+
+The viewer, locally, against runners you name yourself:
+
+```sh
+VIEW_RUNNERS=one=http://localhost:8080 VIEW_REQUIRE_FORWARDED_USER=false \
+  VIEW_PORT=8090 npm run start:view
+```
 
 ## Where the disk went
 
@@ -612,7 +633,25 @@ because one object configures the runners and the holder:
 },
 "toolchain": {
   "substituters": ["http://caterpillar-nix-cache/"],
-  "trustedPublicKeys": []        // none needed: the proxy passes upstream signatures through
+  "trustedPublicKeys": [],       // none needed: the proxy passes upstream signatures through
+  "minFreeGb": 8,                // below this much free on the NODE, nix collects mid-build
+  "maxFreeGb": 25                // …until this much is free again
+}
+```
+
+The third thing a fleet needs is the one nobody configures, because it defaults to on: each
+replica **reaps its own task worktrees**. A worktree is a full checkout plus whatever a
+session installs into it, per repo the task declares, and until this existed nothing ever
+removed one — so a replica's 20Gi volume grew monotonically with every task it had ever
+worked. The supervisor removes a task's checkout when it is done, when it failed, or when it
+loses the lease to another replica; a sweep from the idle poll catches whatever a killed pod
+left behind. Tasks that hand off or are waiting on a human keep their checkout, so answering
+a question does not cost a re-clone. Both numbers are tunable and neither usually needs to
+be:
+
+```jsonc
+"workspace": {
+  "reap": { "intervalHours": 24, "keepHours": 72 }
 }
 ```
 
@@ -627,6 +666,22 @@ per-account rate limit**, which is shared with your own interactive usage. The f
 degrades rather than failing tasks when it is hit (§6.3), but many replicas contending for
 one subscription mostly produces many runners in cooldown. Scaling *down* leaves the claims
 behind — Kubernetes never deletes a StatefulSet's volumes.
+
+> **A volume's requested size is not a quota, and this is the trap.** Under `local-path` a
+> PVC is a directory on the node's own filesystem; the 15Gi request schedules the pod and
+> the provisioner enforces nothing. A nix store that grows to 60Gi does not get ENOSPC at
+> 15 — it fills the **node** and takes every other pod on it down. No storage class here
+> behaves differently, and `ephemeral-storage` limits do not cover a PersistentVolume.
+>
+> `minFreeGb`/`maxFreeGb` above are the real bound: below `minFreeGb` free on the node's
+> disk, nix collects **mid-build** until `maxFreeGb` is free. Measured against the node
+> rather than the volume on purpose — replicas share a disk, so per-store ceilings that are
+> each individually fine still add up to a full node. It bounds *growth*, which is the only
+> time a store gets bigger; `gcKeepDays` still decides what is worth keeping. On by default
+> at 5/20, because an unbounded store is how a runner takes down the machine it is on and
+> a workstation is no different. `minFreeGb: 0` turns it off.
+>
+> The **work** volume is bounded separately, by worktree reaping (§3.1).
 
 ## Who the fleet commits as
 

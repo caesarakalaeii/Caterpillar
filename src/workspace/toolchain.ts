@@ -149,7 +149,7 @@ export class ToolchainResolver {
     this.logger = options.logger;
     this.config = options.config;
     this.tasksDir = options.tasksDir;
-    this.baseEnv = withBinaryCaches(options.baseEnv ?? process.env, options.config);
+    this.baseEnv = withNixSettings(options.baseEnv ?? process.env, options.config);
     this.repo = options.repo;
   }
 
@@ -563,7 +563,7 @@ interface PrintDevEnv {
  * pin next to the flake it is substituted into.
  */
 /**
- * Fold the configured binary caches into `NIX_CONFIG` (DESIGN.md §8.1).
+ * Fold the binary caches AND the store's disk quota into `NIX_CONFIG` (DESIGN.md §8.1).
  *
  * `NIX_CONFIG` rather than `--option` flags on the one `print-dev-env` call, for three
  * reasons that all matter:
@@ -584,8 +584,36 @@ interface PrintDevEnv {
  * `NIX_CONFIG="experimental-features = nix-command flakes"`, and replacing it turns every
  * flake reference into an error about an experimental feature — a failure that reads as a
  * broken flake rather than as a clobbered variable.
+ *
+ * **`min-free`/`max-free` are the store's only real quota**, and the reason is worth
+ * stating plainly because the manifests LOOK like they say otherwise. A
+ * `volumeClaimTemplate` requesting 15Gi under `local-path` is a SCHEDULING REQUEST, not a
+ * limit: the provisioner hands out a `hostPath` on the node's own filesystem and enforces
+ * nothing, so a store that grows to 60Gi fills the node and takes every other pod on it
+ * down. There is no storage class here that would enforce it, and `ephemeral-storage`
+ * limits do not cover a PersistentVolume.
+ *
+ * So the bound is nix's own automatic collector: when free space on the store's filesystem
+ * falls below `min-free`, nix garbage-collects **mid-build** until `max-free` is available
+ * again. Three properties make this the right instrument rather than a store-size cap:
+ *
+ *   It measures the NODE, which is the thing that actually breaks. Four replicas'
+ *   volumes share one disk with everything else scheduled there, and a per-store ceiling
+ *   that is individually fine can still add up to a full node.
+ *
+ *   It fires while the store is GROWING, not on a timer. `maybeCollectGarbage` runs on the
+ *   idle branch every `gcIntervalHours`; a substitution that adds 4GB in ninety seconds
+ *   happens entirely between two of those.
+ *
+ *   It costs nothing when there is room. The check is a `statvfs` before a build, and it
+ *   collects only when it must — so the age-based pass stays the thing that decides what
+ *   is worth keeping, and this only decides when keeping it stops being affordable.
+ *
+ * The GC roots `print-dev-env --profile` registers still protect a live task's
+ * environment, so an auto-collect cannot delete the toolchain of the session that
+ * triggered it.
  */
-const withBinaryCaches = (
+const withNixSettings = (
   env: NodeJS.ProcessEnv,
   config: ToolchainConfig,
 ): NodeJS.ProcessEnv => {
@@ -595,6 +623,13 @@ const withBinaryCaches = (
   }
   if (config.trustedPublicKeys.length > 0) {
     lines.push(`extra-trusted-public-keys = ${config.trustedPublicKeys.join(" ")}`);
+  }
+  if (config.minFreeGb > 0) {
+    // Bytes, not a suffixed string: nix parses these as plain integers and silently
+    // ignores a value it cannot read, which would leave the quota off while the config
+    // says it is on.
+    lines.push(`min-free = ${config.minFreeGb * 1024 ** 3}`);
+    lines.push(`max-free = ${config.maxFreeGb * 1024 ** 3}`);
   }
   if (lines.length === 0) return env;
 
@@ -618,6 +653,12 @@ export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
   // existed. The cluster fills them in; nothing else has an in-cluster cache to point at.
   substituters: [],
   trustedPublicKeys: [],
+  // ON by default, unlike the caches. A store with no bound is how a runner takes its
+  // whole node down, and that is not a cluster-only hazard — a workstation runner filling
+  // a laptop's disk is the same failure with a shorter fuse. 5/20 GiB suits the smallest
+  // node here (80GB) without being so eager that a normal dotnet closure trips it.
+  minFreeGb: 5,
+  maxFreeGb: 20,
 };
 
 /**

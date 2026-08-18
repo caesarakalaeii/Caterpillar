@@ -15,6 +15,7 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
+import { DEFAULT_REAP_CONFIG as REAP_DEFAULTS } from "../workspace/worktree.ts";
 import { DEFAULT_USAGE_CONFIG as USAGE_DEFAULTS, defaultWorkRoot } from "../workspace/usage.ts";
 import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
 import type {
@@ -68,6 +69,14 @@ interface RawConfig {
     readonly gcKeepDays?: unknown;
     readonly substituters?: unknown;
     readonly trustedPublicKeys?: unknown;
+    readonly minFreeGb?: unknown;
+    readonly maxFreeGb?: unknown;
+  };
+  readonly workspace?: {
+    readonly reap?: {
+      readonly intervalHours?: unknown;
+      readonly keepHours?: unknown;
+    };
   };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
@@ -97,6 +106,37 @@ const num = (value: unknown, field: string, fallback?: number): number => {
     throw new ConfigError(`${field} must be a finite number`);
   }
   return value;
+};
+
+/**
+ * The nix store's disk quota (DESIGN.md §8.1).
+ *
+ * Validated together rather than as two independent numbers, because the ORDER between
+ * them is the setting. `max-free` at or below `min-free` means nix has already met its
+ * target the moment it starts collecting, so it collects on every single build and frees
+ * almost nothing each time — a store that thrashes its garbage collector while still
+ * filling the disk, which reads from outside as "the quota is on and not working".
+ *
+ * Refused at boot rather than corrected, because either number could be the typo and
+ * picking one would be guessing which.
+ */
+const nixFreeSpace = (
+  toolchain: RawConfig["toolchain"],
+): { minFreeGb: number; maxFreeGb: number } => {
+  const minFreeGb = num(toolchain?.minFreeGb, "toolchain.minFreeGb", DEFAULTS.minFreeGb);
+  const maxFreeGb = num(toolchain?.maxFreeGb, "toolchain.maxFreeGb", DEFAULTS.maxFreeGb);
+
+  if (minFreeGb < 0) throw new ConfigError("toolchain.minFreeGb cannot be negative");
+  // 0 is the documented off switch, and off means neither number applies.
+  if (minFreeGb > 0 && maxFreeGb <= minFreeGb) {
+    throw new ConfigError(
+      `toolchain.maxFreeGb (${maxFreeGb}) must exceed toolchain.minFreeGb (${minFreeGb}) — ` +
+        `the gap between them is the hysteresis, and without one nix collects on every ` +
+        `build and frees almost nothing`,
+    );
+  }
+
+  return { minFreeGb, maxFreeGb };
 };
 
 /**
@@ -484,6 +524,25 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         raw.toolchain?.trustedPublicKeys,
         "toolchain.trustedPublicKeys",
       ),
+      ...nixFreeSpace(raw.toolchain),
+    },
+    // The worktree half of the same janitor. Both entirely defaulted, because the numbers
+    // that are right for a 20Gi PVC are right for every runner on one and an operator who
+    // has to tune a garbage collector before the disk stops filling has not been given a
+    // garbage collector.
+    workspace: {
+      reap: {
+        intervalHours: num(
+          raw.workspace?.reap?.intervalHours,
+          "workspace.reap.intervalHours",
+          REAP_DEFAULTS.intervalHours,
+        ),
+        keepHours: num(
+          raw.workspace?.reap?.keepHours,
+          "workspace.reap.keepHours",
+          REAP_DEFAULTS.keepHours,
+        ),
+      },
     },
     stateRepo: {
       url: str(raw.stateRepo?.url, "stateRepo.url"),

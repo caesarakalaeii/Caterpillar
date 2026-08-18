@@ -1,0 +1,250 @@
+/**
+ * Regression tests for two bugs that only surfaced against a real private repo in
+ * the cluster — the unit tests and every live credential check passed while the
+ * mirror path was broken.
+ */
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { Git } from "../state/git.ts";
+import type { RepoRef } from "../domain/task.ts";
+import { WorktreeManager } from "./worktree.ts";
+
+const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
+const roots: string[] = [];
+
+after(async () => {
+  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+});
+
+const scratch = async (): Promise<string> => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-worktree-"));
+  roots.push(root);
+  return root;
+};
+
+const manager = (root: string): WorktreeManager =>
+  new WorktreeManager({
+    git: new Git(root),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketPath: "/run/caterpillar/cred.sock",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+const mirrorDir = (root: string): string =>
+  join(root, "mirrors", REPO.host, REPO.owner, `${REPO.name}.git`);
+
+test("a failed clone leaves no directory behind to poison the next attempt", async () => {
+  // The original bug: syncMirror mkdir'd the target BEFORE cloning, so a clone that
+  // failed (a private repo, anonymously — see the next test) left an empty directory.
+  // Every later call then saw "the directory exists", took the fetch branch, and died
+  // with `not a git repository` — a message describing the symptom, not the cause.
+  // The task was unrecoverable without deleting the path by hand.
+  const root = await scratch();
+
+  await assert.rejects(() => manager(root).syncMirror(REPO));
+  assert.equal(
+    existsSync(mirrorDir(root)),
+    false,
+    "a failed clone must not leave the mirror path behind",
+  );
+});
+
+test("an existing but empty mirror directory is discarded, not fetched into", async () => {
+  // Recovery for a PVC already poisoned by the old code: the check is for HEAD inside
+  // the mirror, not for the directory, so a partial mirror is re-cloned.
+  const root = await scratch();
+  await mkdir(mirrorDir(root), { recursive: true });
+
+  // Still fails (no such remote), but the failure must come from the CLONE, not from
+  // fetching inside a non-repository.
+  await assert.rejects(
+    () => manager(root).syncMirror(REPO),
+    (error: unknown) =>
+      error instanceof Error && !/not a git repository/i.test(error.message),
+  );
+  assert.equal(existsSync(mirrorDir(root)), false);
+});
+
+test("the mirror clone carries the credential helper, not just the repo config", async () => {
+  // The bug that broke the first end-to-end run: `configure` set credential.helper
+  // AFTER cloning, so the clone itself was anonymous. Every private repo failed with
+  // `could not read Username for 'https://github.com'`, and public repos hid it.
+  //
+  // Asserted on the invocation rather than on an error, because "it threw" is true
+  // with or without the fix — the earlier version of this test proved nothing.
+  const root = await scratch();
+  const invocations: (readonly string[])[] = [];
+
+  class RecordingGit extends Git {
+    override async run(...args: readonly string[]): Promise<string> {
+      invocations.push(args);
+      return "";
+    }
+    override at(): Git {
+      return this;
+    }
+    // Both derivation points must fold back to the recorder, or the manager records
+    // nothing: it strips the credential once up front (see the next test).
+    override withoutCredentials(): Git {
+      return this;
+    }
+  }
+
+  const subject = new WorktreeManager({
+    git: new RecordingGit(root),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketPath: "/run/caterpillar/cred.sock",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+  await subject.syncMirror(REPO).catch(() => undefined);
+
+  const clone = invocations.find((args) => args.includes("clone"));
+  assert.ok(clone !== undefined, "syncMirror must clone when no mirror exists");
+
+  const joined = clone.join(" ");
+  assert.match(joined, /credential\.helper=!\/usr\/local\/bin\/caterpillar-cred/);
+  assert.match(joined, /--socket \/run\/caterpillar\/cred\.sock/);
+  assert.match(joined, /credential\.useHttpPath=true/);
+
+  // The overrides must precede the subcommand — `git clone -c ...` is not valid.
+  assert.ok(
+    clone.indexOf("-c") < clone.indexOf("clone"),
+    "-c overrides must come before the subcommand",
+  );
+  // And the token itself must never appear on argv (DESIGN.md §9.2) — the helper
+  // path is passed, the credential is resolved over the socket.
+  assert.ok(!/ghs_|ghp_|x-access-token/.test(joined));
+});
+
+test("the mirror clone does not inherit the supervisor's own credential", async () => {
+  // The bug that produced `remote: Repository not found` on the first real task.
+  // `index.ts` builds ONE Git for the state repo, carrying an http.extraHeader with an
+  // App token scoped to the state repo alone, and passed that same object to
+  // WorktreeManager. `syncMirror` is the one call site that uses it directly instead of
+  // going through `at()`, so `git clone` of a TASK repo authenticated as the state repo.
+  //
+  // GitHub answers a valid-but-unauthorised token with 404 `Repository not found`, NOT
+  // 401 — so git never asks the credential helper at all, and the correct task-scoped
+  // token was never even requested. Against a Codeberg workspace the same bug ships a
+  // GitHub token to a different host.
+  const root = await scratch();
+
+  // The credential provider records every consultation. `Git` only calls it when it is
+  // about to hand the credential to a git process, so a single call is the bug.
+  let consulted = 0;
+  const stateRepoCredential = (): Promise<NodeJS.ProcessEnv> => {
+    consulted += 1;
+    return Promise.resolve({
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "http.extraheader",
+      GIT_CONFIG_VALUE_0: "Authorization: Basic c3RhdGUtcmVwby10b2tlbg==",
+    });
+  };
+
+  const subject = new WorktreeManager({
+    git: new Git(root, process.env, stateRepoCredential),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketPath: "/run/caterpillar/cred.sock",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+  await subject.syncMirror(REPO).catch(() => undefined);
+
+  assert.equal(
+    consulted,
+    0,
+    "the workspace clone must never resolve the supervisor's own git credential",
+  );
+});
+
+test("refreshing a mirror does not fail because a task branch is checked out", async () => {
+  // The bug that parked the second task on a repo two seconds after it was claimed.
+  //
+  // `clone --mirror` configures `+refs/*:refs/*`, so `fetch --prune` tries to write every
+  // remote ref onto the same-named LOCAL ref. Once a task pushes `agent/<task>`, the
+  // remote has it, and the local head of that name is checked out in the task's worktree —
+  // which persists on the PVC after the session ends. git then refuses the entire fetch:
+  //
+  //   fatal: refusing to fetch into branch 'refs/heads/agent/T-1' checked out at ...
+  //
+  // So ONE task pushing broke `syncMirror` for every later task on that repo, forever. It
+  // surfaced as `task.parked` with a git message, which reads as a scheduler fault.
+  const root = await scratch();
+  const origin = join(root, "origin.git");
+  const hermetic = {
+    ...process.env,
+    // A runner must never author from the operator's global config, and a test that reads
+    // it measures the workstation rather than the subject.
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_AUTHOR_NAME: "caterpillar",
+    GIT_AUTHOR_EMAIL: "caterpillar@example.invalid",
+    GIT_COMMITTER_NAME: "caterpillar",
+    GIT_COMMITTER_EMAIL: "caterpillar@example.invalid",
+  };
+  const plain = new Git(root, hermetic);
+
+  await plain.run("init", "--bare", "--initial-branch=main", origin);
+  const seed = join(root, "seed");
+  await plain.run("clone", origin, seed);
+  const seedGit = new Git(seed, hermetic);
+  await writeFile(join(seed, "f"), "one\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "one");
+  await seedGit.run("push", "origin", "HEAD:main");
+
+  // The agent's branch, pushed — the precondition that turns the shared mirror hostile.
+  await seedGit.run("checkout", "-b", "agent/T-1");
+  await writeFile(join(seed, "f"), "two\n");
+  await seedGit.run("commit", "-am", "two");
+  await seedGit.run("push", "origin", "HEAD:refs/heads/agent/T-1");
+
+  // A mirror as `syncMirror` would have left it, pointed at the local origin so the fetch
+  // path runs without a network or a credential.
+  const mirror = mirrorDir(root);
+  await mkdir(join(mirror, ".."), { recursive: true });
+  await plain.run("clone", "--mirror", origin, mirror);
+  const mirrorGit = new Git(mirror, hermetic);
+  await mirrorGit.run("worktree", "add", join(root, "wt"), "agent/T-1");
+
+  // Upstream moves, and so does the agent branch — a merge, or the next session's push.
+  await seedGit.run("checkout", "main");
+  await writeFile(join(seed, "g"), "later\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "later");
+  await seedGit.run("push", "origin", "HEAD:main");
+  const upstreamMain = (await seedGit.run("rev-parse", "HEAD")).trim();
+
+  const agentBefore = await mirrorGit.revParse("refs/heads/agent/T-1");
+
+  // The assertion that matters: this used to throw for every task after the first.
+  await manager(root).syncMirror(REPO);
+
+  assert.equal(
+    (await mirrorGit.revParse("refs/heads/main"))?.trim(),
+    upstreamMain,
+    "the mirror must still pick up upstream history — excluding agent refs must not " +
+      "quietly stop the refresh doing its job",
+  );
+  assert.equal(
+    await mirrorGit.revParse("refs/heads/agent/T-1"),
+    agentBefore,
+    "an agent branch checked out by a worktree must not be written by a mirror refresh",
+  );
+  assert.equal(
+    (await new Git(join(root, "wt"), hermetic).run("rev-parse", "--abbrev-ref", "HEAD")).trim(),
+    "agent/T-1",
+    "the live worktree must survive the refresh",
+  );
+});

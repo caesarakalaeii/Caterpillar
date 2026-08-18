@@ -91,6 +91,23 @@ export interface IntakePass {
   readonly failed: number;
 }
 
+/** What intake decided about one item. Mirrored into the metric's `outcome` label. */
+export type IntakeOutcome = "created" | "rejected" | "skipped";
+
+/**
+ * Told about every decision intake makes, so an operator can count refusals in Grafana
+ * without reading a pod's stdout.
+ *
+ * The same shape as `AlertObserver` in `remediation/receiver.ts`, and here for the same
+ * reason: `Ingester` should not learn how a counter is incremented, and the adapter in
+ * `index.ts` is the one place that decides what the labels are called.
+ */
+export interface IntakeObserver {
+  observe(workspace: WorkspaceName, outcome: IntakeOutcome): void;
+  /** How many items the tracker returned for this workspace in this pass. */
+  items(workspace: WorkspaceName, seen: number): void;
+}
+
 export interface IngesterDeps {
   readonly store: StateStore;
   /** Trackers to ingest from, by workspace. A workspace without one is supported. */
@@ -103,6 +120,8 @@ export interface IngesterDeps {
   readonly logger: Logger;
   /** Session cap stamped into each new task's `state.json`. */
   readonly maxSessionsPerTask: number;
+  /** Optional: without one intake behaves exactly as it did before it had a metric. */
+  readonly metrics?: IntakeObserver;
 }
 
 /**
@@ -168,8 +187,14 @@ export class Ingester {
       }
 
       seen += items.length;
+      // Published even when it is zero, and that is the point of the gauge: a workspace
+      // whose backlog has just been drained must report 0 rather than keep the number it
+      // had when it last had work.
+      this.deps.metrics?.items(workspace, items.length);
+
       for (const item of items) {
         const outcome = await this.ingestItem(workspace, tracker, item);
+        this.deps.metrics?.observe(workspace, outcome);
         if (outcome === "created") created += 1;
         if (outcome === "rejected") rejected += 1;
         if (outcome !== "skipped") changed = true;
@@ -190,7 +215,7 @@ export class Ingester {
     workspace: WorkspaceName,
     tracker: Tracker,
     item: TrackerItem,
-  ): Promise<"created" | "rejected" | "skipped"> {
+  ): Promise<IntakeOutcome> {
     const { store, logger } = this.deps;
     const id = taskIdFor(item.ref);
 
@@ -244,7 +269,18 @@ export class Ingester {
         url: item.url,
         reason: rendered.reason,
       });
-      await store.writeIntakeRejection(id, { digest, reason: rendered.reason });
+      // `url`, `title` and `workspace` are written alongside the suppression key so the
+      // `/intake` page can link to the item being refused. The DIGEST is unchanged by
+      // their presence — it covers the item's title and body, not the record — so a
+      // record written before these fields existed still suppresses, and the first poll
+      // after this build ships does not re-comment on every open refusal.
+      await store.writeIntakeRejection(id, {
+        digest,
+        reason: rendered.reason,
+        url: item.url,
+        title: item.title,
+        workspace,
+      });
 
       // The record is written BEFORE the comment. If commenting fails, the refusal is
       // still suppressed next pass — a human who has to be told twice is a smaller

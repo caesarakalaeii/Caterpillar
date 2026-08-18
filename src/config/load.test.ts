@@ -232,6 +232,62 @@ test("the remediation port is validated even with the receiver off", async () =>
   assert.equal(config.remediation.port, 9101);
 });
 
+test("worktree reaping is on by default, because a full volume is not opt-in", async () => {
+  // The one section here whose default is ON, and deliberately so. Every other default in
+  // this file is off because turning it on does something outward-facing — a port, a
+  // channel, a cluster read. Reaping does something inward-facing and unavoidable: without
+  // it a replica's 20Gi volume grows by one full checkout per task it has ever worked,
+  // forever, and an operator who has to configure a garbage collector before the disk stops
+  // filling has not been given a garbage collector.
+  const config = await load({});
+
+  assert.equal(config.workspace.reap.intervalHours, 24);
+  assert.equal(config.workspace.reap.keepHours, 72);
+});
+
+test("both reaping numbers can be set, and nonsense in either is refused", async () => {
+  const config = await load({ workspace: { reap: { intervalHours: 6, keepHours: 12 } } });
+  assert.equal(config.workspace.reap.intervalHours, 6);
+  assert.equal(config.workspace.reap.keepHours, 12);
+
+  // A keep-age that arrives as a string is the failure worth refusing loudly: `num()`
+  // would not coerce it, but a section that silently fell back to the default would leave
+  // an operator who wrote "12" believing they had shortened it.
+  await assert.rejects(
+    () => load({ workspace: { reap: { keepHours: "12" } } }),
+    (error: unknown) =>
+      error instanceof ConfigError && /workspace\.reap\.keepHours/.test(error.message),
+  );
+  await assert.rejects(
+    () => load({ workspace: { reap: { intervalHours: null } } }),
+    (error: unknown) =>
+      error instanceof ConfigError && /workspace\.reap\.intervalHours/.test(error.message),
+  );
+});
+
+test("a store quota with no hysteresis is refused rather than corrected", async () => {
+  // `max-free` at or below `min-free` means nix has already met its target the moment it
+  // starts collecting, so it collects on EVERY build and frees almost nothing each time.
+  // From outside that reads as "the quota is on and not working", which is the worst of
+  // the three possible states. Either number could be the typo, so neither is guessed at.
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 20 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 5 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: -1 } }), ConfigError);
+});
+
+test("the store quota defaults on, and 0 is the off switch", async () => {
+  // On by default unlike the caches: an unbounded store is how a runner fills the node it
+  // shares with every other pod, and that is not a cluster-only hazard.
+  const defaults = await load({});
+  assert.equal(defaults.toolchain.minFreeGb, 5);
+  assert.equal(defaults.toolchain.maxFreeGb, 20);
+
+  // 0 disables it, and the pair check must not fire on the way past — off means neither
+  // number applies, so an untouched maxFreeGb is not a misconfiguration.
+  const off = await load({ toolchain: { minFreeGb: 0 } });
+  assert.equal(off.toolchain.minFreeGb, 0);
+});
+
 test("a config written before the usage measurement existed still loads", async () => {
   // `paths.root` is new and every deployed ConfigMap omits it. Requiring it would refuse
   // to load a config that was correct the day before this shipped.
