@@ -25,6 +25,7 @@
  * tokens never cover the state repo, so the audit trail cannot be rewritten by the
  * thing being audited (DESIGN.md §9.3).
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -307,42 +308,42 @@ export interface ExclusiveTree {
  * `store.test.ts` pins it, and narrowing `add -A` to per-task pathspecs would break it —
  * the `add -A` property is what makes one writer's commit speak for the other's files.
  *
- * That argument covers writes that COMPLETED before the `add`. It says nothing about a
- * write that lands during the commit itself, and that window is real: `stageCommitPush` is
- * several subprocess spawns wide, and store writes are plain `writeFile` + `touched()` that
- * do NOT take the mutex — deliberately, since holding it across a session's minutes-long
- * write-then-commit window is the deadlock `exclusively` exists to avoid. A session's
- * `publishArtifact` landing between the `add -A tasks` and a naive `dirty = false` would be
- * in neither the commit nor the flag, and the next housekeeping `pull` would `clean -ffdq`
- * it away — the destroyed-task incident again, through a two-hundred-millisecond hole
- * instead of a two-minute one. So the flag is backed by a monotonic write COUNTER
- * (`writeGeneration`): `stageCommitPush` samples it before the first `add` and clears
- * `dirty` only if it has not moved. A write that raced the commit leaves the flag set, the
- * next `pull` declines, and the next commit carries the file. Erring towards "dirty" costs
- * an interval; erring the other way costs a task.
+ * **Writes take the mutex too, one write at a time.** They did not, and the argument for
+ * that was careful and wrong. It went: a write is a `writeFile`, `pull` declines while
+ * `dirty` is set, and holding the lock across a session's minutes-long write-then-commit
+ * window is the deadlock `exclusively` exists to avoid. Every clause is true and the
+ * conclusion still does not follow, because `dirty` is a SAMPLE. Both destructive paths in
+ * this file spend several subprocess spawns in the working tree AFTER the last time they
+ * could check it — `pullNow` between its post-fetch re-check and its `clean -ffdq`, and
+ * `rebaseOnto` between its `reset --hard HEAD` and the end of its salvage — and an unlocked
+ * write landing in there is deleted having been visible to nothing.
  *
- * The same counter closes the mirror-image window inside `pull` itself, and for the same
- * reason: `dirty` is a sample, and `pull` does a network `fetch` before it does anything
- * destructive. A write landing in that gap was invisible to the check at the top and
- * deleted by the `clean` at the bottom — the original incident, still reachable after the
- * flag was added. `pullNow` therefore re-reads the generation after its fetch and declines
- * the reset if it moved. Read it as one rule with two instances rather than two tricks:
- * anything that samples `dirty` and then spends time before touching the tree must
- * re-check that nothing was written while it was not looking.
+ * That was not caught by reasoning about it. It was caught as a FLAKE: one CI run in three,
+ * `an answer from the bridge unparks the task on the REMOTE`, where an answer from Discord
+ * reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work loop's
+ * pre-claim pull, and then pushed a `state.json` saying the question had been answered — the
+ * answer gone from the one file the next session reads it out of (§4.1). The same red job
+ * skipped the image build, so a deploy silently did not happen either.
  *
- * `pull` is NOT the only destructive reset in this file, and the `dirty` gate protects
- * only that one. `rebaseOnto` — reached from `push` when the remote has moved — opens with
- * `reset --hard HEAD`, and its salvage path resets to the remote outright. Both run under
- * the mutex, so no other GIT command interleaves, but a session's plain `writeFile` is not
- * under the mutex and a write landing in that window is reverted with everything else.
- * Three things keep it acceptable rather than merely unnoticed. It is far narrower than
- * the pull window — microseconds inside one already-running git command, against the
- * minutes between a `writeState` and its commit. It only happens on a rejected push, which
- * needs another runner to have written the branch in the same instant. And it is not new:
- * `reset --hard` was what the old code did on EVERY pull, and this is the residue of that
- * after the dangerous case was removed. Closing it properly means writes taking the mutex,
- * which is what `exclusively` is for — so if a session is ever seen losing a write here,
- * that is the fix, not another flag.
+ * The deadlock objection is answered by SCOPE: `write` holds the lock for one `writeFile`,
+ * never for a write-then-commit unit, and no public write is reachable from inside a
+ * critical section — `exclusively`'s handle exposes `commitAndPush` and `pull` and nothing
+ * else, precisely so that stays true. What a write can now do is wait out a fetch. Losing it
+ * was the alternative.
+ *
+ * `dirty` and its write COUNTER (`writeGeneration`) stay, and are no longer the only line.
+ * `stageCommitPush` samples the counter before its first `add` and clears `dirty` only if it
+ * has not moved; `pullNow` re-reads it after its fetch and declines the reset if it did. With
+ * writes serialised, neither can now be moved by a write in this process — they are the
+ * belt to the mutex's braces, they still hold against anything else sharing the checkout
+ * (`serial` is injectable for exactly that), and a guard whose incident is written down is
+ * not one to delete because it has become hard to reach. Erring towards "dirty" costs an
+ * interval; erring the other way costs a task.
+ *
+ * What the mutex does NOT do is make a read-then-write atomic. A caller that reads state,
+ * decides, and writes it back can still have a pull land in the middle and write a decision
+ * made against the previous remote. That is what `exclusively` is for, it is unchanged by
+ * this, and no caller has needed it yet.
  */
 export class StateStore {
   private readonly root: string;
@@ -350,6 +351,13 @@ export class StateStore {
 
   /** Serialises every git invocation in this checkout. See the class docstring. */
   private readonly serial: Serial;
+
+  /**
+   * Marks the async context that currently holds the checkout, so a write issued from
+   * inside a hold is recognised as the holder's own rather than queued behind it. See
+   * `exclusive`.
+   */
+  private readonly holder = new AsyncLocalStorage<true>();
 
   /**
    * True once something has been written into the working tree and not yet committed.
@@ -433,13 +441,19 @@ export class StateStore {
    * commit carries this one's half-written files under the wrong message — the mixed commit
    * in the class docstring, arrived at without a single interleaved git call.
    *
-   * `body` receives a handle rather than nothing because the mutex is deliberately not
-   * re-entrant (see `Serial`): calling `this.commitAndPush` from inside would deadlock, so
-   * the handle exposes the unlocked body of it instead. Nothing else on the store may be
-   * called from in here — the handle is the entire vocabulary.
+   * `body` receives a handle because the mutex is not re-entrant (see `Serial`): the handle
+   * exposes the unlocked bodies of `commitAndPush` and `pull`, so a holder can use them
+   * without acquiring what it already has.
+   *
+   * The store's WRITE methods may be called from in here as well, and that is not a
+   * loophole: `exclusive` recognises the holding async context, so the holder's own write
+   * runs immediately while anybody else's queues. Without that, writes taking the mutex
+   * would have made this method a deadlock on its first `appendJournal` — which is exactly
+   * how the omission was found (`loop.test.ts` hung rather than failed). Reads were never
+   * locked and are unaffected.
    */
   exclusively<T>(body: (tree: ExclusiveTree) => Promise<T>): Promise<T> {
-    return this.serial.run(() =>
+    return this.exclusive(() =>
       body({
         commitAndPush: (message, remote, branch) => this.stageCommitPush(message, remote, branch),
         pull: async (remote, branch) => {
@@ -460,11 +474,72 @@ export class StateStore {
   }
 
   /**
+   * Every working-tree write: under the mutex, and counted.
+   *
+   * **Writes take the lock.** They did not, and the reasoning for that was explicit — a
+   * write is a `writeFile`, `pull` declines while `dirty` is set, and holding the mutex
+   * across a session's minutes-long write-then-commit window is the deadlock `exclusively`
+   * exists to avoid. The first two halves of that were true and the conclusion still did not
+   * hold, because `dirty` is a SAMPLE: `pullNow` re-checks it after its fetch and then spends
+   * a `reset --hard` and up to three `clean -ffdq` calls in the working tree. A write landing
+   * in THAT window was invisible to every check and deleted by the sweep.
+   *
+   * It is not hypothetical and it was not caught by reasoning: it was a flake in
+   * `loop.test.ts` that failed one CI run in three. An answer from Discord reported
+   * `applied`, wrote `questions/004-answer.md`, had it deleted by the work loop's pre-claim
+   * pull, and then pushed a `state.json` saying the question was answered — an answer the
+   * next session cannot read, in the file that IS the record of it (§4.1). One CI job also
+   * skipped the image build over it, so a deploy silently did not happen.
+   *
+   * The deadlock objection is answered by scope: this holds the lock for ONE write, not for
+   * a write-then-commit unit, and no store method calls another public write from inside a
+   * critical section — `exclusively`'s handle deliberately exposes only `commitAndPush` and
+   * `pull` for exactly this reason. What a write can now do is WAIT, for as long as a pull's
+   * fetch takes; losing it was the alternative.
+   *
+   * `dirty` is set in a `finally`, so a write that threw halfway still counts as one. The
+   * flag errs towards "yes" by design (see the class docstring): a pull skipped for no
+   * reason costs an interval, and a pull taken over a half-written file costs a task.
+   */
+  private write<T>(body: () => Promise<T>): Promise<T> {
+    return this.exclusive(async () => {
+      try {
+        return await body();
+      } finally {
+        this.touched();
+      }
+    });
+  }
+
+  /**
+   * Take the checkout — unless this async context is already the one holding it.
+   *
+   * Every mutex-taking entry point goes through here: `write`, `commitAndPush`, `pull` and
+   * `exclusively`. That uniformity is the point. Once writes take the lock, a caller inside
+   * `exclusively` — which exists precisely so a write and its commit are one unit — would
+   * deadlock on its own hold the moment it wrote anything, and `loop.test.ts`'s mutex test
+   * did exactly that: it hung the whole file rather than failing, which is how this was
+   * found. The same trap waits for `onSalvage`, which `rebaseOnto` invokes with the lock
+   * held.
+   *
+   * `Serial` stays re-entrant-HOSTILE and this does not weaken it: the re-entrancy is
+   * scoped to the ASYNC CONTEXT that actually holds the lock, so a write from anywhere
+   * else still queues. That identity is why this is `AsyncLocalStorage` and not a boolean —
+   * a flag saying "someone holds it" would wave through the very concurrent write the lock
+   * exists to order, which is the bug this whole change is about, restored by its own fix.
+   * The hazard `Serial`'s docstring warns of — a public method quietly calling another —
+   * remains visible: nothing in this class does it, and a reader can still grep for it.
+   */
+  private exclusive<T>(body: () => Promise<T>): Promise<T> {
+    if (this.holder.getStore() === true) return body();
+    return this.serial.run(() => this.holder.run(true, body));
+  }
+
+  /**
    * Record that the working tree has been written.
    *
-   * Every write path calls this. It is a method rather than a bare assignment so that the
-   * one place the flag is set is greppable, and so a future write helper that forgets it
-   * is visible as an absence rather than as a missing `= true`.
+   * Every write path goes through `write`, which calls this. It is a method rather than a
+   * bare assignment so that the one place the flag is set is greppable.
    */
   private touched(): void {
     this.dirty = true;
@@ -561,42 +636,43 @@ export class StateStore {
    * delimiter, where `readSpec`'s regex takes everything remaining as prose.
    */
   async writeSpec(spec: TaskSpec): Promise<void> {
-    const dir = this.taskDir(spec.id);
-    const path = join(dir, "spec.md");
-    if (existsSync(path)) {
-      throw new Error(`spec.md for ${spec.id} already exists and specs are immutable`);
-    }
+    return this.write(async () => {
+      const dir = this.taskDir(spec.id);
+      const path = join(dir, "spec.md");
+      if (existsSync(path)) {
+        throw new Error(`spec.md for ${spec.id} already exists and specs are immutable`);
+      }
 
-    const frontMatter = stringifyYaml({
-      workspace: spec.workspace,
-      // Omitted when it is the default, so an ordinary spec looks exactly as it did
-      // before this field existed and a hand-written one need not know about it. Every
-      // other kind — `brainstorm`, `remediation` — is written out, because losing it
-      // would silently turn the task back into an ordinary implementation task on the
-      // way back in through `readSpec`.
-      ...(spec.kind !== undefined && spec.kind !== "implement" ? { kind: spec.kind } : {}),
-      // Always fully qualified, so the host never has to be inferred on the way back in.
-      repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
-      requires: [...spec.requires],
-      acceptance: [...spec.acceptance],
-      // Omitted when absent, like `kind`: the overwhelmingly common spec declares no
-      // toolchain, and an empty key in every spec.md would suggest one is expected.
-      ...(spec.toolchain === undefined
-        ? {}
-        : {
-            toolchain: {
-              mode: spec.toolchain.mode,
-              ...(spec.toolchain.packages === undefined
-                ? {}
-                : { packages: [...spec.toolchain.packages] }),
-            },
-          }),
-      ...(spec.tracker !== undefined ? { tracker: { ...spec.tracker } } : {}),
+      const frontMatter = stringifyYaml({
+        workspace: spec.workspace,
+        // Omitted when it is the default, so an ordinary spec looks exactly as it did
+        // before this field existed and a hand-written one need not know about it. Every
+        // other kind — `brainstorm`, `remediation` — is written out, because losing it
+        // would silently turn the task back into an ordinary implementation task on the
+        // way back in through `readSpec`.
+        ...(spec.kind !== undefined && spec.kind !== "implement" ? { kind: spec.kind } : {}),
+        // Always fully qualified, so the host never has to be inferred on the way back in.
+        repos: spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`),
+        requires: [...spec.requires],
+        acceptance: [...spec.acceptance],
+        // Omitted when absent, like `kind`: the overwhelmingly common spec declares no
+        // toolchain, and an empty key in every spec.md would suggest one is expected.
+        ...(spec.toolchain === undefined
+          ? {}
+          : {
+              toolchain: {
+                mode: spec.toolchain.mode,
+                ...(spec.toolchain.packages === undefined
+                  ? {}
+                  : { packages: [...spec.toolchain.packages] }),
+              },
+            }),
+        ...(spec.tracker !== undefined ? { tracker: { ...spec.tracker } } : {}),
+      });
+
+      await mkdir(dir, { recursive: true });
+      await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
     });
-
-    await mkdir(dir, { recursive: true });
-    await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
-    this.touched();
   }
 
   private intakePath(task: TaskId): string {
@@ -649,19 +725,21 @@ export class StateStore {
   }
 
   async writeIntakeRejection(task: TaskId, record: IntakeRejection): Promise<void> {
-    await mkdir(join(this.root, "intake"), { recursive: true });
-    await writeFile(
-      this.intakePath(task),
-      `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
-      "utf8",
-    );
-    this.touched();
+    return this.write(async () => {
+      await mkdir(join(this.root, "intake"), { recursive: true });
+      await writeFile(
+        this.intakePath(task),
+        `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+        "utf8",
+      );
+    });
   }
 
   /** Idempotent: the success path clears unconditionally. */
   async clearIntakeRejection(task: TaskId): Promise<void> {
-    await rm(this.intakePath(task), { force: true });
-    this.touched();
+    return this.write(async () => {
+      await rm(this.intakePath(task), { force: true });
+    });
   }
 
   /**
@@ -723,26 +801,28 @@ export class StateStore {
   }
 
   async writeAlertRefusal(fingerprint: string, record: AlertRefusal): Promise<void> {
-    // The fingerprint becomes a file name, so it is checked rather than trusted: it
-    // arrives in an HTTP body from outside this process, and `..` is a legal directory
-    // name that resolves out of `alerts/` — the same trap a task id is guarded against.
-    if (!isAlertFingerprint(fingerprint)) {
-      throw new Error(`'${fingerprint}' is not an alert fingerprint this can be filed under`);
-    }
-    await mkdir(join(this.root, "alerts", "refusals"), { recursive: true });
-    await writeFile(
-      this.alertRefusalPath(fingerprint),
-      `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
-      "utf8",
-    );
-    this.touched();
+    return this.write(async () => {
+      // The fingerprint becomes a file name, so it is checked rather than trusted: it
+      // arrives in an HTTP body from outside this process, and `..` is a legal directory
+      // name that resolves out of `alerts/` — the same trap a task id is guarded against.
+      if (!isAlertFingerprint(fingerprint)) {
+        throw new Error(`'${fingerprint}' is not an alert fingerprint this can be filed under`);
+      }
+      await mkdir(join(this.root, "alerts", "refusals"), { recursive: true });
+      await writeFile(
+        this.alertRefusalPath(fingerprint),
+        `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+        "utf8",
+      );
+    });
   }
 
   /** Idempotent, like `clearIntakeRejection`: the success path clears unconditionally. */
   async clearAlertRefusal(fingerprint: string): Promise<void> {
-    if (!isAlertFingerprint(fingerprint)) return;
-    await rm(this.alertRefusalPath(fingerprint), { force: true });
-    this.touched();
+    return this.write(async () => {
+      if (!isAlertFingerprint(fingerprint)) return;
+      await rm(this.alertRefusalPath(fingerprint), { force: true });
+    });
   }
 
   /**
@@ -807,11 +887,12 @@ export class StateStore {
   }
 
   async writeState(state: TaskState): Promise<void> {
-    const dir = this.taskDir(state.id);
-    await mkdir(dir, { recursive: true });
-    const next: TaskState = { ...state, updatedAt: new Date().toISOString() };
-    await writeFile(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
-    this.touched();
+    return this.write(async () => {
+      const dir = this.taskDir(state.id);
+      await mkdir(dir, { recursive: true });
+      const next: TaskState = { ...state, updatedAt: new Date().toISOString() };
+      await writeFile(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    });
   }
 
   /**
@@ -830,30 +911,31 @@ export class StateStore {
    * same session, and the runner id separates two runners that managed both.
    */
   async appendJournal(task: TaskId, session: number, body: string): Promise<void> {
-    const dir = join(this.taskDir(task), "journal");
-    await mkdir(dir, { recursive: true });
+    return this.write(async () => {
+      const dir = join(this.taskDir(task), "journal");
+      await mkdir(dir, { recursive: true });
 
-    const at = new Date();
-    const entry = [`## Session ${session} — ${at.toISOString()}`, "", body.trim(), ""].join("\n");
+      const at = new Date();
+      const entry = [`## Session ${session} — ${at.toISOString()}`, "", body.trim(), ""].join("\n");
 
-    // Collision within a millisecond on ONE runner is still possible — two entries for
-    // the same session, written back to back — and overwriting would silently drop an
-    // entry from the audit trail. `wx` fails rather than truncates, so the retry is on
-    // the file system's answer and not on a check that another write can race past.
-    // Suffixing leaves the sort order alone, because the suffix is the last component.
-    for (let n = 1; ; n += 1) {
-      const suffix = n === 1 ? this.runnerId : `${this.runnerId}-${n}`;
-      try {
-        await writeFile(join(dir, journalShardName(session, at, suffix)), entry, {
-          encoding: "utf8",
-          flag: "wx",
-        });
-        this.touched();
-        return;
-      } catch (error: unknown) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Collision within a millisecond on ONE runner is still possible — two entries for
+      // the same session, written back to back — and overwriting would silently drop an
+      // entry from the audit trail. `wx` fails rather than truncates, so the retry is on
+      // the file system's answer and not on a check that another write can race past.
+      // Suffixing leaves the sort order alone, because the suffix is the last component.
+      for (let n = 1; ; n += 1) {
+        const suffix = n === 1 ? this.runnerId : `${this.runnerId}-${n}`;
+        try {
+          await writeFile(join(dir, journalShardName(session, at, suffix)), entry, {
+            encoding: "utf8",
+            flag: "wx",
+          });
+          return;
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
       }
-    }
+    });
   }
 
   /**
@@ -890,10 +972,11 @@ export class StateStore {
 
   /** Overwritten every handoff — this file must not grow without bound. */
   async writeHandoff(task: TaskId, body: string): Promise<void> {
-    const dir = this.taskDir(task);
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "handoff.md"), `${body.trim()}\n`, "utf8");
-    this.touched();
+    return this.write(async () => {
+      const dir = this.taskDir(task);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "handoff.md"), `${body.trim()}\n`, "utf8");
+    });
   }
 
   async readIfPresent(task: TaskId, file: string): Promise<string | undefined> {
@@ -908,11 +991,12 @@ export class StateStore {
     session: number,
     jsonl: string,
   ): Promise<void> {
-    const dir = join(this.taskDir(task), "sessions");
-    await mkdir(dir, { recursive: true });
-    const name = `${String(session).padStart(3, "0")}.jsonl.gz`;
-    await writeFile(join(dir, name), gzipSync(Buffer.from(jsonl, "utf8")));
-    this.touched();
+    return this.write(async () => {
+      const dir = join(this.taskDir(task), "sessions");
+      await mkdir(dir, { recursive: true });
+      const name = `${String(session).padStart(3, "0")}.jsonl.gz`;
+      await writeFile(join(dir, name), gzipSync(Buffer.from(jsonl, "utf8")));
+    });
   }
 
   /**
@@ -1023,20 +1107,22 @@ export class StateStore {
   }
 
   async writeQuestion(task: TaskId, index: number, question: string): Promise<void> {
-    const dir = join(this.taskDir(task), "questions");
-    await mkdir(dir, { recursive: true });
-    const name = `${String(index).padStart(3, "0")}-question.md`;
-    await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
-    this.touched();
+    return this.write(async () => {
+      const dir = join(this.taskDir(task), "questions");
+      await mkdir(dir, { recursive: true });
+      const name = `${String(index).padStart(3, "0")}-question.md`;
+      await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+    });
   }
 
   /** Mirror of `writeQuestion`. The file's existence is what marks a question answered. */
   async writeAnswer(task: TaskId, index: number, answer: string): Promise<void> {
-    const dir = join(this.taskDir(task), "questions");
-    await mkdir(dir, { recursive: true });
-    const name = `${String(index).padStart(3, "0")}-answer.md`;
-    await writeFile(join(dir, name), `${answer.trim()}\n`, "utf8");
-    this.touched();
+    return this.write(async () => {
+      const dir = join(this.taskDir(task), "questions");
+      await mkdir(dir, { recursive: true });
+      const name = `${String(index).padStart(3, "0")}-answer.md`;
+      await writeFile(join(dir, name), `${answer.trim()}\n`, "utf8");
+    });
   }
 
   /**
@@ -1065,11 +1151,12 @@ export class StateStore {
    * these are the documents.
    */
   async writeVerdict(task: TaskId, index: number, body: string): Promise<void> {
-    const dir = join(this.taskDir(task), "reviews");
-    await mkdir(dir, { recursive: true });
-    const name = `${String(index).padStart(3, "0")}-verdict.md`;
-    await writeFile(join(dir, name), `${body.trim()}\n`, "utf8");
-    this.touched();
+    return this.write(async () => {
+      const dir = join(this.taskDir(task), "reviews");
+      await mkdir(dir, { recursive: true });
+      const name = `${String(index).padStart(3, "0")}-verdict.md`;
+      await writeFile(join(dir, name), `${body.trim()}\n`, "utf8");
+    });
   }
 
   /** The most recent verdict, if the council has ever run on this task. */
@@ -1091,27 +1178,31 @@ export class StateStore {
    * told to summarise, which is nearly always what was wanted anyway.
    */
   async writeArtifact(task: TaskId, name: string, contents: Buffer): Promise<void> {
-    if (!isArtifactName(name)) {
-      throw new Error(
-        `'${name}' is not a usable artifact name — letters, digits, dot, dash, underscore`,
-      );
-    }
-    if (contents.byteLength > ARTIFACT_BYTES) {
-      throw new Error(
-        `'${name}' is ${contents.byteLength} bytes; the limit is ${ARTIFACT_BYTES}`,
-      );
-    }
+    // `listArtifacts` is a READ, and reads deliberately do not take the mutex — so calling
+    // it from inside `write` is safe. A public write calling another public WRITE would
+    // deadlock (`Serial` is re-entrant-hostile on purpose); none does.
+    return this.write(async () => {
+      if (!isArtifactName(name)) {
+        throw new Error(
+          `'${name}' is not a usable artifact name — letters, digits, dot, dash, underscore`,
+        );
+      }
+      if (contents.byteLength > ARTIFACT_BYTES) {
+        throw new Error(
+          `'${name}' is ${contents.byteLength} bytes; the limit is ${ARTIFACT_BYTES}`,
+        );
+      }
 
-    const dir = join(this.taskDir(task), "artifacts");
-    await mkdir(dir, { recursive: true });
+      const dir = join(this.taskDir(task), "artifacts");
+      await mkdir(dir, { recursive: true });
 
-    const existing = await this.listArtifacts(task);
-    if (!existing.includes(name) && existing.length >= ARTIFACT_COUNT) {
-      throw new Error(`${task} already has ${existing.length} artifacts; the limit is ${ARTIFACT_COUNT}`);
-    }
+      const existing = await this.listArtifacts(task);
+      if (!existing.includes(name) && existing.length >= ARTIFACT_COUNT) {
+        throw new Error(`${task} already has ${existing.length} artifacts; the limit is ${ARTIFACT_COUNT}`);
+      }
 
-    await writeFile(join(dir, name), contents);
-    this.touched();
+      await writeFile(join(dir, name), contents);
+    });
   }
 
   async listArtifacts(task: TaskId): Promise<readonly string[]> {
@@ -1139,12 +1230,13 @@ export class StateStore {
    * turn that bug into a released claim and a day published by nobody.
    */
   async writeDigest(date: string, body: string): Promise<void> {
-    if (!isDigestDate(date)) throw new Error(`'${date}' is not a date this can be filed under`);
+    return this.write(async () => {
+      if (!isDigestDate(date)) throw new Error(`'${date}' is not a date this can be filed under`);
 
-    const dir = join(this.root, "digests");
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${date}.md`), `${body.trimEnd()}\n`, "utf8");
-    this.touched();
+      const dir = join(this.root, "digests");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, `${date}.md`), `${body.trimEnd()}\n`, "utf8");
+    });
   }
 
   /**
@@ -1202,14 +1294,14 @@ export class StateStore {
    * a committed tree marked clean, and a `git commit` that throws leaves it dirty.
    *
    * And it is cleared CONDITIONALLY, on the write generation not having moved since the
-   * first `add`. Writes do not take the mutex, so a session's `publishArtifact` or
-   * `appendJournal` can land inside this method — after its file would have been staged,
-   * before the flag is cleared. Such a write is in neither the commit nor the flag, and the
-   * next `pull` would `clean -ffdq` it out of existence; a session then goes hours to its
-   * next commit with the loss already taken. Leaving the flag set costs one skipped pull.
+   * first `add`. Writes now take the mutex, so nothing in THIS process can land inside this
+   * method any more — but the check stays: `serial` is injectable, so another component can
+   * share this checkout, and the loss it prevents is a file in neither the commit nor the
+   * flag, which the next `pull` would `clean -ffdq` out of existence. Leaving the flag set
+   * costs one skipped pull.
    */
   commitAndPush(message: string, remote: string, branch: string): Promise<void> {
-    return this.serial.run(() => this.stageCommitPush(message, remote, branch));
+    return this.exclusive(() => this.stageCommitPush(message, remote, branch));
   }
 
   /** The body of `commitAndPush`, assuming the caller already holds the mutex. */
@@ -1299,11 +1391,12 @@ export class StateStore {
    * of this method is protecting local COMMITS, which that reset destroyed.
    *
    * Since housekeeping and a session now run concurrently, be clear about who that
-   * discard can hit. The caller holds the mutex, so no other git command interleaves — but
-   * a session's `writeFile` does not take the mutex, and one landing between the `add -A`
-   * above and this reset is reverted. The window is microseconds wide and only opens on a
-   * rejected push; the class docstring says why that is accepted rather than patched, and
-   * what the real fix would be.
+   * discard can hit — and the answer has changed. The caller holds the mutex, and writes
+   * now take it too (`write`), so a session's `writeFile` can no longer land between the
+   * `add -A` above and this reset: it waits, and lands after. This used to be the one
+   * destructive path the `dirty` gate did not cover, accepted because the window was
+   * microseconds wide and only opened on a rejected push. It is closed, by the fix the class
+   * docstring named — writes going through the lock — rather than by another flag.
    */
   private async rebaseOnto(remote: string, branch: string): Promise<void> {
     await this.git.run("reset", "--hard", "HEAD");
@@ -1376,7 +1469,7 @@ export class StateStore {
    * is not symmetrical — it is a destroyed task.
    */
   pull(remote: string, branch: string): Promise<"pulled" | "skipped"> {
-    return this.serial.run(async () => {
+    return this.exclusive(async () => {
       // Checked INSIDE the lock. Outside it, a session could take the lock between the
       // check and the fetch, write, and be reset over by a pull that had already decided
       // the tree was clean.
@@ -1388,20 +1481,24 @@ export class StateStore {
   /**
    * The body of `pull`. Returns whether it actually refreshed anything.
    *
-   * Holding the mutex and having seen a clean tree is NOT enough, and this is the subtlest
-   * corner of the whole invariant. Store writes deliberately do not take the mutex, so
-   * `dirty` is only a sample of the instant it was read — and the `fetch` below is a
-   * network round trip, hundreds of milliseconds during which a write can land. The
-   * destructive part comes AFTER that, so a `writeSpec` arriving mid-fetch is deleted by
-   * the `clean -ffdq tasks` at the bottom having never been visible to the check at the
-   * top.
+   * Holding the mutex and having seen a clean tree is NOT enough on its own, and this is the
+   * subtlest corner of the whole invariant. `dirty` is a sample of the instant it was read,
+   * and the `fetch` below is a network round trip. When writes did not take the mutex, one
+   * landing mid-fetch was deleted by the `clean -ffdq tasks` at the bottom having been
+   * visible to nothing — and one landing AFTER the re-check below, inside the reset and the
+   * clean themselves, could not even be re-checked for.
    *
    * That is not hypothetical: it is the five-destroyed-tasks incident, and it was still
    * reachable after the `dirty` gate was added. It surfaced the moment the work loop began
    * pulling before each claim, which put a pull in the same instant as a `/brainstorm`
    * creating a task — the spec was written between this method's `fetch` and its `clean`,
    * and vanished before the `commitAndPush` three lines later could stage it. The commit
-   * then found nothing to commit and reported success.
+   * then found nothing to commit and reported success. The narrower version of the same
+   * window, past the re-check, later cost an operator's answer and read as a flaky test.
+   *
+   * Writes take the mutex now, so this method has the tree to itself for its whole duration
+   * and a write issued during it waits rather than being swept. The re-check below is kept
+   * as the second line, not the only one — see the class docstring.
    *
    * So the generation is re-read after the fetch and before anything destructive, exactly
    * as `stageCommitPush` re-reads it after its `add`. A write that raced us leaves the
