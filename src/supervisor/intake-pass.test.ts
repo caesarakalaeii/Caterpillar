@@ -94,6 +94,12 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
     maxLogLines: 2000,
   },
   remediation: { enabled: false, port: 8081 },
+  redis: {
+    enabled: false,
+    url: "redis://localhost:6379",
+    commandTimeoutMs: 1000,
+    keyPrefix: "caterpillar:",
+  },
   web: {
     enabled: false,
     port: 8080,
