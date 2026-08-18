@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -9,7 +9,7 @@ import { LiveSession } from "../obs/live.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
-import { diskView, fleet, runnerExport, taskDetail } from "./view.ts";
+import { diskView, fleet, intakeView, runnerExport, taskDetail } from "./view.ts";
 
 const roots: string[] = [];
 
@@ -58,6 +58,8 @@ const CONFIG: RunnerConfig = {
     gcKeepDays: 7,
     substituters: [],
     trustedPublicKeys: [],
+    minFreeGb: 5,
+    maxFreeGb: 20,
   },
   stateRepo: {
     url: "https://github.com/acme/state.git",
@@ -231,7 +233,12 @@ test("the live session is attached to the task it belongs to", async () => {
   live.record({ role: "user", content: "go", timestamp: 0 });
 
   const view = await fleet({ store: subject, live, runnerId: "pod-7f3a" });
-  assert.equal(view.live?.task, "TASK-1");
+  // A LIST since the fleet grew past one replica: a single runner answering for itself
+  // reports at most one entry, and the aggregating viewer unions them across replicas.
+  assert.deepEqual(
+    view.live.map((entry) => `${entry.runner}:${entry.task}`),
+    ["pod-7f3a:TASK-1"],
+  );
 
   const detail = await taskDetail(subject, asTaskId("TASK-1"), live);
   assert.equal(detail?.live?.entries.length, 1, "the in-flight messages render like a stored one");
@@ -392,4 +399,177 @@ test("the export says how often the disk numbers are refreshed", async () => {
   assert.equal(exported.usage.intervalHours, 1);
   assert.equal(exported.usage.deadlineSeconds, 120);
   assert.equal(exported.paths.root, "/work");
+});
+
+/* ------------------------------------------------------------------ intake */
+
+test("the fleet carries the last intake pass, and says when there has not been one", async () => {
+  // The line an operator reads first. `seen` is the field that separates "nobody labelled
+  // anything" from "the tracker returned items and none became tasks", and until this
+  // existed it was reachable only from one pod's stdout.
+  const subject = await store();
+
+  const none = await fleet({ store: subject, live: new LiveSession(), runnerId: "pod-7f3a" });
+  assert.equal(none.intake, undefined, "no reader wired means no claim about intake");
+
+  const view = await fleet({
+    store: subject,
+    live: new LiveSession(),
+    runnerId: "pod-7f3a",
+    intake: {
+      current: () => ({
+        at: "2026-08-18T09:00:00.000Z",
+        ref: "refs/intake/5555",
+        runner: "pod-7f3a",
+        outcome: "ingested" as const,
+        seen: 3,
+        created: 0,
+        rejected: 1,
+        failed: 0,
+      }),
+    },
+  });
+
+  assert.equal(view.intake?.seen, 3);
+  assert.equal(view.intake?.rejected, 1);
+  assert.equal(view.intake?.runner, "pod-7f3a");
+});
+
+test("intakeView gathers the four things that explain a pickup that did not happen", async () => {
+  const subject = await store();
+  await subject.writeIntakeRejection(asTaskId("GH-acme-widget-724"), {
+    digest: "d1",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/724",
+    title: "please fix the widget",
+    workspace: "caesar",
+  });
+  await subject.writeAlertRefusal("aa01", {
+    fingerprint: "aa01",
+    alertname: "CaterpillarContextOverrun",
+    reason: "no policy entry",
+  });
+  await subject.writeAlertRefusal("aa02", {
+    fingerprint: "aa02",
+    alertname: "CaterpillarTaskThrashing",
+    reason: "created",
+    task: asTaskId("ALERT-aa02"),
+  });
+
+  const view = await intakeView({ store: subject, config: CONFIG });
+
+  assert.equal(view.rejections.length, 1);
+  assert.equal(view.rejections[0]?.task, "GH-acme-widget-724");
+  assert.equal(view.rejections[0]?.url, "https://github.com/acme/widget/issues/724");
+  // The ledger is every DECISION, not only the refusals: `queue.ts` writes one on the
+  // success path too, which is what makes it a complete record of the alert path.
+  assert.deepEqual(
+    [...view.alerts].map((record) => record.reason).sort(),
+    ["created", "no policy entry"],
+  );
+  assert.deepEqual(view.policy, []);
+  assert.equal(view.policyMissing, true, "no alerts/policy.yaml at all, not an empty one");
+  assert.equal(view.receiver.enabled, false);
+});
+
+test("a policy that will not parse is rendered as a message, not thrown at the page", async () => {
+  // This is the page an operator opens to find out why an alert produced nothing, and a
+  // typo in the policy file is the likeliest answer that a working supervisor cannot
+  // otherwise tell them — the poll loop catches this error into a log nobody is reading.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-view-policy-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root));
+  await mkdir(join(root, "alerts"), { recursive: true });
+  await writeFile(
+    join(root, "alerts", "policy.yaml"),
+    "version: 1\nalerts:\n  - alertname: X\n    acceptence: []\n",
+    "utf8",
+  );
+
+  const view = await intakeView({ store: subject, config: CONFIG });
+
+  assert.match(view.policyError ?? "", /unknown key/);
+  assert.equal(view.policyMissing, false, "a file that exists is not a missing one");
+  assert.deepEqual(view.policy, []);
+});
+
+test("a task says which of the four intake paths produced it", async () => {
+  const subject = await store();
+
+  await subject.writeSpec({
+    ...spec("GH-acme-widget-12", "# Fix it\n\nprose\n\nTracker item: https://github.com/acme/widget/issues/12"),
+    tracker: { kind: "github-issues", id: "12", container: "acme/widget" },
+  });
+  await subject.writeState(state("GH-acme-widget-12"));
+
+  await subject.writeSpec({ ...spec("HAND-1", "# Committed by hand") });
+  await subject.writeState(state("HAND-1"));
+
+  await subject.writeSpec({
+    ...spec("BS-99", "# A brainstorm"),
+    kind: "brainstorm",
+  });
+  await subject.writeState(state("BS-99"));
+
+  await subject.writeSpec({
+    ...spec("ALERT-bb01", "# Alert `X` is firing\n\n- Rule: https://prom.example.invalid/graph?g0=1"),
+    kind: "remediation",
+  });
+  await subject.writeState(state("ALERT-bb01"));
+  await subject.writeAlertRefusal("bb01", {
+    fingerprint: "bb01",
+    alertname: "CaterpillarContextOverrun",
+    task: asTaskId("ALERT-bb01"),
+    reason: "created",
+  });
+
+  const view = await fleet({ store: subject, live: new LiveSession(), runnerId: "pod-7f3a" });
+  const origins = new Map(view.tasks.map((task) => [task.id, task.origin]));
+
+  assert.equal(origins.get(asTaskId("GH-acme-widget-12"))?.kind, "tracker");
+  assert.equal(
+    origins.get(asTaskId("GH-acme-widget-12"))?.url,
+    "https://github.com/acme/widget/issues/12",
+    "the item's address is in the goal, because a TrackerRef does not carry one",
+  );
+  assert.equal(origins.get(asTaskId("HAND-1"))?.kind, "spec");
+  assert.equal(origins.get(asTaskId("BS-99"))?.kind, "brainstorm");
+
+  const alert = origins.get(asTaskId("ALERT-bb01"));
+  assert.equal(alert?.kind, "alert");
+  // Not recoverable from the id — a fingerprint is a hash — so it comes from the ledger.
+  assert.equal(alert?.alertname, "CaterpillarContextOverrun");
+  assert.equal(alert?.url, "https://prom.example.invalid/graph?g0=1");
+
+  const detail = await taskDetail(subject, asTaskId("ALERT-bb01"), new LiveSession());
+  assert.equal(detail?.origin?.alertname, "CaterpillarContextOverrun");
+});
+
+test("a tracker task whose goal lost its link still names its source", async () => {
+  // The URL is recovered from the goal's prose, which an agent could have rewritten, and
+  // for github-issues the ref alone is enough to rebuild it. A Vikunja ref is not: its web
+  // address depends on the instance's frontend, and a guessed link that 404s is worse than
+  // plain text.
+  const subject = await store();
+  await subject.writeSpec({
+    ...spec("GH-acme-widget-13", "# No trailing link here"),
+    tracker: { kind: "github-issues", id: "13", container: "acme/widget" },
+  });
+  await subject.writeState(state("GH-acme-widget-13"));
+  await subject.writeSpec({
+    ...spec("VK-7-42", "# From Vikunja"),
+    tracker: { kind: "vikunja", id: "42", container: "7" },
+  });
+  await subject.writeState(state("VK-7-42"));
+
+  const view = await fleet({ store: subject, live: new LiveSession(), runnerId: "pod-7f3a" });
+  const origins = new Map(view.tasks.map((task) => [task.id, task.origin]));
+
+  assert.equal(
+    origins.get(asTaskId("GH-acme-widget-13"))?.url,
+    "https://github.com/acme/widget/issues/13",
+  );
+  assert.equal(origins.get(asTaskId("VK-7-42"))?.kind, "tracker");
+  assert.equal(origins.get(asTaskId("VK-7-42"))?.url, undefined);
+  assert.match(origins.get(asTaskId("VK-7-42"))?.label ?? "", /vikunja/);
 });

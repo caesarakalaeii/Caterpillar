@@ -28,10 +28,13 @@ after(async () => {
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
 });
 
-const store = async (): Promise<StateStore> => {
+const store = async (): Promise<StateStore> => (await storeAt()).subject;
+
+/** The same store, with the checkout path a test needs when it writes a file by hand. */
+const storeAt = async (): Promise<{ subject: StateStore; root: string }> => {
   const root = await mkdtemp(join(tmpdir(), "caterpillar-store-"));
   roots.push(root);
-  return new StateStore(root, new Git(root));
+  return { subject: new StateStore(root, new Git(root)), root };
 };
 
 const SPEC: TaskSpec = {
@@ -166,6 +169,92 @@ test("an intake rejection round-trips and is keyed by task id", async () => {
     !Number.isNaN(Date.parse((record as unknown as { at: string }).at)),
     "the record carries a parseable timestamp",
   );
+});
+
+test("the optional fields a page needs round-trip, and the digest keeps its meaning", async () => {
+  // The record grew `url`, `title` and `workspace` so `/intake` can link to the item being
+  // refused — `GH-acme-widget-96` does not say where the owner ends and the repo begins.
+  // They are decoration: the DIGEST is the suppression key and covers the item's title and
+  // body, so adding them must not change what "already refused" means.
+  const subject = await store();
+  const id = asTaskId("GH-acme-widget-96");
+
+  await subject.writeIntakeRejection(id, {
+    digest: "deadbeef",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/96",
+    title: "the widget drops frames",
+    workspace: "caesar",
+  });
+
+  const record = await subject.readIntakeRejection(id);
+  assert.equal(record?.digest, "deadbeef");
+  assert.equal(record?.url, "https://github.com/acme/widget/issues/96");
+  assert.equal(record?.title, "the widget drops frames");
+  assert.equal(record?.workspace, "caesar");
+});
+
+test("listIntakeRejections reads an old-shape record beside a new-shape one", async () => {
+  // The whole reason the new fields are OPTIONAL. Records written before they existed are
+  // in every state repo the fleet has ever polled, and a listing that skipped them — or,
+  // worse, a reader that treated them as unreadable — would make the first poll after this
+  // build re-comment on every open refusal, which is the tracker spam §14.2 exists to stop.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "intake"), { recursive: true });
+
+  // Written by hand, exactly as the shipped code wrote it: digest, reason, at. Nothing else.
+  await writeFile(
+    join(root, "intake", "GH-acme-widget-1.json"),
+    `${JSON.stringify({ digest: "old", reason: "no acceptance", at: "2026-08-01T00:00:00.000Z" })}\n`,
+    "utf8",
+  );
+  await subject.writeIntakeRejection(asTaskId("GH-acme-widget-2"), {
+    digest: "new",
+    reason: "no `agent` block",
+    url: "https://github.com/acme/widget/issues/2",
+    title: "a second item",
+    workspace: "caesar",
+  });
+
+  // Neither of these is a task and neither is a rejection: a directory listing is whatever
+  // is on the disk, and a page that turned any of it into a `/tasks/<id>` link would build
+  // a path from an unvalidated string.
+  await writeFile(join(root, "intake", "README.md"), "not a record\n", "utf8");
+  await writeFile(join(root, "intake", "a name with spaces.json"), "{}\n", "utf8");
+  await writeFile(join(root, "intake", "...json"), "{}\n", "utf8");
+  await writeFile(join(root, "intake", "GH-acme-widget-3.json"), "{ not json", "utf8");
+
+  const listed = await subject.listIntakeRejections();
+  assert.deepEqual(
+    listed.map((record) => record.task),
+    [asTaskId("GH-acme-widget-1"), asTaskId("GH-acme-widget-2")],
+  );
+
+  const [old, fresh] = listed;
+  assert.equal(old?.reason, "no acceptance");
+  assert.equal(old?.url, undefined, "an old record simply has no url");
+  assert.equal(old?.workspace, undefined);
+  assert.equal(fresh?.url, "https://github.com/acme/widget/issues/2");
+  assert.equal(fresh?.title, "a second item");
+});
+
+test("listIntakeRejections on a state repo with no intake/ is empty, not a throw", async () => {
+  const subject = await store();
+  assert.deepEqual(await subject.listIntakeRejections(), []);
+});
+
+test("hasAlertPolicy separates a missing policy from an empty one", async () => {
+  // `readAlertPolicy` answers a missing file with EMPTY_POLICY, which is right for the
+  // poll loop and wrong for a page: "nobody has ever opted an alert in" and "the file
+  // lists nothing" want different sentences, and only one is fixed by writing the file.
+  const { subject, root } = await storeAt();
+  assert.equal(await subject.hasAlertPolicy(), false);
+
+  await mkdir(join(root, "alerts"), { recursive: true });
+  await writeFile(join(root, "alerts", "policy.yaml"), "version: 1\nalerts: []\n", "utf8");
+
+  assert.equal(await subject.hasAlertPolicy(), true);
+  assert.deepEqual((await subject.readAlertPolicy()).entries, []);
 });
 
 test("a rejection is cleared once the item is finally ingested", async () => {

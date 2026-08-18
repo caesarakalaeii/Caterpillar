@@ -32,6 +32,7 @@ import {
   digestsPage,
   errorPage,
   fleetPage,
+  intakePage,
   layout,
   logsPage,
   runnerPage,
@@ -41,7 +42,8 @@ import {
   type Page,
 } from "./pages.ts";
 import { parseTranscript } from "./transcript.ts";
-import { digests, digestView, diskView, fleet, runnerExport, taskDetail } from "./view.ts";
+import { digests, digestView, diskView, fleet, intakeView, runnerExport, taskDetail } from "./view.ts";
+import type { IntakeStatusView } from "../intake/status.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
 
 /**
@@ -65,6 +67,14 @@ export interface WebServerOptions {
   readonly logger: Logger;
   /** Absent on a runner with the measurement disabled; the page then says so. */
   readonly usage?: UsageSnapshotReader;
+  /**
+   * The last intake pass, for `/intake` and the fleet page's one-line summary (§14).
+   *
+   * A READER, for the same reason `usage` is one: a web request must never be able to
+   * trigger a pass. Intake is rate-limited to protect a forge's installation budget, and a
+   * route that could start one would hand that budget to anyone with the page open.
+   */
+  readonly intake?: { current(): IntakeStatusView | undefined };
 }
 
 interface Reply {
@@ -163,10 +173,13 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return { status: 200, type: "text/javascript; charset=utf-8", body: SCRIPT };
   }
 
-  const { config, store, live, ring } = options;
+  const { config, store, ring } = options;
 
   if (path === "/") {
-    return page(options, "fleet", "fleet", fleetPage(await fleet({ store, live, runnerId: config.runnerId })), 200, user);
+    return page(options, "fleet", "fleet", fleetPage(await fleetView(options)), 200, user);
+  }
+  if (path === "/intake") {
+    return page(options, "intake", "intake", intakePage(await intakeOf(options)), 200, user);
   }
   if (path === "/logs") {
     return page(options, "logs", "logs", logsPage(ring.records(), config.web.logCapacity), 200, user);
@@ -194,7 +207,8 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return page(options, "digests", `digest ${view.date}`, digestPage(view), 200, user);
   }
 
-  if (path === "/api/fleet") return json(200, await fleet({ store, live, runnerId: config.runnerId }));
+  if (path === "/api/fleet") return json(200, await fleetView(options));
+  if (path === "/api/intake") return json(200, await intakeOf(options));
   if (path === "/api/digests") return json(200, { dates: await digests(store) });
   if (path.startsWith("/api/digests/")) {
     const view = await digestView(store, path.slice("/api/digests/".length));
@@ -219,6 +233,23 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
 
   return notFound(options, user);
 };
+
+/** The fleet, assembled the same way for the page and for `/api/fleet`. */
+const fleetView = (options: WebServerOptions): ReturnType<typeof fleet> =>
+  fleet({
+    store: options.store,
+    live: options.live,
+    runnerId: options.config.runnerId,
+    ...(options.intake === undefined ? {} : { intake: options.intake }),
+  });
+
+/** `/intake` and `/api/intake`, likewise from one place. */
+const intakeOf = (options: WebServerOptions): ReturnType<typeof intakeView> =>
+  intakeView({
+    store: options.store,
+    config: options.config,
+    ...(options.intake === undefined ? {} : { intake: options.intake }),
+  });
 
 /** The parts of a `/tasks/...` or `/api/tasks/...` path, once the id has been validated. */
 interface TaskRoute {

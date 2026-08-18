@@ -235,6 +235,47 @@ export class AgentMetrics {
   );
 
   /**
+   * What intake did with each item it saw, by workspace (DESIGN.md §14).
+   *
+   * Intake had no metric at all until this existed, which made the fourth intake path the
+   * only one Grafana could not answer a question about: an alert delivery has
+   * `caterpillar_alerts_received_total`, a session has `caterpillar_sessions_total`, and a
+   * labelled issue that never became a task had a warn line in one pod's stdout.
+   *
+   * `outcome` is `created|rejected|skipped` — the three answers `Ingester.ingestItem`
+   * returns, verbatim, rather than a collapsed ok/error. `skipped` is overwhelmingly the
+   * normal case (the item is already a task) and `rejected` is the one that needs a human,
+   * so merging them would hide the series this was added for.
+   *
+   * `workspace` rather than `tracker`, because the workspace is the unit an operator
+   * configures and the unit a repo bound is set on; two workspaces on the same tracker
+   * kind are two different questions.
+   */
+  readonly intake = this.registry.counter(
+    "caterpillar_intake_total",
+    "tracker items by workspace and what intake did with them",
+  );
+
+  /**
+   * Items the trackers returned in the last pass, before any were skipped or refused.
+   *
+   * A GAUGE and not a counter, and the distinction is the whole point of the series:
+   * `caterpillar_intake_total` counts decisions and only ever grows, so a fleet whose
+   * tracker has gone quiet looks identical to one nobody is polling. This is the standing
+   * size of the labelled backlog — `seen` from `IntakePass` — and it goes back to zero
+   * when the last labelled item becomes a task, which is exactly the transition an
+   * operator wants a graph of.
+   *
+   * Set only by the runner that WON the interval's claim (`intakeRef`), so on a fleet of
+   * four this is published by whichever pod ingested and stays stale on the other three
+   * until their turn. Aggregate it with `max` rather than `sum`.
+   */
+  readonly intakeItems = this.registry.gauge(
+    "caterpillar_intake_items",
+    "items the trackers returned in the last intake pass, by workspace",
+  );
+
+  /**
    * Bytes on the work volume, by what is using them (`workspace/usage.ts`).
    *
    * The series the complaint that started this asked for: "the scaling mechanisms use so

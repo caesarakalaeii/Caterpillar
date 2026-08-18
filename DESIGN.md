@@ -1049,6 +1049,46 @@ Two properties of how it is applied are load-bearing:
 `extra-substituters` from an untrusted caller is silently ignored by a nix **daemon**. This
 image runs single-user nix with `node` owning `/nix`, so the caller is the trusted user and
 it is honoured — worth knowing before anyone introduces a daemon.
+
+#### The store's quota is `min-free`, and the volume size is not a quota at all
+
+The `nix` `volumeClaimTemplate` requests 15Gi and that number **enforces nothing**. Under
+`local-path` a PVC is a directory on the node's own filesystem: the request decides where
+the pod is scheduled and the provisioner applies no limit whatsoever. A store that grows to
+60Gi does not get ENOSPC at 15 — it fills the node and takes every other pod on it down.
+There is no storage class here that would behave differently, and `ephemeral-storage`
+limits govern the container's writable layer and emptyDirs, not a PersistentVolume.
+
+That is worth stating in this much detail because the manifest reads exactly like a quota,
+so the failure would arrive as a surprise on a node nobody was watching.
+
+The actual bound is nix's own automatic collector, set through the same `NIX_CONFIG`:
+below `toolchain.minFreeGb` of free space on the store's filesystem, nix garbage-collects
+**mid-build** until `maxFreeGb` is free again. Three properties make it the right
+instrument rather than a store-size cap:
+
+- **It measures the NODE**, which is the thing that actually breaks. Four replicas' volumes
+  share one disk with everything else scheduled there, so per-store ceilings that are each
+  individually fine still add up to a full node.
+- **It fires while the store is GROWING**, not on a timer. `maybeCollectGarbage` runs on the
+  idle branch every `gcIntervalHours`; a substitution that adds 4GB in ninety seconds
+  happens entirely between two of those.
+- **It costs nothing when there is room** — a `statvfs` before a build. So the age-based
+  pass stays the thing that decides *what* is worth keeping, and this only decides when
+  keeping it stops being affordable.
+
+`maxFreeGb` must exceed `minFreeGb` and the loader refuses otherwise. With no gap nix has
+already met its target the moment it starts collecting, so it collects on every build and
+frees almost nothing — a store that thrashes its collector while still filling the disk,
+which from outside reads as "the quota is on and not working". Either number could be the
+typo, so neither is guessed at.
+
+**On by default (5/20 GiB), unlike the caches**, which default to empty. An unbounded store
+is how a runner takes down the machine it is on, and that is not a cluster-only hazard — a
+workstation runner filling a laptop's disk is the same failure with a shorter fuse.
+`minFreeGb: 0` is the documented off switch. The GC roots `print-dev-env --profile`
+registers still protect a live task's environment, so an automatic collection cannot delete
+the toolchain of the session that triggered it.
 - **nixpkgs is pinned** for generated environments. An unattended agent picking up a silent
   bump produces a red acceptance run with no diff to explain it.
 - **A toolchain that will not build parks the task**, naming nix's own error. Falling
@@ -2149,6 +2189,45 @@ Ordering inside a single ingest is load-bearing: `state.json` is written first a
 a task the claim loop skips and the next pass recreates cleanly; the reverse order would
 wedge the item as permanently existing and never claimable.
 
+### 14.5 A refusal that nobody can see is a refusal that did not happen
+
+Everything above is durable and none of it was *visible*. A refused item was a warn line in
+one pod's stdout, a JSON file in the state repo, and a comment on a tracker item nobody is
+watching — so a fleet whose only labelled issue was refused looked exactly like a fleet
+nobody had given work to. That is how this was reported: "I have never seen an agent pick up
+an issue", about a fleet that had worked an issue across five sessions and opened a PR.
+
+Three things changed, and each of them is the smallest one that answers the question.
+
+**The refusal record grew the fields a page needs.** `{digest, reason, at}` could not be
+rendered as anything but text: `GH-caesarakalaeii-all-chat-724` does not say where the owner
+ends and the repo begins, so nothing could link to the item being refused. `url`, `title`
+and `workspace` are now written too, and all three are **optional** on read. That is not
+tidiness: the digest is the suppression key, a record whose *shape* changed must not read as
+a record whose *item* changed, or the first poll after a deploy re-comments on every open
+refusal — the exact spam §14.2 exists to prevent. `listIntakeRejections()` is the mirror of
+the `listAlertRefusals()` the alert path already had.
+
+**The pass is remembered, in memory, for one runner.** `IntakePass {seen, created, rejected,
+failed}` was returned, logged once, and discarded; `seen` is the field that separates
+"nobody labelled anything" from "the tracker returned three items and none became tasks".
+It is now held by `IntakeStatus` alongside the timestamp and the `refs/intake/<bucket>` this
+runner contended for, and rendered as one line on the fleet page. **Not in git**, for the
+reason §18 gives for not writing a runner registry: a record committed every interval is a
+commit per runner per interval forever, and a pass that mattered is already durable as a
+task or as a refusal record. A runner that *lost* the claim records that fact rather than a
+pass of zero — on a fleet of four, three do so every interval, and zeroes would report a
+working intake as a broken one.
+
+**Intake got a metric.** It had none, which made it the only path Grafana could not answer a
+question about. `caterpillar_intake_total{workspace,outcome}` counts decisions with
+`outcome ∈ created|rejected|skipped` — the three answers `ingestItem` already returns,
+uncollapsed, because `skipped` is the normal case and `rejected` is the one that needs a
+human. `caterpillar_intake_items{workspace}` is a **gauge** of `seen`: counters only grow,
+so a tracker that has gone quiet looks identical to one nobody is polling, while a gauge
+goes back to zero when the last labelled item becomes a task. Only the runner that won the
+interval publishes it, so aggregate it with `max` and not `sum`.
+
 ---
 
 ## 15. Risks and open questions
@@ -2303,24 +2382,93 @@ exists; none of them was reachable without `kubectl exec` and a `git log`.
 
 So: a read-only web view, one page per thing, behind the cluster's existing SSO.
 
-### It runs inside the supervisor
+### It ran inside the supervisor, and at four replicas that was reversed
 
-The obvious shape is a second Deployment that clones the state repo. It was rejected.
+**The original decision, kept because the reasoning still applies to the runners' own
+port.** The obvious shape was a second Deployment that clones the state repo, and it was
+rejected: such a process needs its own copy of the state-repo credential and its own clone
+to keep fresh — a second thing that can fall behind and a second place a token lives — and
+it still could not show the two things the view exists for, **the log this process is
+writing** and **the session it is running**, because both are in this process's memory and
+neither is in git until later. A transcript is written when a session ENDS, and pushed after
+that. So the view ran in the supervisor, next to the outbound notifier and the gateway
+websocket (§11.2, §7), with the consequence stated rather than hidden: *fleet-wide task data
+comes from git and is complete; logs and in-flight messages are this runner's only.*
 
-Such a process needs its own copy of the state-repo credential and its own clone to keep
-fresh, which is a second thing that can fall behind and a second place a token lives. And
-it still could not show the two things the view exists for: **the log this process is
-writing** and **the session it is running**. Both are in this process's memory, and
-neither is in git until later — a transcript is written when a session ENDS, and pushed
-after that.
+**That was right for one replica and became a broken page at four.** `caterpillar-ingress`
+points at a Service that balances across every pod, so the sentence above stopped describing
+a documented limitation and started describing a lie: the live panel showed whichever pod
+answered *this* request and a refresh showed a different one; `/logs` showed one ring of a
+thousand lines out of four thousand and said "this runner only" as though the reader had
+chosen which; three runners in four were invisible unless they happened to hold a running
+task, because membership was derived from task ownership. The only hint any of it was
+happening was the runner id in the rail.
 
-So the view runs in the supervisor, next to the outbound notifier and the gateway
-websocket, for the same reason those do (§11.2, §7).
+**Both objections dissolve when the second process aggregates instead of cloning.**
 
-The consequence is stated rather than hidden: **fleet-wide task data comes from git and is
-complete; logs and in-flight messages are this runner's only.** Another runner's tasks are
-visible here — the state repo is the fleet's shared surface — but its logs are in Loki and
-its live session is in its own process.
+> *"needs its own copy of the state-repo credential and its own clone"* — not if it never
+> reads git. Every runner already serves `/api/fleet`, `/api/tasks/<id>`, `/api/logs` and
+> the raw transcript route out of the checkout it maintains anyway. The viewer proxies
+> those. It holds **no state-repo credential, no forge token, no provider credential, no PVC
+> and no ServiceAccount token** — strictly less privilege than the process serving that page
+> before it existed.
+>
+> *"could not show the log this process is writing and the session it is running"* — not if
+> it asks each process for them. That is one HTTP GET per replica per refresh, and it turns
+> the weakness into the feature: **N live sessions and a merged log, instead of one at
+> random.**
+
+So `src/view/` is a second entrypoint on the same image (`caterpillar-view`, a different
+`command` — `dist/` already ships whole) running as a **Deployment**, not a StatefulSet:
+there are no volumes and nothing to keep. The runners keep serving `web` in-cluster,
+because those endpoints *are* the viewer's data source; what moves is the Ingress.
+
+This section is the record of a decision that was correct and was then reversed, kept in
+full so the next person to consider folding the view back into the supervisor finds the
+argument rather than repeating it. The condition that flipped it was `replicas: 4`; at
+`replicas: 1` the two shapes are equivalent and the in-process one is cheaper.
+
+### How the viewer aggregates
+
+**Discovery is DNS, not Kubernetes.** `caterpillar-headless` already exists with a named
+`web` port, so `_web._tcp.caterpillar-headless.<ns>.svc.cluster.local` enumerates exactly
+the ready pods, by stable name, and shrinks and grows with `kubectl scale`. No API access,
+no RBAC, no mounted token, and no replica count in a ConfigMap to fall out of step with the
+StatefulSet. `VIEW_RUNNERS=name=url,…` is the escape hatch for running it outside a cluster,
+which is what keeps the one thing worth testing by hand testable by hand.
+
+**Task data from any one runner; per-process data from all of them.** The state repo is
+identical everywhere, so a task list, a task's documents and a stored transcript come from
+the first healthy responder — asking four for the same bytes is four times the work for one
+answer. `live` and `logs` are unioned across every replica, each entry tagged with the
+runner it came from.
+
+**`FleetView.live` is a list.** `live?: LiveSummary` → `live: readonly (LiveSummary &
+{runner})[]`. A breaking change to `/api/fleet`, made while that route had no consumer
+outside this repo. A single runner answering for itself reports a list of at most one.
+
+**Failure is rendered, not swallowed.** A runner that times out or refuses appears next to
+its name as unreachable. A dashboard that silently drops a replica is worse than one that
+has none, because a missing runner reads as an idle runner — and "three of the four are
+idle" is a sentence an operator acts on. The per-runner timeout is a few seconds and the
+fan-out is parallel, so one wedged pod costs the page that timeout, not four of them.
+
+**Idle runners stop being invisible** without the registry §18 rejected twice below: the
+viewer asks each pod what it is doing instead of inferring it from lease mirrors in git.
+The objection to the registry was to a heartbeat file committed every poll, and it stands —
+asking over HTTP costs one GET per refresh and nothing durable.
+
+**The seatbelt is kept, not punched through.** The runners' `web.requireForwardedUser` is a
+fail-closed check on the Ingress losing its forward-auth annotations, so the viewer
+**forwards the `Remote-User` header it received** on every fan-out request rather than the
+runners relaxing the check. A runner's port stays useless to anything in the cluster that
+cannot present an identity Authelia vouched for, and the viewer authenticates nobody: it
+repeats what the proxy in front of *it* asserted.
+
+Everything in the read-only argument below survives verbatim in the new process — non-`GET`
+refused before routing, the same CSP, `html.ts` escaping by default, artifacts as
+`application/octet-stream` attachments, `isTaskId`/`isArtifactName` on every path segment —
+and its tests assert each of them again rather than trusting the shared module.
 
 ### Its own port
 
@@ -2395,6 +2543,49 @@ unbounded copy of every transcript. The tap is `SessionOptions.onMessage`, calle
 `try`, because an observer that throws would tear down pi's event dispatch mid-session,
 which is a live view costing the task it was watching.
 
+### `/intake`, the page for the paths that produce nothing
+
+Every other page here answers a question about a task that exists. `/intake` answers the one
+asked when none does: *I labelled an issue / an alert fired, and nothing happened.* It is fed
+entirely by records that already existed and that nothing rendered.
+
+- **Refused tracker items** (`intake/<task-id>.json`, §14.5) — with a link back to the item,
+  which is what the record's new `url` field is for.
+- **The alert ledger** (`alerts/refusals/`). The directory is misnamed: `queue.ts` writes a
+  record on the success path too (`reason: "created"`, with `task`), so it is a complete list
+  of every alert this fleet has decided anything about, refusals and tasks alike.
+- **Which alerts are opted in** (`alerts/policy.yaml`, §20). An operator learns here that an
+  alert fired and was refused because it was never listed. A **missing** file is rendered as
+  that sentence with the runbook next to it rather than as an empty table — "nobody listed
+  it" is the refusal least likely to be guessed, and an empty table reads as "nothing has
+  happened". A file that does not *parse* is rendered as its `PolicyParseError` for the same
+  reason: the poll loop catches that error into a log nobody is reading.
+- **Whether the receiver is listening.** `remediation.enabled` and the `cluster` bounds are
+  now on `/runner` and on this page. A disabled receiver is the single most likely reason a
+  firing alert produced nothing, and it was invisible.
+
+The page is a new front door to agent-authored bytes and inherits every rule above verbatim:
+an alertname is whatever a Prometheus rule's template produced and a refusal reason quotes a
+tracker item anyone with an account can edit. Its tests assert the escaping again rather than
+trusting `html.ts` to have been reached.
+
+### A task says where it came from
+
+`TaskSpec.tracker` has been on every ingested task since intake shipped and no page rendered
+it. There are four ways a task can exist — a labelled tracker item, a brainstorm's plan, a
+firing alert, a hand-committed spec — and the fleet page could not distinguish work a human
+asked for from work the fleet proposed to itself.
+
+The source is decided from the spec, not from the id: `kind` is authoritative for a
+brainstorm and a remediation task, and `spec.tracker` identifies an ingested one because
+`kind: implement` is also what a hand-committed spec defaults to. The **link** is recovered
+from the goal's prose (`Tracker item: …`, `- Rule: …`), because a `TrackerRef` carries no
+URL and a `FiringAlert`'s `generatorURL` is written into the goal and nowhere else; for
+`github-issues` the ref alone is enough to rebuild it as a fallback. Vikunja's is not — its
+web address depends on the instance's frontend — and a guessed link that 404s is worse than
+the plain text it falls back to. An alert task's **alertname** comes from the ledger, since
+`ALERT-<fingerprint>` is a hash and cannot carry one.
+
 ### There is no runner registry
 
 `runners/<runner-id>.json` has been in the §4.1 layout since the beginning and is still not
@@ -2403,9 +2594,14 @@ state repo every poll is a commit per runner per interval, forever, in a repo ev
 clones and pulls constantly — the same objection §17 makes to large artifacts.
 
 Who is running what is derived from task ownership instead, which costs nothing and is
-already true. The price is that an **idle** runner other than this one is invisible: it owns
-nothing, so nothing names it. That is the correct trade for a question ("where is this task
-running") that is only ever asked about tasks that are running.
+already true. On a runner's own page that still carries a price: an **idle** runner other
+than this one is invisible, because it owns nothing and nothing names it.
+
+**The viewer pays no such price and still writes nothing.** It asks each pod directly — the
+headless Service names them all, ready or idle — so "which runners exist" is answered by
+DNS and one HTTP GET per refresh rather than by a file in git. That is what makes the
+registry unnecessary rather than overdue: the objection was never to knowing, it was to a
+commit per runner per interval, forever.
 
 §21 adds a presence heartbeat in Redis, and it does not change any of the above. It is a
 DISPLAY: advisory, expiring, and explicitly forbidden as an input to routing or claiming.

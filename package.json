@@ -9,13 +9,15 @@
   },
   "bin": {
     "caterpillar": "./dist/index.js",
-    "caterpillar-cred": "./dist/cli/credential-helper.js"
+    "caterpillar-cred": "./dist/cli/credential-helper.js",
+    "caterpillar-view": "./dist/cli/view.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "node --test 'src/**/*.test.ts'",
     "start": "node src/index.ts",
+    "start:view": "node src/cli/view.ts",
     "verify:github-app": "node src/cli/verify-github-app.ts",
     "verify:reviewer": "node src/cli/verify-reviewer.ts",
     "verify:forgejo": "node src/cli/verify-forgejo.ts",
