@@ -141,7 +141,10 @@ export class AgentSessionRunner {
     if (profile === undefined) throw new WorkspaceNotConfiguredError(spec.workspace);
 
     const forge = await forgeFactory.forTask(spec);
-    credentials.setActive({
+    // Keyed by THIS task and handed back as a lease. Nothing here names another task's
+    // credential, and nothing here can revoke one: the pairing is this `activate` and the
+    // `lease.close()` in the `finally` below, and the two cannot drift apart (§9.2).
+    const lease = await credentials.activate(spec.id, {
       forge,
       repos: spec.repos,
       scope: workspaceScopeOf(profile, stateRepoRef(this.options.config.stateRepo)),
@@ -307,7 +310,7 @@ export class AgentSessionRunner {
       // live view that outlived its session would show the last thing that ran as the
       // thing running.
       live?.end();
-      credentials.clearActive();
+      await lease.close().catch(() => undefined);
       await forge.revoke().catch(() => undefined);
     }
   }

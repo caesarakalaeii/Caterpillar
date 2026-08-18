@@ -232,7 +232,7 @@ export interface SupervisorDeps {
    * moment it is lost rather than when the session eventually returns. Optional because
    * nothing else in the loop needs it and the tests do not build one.
    */
-  readonly credentials?: { clearActive(): void };
+  readonly credentials?: { deactivate(task: TaskId): Promise<void> };
   /**
    * Tracker → task ingestion. Optional: a runner with no trackers configured, or one
    * fed only by hand-committed specs (§14.4), does not need it.
@@ -1190,11 +1190,15 @@ export class Supervisor {
       config.lease.heartbeatSeconds,
       (error) => {
         lost = error;
-        // Immediately, not at the next loop iteration. The credential goes with it:
-        // `CredentialService.active` outlived the lease that justified it, so a session
-        // that had already lost its claim kept getting fresh tokens minted on demand.
+        // Immediately, not at the next loop iteration. The credential goes with it: this
+        // task's entry outlived the lease that justified it, so a session that had already
+        // lost its claim kept getting fresh tokens minted on demand.
+        //
+        // By task id, and only this one. The single global clear this replaced would, on a
+        // runner working two tasks, have revoked the credential of a session whose lease
+        // was perfectly healthy — a lost lease here is not evidence about anything there.
         logger.warn("lease.lost-mid-session", { task: spec.id, ...errorFields(error) });
-        this.deps.credentials?.clearActive();
+        void this.deps.credentials?.deactivate(spec.id).catch(() => undefined);
         interrupt.abort();
       },
     );

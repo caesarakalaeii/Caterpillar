@@ -1418,6 +1418,49 @@ or in an environment dump becomes a token **committed to git history**. So:
 The 1-hour expiry is invisible because the helper mints on demand. Exporting `GH_TOKEN`
 once at session start is what would break mid-session.
 
+**The credential service is keyed by task.** It holds a map `TaskId → ActiveCredential`
+and opens one unix socket per active task, at `<runtimeDir>/cred/<task>.sock`. A request
+is answered from the entry belonging to the socket it arrived on, or refused — never from
+another task's entry, and never from "whatever was set most recently".
+
+This is a prerequisite for running more than one session per replica, not a refinement of
+one. The service used to hold a single `active` slot, set when the supervisor claimed a
+task and cleared when it finished. Two concurrent sessions on one runner therefore shared
+it: whichever task registered last owned the answer, so task A's `git push` was handed
+task B's repo credential — with nothing adversarial happening, on the ordinary path. That
+crosses the §9.1 trust boundary by accident. A single global `clearActive()` had the
+mirror-image failure: a task that finished, parked, or lost its lease revoked the
+credential of a concurrent task that was still running, which surfaces as an
+unexplainable mid-session auth failure.
+
+Both are removed structurally rather than by discipline. `activate(task, credential)`
+returns a lease whose `close()` revokes **that task only**, taken in the session runner's
+`finally`, so there is no exit path that can forget it and none that can revoke a
+neighbour.
+
+**Task identity is carried by which socket git connects to**, not by a field in the
+request — there is no protocol change and nothing for a caller to fill in wrongly. The
+per-task socket path is written into the worktree's `credential.helper`, which forces one
+non-obvious detail: `git config` inside a linked worktree writes to the repository's
+**common** config, shared by the mirror and every other worktree of it. Writing a per-task
+socket there would point every worktree at the last task to configure — the same
+cross-task leak, relocated from the service into git's config resolution. So the helper
+goes to worktree-scoped config (`git config --worktree`), which requires
+`extensions.worktreeConfig` on the mirror. Enabling that extension makes the common
+config's `core.bare = true` — which `clone --mirror` writes — apply to linked worktrees
+too, so `core.bare` is relocated into the main worktree's own config as git's worktree
+documentation prescribes; without that step every command needing a working tree fails
+with `fatal: this operation must be run in a work tree`. Identity, the push rules and the
+commit identity stay shared, because they are properties of the repo rather than of a task.
+
+Socket hygiene is per task and survives a restart: `0600`, a stale path removed before
+bind, the socket unlinked on revoke, and the directory swept on `start()` so a pod killed
+mid-session cannot leave a bound path that makes the task it was restarted for
+un-resumable.
+
+None of this makes the socket a wall — see immediately below. It removes the case where
+the wrong token is served *without anyone trying*.
+
 > **How strong is this boundary, honestly?** The trust diagram above says the agent
 > "never sees" the token. That holds against *accidental* exposure, which is the
 > realistic failure mode here: nothing routine puts the token where a committed
@@ -1425,7 +1468,9 @@ once at session start is what would break mid-session.
 >
 > It does **not** hold against a deliberately adversarial agent. The agent has `bash`
 > in the same container as the supervisor, so it could invoke the credential helper
-> itself. Process-level separation inside one container cannot prevent that.
+> itself — and with per-task sockets, it could connect to a concurrent task's socket by
+> naming its path. Per-task keying narrows an *accidental* leak; it is not an access
+> control. Process-level separation inside one container cannot prevent either.
 >
 > What holds unconditionally is the blast radius: 1-hour TTL, one repo, no merge, no
 > admin. Treat the helper as leak *hygiene* and the token scope as the actual security
@@ -1956,8 +2001,9 @@ exists — the point the task branch forked from. Both halves are load-bearing:
   never trip the detector at all.
 
 The fork point is resolved locally (`merge-base` against the mirror's default branch),
-because the probe runs after `clearActive()` where the credential service refuses to
-answer by design (§9.2) and anything touching the network fails.
+because the probe runs after the session's credential lease is closed, and the credential
+service then refuses to answer for that task by design (§9.2) — anything touching the
+network fails.
 
 ### 11.2 The Discord webhook
 
@@ -2686,8 +2732,9 @@ from being wrong:
 2. every handler goes through `web/view.ts`, which reads and does nothing else — no
    commit, no push, no ref update, no forge call. The property is checkable by reading one
    file;
-3. the process holds no forge token while serving. The credential service refuses to
-   answer outside a session by design (§9.2), so even a bug here has nothing to spend.
+3. the process holds no forge token while serving. The credential service answers only
+   for a task with a live lease, and only on that task's own socket (§9.2), so even a bug
+   here has nothing to spend.
 
 ### Everything on these pages is untrusted input
 

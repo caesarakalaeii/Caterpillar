@@ -133,6 +133,9 @@ process.stdout.write(JSON.stringify(config, null, 2));
 
 # ------------------------------------------------------------------------- unit + dirs
 
+# The supervisor opens one credential socket PER TASK (DESIGN.md §9.2) and takes the
+# DIRECTORY of this path, not the path itself — so an existing installation keeps the
+# same `$ROOT/run` and simply gains `<task>.sock` files inside it.
 CRED_SOCKET="$ROOT/run/cred.sock"
 CRED_HELPER="$ROOT/bin/caterpillar-cred"
 
