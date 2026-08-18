@@ -52,9 +52,11 @@ import {
 export interface EphemeralPlane {
   readonly chat: ChatQueue;
   readonly snapshot: SnapshotStore;
-  /** Named `runners` and not `presence`: the supervisor already has a `presence`, and it
-   * is the Discord typing indicator. Two fields with one name in the same deps object is
-   * how one silently shadows the other. */
+  /**
+   * Named `runners` and not `presence`: the supervisor already has a `presence`, and it is
+   * the Discord typing indicator. Two fields with one name in the same deps object is how
+   * one silently shadows the other.
+   */
   readonly runners: PresenceRegistry;
   readonly cancels: CancelSignals;
   /** True when a Redis client is behind the four above. For logs and the web view. */

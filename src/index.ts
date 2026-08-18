@@ -441,6 +441,10 @@ const main = async (): Promise<void> => {
     stopReceiver();
     await credentials.stop();
     await bridge;
+    // Leave the display before closing the connection, so a rollout does not show a
+    // runner that has already gone for the whole presence TTL. Advisory either way (§21):
+    // a runner that dies without departing ages out on its heartbeat score.
+    await plane.runners.depart(asRunnerId(config.runnerId));
     // Last: the bridge submits through it, so closing the plane first would leave a
     // request in flight with no way back. Never throws — shutdown must not be the path
     // that hangs (`IoRedisClient.close`).

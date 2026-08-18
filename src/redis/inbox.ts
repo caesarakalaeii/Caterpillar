@@ -193,14 +193,17 @@ export class RedisChatQueue implements ChatQueue {
       const parsedEarly = early === undefined ? undefined : parseOutcome(early);
       if (parsedEarly !== undefined) return parsedEarly;
 
-      return await this.await(outcome, channel);
+      return await this.waitForOutcome(outcome, channel);
     } finally {
       await subscription?.close().catch(() => undefined);
     }
   }
 
   /** Race the subscription against the give-up timer, re-reading the key before failing. */
-  private async await(outcome: Promise<ChatOutcome>, channel: string): Promise<ChatOutcome> {
+  private async waitForOutcome(
+    outcome: Promise<ChatOutcome>,
+    channel: string,
+  ): Promise<ChatOutcome> {
     let timer: NodeJS.Timeout | undefined;
     // NOT unref'd. This timer is the only thing that will ever settle a submission the
     // loop never answers, and an unref'd one lets the process exit with the submitter's
