@@ -47,7 +47,8 @@
  * memory cost paid on every pass to sharpen a number that is already only a hint.
  */
 import { readdir, stat, statfs } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import type { UsageConfig } from "../config/types.ts";
 
 /** One directory that was measured — a mirror repo, or a task's worktree. */
 export interface UsageEntry {
@@ -144,6 +145,38 @@ export const TOP_N = 10;
 
 /** Default ceiling: generous enough to finish, short enough to be an interruption. */
 export const DEFAULT_DEADLINE_MS = 120_000;
+
+/**
+ * Defaults for `usage` in the runner config.
+ *
+ * Here rather than inline in `config/load.ts` for the reason `DEFAULT_TOOLCHAIN_CONFIG`
+ * gives: the numbers sit next to the code that has to live with them, so the deadline is
+ * read next to the walk it bounds.
+ *
+ * ON by default, unlike the web view and the digest. Those two publish — to a shared
+ * channel, to a shared repo — so a runner has to be told to do them. This one reads its
+ * own disk, once an hour, and tells nobody but its own metrics endpoint; a runner that
+ * had to be told would be a runner whose disk complaint is still unmeasurable by default,
+ * which is the whole thing this is here to fix.
+ */
+export const DEFAULT_USAGE_CONFIG: UsageConfig = {
+  intervalHours: 1,
+  deadlineSeconds: DEFAULT_DEADLINE_MS / 1000,
+};
+
+/**
+ * The volume `mirrors` and `tasks` sit on, when nothing says.
+ *
+ * Their common parent, which in every shipped configuration is `/work` — the directory
+ * the PVC is mounted at. Falls back to the tasks directory itself when the two share no
+ * parent, which is a configuration nobody has but which must still produce a path rather
+ * than a guess at `/`: measuring the root filesystem of a container would report the
+ * image's free space as the work volume's, and be wrong in the reassuring direction.
+ */
+export const defaultWorkRoot = (mirrorsDir: string, tasksDir: string): string => {
+  const parent = dirname(mirrorsDir);
+  return parent === dirname(tasksDir) ? parent : tasksDir;
+};
 
 /**
  * Where nix keeps its store, as this process would find it.

@@ -15,6 +15,7 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
+import { DEFAULT_USAGE_CONFIG as USAGE_DEFAULTS, defaultWorkRoot } from "../workspace/usage.ts";
 import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
 import type {
   ClusterConfig,
@@ -44,7 +45,12 @@ interface RawConfig {
     readonly path?: unknown;
     readonly secretRef?: unknown;
   };
-  readonly paths?: { readonly mirrors?: unknown; readonly tasks?: unknown };
+  readonly paths?: {
+    readonly mirrors?: unknown;
+    readonly tasks?: unknown;
+    readonly root?: unknown;
+  };
+  readonly usage?: { readonly intervalHours?: unknown; readonly deadlineSeconds?: unknown };
   readonly lease?: { readonly heartbeatSeconds?: unknown; readonly staleAfterSeconds?: unknown };
   readonly handoff?: { readonly thresholdFraction?: unknown };
   readonly limits?: {
@@ -409,6 +415,9 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
 
   const llm = raw.llm ?? {};
 
+  const mirrors = str(raw.paths?.mirrors, "paths.mirrors");
+  const tasks = str(raw.paths?.tasks, "paths.tasks");
+
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
@@ -441,8 +450,23 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         : { secretRef: str(raw.stateRepo.secretRef, "stateRepo.secretRef") }),
     },
     paths: {
-      mirrors: str(raw.paths?.mirrors, "paths.mirrors"),
-      tasks: str(raw.paths?.tasks, "paths.tasks"),
+      mirrors,
+      tasks,
+      // Defaulted rather than required: every config written before the usage measurement
+      // existed omits it, and a mandatory field would refuse to load all of them.
+      root: str(raw.paths?.root, "paths.root", defaultWorkRoot(mirrors, tasks)),
+    },
+    usage: {
+      intervalHours: num(
+        raw.usage?.intervalHours,
+        "usage.intervalHours",
+        USAGE_DEFAULTS.intervalHours,
+      ),
+      deadlineSeconds: num(
+        raw.usage?.deadlineSeconds,
+        "usage.deadlineSeconds",
+        USAGE_DEFAULTS.deadlineSeconds,
+      ),
     },
     lease: {
       heartbeatSeconds: num(raw.lease?.heartbeatSeconds, "lease.heartbeatSeconds", 60),

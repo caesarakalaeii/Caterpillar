@@ -32,6 +32,7 @@ import { Git } from "../state/git.ts";
 import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
+import { DEFAULT_USAGE_CONFIG } from "../workspace/usage.ts";
 import { ChatInbox, type ChatOutcome } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
@@ -112,7 +113,8 @@ const config: RunnerConfig = {
   identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
   toolchain: DEFAULT_TOOLCHAIN_CONFIG,
   stateRepo: { url: origin, branch: "main", path: statePath },
-  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks") },
+  paths: { mirrors: join(root, "mirrors"), tasks: join(root, "tasks"), root },
+  usage: DEFAULT_USAGE_CONFIG,
   // A heartbeat long enough never to fire: this test is about the failure path, and a
   // renewal landing mid-park would muddy which CAS was under test.
   lease: { heartbeatSeconds: 3600, staleAfterSeconds: 300 },
