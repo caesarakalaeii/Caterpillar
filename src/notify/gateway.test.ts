@@ -6,8 +6,10 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { asTaskId } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
-import { DiscordGateway, type SocketLike } from "./gateway.ts";
+import { FleetActivity } from "./activity.ts";
+import { DiscordGateway, type GatewayOptions, type SocketLike } from "./gateway.ts";
 
 const CHANNEL = "999";
 
@@ -51,6 +53,7 @@ const fakeSocket = (): Fake => {
 
 const build = (
   onMessage: (content: string, author: string) => Promise<void> = () => Promise.resolve(),
+  presence?: GatewayOptions["presence"],
 ): { gateway: DiscordGateway; sockets: Fake[]; slept: number[] } => {
   const sockets: Fake[] = [];
   const slept: number[] = [];
@@ -59,6 +62,7 @@ const build = (
     token: "bot-token",
     channelId: CHANNEL,
     onMessage,
+    ...(presence === undefined ? {} : { presence }),
     logger: SILENT_LOGGER,
     random: () => 0.5,
     sleep: async (ms) => {
@@ -230,5 +234,127 @@ test("an invalid session forces a fresh IDENTIFY instead of resuming forever", a
   );
   assert.ok(next.sent.some((p) => (p as { op: number }).op === 2), "must IDENTIFY afresh");
 
+  await stop();
+});
+
+/* ----------------------------------------------------------------- presence (§7.2) */
+
+const ready = (over: Record<string, unknown> = {}): unknown => ({
+  op: 0,
+  s: 1,
+  t: "READY",
+  d: { session_id: "sess-1", resume_gateway_url: "wss://resume.example", ...over },
+});
+
+/** A fleet with one running task, already surveyed once. */
+const surveyed = (): FleetActivity => {
+  const activity = new FleetActivity({ now: () => 1_000 });
+  activity.publish([
+    { id: asTaskId("ALERT-6155db"), status: "running", phase: "implementing" },
+  ]);
+  return activity;
+};
+
+test("IDENTIFY carries the presence, rather than sending it as a second frame", async () => {
+  // A separate opcode 3 after IDENTIFY would leave the bot briefly online with no activity.
+  // On a fleet that reconnects during every rollout that is a visible flicker to no purpose.
+  const built = build(undefined, surveyed());
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  const identify = socket.sent.find((p) => (p as { op: number }).op === 2) as {
+    d: { presence?: { activities: { name: string; type: number }[]; status: string } };
+  };
+
+  assert.ok(identify.d.presence !== undefined, "a fresh connection must not be briefly blank");
+  assert.equal(identify.d.presence.activities[0]?.name, "ALERT-6155db · implementing");
+  assert.equal(identify.d.presence.activities[0]?.type, 3, "Watching");
+  assert.equal(identify.d.presence.status, "online");
+
+  await stop();
+});
+
+test("a gateway with no presence source identifies exactly as it did before", async () => {
+  // The field must be ABSENT and not empty: Discord reads a `presence` carrying no
+  // activities as an instruction to clear one.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  const identify = socket.sent.find((p) => (p as { op: number }).op === 2) as {
+    d: Record<string, unknown>;
+  };
+
+  assert.equal("presence" in identify.d, false);
+  await stop();
+});
+
+test("a change after READY is sent as an opcode 3 on that connection", async () => {
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+
+  activity.publish([{ id: asTaskId("TASK-9"), status: "awaiting-human", phase: "review" }]);
+
+  const updates = socket.sent.filter((p) => (p as { op: number }).op === 3) as {
+    d: { activities: { name: string }[] };
+  }[];
+
+  assert.equal(updates.length, 1, "the change must reach the live socket");
+  assert.equal(updates[0]?.d.activities[0]?.name, "1 waiting for you");
+
+  await stop();
+});
+
+test("RESUMED re-sends the presence, because a resume carries no IDENTIFY", async () => {
+  // The failure this pins: a runner comes back from a blip and keeps advertising whatever it
+  // was doing before it, indefinitely — worst for the runners that were out longest.
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit({ op: 0, s: 2, t: "RESUMED", d: {} });
+
+  const resumed = socket.sent.filter((p) => (p as { op: number }).op === 3) as {
+    d: { activities: { name: string }[] };
+  }[];
+  assert.equal(resumed.length, 1, "a resumed session must be told the presence again");
+  assert.equal(resumed[0]?.d.activities[0]?.name, "ALERT-6155db · implementing");
+
+  await stop();
+});
+
+test("READY does NOT re-send, because the IDENTIFY beside it already carried the presence", async () => {
+  // A per-connection allowance spent repeating what Discord was just told is the one that is
+  // not available when the state actually changes.
+  const built = build(undefined, surveyed());
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+
+  assert.equal(socket.sent.filter((p) => (p as { op: number }).op === 3).length, 0);
+  await stop();
+});
+
+test("a presence change after the socket is gone is not written to it", async () => {
+  // Surveys keep running across a disconnect. Writing into a disposed socket is the bug.
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+  const before = socket.sent.length;
+
+  socket.fire("close");
+  await new Promise((r) => setImmediate(r));
+  activity.publish([{ id: asTaskId("TASK-4"), status: "running", phase: "planning" }]);
+
+  assert.equal(socket.sent.length, before, "nothing may be sent on a closed connection");
   await stop();
 });

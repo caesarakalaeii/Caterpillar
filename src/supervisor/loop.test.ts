@@ -39,6 +39,7 @@ import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { type ChatOutcome, type ChatRequest } from "./inbox.ts";
+import { FleetActivity } from "../notify/activity.ts";
 import { TaskSnapshot } from "./snapshot.ts";
 import {
   Supervisor,
@@ -3176,4 +3177,53 @@ test("the work loop refreshes the checkout before it decides what to claim", asy
   );
 
   await seedTask(REMOTE_ONLY, { status: "done" });
+});
+
+test("the Discord presence keeps up with a session it is describing", async () => {
+  // The whole point of §7.2: someone looking at the member list should see what the fleet is
+  // working on without opening the web view. `survey` publishes it, and `survey` is on the
+  // HOUSEKEEPING loop — so this is the same defect class the tests above pin, arriving
+  // through the presence: a status that said "for work · 1 ready" for the entire length of a
+  // session would be worse than no status, because it would be confidently wrong.
+  //
+  // The wait for the session to actually start is load-bearing. Without it this passes on
+  // the first housekeeping pass, before anything is claimed, and proves nothing.
+  const BUSY = asTaskId("HK-PRESENCE-1");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const published: string[] = [];
+  const activity = new FleetActivity({ now: () => 1_000 });
+  activity.attach((payload) => {
+    const name = payload.activities[0]?.name;
+    if (name !== undefined) published.push(name);
+  });
+
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner, { activity });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !published.some((name) => name.startsWith(`${BUSY} · `)))
+    await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  // Asserted on the PREFIX rather than the whole line. The phase is the session's to move,
+  // and the suffix counts tasks the other tests in this file left behind — pinning either
+  // here would make this test fail for reasons that have nothing to do with what it is
+  // about, which is that the running task reaches the presence at all.
+  assert.ok(
+    published.some((name) => name.startsWith(`${BUSY} · `)),
+    `the presence must name the running task, got ${JSON.stringify(published)}`,
+  );
+
+  await seedTask(BUSY, { status: "done" });
 });
