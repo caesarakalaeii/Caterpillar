@@ -6,6 +6,7 @@
  * repo, so recovery is "fetch and reclaim".
  */
 import { createServer } from "node:http";
+import { dirname } from "node:path";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
@@ -63,7 +64,17 @@ const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json"
 /** Where state-repo installation tokens are minted. Not a workspace forge. */
 const GITHUB_API_BASE = process.env["GITHUB_API_BASE"] ?? "https://api.github.com";
 const METRICS_PORT = Number.parseInt(process.env["METRICS_PORT"] ?? "9090", 10);
-const CRED_SOCKET = process.env["CRED_SOCKET"] ?? "/run/caterpillar/cred.sock";
+/**
+ * Directory the credential service opens one socket PER TASK in (§9.2).
+ *
+ * `CRED_SOCKET` still names a path for compatibility with deployments and
+ * `scripts/install-runner.sh`, which set it to a socket FILE. Its directory is what is
+ * used: a runner upgraded in place keeps the same `/run/caterpillar`, and the sockets
+ * inside it simply gain task names. A directory of its own rather than the file's parent
+ * would silently move on upgrade, and an operator who had bind-mounted the old path would
+ * find nothing there.
+ */
+const CRED_SOCKET_DIR = dirname(process.env["CRED_SOCKET"] ?? "/run/caterpillar/cred.sock");
 const CRED_HELPER = process.env["CRED_HELPER"] ?? "/usr/local/bin/caterpillar-cred";
 
 /** Serves /metrics for the ServiceMonitor. */
@@ -260,12 +271,12 @@ const main = async (): Promise<void> => {
     mirrorsDir: config.paths.mirrors,
     tasksDir: config.paths.tasks,
     helperPath: CRED_HELPER,
-    socketPath: CRED_SOCKET,
+    socketDir: CRED_SOCKET_DIR,
     identity: config.identity,
   });
 
   const credentials = new CredentialService();
-  await credentials.start(CRED_SOCKET);
+  await credentials.start(CRED_SOCKET_DIR);
 
   const leases = new LeaseManager({
     git,

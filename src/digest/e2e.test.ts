@@ -191,7 +191,7 @@ const world = async (): Promise<World> => {
               mirrorsDir,
               tasksDir: join(root, `${id}-tasks`),
               helperPath: "/nonexistent/helper",
-              socketPath: "/nonexistent/socket",
+              socketDir: "/nonexistent/socket",
               identity: { name: "test", email: "test@example.invalid" },
             }),
           ),
