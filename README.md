@@ -157,7 +157,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/notify/http.ts` | The retrying JSON client every Discord path shares. |
 | `src/notify/discord.ts` | Notification rendering + the webhook transport (§11.2). |
 | `src/notify/bot.ts` | The bot's REST half — messages, threads. The only transport that can carry buttons (§7.1). |
-| `src/notify/gateway.ts` | Discord gateway websocket — messages and interactions (§7). |
+| `src/notify/gateway.ts` | Discord gateway websocket — messages, interactions, presence (§7). |
+| `src/notify/activity.ts` | What the bot advertises it is working on. Rendering is pure (§7.2). |
 | `src/notify/commands.ts` | `!answer` parsing. Pure, no IO (§7). |
 | `src/notify/components.ts` | Buttons and modals, and the `custom_id` codec. Pure (§7.1). |
 | `src/notify/slash.ts` | The registered command set + what an interaction means. Pure (§7.1). |
@@ -850,6 +851,27 @@ and renders the typed `!answer` instruction instead (§7.1).
 The bot needs the **MESSAGE_CONTENT** privileged intent enabled in the Discord developer
 portal. Without it every message arrives with empty content and no command ever matches —
 a checkbox, not something code can detect or fix.
+
+### Seeing what it is working on, without asking
+
+Where a bot token exists, the bot's **presence** says what the fleet is doing — visible in
+the member list, with nothing to type and no page to open (§7.2):
+
+| presence | what it means |
+|---|---|
+| `Watching ALERT-6155db · implementing` | one task running, and the phase it is in |
+| `Watching 3 tasks running` | several at once — the web view says which |
+| `Watching TASK-1 · review · 2 needs you` | working, and two tasks are also waiting on a human |
+| `Watching 1 waiting for you` | nothing running; the fleet is stopped until you answer |
+| `Watching for work · 4 ready` | idle **with a backlog** — if this persists, something is wrong |
+| `Watching for work · nothing queued` | idle with nothing to do |
+
+It is rendered from the same surveyed task state the web view uses, so it agrees with
+`/tasks` rather than being a second source of truth, and it updates on the housekeeping
+timer — which means it stays current *during* a session rather than freezing for the length
+of one. Every replica publishes the identical line, so it survives a rollout without a
+handover gap. Needs no configuration and no extra Discord permission beyond the bot token
+already required above.
 
 ## Brainstorming a plan
 

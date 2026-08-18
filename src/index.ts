@@ -30,6 +30,7 @@ import { DiscordBridge } from "./notify/bridge.ts";
 import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
 import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
+import { FleetActivity } from "./notify/activity.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { AlertProcessor, AlertQueue } from "./remediation/queue.ts";
 import { startRemediationReceiver, type AlertObserver } from "./remediation/receiver.ts";
@@ -343,6 +344,17 @@ const main = async (): Promise<void> => {
     logger,
   });
 
+  // Also built before both users, and for a sharper version of the same reason (§7.2). The
+  // supervisor's survey writes into it on the housekeeping timer; the gateway reads it at
+  // IDENTIFY and subscribes at READY. Those two have deliberately different lifetimes — the
+  // survey outlives every socket, and a socket is replaced on every reconnect — so neither
+  // can own the other and both hold this.
+  //
+  // Only when there IS a bot: the presence travels over the gateway connection, and without
+  // a token there is no gateway. Leaving it undefined is what makes the supervisor's
+  // `activity` call a no-op on a webhook-only runner rather than a wasted render per poll.
+  const activity = discord.bot === undefined ? undefined : new FleetActivity();
+
   const supervisor = new Supervisor({
     config,
     store,
@@ -384,6 +396,7 @@ const main = async (): Promise<void> => {
     credentials,
     inbox,
     snapshot,
+    ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     runners: plane.runners,
     metrics,
@@ -444,11 +457,18 @@ const main = async (): Promise<void> => {
   const bridge =
     discord.bot === undefined
       ? Promise.resolve()
-      : runBridge(discord.bot, inbox, snapshot, threads, logger, controller.signal, chat).catch(
-          (error: unknown) => {
-            logger.error("bridge.failed", errorFields(error));
-          },
-        );
+      : runBridge(
+          discord.bot,
+          inbox,
+          snapshot,
+          threads,
+          logger,
+          controller.signal,
+          chat,
+          activity,
+        ).catch((error: unknown) => {
+          logger.error("bridge.failed", errorFields(error));
+        });
 
   try {
     await supervisor.run(controller.signal);
@@ -791,6 +811,7 @@ const runBridge = (
   logger: Logger,
   signal: AbortSignal,
   leadership: ChatLeadership,
+  activity?: FleetActivity,
 ): Promise<void> => {
   // Every replica connects; one acts (§7). The connection is what keeps the bot online
   // through a rollout, and it costs nothing — it is acting four times that broke things.
@@ -803,6 +824,11 @@ const runBridge = (
     logger,
     onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
+    // Passed WITHOUT a leadership check, unlike everything else the bridge does. Presence
+    // is idempotent and identical on every replica — all four render from the same surveyed
+    // state — so four senders converge where four ACTORS conflicted (§7.2). Holder-only
+    // would make the status go stale for the length of a claim handover instead.
+    ...(activity === undefined ? {} : { presence: activity }),
   }).run(signal);
 };
 
