@@ -207,11 +207,13 @@ awkward, the change is probably wrong.
    audit trail cannot be rewritten by the thing being audited.
 4. **Every push verifies the lease first.** Claim-time exclusion is not enough — a
    partitioned runner must not resurrect stale work.
-5. **`journal.md` appends; `handoff.md` is overwritten.** An append-forever handoff
+5. **The journal appends; `handoff.md` is overwritten.** An append-forever handoff
    eventually consumes the context window it exists to preserve. The journal keeps every
-   entry on disk, but reaches a prompt as a bounded VIEW — repeats collapsed, oldest
-   entries elided and declared — because append-only and unbounded-in-context are
-   different properties and only the first is wanted (§4.1).
+   entry on disk — one file per entry under `journal/`, so two runners recording the same
+   task write different paths and their commits still rebase — but reaches a prompt as a
+   bounded VIEW: repeats collapsed, oldest entries elided and declared, because
+   append-only and unbounded-in-context are different properties and only the first is
+   wanted (§4.1).
 6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
    the state repo is written and pushed, and a mirroring failure only logs — an
    unreachable tracker must never fail a task. Discord is a view on the same terms: a
@@ -714,7 +716,7 @@ so, then archived. It works on a task that is *running*, not only on an idle one
 session stops at the next turn boundary, nothing from it is recorded, and the park lands
 on the following poll (the reply says `cancelling` until then). The task is never claimed
 again; the thread keeps its history and un-archives if anyone posts in it. Nothing is deleted: parking already stops all work, and
-`journal.md` is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
+the journal is the audit trail. To reclaim the disk, `git rm -r tasks/<id>` in the state
 repo by hand, once no lease is held.
 
 `/resume <task>` brings one back, from `parked` **or** `failed`. That matters more than it

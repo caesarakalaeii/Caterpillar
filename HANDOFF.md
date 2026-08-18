@@ -12,7 +12,7 @@ branch without a human touching it**. What is left is mostly a toolchain gap own
 
 Overwrite this file rather than appending to it — an append-forever handoff eventually
 consumes the context it exists to preserve (the same reason `handoff.md` is overwritten and
-`journal.md` appends, DESIGN.md §4.1).
+the journal appends, DESIGN.md §4.1).
 
 ## Orientation
 

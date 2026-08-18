@@ -234,7 +234,9 @@ state-repo/
     TASK-123/
       spec.md                  # immutable: goal, acceptance criteria, repos, requires
       state.json               # mutable control record
-      journal.md               # append-only: one block per session
+      journal/                 # append-only: ONE FILE per entry — the audit trail
+        0007-20260813T094100123Z-pod-7f3a.md
+      journal.md               # legacy single-file journal: still read, never written
       handoff.md               # overwritten each handoff — the baton
       questions/
         001-question.md
@@ -244,14 +246,35 @@ state-repo/
       artifacts/
 ```
 
-`spec.md` is written once and never edited by the agent. `journal.md` is append-only —
+`spec.md` is written once and never edited by the agent. The journal is append-only —
 it is the audit trail. `handoff.md` is deliberately *overwritten*: it holds only what the
 next session needs, so it cannot grow without bound.
 
+**The journal is one file per entry, not one file appended to.** Append-only is the
+invariant; a single file was never part of it, and it was the one place the state repo
+broke the property everything else relies on. Runners touch disjoint `tasks/<id>/` paths,
+so their histories commute and rebase — but two runners recording the *same* task both
+appended to the last line of `journal.md`, and no rebase can ever apply that (§4.3). A
+sharded journal has no such line: they write different files and both commits apply. No
+amount of better rebasing achieves this; only the format does.
+
+The name is `<zero-padded-session>-<iso-ish-timestamp>-<runner-id>.md`. It sorts
+chronologically as a plain string, which is what `readJournal` concatenates on and what
+the digest reads the window in; the session orders entries the way a reader expects, the
+timestamp orders two entries of one session, and the runner id separates two runners that
+managed both. A name already taken is suffixed rather than overwritten — an entry is never
+rewritten, which is the invariant restated at the level of files.
+
+Existing `journal.md` files are **read and never touched**. `StateStore.readJournal`
+prepends the legacy file to the shards and hands back the same markdown the single file
+always did, so a task that started before the change keeps rendering, keeps feeding
+digests, and keeps resuming on its full history. Rewriting those files into shards would
+put the unmergeable conflict straight back, this time in the migration.
+
 **The journal is bounded on the way INTO a prompt, never on disk** (amended after
 SMOKE-1). Append-only and unbounded-in-context are different properties, and only the
-first one is wanted: the file is the audit trail and git keeps it whole, but every
-session was opening by paying for all of it. SMOKE-1 finished with a 347KB journal —
+first one is wanted: the journal is the audit trail and git keeps it whole — every shard
+of it — but every session was opening by paying for all of it. SMOKE-1 finished with a 347KB journal —
 620 byte-identical park entries from a retry storm around two that said anything — so
 any further session on that task would have started ~90k tokens down.
 
@@ -287,9 +310,7 @@ the same reason is real history, and the second park means something the first d
 
 `pull` keeps unpushed commits by rebasing onto the remote rather than resetting over them —
 it used to reset, and that destroyed five tasks' work. But a rebase can conflict, and a
-conflict here is **unresolvable rather than transient**: `journal.md` is append-only, so
-two runners appending to the same task collide on the same line and no retry will ever
-apply.
+conflict here is **unresolvable rather than transient**.
 
 Throwing made that fatal to the runner rather than to the pull. `pollOnce` logs
 `poll.failed` and tries again in thirty seconds, and the retry is the identical rebase. On
@@ -297,13 +318,22 @@ a four-replica fleet two runners sat in that loop indefinitely within minutes of
 existing — claiming nothing, draining no chat, answering every probe — and a restart does
 not help, because the commit is on the volume.
 
-It is reachable whenever two runners record the same task: one has its push refused (a
-forge outage will do it), keeps the commit, and another takes the task over and pushes its
-own. So the commits are moved to `refs/salvaged/<oid>` and the runner carries on. Nothing
-is destroyed, the ref outlives the pod because the volume does, and the event is logged at
-`error` — the runner recovers, so nothing else would raise it, and two runners disagreeing
-about a task is never routine. The remote wins because it has to: it is what every other
-runner already agrees on.
+The conflict that caused *that* incident was `journal.md`: append-only and single-file, so
+two runners recording the same task collided on the same line. It was reachable whenever
+one runner had its push refused (a forge outage will do it), kept the commit, and another
+took the task over and pushed its own. **That conflict class no longer exists.** The
+journal is one file per entry (§4.1), the two runners write different paths, and both
+commits apply — which is a property of the format rather than of the recovery, and so
+cannot regress by being retried differently.
+
+The salvage stays anyway, because it is the correct backstop for every *other* conflict —
+a hand-edited file, a `state.json` two runners wrote, a future format that forgets this
+lesson. Unmergeable commits are moved to `refs/salvaged/<oid>` and the runner carries on.
+Nothing is destroyed, the ref outlives the pod because the volume does, and the event is
+logged at `error` — the runner recovers, so nothing else would raise it, and two runners
+disagreeing about a task is never routine. The remote wins because it has to: it is what
+every other runner already agrees on. A `state.salvaged` line today means something the
+fleet has not seen before, not the journal.
 
 ---
 
@@ -394,11 +424,11 @@ supervisor loop:
 
   loop:
     session = new pi Agent
-      system prompt + spec.md + journal.md + handoff.md
+      system prompt + spec.md + journal/ + handoff.md
       shouldStopAfterTurn → true when usage > contextWindow * 0.70
 
     run until stop
-    write sessions/NNN.jsonl.gz, append journal.md, update state.json
+    write sessions/NNN.jsonl.gz, write a journal/ entry, update state.json
     push state (supervisor credential)
 
     case exit reason:
@@ -444,7 +474,7 @@ On reclaim, the new session:
 1. Commits any uncommitted worktree changes to the task branch as `wip: recovered from
    interrupted session`, rather than discarding them.
 2. Appends a journal entry recording the interruption.
-3. Replays context from `spec.md` + `journal.md` + `handoff.md`.
+3. Replays context from `spec.md` + the journal + `handoff.md`.
 
 **A reclaim requires `running` to be claimable, and for a long time it was not.** From
 the end of session 1 the pushed `state.json` says `running` — `recordSession` writes the
@@ -1508,7 +1538,7 @@ Three channels, and they answer different questions. Keeping them apart is delib
 |---|---|---|
 | Metrics | "is the fleet healthy" — rates, totals, queue depth | Prometheus |
 | **Logs** | "what is this runner doing, and why did that task park" | Loki |
-| Journal (`journal.md`) | "what did the AGENT do and decide" — handoff continuity | git, forever |
+| Journal (`journal/`) | "what did the AGENT do and decide" — handoff continuity | git, forever |
 
 **Logs** (amended after the first in-cluster run)
 
@@ -2338,9 +2368,12 @@ Two commits also make a **catch-up digest correct**. "The end of the day" is a c
 `HEAD`, so a digest published the next morning describes the day it names rather than
 folding that morning's work into it.
 
-The journal is exploited rather than parsed: `journal.md` is append-only by design (§4.1),
-so the day's entries are exactly the suffix the earlier copy does not have. No session
-headings are matched, and nothing breaks when their format changes.
+The journal is exploited rather than parsed: it is one append-only file per entry (§4.1),
+so the day's entries are exactly the shard files that appeared between the two commits —
+a `--diff-filter=A` question. No session headings are matched, and nothing breaks when
+their format changes. A task whose history predates the sharding still has a single
+`journal.md`, and for that file the day's entries are the suffix the earlier copy does not
+have; both paths run, so a window straddling the change reports both halves.
 
 ### A day ends when the operator's day ends
 
