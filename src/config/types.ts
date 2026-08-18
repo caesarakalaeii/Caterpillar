@@ -254,6 +254,31 @@ export interface ToolchainConfig {
    * editing a string is exactly the accident worth preventing.
    */
   readonly trustedPublicKeys: readonly string[];
+  /**
+   * Free space on the store's filesystem, in GiB, below which nix collects MID-BUILD
+   * until `maxFreeGb` is available again. 0 disables it. DESIGN.md §8.1.
+   *
+   * **This is the store's only real quota, and it has to be, because the manifests look
+   * like they say otherwise.** A `volumeClaimTemplate` requesting 15Gi under `local-path`
+   * is a scheduling request and not a limit: the provisioner hands out a directory on the
+   * node's own filesystem and enforces nothing. A store that grows to 60Gi fills the node
+   * and takes every other pod on it down with it. No storage class here would enforce it,
+   * and `ephemeral-storage` limits do not cover a PersistentVolume.
+   *
+   * Measured against the NODE rather than the volume, deliberately: four replicas' volumes
+   * share one disk with everything else scheduled there, so per-store ceilings that are
+   * each individually fine still add up to a full node.
+   */
+  readonly minFreeGb: number;
+  /**
+   * How much free space an automatic collection aims to leave, in GiB. Must exceed
+   * `minFreeGb` or nix collects on every build.
+   *
+   * The gap between the two is the hysteresis. Too narrow and a big substitution
+   * re-triggers a collection it just paid for; this is why it is a separate number rather
+   * than a multiple of `minFreeGb`.
+   */
+  readonly maxFreeGb: number;
 }
 
 /**

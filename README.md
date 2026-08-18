@@ -499,7 +499,9 @@ because one object configures the runners and the holder:
 },
 "toolchain": {
   "substituters": ["http://caterpillar-nix-cache/"],
-  "trustedPublicKeys": []        // none needed: the proxy passes upstream signatures through
+  "trustedPublicKeys": [],       // none needed: the proxy passes upstream signatures through
+  "minFreeGb": 8,                // below this much free on the NODE, nix collects mid-build
+  "maxFreeGb": 25                // …until this much is free again
 }
 ```
 
@@ -514,6 +516,22 @@ per-account rate limit**, which is shared with your own interactive usage. The f
 degrades rather than failing tasks when it is hit (§6.3), but many replicas contending for
 one subscription mostly produces many runners in cooldown. Scaling *down* leaves the claims
 behind — Kubernetes never deletes a StatefulSet's volumes.
+
+> **A volume's requested size is not a quota, and this is the trap.** Under `local-path` a
+> PVC is a directory on the node's own filesystem; the 15Gi request schedules the pod and
+> the provisioner enforces nothing. A nix store that grows to 60Gi does not get ENOSPC at
+> 15 — it fills the **node** and takes every other pod on it down. No storage class here
+> behaves differently, and `ephemeral-storage` limits do not cover a PersistentVolume.
+>
+> `minFreeGb`/`maxFreeGb` above are the real bound: below `minFreeGb` free on the node's
+> disk, nix collects **mid-build** until `maxFreeGb` is free. Measured against the node
+> rather than the volume on purpose — replicas share a disk, so per-store ceilings that are
+> each individually fine still add up to a full node. It bounds *growth*, which is the only
+> time a store gets bigger; `gcKeepDays` still decides what is worth keeping. On by default
+> at 5/20, because an unbounded store is how a runner takes down the machine it is on and
+> a workstation is no different. `minFreeGb: 0` turns it off.
+>
+> The **work** volume is bounded separately, by worktree reaping (§3.1).
 
 ## Who the fleet commits as
 

@@ -40,6 +40,8 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     gcKeepDays: 7,
     substituters: [],
     trustedPublicKeys: [],
+    minFreeGb: 5,
+    maxFreeGb: 20,
   },
   stateRepo: {
     url: "https://example.invalid/state.git",

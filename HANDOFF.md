@@ -333,7 +333,7 @@ scripts this session used, which is strictly better than a commit per file.
 | Fleet | `StatefulSet/caterpillar`, `RollingUpdate`, `/healthz` + `/metrics` on 9090 |
 | Volumes | `work-caterpillar-N` (10Gi) + `nix-caterpillar-N` (15Gi), one pair per replica |
 | Singletons | `caterpillar-credentials` (1Gi) and `caterpillar-nix-cache` (50Gi), **1 replica each, never more** |
-| Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, retained until the credential is migrated |
+| Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, credential already migrated off; **safe to prune** |
 | Image | `ghcr.io/caesarakalaeii/caterpillar:main`, rolled by Keel (`policy: force`, `trigger: poll`) |
 
 Deploy = merge to `main`. CI builds and pushes, Keel notices within ~45–90s and rolls the
@@ -406,11 +406,18 @@ Full commands in `caesar-deployment/apps/workloads/caterpillar/README.md`, prere
 - **Do not scale the holder past 1.** A second replica is a second writer, which is the
   condition it exists to make impossible.
 
-**MIGRATION, not yet done:** the live `caterpillar-work` PVC still holds the credential
-from the single-replica era. It is deliberately still in `kustomization.yaml` so ArgoCD's
-`prune` does not delete it — copy the file onto the holder, verify
-`llm.credential-source source=holder` in a runner's logs, and only then remove `pvc.yaml`.
-The order is written out in that file's own header.
+**MIGRATION: done and verified.** The credential has been on the holder since
+2026-08-18 04:03, and all four runners log
+`llm.credential-source source=holder url=http://caterpillar-credentials:8081`.
+
+**What is left is a prune, not a migration.** `caterpillar-work` (20Gi) and
+`caterpillar-nix` (30Gi) are still bound on caesar3 and mounted by nothing, because
+`pvc.yaml` is still listed in `kustomization.yaml`. Removing that file lets ArgoCD prune
+both and returns 50Gi to the node.
+
+Note what the old volume is NOT: a backup. The copy of `anthropic.json` still on it is a
+token the provider has already invalidated — the holder has been refreshing since 04:03,
+and every refresh rotates the refresh token. Keeping it buys nothing and costs 50Gi.
 
 ### Discord: every half is LIVE
 

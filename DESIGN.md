@@ -1000,6 +1000,46 @@ Two properties of how it is applied are load-bearing:
 `extra-substituters` from an untrusted caller is silently ignored by a nix **daemon**. This
 image runs single-user nix with `node` owning `/nix`, so the caller is the trusted user and
 it is honoured — worth knowing before anyone introduces a daemon.
+
+#### The store's quota is `min-free`, and the volume size is not a quota at all
+
+The `nix` `volumeClaimTemplate` requests 15Gi and that number **enforces nothing**. Under
+`local-path` a PVC is a directory on the node's own filesystem: the request decides where
+the pod is scheduled and the provisioner applies no limit whatsoever. A store that grows to
+60Gi does not get ENOSPC at 15 — it fills the node and takes every other pod on it down.
+There is no storage class here that would behave differently, and `ephemeral-storage`
+limits govern the container's writable layer and emptyDirs, not a PersistentVolume.
+
+That is worth stating in this much detail because the manifest reads exactly like a quota,
+so the failure would arrive as a surprise on a node nobody was watching.
+
+The actual bound is nix's own automatic collector, set through the same `NIX_CONFIG`:
+below `toolchain.minFreeGb` of free space on the store's filesystem, nix garbage-collects
+**mid-build** until `maxFreeGb` is free again. Three properties make it the right
+instrument rather than a store-size cap:
+
+- **It measures the NODE**, which is the thing that actually breaks. Four replicas' volumes
+  share one disk with everything else scheduled there, so per-store ceilings that are each
+  individually fine still add up to a full node.
+- **It fires while the store is GROWING**, not on a timer. `maybeCollectGarbage` runs on the
+  idle branch every `gcIntervalHours`; a substitution that adds 4GB in ninety seconds
+  happens entirely between two of those.
+- **It costs nothing when there is room** — a `statvfs` before a build. So the age-based
+  pass stays the thing that decides *what* is worth keeping, and this only decides when
+  keeping it stops being affordable.
+
+`maxFreeGb` must exceed `minFreeGb` and the loader refuses otherwise. With no gap nix has
+already met its target the moment it starts collecting, so it collects on every build and
+frees almost nothing — a store that thrashes its collector while still filling the disk,
+which from outside reads as "the quota is on and not working". Either number could be the
+typo, so neither is guessed at.
+
+**On by default (5/20 GiB), unlike the caches**, which default to empty. An unbounded store
+is how a runner takes down the machine it is on, and that is not a cluster-only hazard — a
+workstation runner filling a laptop's disk is the same failure with a shorter fuse.
+`minFreeGb: 0` is the documented off switch. The GC roots `print-dev-env --profile`
+registers still protect a live task's environment, so an automatic collection cannot delete
+the toolchain of the session that triggered it.
 - **nixpkgs is pinned** for generated environments. An unattended agent picking up a silent
   bump produces a red acceptance run with no diff to explain it.
 - **A toolchain that will not build parks the task**, naming nix's own error. Falling

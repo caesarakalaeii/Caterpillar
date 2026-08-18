@@ -1322,7 +1322,7 @@ test("a git failure in the poll loop is logged and retried, not fatal", async ()
   );
 });
 
-test("/cancel stops a session running on this runner instead of refusing it", async () => {
+test("/cancel stops a session running on this runner instead of refusing it", async (t) => {
   // `applyPark` used to refuse a running task outright, so the only way to stop a
   // session was deleting the pod — which then stranded the task, because an interrupted
   // task is pushed as `running` and nothing moved it back (§6.2). The two bugs made
@@ -1345,11 +1345,24 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   // ends the test with "Promise resolution is still pending" before the cancel is ever
   // answered. That is the stub being unfaithful to a hang, not the supervisor misbehaving
   // — it failed on node 22 and passed on 26.
+  //
+  // It is cleared from `t.after` as well as on abort, and THAT is not decoration either.
+  // Clearing it only on abort means the one run where the abort never arrives leaves a
+  // live interval behind: the assertions below fail, and then node cannot exit, so the
+  // whole suite HANGS after reporting the failure instead of finishing. That is not
+  // hypothetical — it is what wedged a review council reviewer for 2h42m in the cluster
+  // (DESIGN.md §6.4), because the reviewer ran `npm test` and this interval outlived the
+  // failure. A test that fails must fail, not hang.
+  let keepalive: NodeJS.Timeout | undefined;
+  t.after(() => {
+    if (keepalive !== undefined) clearInterval(keepalive);
+  });
+
   let sawAbort = false;
   const runner: SessionRunner = {
     run: (_spec, _state, signal) =>
       new Promise<SessionOutcome>((resolve) => {
-        const keepalive = setInterval(() => {}, 1_000);
+        keepalive = setInterval(() => {}, 1_000);
         signal.addEventListener("abort", () => {
           clearInterval(keepalive);
           sawAbort = true;

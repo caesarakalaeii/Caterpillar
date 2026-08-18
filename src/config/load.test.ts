@@ -231,3 +231,26 @@ test("the remediation port is validated even with the receiver off", async () =>
   assert.equal(config.remediation.enabled, true);
   assert.equal(config.remediation.port, 9101);
 });
+
+test("a store quota with no hysteresis is refused rather than corrected", async () => {
+  // `max-free` at or below `min-free` means nix has already met its target the moment it
+  // starts collecting, so it collects on EVERY build and frees almost nothing each time.
+  // From outside that reads as "the quota is on and not working", which is the worst of
+  // the three possible states. Either number could be the typo, so neither is guessed at.
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 20 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: 20, maxFreeGb: 5 } }), ConfigError);
+  await assert.rejects(() => load({ toolchain: { minFreeGb: -1 } }), ConfigError);
+});
+
+test("the store quota defaults on, and 0 is the off switch", async () => {
+  // On by default unlike the caches: an unbounded store is how a runner fills the node it
+  // shares with every other pod, and that is not a cluster-only hazard.
+  const defaults = await load({});
+  assert.equal(defaults.toolchain.minFreeGb, 5);
+  assert.equal(defaults.toolchain.maxFreeGb, 20);
+
+  // 0 disables it, and the pair check must not fire on the way past — off means neither
+  // number applies, so an untouched maxFreeGb is not a misconfiguration.
+  const off = await load({ toolchain: { minFreeGb: 0 } });
+  assert.equal(off.toolchain.minFreeGb, 0);
+});
