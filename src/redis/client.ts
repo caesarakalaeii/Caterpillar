@@ -52,6 +52,30 @@ export interface RedisClient {
   get(key: string): Promise<string | undefined>;
   /** `ttlSeconds` absent means no expiry. */
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
+  /**
+   * `SET key value NX EX ttl` — take `key` only if nobody holds it. True if taken.
+   *
+   * The one primitive here that is a DECISION rather than a store, and the only one whose
+   * return value callers branch on. It exists for the standalone bot's leadership lock
+   * (`notify/leadership.ts`): two bot processes overlapping during a rolling update must
+   * not both act, and the atomicity of NX is what decides which one does.
+   *
+   * `renew` is the same call for a holder that already believes it holds the key: it must
+   * NOT be NX, or a renewal would fail against the holder's own value, and it must check
+   * the value still belongs to the caller, or a process that lost the key to an expiry
+   * would take it back from whoever won it in the meantime. See `RedisLock`.
+   */
+  setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean>;
+  /**
+   * Extend `key`'s TTL only while it still holds exactly `value`. True if extended.
+   *
+   * Compare-and-set, expressed as the smallest thing that can be done atomically over a
+   * connection that may be shared: a GET followed by a SET would let another process take
+   * the key between the two, and the loser would then overwrite the winner.
+   */
+  renewIfHeld(key: string, value: string, ttlSeconds: number): Promise<boolean>;
+  /** Drop `key` only while it still holds exactly `value`. For stepping down cleanly. */
+  releaseIfHeld(key: string, value: string): Promise<boolean>;
   del(key: string): Promise<void>;
   /** Append to the right of a list, and bound it: older entries beyond `cap` are dropped. */
   rpush(key: string, value: string, cap?: number): Promise<void>;
@@ -130,6 +154,23 @@ export const withTimeout = async <T>(
 /** Shortest gap between two socket-error lines about the same connection. */
 const ERROR_INTERVAL_MS = 30_000;
 
+/** Seconds, floored at 1: Redis rejects a zero or negative EX. */
+const ttlTo = (ttlSeconds: number): number => Math.max(1, Math.ceil(ttlSeconds));
+
+/**
+ * Extend the TTL only if the value is still ours. 1 when extended, 0 when not.
+ *
+ * The check and the write have to be one operation. A holder that read "still mine" and
+ * then wrote would, if the key expired in between, overwrite whichever process had taken
+ * it in that gap — producing exactly the two-holders state the lock exists to prevent.
+ */
+const RENEW_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end";
+
+/** Delete only if the value is still ours, so stepping down cannot evict a successor. */
+const RELEASE_SCRIPT =
+  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+
 export interface RedisClientOptions {
   readonly connection: RedisConnection;
   readonly logger: Logger;
@@ -146,6 +187,16 @@ export interface RedisDriver {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<unknown>;
   set(key: string, value: string, mode: "EX", ttl: number): Promise<unknown>;
+  /** `SET key value EX ttl NX`. Resolves to null when the key already existed. */
+  set(key: string, value: string, mode: "EX", ttl: number, nx: "NX"): Promise<string | null>;
+  /**
+   * A Lua script, for the two compare-and-set operations a lock needs.
+   *
+   * `eval` rather than `defineCommand`: a script used twice at startup does not justify
+   * teaching the driver a new method name, and EVAL keeps the script visible at the call
+   * site instead of behind a registration that happens somewhere else.
+   */
+  eval(script: string, numKeys: number, ...args: string[]): Promise<unknown>;
   del(key: string): Promise<unknown>;
   rpush(key: string, value: string): Promise<unknown>;
   ltrim(key: string, start: number, stop: number): Promise<unknown>;
@@ -255,6 +306,29 @@ export class IoRedisClient implements RedisClient {
           // window, and second granularity keeps the value readable in `redis-cli ttl`.
           this.driver.set(this.key(key), value, "EX", Math.max(1, Math.ceil(ttlSeconds))),
     );
+  }
+
+  async setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    const reply = await this.run("setnx", () =>
+      this.driver.set(this.key(key), value, "EX", ttlTo(ttlSeconds), "NX"),
+    );
+    // Redis answers OK or nil, never an error, when NX loses. Nil IS the answer "somebody
+    // else holds it", so it must not be treated as a failed command.
+    return reply !== null && reply !== undefined;
+  }
+
+  async renewIfHeld(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    const reply = await this.run("renew", () =>
+      this.driver.eval(RENEW_SCRIPT, 1, this.key(key), value, String(ttlTo(ttlSeconds))),
+    );
+    return reply === 1;
+  }
+
+  async releaseIfHeld(key: string, value: string): Promise<boolean> {
+    const reply = await this.run("release", () =>
+      this.driver.eval(RELEASE_SCRIPT, 1, this.key(key), value),
+    );
+    return reply === 1;
   }
 
   async del(key: string): Promise<void> {

@@ -63,6 +63,27 @@ export class MemoryRedisClient implements RedisClient {
     return Promise.resolve();
   }
 
+  setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    // Through `live`, so a key whose TTL has passed is takeable. Expiry here is lazy (see
+    // the module docstring), and a lock that could not be taken after its holder's TTL
+    // elapsed would be a lock that jams the first time a bot pod is killed.
+    if (this.live(key) !== undefined) return Promise.resolve(false);
+    void this.set(key, value, ttlSeconds);
+    return Promise.resolve(true);
+  }
+
+  renewIfHeld(key: string, value: string, ttlSeconds: number): Promise<boolean> {
+    if (this.live(key)?.value !== value) return Promise.resolve(false);
+    void this.set(key, value, ttlSeconds);
+    return Promise.resolve(true);
+  }
+
+  releaseIfHeld(key: string, value: string): Promise<boolean> {
+    if (this.live(key)?.value !== value) return Promise.resolve(false);
+    this.strings.delete(key);
+    return Promise.resolve(true);
+  }
+
   del(key: string): Promise<void> {
     this.strings.delete(key);
     this.lists.delete(key);
@@ -158,6 +179,18 @@ export class FailingRedisClient implements RedisClient {
   }
 
   set(): Promise<void> {
+    return Promise.reject(this.error());
+  }
+
+  setIfAbsent(): Promise<boolean> {
+    return Promise.reject(this.error());
+  }
+
+  renewIfHeld(): Promise<boolean> {
+    return Promise.reject(this.error());
+  }
+
+  releaseIfHeld(): Promise<boolean> {
     return Promise.reject(this.error());
   }
 
