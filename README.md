@@ -128,7 +128,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
-| `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
+| `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees, and reaping the finished ones (§3.1). |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
 | `src/llm/credentials.ts` | The rotating OAuth credential as a locked file (§9.6). |
 | `src/llm/credential-holder.ts` | The one pod that owns and refreshes it, over HTTP (§9.6). |
@@ -500,6 +500,22 @@ because one object configures the runners and the holder:
 "toolchain": {
   "substituters": ["http://caterpillar-nix-cache/"],
   "trustedPublicKeys": []        // none needed: the proxy passes upstream signatures through
+}
+```
+
+The third thing a fleet needs is the one nobody configures, because it defaults to on: each
+replica **reaps its own task worktrees**. A worktree is a full checkout plus whatever a
+session installs into it, per repo the task declares, and until this existed nothing ever
+removed one — so a replica's 20Gi volume grew monotonically with every task it had ever
+worked. The supervisor removes a task's checkout when it is done, when it failed, or when it
+loses the lease to another replica; a sweep from the idle poll catches whatever a killed pod
+left behind. Tasks that hand off or are waiting on a human keep their checkout, so answering
+a question does not cost a re-clone. Both numbers are tunable and neither usually needs to
+be:
+
+```jsonc
+"workspace": {
+  "reap": { "intervalHours": 24, "keepHours": 72 }
 }
 ```
 

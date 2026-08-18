@@ -136,6 +136,10 @@ test("the runner export carries what an operator actually needs", async () => {
   assert.equal(exported.llm.auth, "subscription");
   assert.equal(exported.limits.maxSessionsPerTask, 20);
   assert.equal(exported.toolchain.nixpkgs, "github:NixOS/nixpkgs/abc");
+  // Exported for the same reason the store's gc numbers are: an operator looking at a full
+  // volume needs both halves of the janitor without knowing which one they are after.
+  assert.equal(exported.workspace.reap.intervalHours, 24);
+  assert.equal(exported.workspace.reap.keepHours, 72);
   assert.equal(exported.stateRepo.branch, "main");
   assert.deepEqual(exported.workspaces[0]?.forge, {
     kind: "github",

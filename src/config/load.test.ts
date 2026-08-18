@@ -231,3 +231,35 @@ test("the remediation port is validated even with the receiver off", async () =>
   assert.equal(config.remediation.enabled, true);
   assert.equal(config.remediation.port, 9101);
 });
+
+test("worktree reaping is on by default, because a full volume is not opt-in", async () => {
+  // The one section here whose default is ON, and deliberately so. Every other default in
+  // this file is off because turning it on does something outward-facing — a port, a
+  // channel, a cluster read. Reaping does something inward-facing and unavoidable: without
+  // it a replica's 20Gi volume grows by one full checkout per task it has ever worked,
+  // forever, and an operator who has to configure a garbage collector before the disk stops
+  // filling has not been given a garbage collector.
+  const config = await load({});
+
+  assert.equal(config.workspace.reap.intervalHours, 24);
+  assert.equal(config.workspace.reap.keepHours, 72);
+});
+
+test("both reaping numbers can be set, and nonsense in either is refused", async () => {
+  const config = await load({ workspace: { reap: { intervalHours: 6, keepHours: 12 } } });
+  assert.equal(config.workspace.reap.intervalHours, 6);
+  assert.equal(config.workspace.reap.keepHours, 12);
+
+  // A keep-age that arrives as a string is the failure worth refusing loudly: `num()`
+  // would not coerce it, but a section that silently fell back to the default would leave
+  // an operator who wrote "12" believing they had shortened it.
+  await assert.rejects(
+    () => load({ workspace: { reap: { keepHours: "12" } } }),
+    (error: unknown) => error instanceof ConfigError && /workspace\.reap\.keepHours/.test(error.message),
+  );
+  await assert.rejects(
+    () => load({ workspace: { reap: { intervalHours: null } } }),
+    (error: unknown) =>
+      error instanceof ConfigError && /workspace\.reap\.intervalHours/.test(error.message),
+  );
+});
