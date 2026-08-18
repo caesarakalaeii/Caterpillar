@@ -733,3 +733,26 @@ test("minFreeGb 0 switches the quota off without switching the caches off", asyn
   assert.match(config, /extra-substituters = http:\/\/cache\.invalid\//);
   assert.ok(!config.includes("min-free"), "the quota must be absent, not zeroed");
 });
+
+/**
+ * `NODE_ENV=production` is set by the supervisor's own Dockerfile, correctly — its
+ * runtime image installed with `--omit=dev`. But it is process-wide, and every agent
+ * session and acceptance command is a child of the supervisor, so all of them inherited
+ * it. npm honours it by skipping devDependencies, so a task whose acceptance list starts
+ * `npm ci` installed no `typescript` and the next command died with
+ * `tsc: command not found` (exit 127) — an acceptance list the container could not
+ * satisfy, which no agent could fix from inside the repo. BS-...-07 hit this in session 5.
+ */
+test("NODE_ENV=production does not leak into a task's environment", async () => {
+  const resolved = await resolver({ NODE_ENV: "production" }).resolve(spec, "/tmp/wt");
+
+  assert.equal(resolved.env["NODE_ENV"], undefined);
+});
+
+test("a NODE_ENV that is not production is left alone", async () => {
+  // Only the npm-devDependency-skipping value is stripped. Anything else is somebody's
+  // deliberate choice and none of this module's business.
+  const resolved = await resolver({ NODE_ENV: "test" }).resolve(spec, "/tmp/wt");
+
+  assert.equal(resolved.env["NODE_ENV"], "test");
+});

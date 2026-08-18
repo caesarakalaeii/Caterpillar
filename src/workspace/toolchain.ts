@@ -157,7 +157,7 @@ export class ToolchainResolver {
     this.config = options.config;
     this.tasksDir = options.tasksDir;
     this.baseEnv = withCommitIdentity(
-      withNixSettings(options.baseEnv ?? process.env, options.config),
+      withNixSettings(withoutProductionNodeEnv(options.baseEnv ?? process.env), options.config),
       options.identity,
     );
     this.repo = options.repo;
@@ -708,6 +708,33 @@ const withCommitIdentity = (
     GIT_COMMITTER_NAME: identity.name,
     GIT_COMMITTER_EMAIL: identity.email,
   };
+};
+
+/**
+ * Drop `NODE_ENV=production` on the way into a task's environment.
+ *
+ * The supervisor's own image sets it (Dockerfile: `ENV NODE_ENV=production`), correctly
+ * — the runtime image installed its dependencies with `--omit=dev` and should behave as
+ * production. But that variable is process-wide, and every agent session and every
+ * acceptance command is a CHILD of the supervisor, so all of them inherited it.
+ *
+ * npm honours `NODE_ENV=production` by omitting devDependencies. A task whose acceptance
+ * list begins `npm ci` therefore installed no devDependencies at all, and the very next
+ * command — `npm run check`, which runs `tsc` — died with `tsc: command not found` and
+ * exit 127. The agent could not fix it, because nothing in the repo was wrong: the
+ * acceptance list was unsatisfiable inside the container. BS-...-07 hit exactly this in
+ * its session 5.
+ *
+ * The supervisor's own `node_modules` are already installed and unaffected by this; what
+ * is stripped here is only what the TASK's commands see. A repo that genuinely wants a
+ * production install can still say so explicitly in its acceptance command
+ * (`npm ci --omit=dev`), which is a statement about that repo rather than an accident of
+ * where the runner happens to be running.
+ */
+const withoutProductionNodeEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  if (env["NODE_ENV"] !== "production") return env;
+  const { NODE_ENV: _dropped, ...rest } = env;
+  return rest;
 };
 
 export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
