@@ -739,9 +739,13 @@ test("minFreeGb 0 switches the quota off without switching the caches off", asyn
  * runtime image installed with `--omit=dev`. But it is process-wide, and every agent
  * session and acceptance command is a child of the supervisor, so all of them inherited
  * it. npm honours it by skipping devDependencies, so a task whose acceptance list starts
- * `npm ci` installed no `typescript` and the next command died with
- * `tsc: command not found` (exit 127) — an acceptance list the container could not
- * satisfy, which no agent could fix from inside the repo. BS-...-07 hit this in session 5.
+ * `npm ci` installs no `typescript` and the next command dies with
+ * `tsc: command not found` (exit 127) — an acceptance list the container cannot satisfy,
+ * which no agent can fix from inside the repo.
+ *
+ * This repo also pins `include=dev` in its own `.npmrc`, which is the right fix for a repo
+ * that knows about the problem. This is the fix for the repos that do not: the fleet runs
+ * acceptance commands for containers that never heard of this supervisor.
  */
 test("NODE_ENV=production does not leak into a task's environment", async () => {
   const resolved = await resolver({ NODE_ENV: "production" }).resolve(spec, "/tmp/wt");

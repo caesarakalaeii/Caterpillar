@@ -2964,15 +2964,30 @@ both produced a session that could only fail:
   image sets it (correctly — that image installed with `--omit=dev`), but it is
   process-wide and every agent session and acceptance command is a child of the
   supervisor. npm honours it by skipping devDependencies, so a task whose acceptance list
-  begins `npm ci` installed no `typescript` and the next command died with
-  `tsc: command not found`, exit 127. Nothing in the repo was wrong and no agent could
-  fix it: the acceptance list was unsatisfiable inside the container. `ToolchainResolver`
-  now strips exactly that value on the way in — a repo that genuinely wants a production
-  install still says so in its own acceptance command.
+  begins `npm ci` installs no `typescript` and the next command dies with
+  `tsc: command not found`, exit 127. Nothing in the repo is wrong when that happens and
+  no agent can fix it from inside the worktree: the acceptance list is unsatisfiable
+  inside the container. `ToolchainResolver` now strips exactly that value on the way in —
+  a repo that genuinely wants a production install still says so in its own acceptance
+  command.
 
-The rule both share: **when a task parks for no progress, suspect the sessions before the
-detector.** Widening the streak limit here would have hidden both defects and parked the
-work later instead of sooner.
+**A caution about the second one, because the record nearly recorded it wrongly.** It is
+tempting to read `BS-…-07`'s exit-127 as proof of the `NODE_ENV` defect. It is not.
+That task's acceptance list is `npm run check` and `npm test` with **no `npm ci` at all**,
+so the gate never ran an install and never had devDependencies stripped from under it; it
+type-checked against whatever `node_modules` the previous session happened to leave in the
+worktree. `GH-…-60` ran the same three commands on the same repo in the same image at
+11:45 the same morning and passed, because its list *does* begin `npm ci --ignore-scripts`.
+The two facts only fit together one way: **an acceptance list that omits its install step
+is not reproducible.** It grades the worktree's leftover state, so it passes or fails on
+what the last session did rather than on what was committed, and it is the omission —
+not the ambient variable — that stranded `BS-…-07`. The `NODE_ENV` strip is still right,
+and is kept, but it is a fix for the *next* repo rather than an account of this one.
+
+The rule all of them share: **when a task parks for no progress, suspect the sessions
+before the detector** — and check what the acceptance list actually runs before believing
+a story about why it failed. Widening the streak limit here would have hidden every one of
+these and parked the work later instead of sooner.
 
 ### 11.2 The Discord webhook
 

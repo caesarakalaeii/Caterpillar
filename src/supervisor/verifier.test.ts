@@ -394,3 +394,56 @@ test("a failing acceptance command is never blamed on CI", async () => {
   assert.notEqual(result.pending, true);
   assert.equal(calls(), 0);
 });
+
+/**
+ * `BS-...-07`'s acceptance list was `npm run check` and `npm test` with no install step.
+ * `npm run check` exited 127 with `tsc: command not found`, and four consecutive sessions
+ * read that as a code defect because the gate reported the exit code and nothing else.
+ * The list was simply grading whatever a previous session had left in the worktree.
+ */
+test("a not-found failure with no install step says so", async () => {
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(specWith(["definitely-not-a-real-binary"]), state);
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /no acceptance command installs dependencies/);
+  assert.match(result.detail, /not to the repository/);
+});
+
+test("a not-found failure is NOT annotated when the list does install", async () => {
+  // The list is reproducible, so a missing binary is a real finding about the repo and
+  // the note would be actively misleading.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(
+    specWith(["npm ci --ignore-scripts", "definitely-not-a-real-binary"]),
+    state,
+  );
+
+  assert.equal(result.passed, false);
+  assert.doesNotMatch(result.detail, /installs dependencies/);
+});
+
+test("an ordinary failure is not annotated", async () => {
+  // Exit 3 from a command that ran is a genuine test failure; nothing to do with install.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(specWith(["echo nope >&2; exit 3"]), state);
+
+  assert.equal(result.passed, false);
+  assert.doesNotMatch(result.detail, /installs dependencies/);
+});
+
+test("a not-found failure still fails the gate", async () => {
+  // The note explains; it must never excuse. A command that cannot run has not passed.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(specWith(["definitely-not-a-real-binary"]), state);
+
+  assert.equal(result.passed, false);
+});

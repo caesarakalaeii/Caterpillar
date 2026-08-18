@@ -719,11 +719,17 @@ const withCommitIdentity = (
  * acceptance command is a CHILD of the supervisor, so all of them inherited it.
  *
  * npm honours `NODE_ENV=production` by omitting devDependencies. A task whose acceptance
- * list begins `npm ci` therefore installed no devDependencies at all, and the very next
- * command — `npm run check`, which runs `tsc` — died with `tsc: command not found` and
- * exit 127. The agent could not fix it, because nothing in the repo was wrong: the
- * acceptance list was unsatisfiable inside the container. BS-...-07 hit exactly this in
- * its session 5.
+ * list begins `npm ci` therefore installs no devDependencies at all, and the very next
+ * command — `npm run check`, which runs `tsc` — dies with `tsc: command not found` and
+ * exit 127. Nothing in the repo is wrong when that happens: the acceptance list is simply
+ * unsatisfiable inside the container, which is not something an agent can fix from inside
+ * the worktree.
+ *
+ * This repo defends itself in its own `.npmrc` (`include=dev`), and that is the right
+ * place for a repo to state what its own install needs. But `.npmrc` only protects the
+ * repo that carries it, and the fleet runs acceptance commands for repos that have never
+ * heard of this supervisor. The variable is the runner's accident rather than the repo's
+ * intent, so it is dropped here, at the one point every task environment is built.
  *
  * The supervisor's own `node_modules` are already installed and unaffected by this; what
  * is stripped here is only what the TASK's commands see. A repo that genuinely wants a

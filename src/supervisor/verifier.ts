@@ -133,7 +133,8 @@ export class AcceptanceVerifier {
     const detail = failures
       .map((f) => `\`${f.command}\` exited ${f.code}:\n\n\`\`\`\n${f.output.slice(-2000)}\n\`\`\``)
       .join("\n\n");
-    return { passed: false, detail: `Acceptance criteria failed.\n\n${detail}` };
+    const note = missingInstallNote(spec.acceptance, failures);
+    return { passed: false, detail: `Acceptance criteria failed.\n\n${detail}${note}` };
   }
 
   /**
@@ -251,3 +252,54 @@ export class AcceptanceVerifier {
 }
 
 export type { ForgeFactory };
+
+/**
+ * A hint appended when a failure looks like a missing toolchain rather than broken code.
+ *
+ * An acceptance list that runs a build or test step but never installs dependencies is
+ * not reproducible: it grades whatever `node_modules` (or equivalent) the last session
+ * happened to leave in the worktree, which persists across sessions by design. It passes
+ * while some earlier session's install is still lying there and fails once anything
+ * clears it — on the same commit, with nothing in the repo having changed.
+ *
+ * `BS-...-07` died of exactly this. Its list was `npm run check` and `npm test` with no
+ * install step, and `npm run check` exited 127 with `tsc: command not found`. Four
+ * consecutive sessions read that as a code defect and went looking for one, because the
+ * gate reported the exit code and nothing else; `GH-...-60` ran the same commands on the
+ * same repo in the same image that morning and passed, because its list begins
+ * `npm ci --ignore-scripts`. The difference was never visible from the failure text.
+ *
+ * This only annotates \u2014 it never changes the verdict. A 127 is still a failure, because
+ * a command that cannot run has not passed. The point is to aim the next session at the
+ * acceptance list instead of at the source, and the note is deliberately conditional on
+ * both signals (an exit code that means "not found", and a list with no install step) so
+ * that a genuine 127 from a repo that does install stays unannotated.
+ */
+const missingInstallNote = (acceptance: readonly string[], failures: CommandResult[]): string => {
+  // 127 is the shell's "command not found"; npm reports the same through its wrapper.
+  const notFound = failures.some(
+    (f) => f.code === 127 || /: (command )?not found/i.test(f.output),
+  );
+  if (!notFound) return "";
+  if (acceptance.some(installsDependencies)) return "";
+
+  return (
+    "\n\nNOTE: a command was not found, and no acceptance command installs dependencies " +
+    "(`npm ci`, `npm install`, `pnpm install`, `yarn install`, `bundle install`, " +
+    "`pip install`, `go mod download`, `cargo fetch`, or a `nix`/`make` step that does " +
+    "it). The list is then graded against whatever a previous session left in the " +
+    "worktree, so it can pass once and fail later on an unchanged commit. Before " +
+    "treating this as a code defect, check whether the acceptance criteria are missing " +
+    "their install step \u2014 that is a change to the task's spec, not to the repository."
+  );
+};
+
+/** Does this command populate the dependency tree the later commands need? */
+const installsDependencies = (command: string): boolean =>
+  /\b(npm|pnpm|yarn)\s+(ci|install|i)\b/.test(command) ||
+  /\bbundle\s+install\b/.test(command) ||
+  /\bpip3?\s+install\b/.test(command) ||
+  /\bgo\s+mod\s+(download|tidy)\b/.test(command) ||
+  /\bcargo\s+(fetch|build)\b/.test(command) ||
+  /\bnix\s+(build|develop|shell)\b/.test(command) ||
+  /\bmake\s+(deps|install|setup|bootstrap)\b/.test(command);
