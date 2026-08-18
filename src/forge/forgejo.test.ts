@@ -230,3 +230,46 @@ test("the state repo is refused at the door, not at the mint", async () => {
   assert.equal(unreachable.length, 1);
   assert.match(unreachable[0]?.reason ?? "", /state repo/);
 });
+
+test("the catalogue is what the tokens can enumerate, narrowed to owners we hold", async () => {
+  // A bot account can be a collaborator on repos this workspace holds no token for.
+  // Suggesting one offers work that cannot be cloned.
+  const factory = reachable([["ElectricBoogaloo", "tok"]], (route) =>
+    route.startsWith("/user/repos")
+      ? new Response(
+          JSON.stringify(
+            route.includes("page=1")
+              ? [
+                  { full_name: "ElectricBoogaloo/eb-api" },
+                  { full_name: "SomeoneElse/not-ours" },
+                  { full_name: "ElectricBoogaloo/eb-web" },
+                ]
+              : [],
+          ),
+          { status: 200 },
+        )
+      : new Response("Not Found", { status: 404 }),
+  );
+
+  assert.deepEqual(await factory.reachable(), [
+    "ElectricBoogaloo/eb-api",
+    "ElectricBoogaloo/eb-web",
+  ]);
+});
+
+test("a token that may not list falls back to the repos it was configured for", async () => {
+  // A repository-scoped token answers 403 here. An empty box is a working box; a thrown
+  // error inside an autocomplete would be a Discord interaction that never gets answered.
+  const factory = new ForgejoForgeFactory(
+    {
+      apiBase: "https://codeberg.org/api/v1",
+      username: "bot",
+      tokensByOwner: new Map([["ElectricBoogaloo", "tok"]]),
+      tokensByRepo: new Map([["ElectricBoogaloo/eb-api", "narrow"]]),
+      fetch: () => Promise.resolve(new Response("Forbidden", { status: 403 })),
+    },
+    { host: "codeberg.org" },
+  );
+
+  assert.deepEqual(await factory.reachable(), ["ElectricBoogaloo/eb-api"]);
+});

@@ -57,6 +57,22 @@ export interface RepoReach {
 }
 
 /**
+ * Every repo a credential can reach, `owner/name`, as the forge spells them.
+ *
+ * The other half of the same idea: `RepoReach` judges a name somebody typed, this one
+ * stops them having to type it. `/brainstorm`'s `repo:` option is autocompleted from it,
+ * which is the only version of this check a human never notices — a name that cannot be
+ * reached is a name that was never offered.
+ *
+ * Empty is a legitimate answer and must not read as an error: a forge that cannot
+ * enumerate (a Forgejo repository-scoped token cannot) returns what it knows, and an empty
+ * catalogue simply means the box behaves as it always did and the door checks still bite.
+ */
+export interface RepoCatalog {
+  reachable(): Promise<readonly string[]>;
+}
+
+/**
  * The reasons joined into one paragraph.
  *
  * Each reason already names its own repo, so this is a join and not a list: two
@@ -186,3 +202,60 @@ export const nearestSlug = (repo: RepoRef, candidates: readonly string[]): strin
  */
 export const nearestName = (name: string, candidates: readonly string[]): string | undefined =>
   closest({ name }, candidates);
+
+/**
+ * Discord's ceiling on an autocomplete response. Exceeding it is a 400 for the WHOLE
+ * response, which the client renders as no suggestions at all.
+ */
+const MAX_CHOICES = 25;
+
+/**
+ * The repos worth suggesting for what has been typed so far, best first.
+ *
+ * Forgiving in exactly the way the incident was. Ranked:
+ *
+ *   1. the slug starts with the query — the ordinary case, `caesarakalaeii/all` narrowing
+ *   2. the query appears in it — `chat` finding `all-chat` without the owner
+ *   3. the SQUASHED query appears in the squashed slug — this is the one that matters:
+ *      `allchat` finds `all-chat` while it is still being typed, so the name that caused
+ *      a parked task is never a name that can be committed to
+ *   4. a name within `editBudget` edits — `all-chta` for `all-chat`
+ *
+ * An empty query lists the catalogue rather than nothing: an empty suggestion box is
+ * indistinguishable from a bot that has stopped working, and the first thing typed into
+ * `repo:` is an owner that every candidate shares anyway.
+ *
+ * Ties keep the forge's own ordering, so the list does not reshuffle between keystrokes.
+ */
+export const rankRepos = (
+  query: string,
+  candidates: readonly string[],
+  limit = MAX_CHOICES,
+): readonly string[] => {
+  const trimmed = query.trim();
+  if (trimmed.length === 0) return candidates.slice(0, limit);
+
+  const wanted = trimmed.toLowerCase();
+  const squashed = squash(trimmed);
+
+  const scored: { readonly slug: string; readonly score: number; readonly at: number }[] = [];
+  candidates.forEach((candidate, at) => {
+    const slug = candidate.toLowerCase();
+    const name = candidate.slice(candidate.indexOf("/") + 1);
+    const score = slug.startsWith(wanted)
+      ? 0
+      : slug.includes(wanted)
+        ? 1
+        : squashed.length > 0 && squash(candidate).includes(squashed)
+          ? 2
+          : withinDistance(wanted, name.toLowerCase(), editBudget(trimmed)) === undefined
+            ? undefined
+            : 3;
+    if (score !== undefined) scored.push({ slug: candidate, score, at });
+  });
+
+  return scored
+    .sort((a, b) => (a.score === b.score ? a.at - b.at : a.score - b.score))
+    .slice(0, limit)
+    .map((entry) => entry.slug);
+};

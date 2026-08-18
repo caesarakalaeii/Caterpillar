@@ -694,6 +694,16 @@ export class GitHubAppForgeFactory implements ForgeFactory {
   }
 
   /**
+   * Every repo this installation can see, for the `/brainstorm repo:` autocomplete.
+   *
+   * The same cached listing `unreachable` judges against, deliberately: a box that offers a
+   * repo the door would then refuse would be worse than no box at all.
+   */
+  async reachable(): Promise<readonly string[]> {
+    return this.installed.list();
+  }
+
+  /**
    * Which of these repos this App cannot reach, and why (DESIGN.md §9.1.1).
    *
    * Both bounds in one answer, because both are things a human typing a repo name gets

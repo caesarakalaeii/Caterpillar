@@ -659,7 +659,11 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
         asWorkspaceName("test"),
         // The reviewer identity never checks anything out, so reachability is not its
         // question — it approves and merges through the API alone (§12.1).
-        { forTask: () => Promise.resolve(reviewerForge), unreachable: () => Promise.resolve([]) },
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
       ],
     ]),
     notifier: new NullNotifier(),

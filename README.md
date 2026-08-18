@@ -130,7 +130,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
-| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). |
+| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). `reach.ts` / `catalog.ts` answer whether a named repo can be reached, and offer the ones that can (§9.1.1). |
 | `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
@@ -911,11 +911,18 @@ that crosses two is refused in the thread rather than quietly narrowed to one (�
 extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
 child tasks inherit the whole list.
 
-A repo the App cannot reach is refused **before the task exists**, and the refusal names
-the near miss: `repo:caesarakalaeii/allchat` answers *"not one of the 65 repositories this
-workspace's GitHub App can see — did you mean `caesarakalaeii/all-chat`?"* rather than
-opening a thread that spends a session and parks on a git exit code (§9.1.1). Retype it and
-run the command again; nothing was created.
+**The `repo:` box autocompletes** from the repos the runner can actually reach, so the name
+is picked rather than typed — and the ranking is deliberately forgiving: typing `allchat`
+offers `caesarakalaeii/all-chat`. With several repos in the box, a suggestion keeps the ones
+already there. `npm run discord:register` has to be re-run after a deploy that changes the
+command set, or the box stays a plain text field.
+
+A repo the App cannot reach is still refused **before the task exists**, for the times
+somebody types past the suggestions, and the refusal names the near miss:
+`repo:caesarakalaeii/allchat` answers *"not one of the 65 repositories this workspace's
+GitHub App can see — did you mean `caesarakalaeii/all-chat`?"* rather than opening a thread
+that spends a session and parks on a git exit code (§9.1.1). Retype it and run the command
+again; nothing was created.
 
 Opens a thread and creates a brainstorm task in it. The agent reads the repos and asks one
 question at a time — answer in the thread, where the task id is implied, so `!answer yes`

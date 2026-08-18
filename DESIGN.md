@@ -989,10 +989,12 @@ fifteen minutes, and a housekeeping pass that waits on a git fetch still can. So
 acknowledged immediately with what is knowable at click time, and the real outcome arrives
 afterwards as an ordinary channel message from the bot.
 
-Reads never take that path at all. `/tasks`, `/task` and autocomplete are served from an
-in-memory snapshot, refreshed by the same sweep that decides what to claim. Going through
-the inbox for a listing would mean waiting on a session to finish before being told what it
-is doing.
+Reads never take that path at all. `/tasks`, `/task` and task-id autocomplete are served
+from an in-memory snapshot, refreshed by the same sweep that decides what to claim. Going
+through the inbox for a listing would mean waiting on a session to finish before being told
+what it is doing. `/brainstorm`'s `repo:` box is the one autocomplete answered from
+somewhere else — the workspaces' forges (§9.1.1) — and it is bounded and failure-isolated
+for the same 3-second reason.
 
 The **housekeeping** loop refreshes it, not only the work loop (§6.4), and that is not
 belt-and-braces. The sweep publishes the snapshot on its way to picking a task, so on the
@@ -1547,6 +1549,43 @@ an error rather than a short list (the same reasoning as the check-run cap in §
 boundary: a 422 now asks the installation what it *can* see and names the repos that are
 missing, with the same near miss. That is the message the credential helper prints into a
 failing `git clone`, so it is the last place a human is told anything at all.
+
+**The refusal is the floor, not the fix.** The better outcome is never typing the name: the
+same list answers forwards as well as backwards, so `/brainstorm`'s `repo:` option is
+**autocompleted** from the repos the runner can actually reach (`RepoCatalog`, the mirror of
+`RepoReach`). A name that cannot be reached is a name that is never offered.
+
+Four things make that box behave:
+
+- **The ranking is forgiving in exactly the way the incident was.** Prefix, then substring,
+  then the *squashed* comparison — so `allchat` finds `all-chat` while it is still being
+  typed — then bounded edit distance for `all-chta`. An empty query lists the catalogue
+  rather than nothing: an empty suggestion box is indistinguishable from a bot that has
+  stopped working.
+- **`repo:` takes several repos** (§14.3), and Discord replaces the *entire* option value
+  with the chosen suggestion — so each choice carries the repos already typed plus the new
+  one. A choice carrying only its own repo would silently delete the others, which is the
+  same "plan about half a system" the cross-workspace refusal exists to prevent. A
+  completion that would exceed Discord's 100-character ceiling is dropped rather than sent,
+  because that ceiling rejects the *whole* response and shows the human no suggestions at
+  all.
+- **One catalogue over every workspace**, because `/brainstorm` does not name one — the loop
+  derives the workspace from the repo. Each workspace's contribution is bounded (1.5s) and
+  failure-isolated: one forge being slow or refusing costs it its place in the list, not the
+  list.
+- **It never throws.** An autocomplete accepts exactly one response and no other kind, so an
+  unanswered interaction is a spinner that never resolves — worse than no suggestions. A
+  bridge with no catalogue at all (a standalone bot process holds no forge credential) is a
+  supported shape and behaves as it did before the box was completed.
+
+GitHub's catalogue is the installation listing already described. Forgejo's is `GET
+/user/repos` narrowed to the owners a token covers, falling back to the configured per-repo
+slugs when the token is repository-scoped and not permitted to list — so the box is as good
+as what the credential can enumerate, and empty rather than wrong when it can enumerate
+nothing.
+
+`COMMANDS` changed, so **`npm run discord:register` has to be re-run** for the box to appear
+(§7.1: registration is a deploy-time step, never done at boot).
 
 ### 9.2 Why the agent never holds the token
 

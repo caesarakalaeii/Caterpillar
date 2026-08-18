@@ -149,6 +149,13 @@ export const summariseCombinedStatus = (body: CombinedStatusResponse): CheckStat
   return { conclusion: "success", summary: `${total} status(es) passed` };
 };
 
+/**
+ * Enumeration bounds for `/user/repos`. 50 is Forgejo's usual `limit` ceiling, and 20 pages
+ * is 1000 repos — past any account this runs against, and a cap rather than a loop.
+ */
+const REPO_PAGE_SIZE = 50;
+const REPO_PAGES = 20;
+
 /** The transport for one set of options: injected in tests, the global otherwise. */
 const http = (options: ForgejoOptions): FetchLike =>
   options.fetch ?? ((input, init) => fetch(input, init));
@@ -301,6 +308,45 @@ export class ForgejoForgeFactory implements ForgeFactory {
   async forTask(spec: TaskSpec): Promise<Forge> {
     for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
     return new ForgejoForge(this.options, spec.repos, this.scope);
+  }
+
+  /**
+   * Every repo these tokens can reach, for the `/brainstorm repo:` autocomplete.
+   *
+   * `GET /user/repos` is the enumeration Forgejo has — repos the token's account owns or
+   * collaborates on — narrowed to the owners this workspace actually holds a token for, so
+   * the box cannot offer a repo `tokenFor` would then refuse.
+   *
+   * A repository-scoped token is not permitted to list, and answers 403. That is not an
+   * error worth propagating into a suggestion box: the configured per-repo slugs are what
+   * it can still name for certain, and an empty catalogue leaves the box exactly as it was
+   * before it had one. The door checks bite either way.
+   */
+  async reachable(): Promise<readonly string[]> {
+    const configured = [...(this.options.tokensByRepo?.keys() ?? [])];
+    const token = [...this.options.tokensByOwner.values()][0];
+    if (token === undefined) return configured;
+
+    const owned: string[] = [];
+    for (let page = 1; page <= REPO_PAGES; page += 1) {
+      const route = `/user/repos?limit=${REPO_PAGE_SIZE}&page=${page}`;
+      const response = await http(this.options)(`${this.options.apiBase}${route}`, {
+        headers: { authorization: `token ${token}`, accept: "application/json" },
+      });
+      if (!response.ok) return configured;
+
+      const body = (await response.json()) as readonly { readonly full_name?: string }[] | null;
+      const slugs = (body ?? []).flatMap((repo) =>
+        repo.full_name === undefined ? [] : [repo.full_name],
+      );
+      // Only owners a token covers. A bot account can be a collaborator on repos this
+      // workspace holds no credential for, and suggesting one is offering work that cannot
+      // be cloned.
+      owned.push(...slugs.filter((slug) => this.options.tokensByOwner.has(slug.split("/")[0] ?? "")));
+      if (slugs.length < REPO_PAGE_SIZE) break;
+    }
+
+    return [...new Set([...configured, ...owned])];
   }
 
   /**

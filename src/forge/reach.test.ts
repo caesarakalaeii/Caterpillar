@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { nearestName, nearestSlug, unreachableSummary } from "./reach.ts";
+import { nearestName, nearestSlug, rankRepos, unreachableSummary } from "./reach.ts";
 
 const repo = (slug: string) => {
   const [owner, name] = slug.split("/") as [string, string];
@@ -72,4 +72,57 @@ test("the summary reads as prose, whichever number of repos it covers", () => {
     { repo: repo("acme/b"), reason: "`acme/b` is not there either." },
   ]);
   assert.equal(two, "`acme/a` is not there. `acme/b` is not there either.");
+});
+
+/**
+ * Ranking for the `/brainstorm repo:` autocomplete.
+ *
+ * The point is that a human should not be able to type a repo that does not exist, so the
+ * ranking has to be forgiving in exactly the way the incident was: `allchat` must find
+ * `all-chat` while it is still being typed.
+ */
+const CATALOG = [
+  "caesarakalaeii/Caterpillar",
+  "caesarakalaeii/all-chat",
+  "caesarakalaeii/all-chat-extension",
+  "caesarakalaeii/caesar-deployment",
+  "caesarakalaeii/streamer-shield",
+];
+
+test("no query yet lists the catalog, so the box is never empty", () => {
+  // An empty suggestion list is indistinguishable from a broken bot. The first keystroke
+  // is `owner/…` for every repo, so there is nothing to narrow on yet.
+  assert.deepEqual(rankRepos("", CATALOG, 3), [
+    "caesarakalaeii/Caterpillar",
+    "caesarakalaeii/all-chat",
+    "caesarakalaeii/all-chat-extension",
+  ]);
+});
+
+test("the separator the human omits does not hide the repo they meant", () => {
+  assert.deepEqual(rankRepos("allchat", CATALOG), [
+    "caesarakalaeii/all-chat",
+    "caesarakalaeii/all-chat-extension",
+  ]);
+});
+
+test("a prefix beats a match in the middle of a name", () => {
+  const ranked = rankRepos("cat", CATALOG);
+  assert.equal(ranked[0], "caesarakalaeii/Caterpillar", ranked.join(", "));
+});
+
+test("the owner is searchable too, and case never matters", () => {
+  assert.deepEqual(rankRepos("CAESARAKALAEII/STREAMER", CATALOG), [
+    "caesarakalaeii/streamer-shield",
+  ]);
+});
+
+test("a typo still finds it, and a different word finds nothing", () => {
+  assert.deepEqual(rankRepos("all-chta", CATALOG), ["caesarakalaeii/all-chat"]);
+  assert.deepEqual(rankRepos("tractor", CATALOG), []);
+});
+
+test("the list is capped, because Discord rejects more than 25 choices", () => {
+  const many = Array.from({ length: 60 }, (_, index) => `acme/repo-${index}`);
+  assert.equal(rankRepos("repo", many).length, 25);
 });
