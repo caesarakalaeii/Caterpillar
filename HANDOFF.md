@@ -615,6 +615,14 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
 ### Credentials and git
 
 - **`credential.helper` set AFTER a clone is set too late** — pass it with `-c`.
+- **Every mirror command that talks to a remote needs `-c`, not just the clone.** Once the
+  helper became per-task it lives in each worktree's `config.worktree`, and a mirror is not
+  a worktree — so `syncMirror`'s **fetch** had nothing to read and went out anonymous. The
+  clone still authenticated, which is exactly what hid it: a repo's FIRST task built the
+  mirror and succeeded, and every task afterwards failed the refresh with `could not read
+  Username`. It presents as "the second task on a repo is broken". No test caught it because
+  a `file://` origin needs no credential to fetch from — assert on the *invocation*, not on
+  whether it threw.
 - **`Repository not found` means a credential ARRIVED and was refused.** 404 = the WRONG
   token was sent; 401 = NO token was. They look equally like "auth is broken" and point in
   opposite directions. **A 404 stops git asking the credential helper**, so a
