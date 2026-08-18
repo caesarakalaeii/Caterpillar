@@ -329,3 +329,41 @@ test("a fleet where every runner has only skipped still says something", async (
   const merged = await aggregatorWith(fetcherFor(answers)).fleet({ path: "/api/fleet" });
   assert.equal(merged.view.intake?.runner, "caterpillar-1", "the newest record of any kind");
 });
+
+test("a runner of the previous vintage is read, not thrown on", async () => {
+  // The viewer and the fleet roll independently, so during any update this process is
+  // talking to a mix of builds — one of which predates `live` being a list and answers with
+  // a single object, or with nothing. A dashboard that threw on that would be missing for
+  // exactly the minutes an operator is watching a rollout.
+  const answers = new Map<string, unknown>([
+    [
+      "http://caterpillar-0:8080/api/fleet",
+      {
+        tasks: [task("TASK-1")],
+        counts: { ready: 1 },
+        runners: [],
+        // The OLD shape: one object, no `runner` field, no list.
+        live: {
+          task: "TASK-1",
+          session: 1,
+          model: "claude-opus-5",
+          startedAt: "2026-08-18T08:00:00.000Z",
+          messages: 2,
+        },
+      },
+    ],
+    // Older still: no `live` key at all, because nothing was running.
+    ["http://caterpillar-1:8080/api/fleet", { tasks: [], counts: {}, runners: [] }],
+    ["http://caterpillar-2:8080/api/fleet", fleetOf([])],
+    ["http://caterpillar-3:8080/api/fleet", { records: [] }],
+  ]);
+
+  const merged = await aggregatorWith(fetcherFor(answers)).fleet({ path: "/api/fleet" });
+
+  assert.deepEqual(
+    merged.view.live.map((entry) => `${entry.runner}:${entry.task}`),
+    ["caterpillar-0:TASK-1"],
+  );
+  assert.deepEqual(merged.view.tasks.map((row) => row.id), ["TASK-1"]);
+  assert.deepEqual(merged.unreachable, []);
+});

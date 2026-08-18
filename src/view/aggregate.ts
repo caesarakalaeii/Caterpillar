@@ -87,16 +87,24 @@ export class Aggregator {
     const first = replies.find((reply) => reply.ok);
     const pass = lastIntakePass(replies);
 
-    const tasks: readonly TaskRow[] = first?.ok === true ? first.value.tasks : [];
-    const counts = first?.ok === true ? first.value.counts : {};
+    const tasks: readonly TaskRow[] = first?.ok === true ? first.value.tasks ?? [] : [];
+    const counts = first?.ok === true ? first.value.counts ?? {} : {};
 
     // Unioned across replicas, each entry already carrying the runner that reported it.
     // The name is overwritten with the DISCOVERED one: a runner's `runnerId` is set in its
     // own ConfigMap and the pod name is what the operator will `kubectl logs`.
+    //
+    // Every field is read defensively, and not out of habit: the viewer and the fleet roll
+    // independently, so during any update this process is talking to a mix of builds — one
+    // of which predates `live` being a list, and answers with a single object or with
+    // nothing at all. A dashboard that threw on that would be missing for exactly the
+    // minutes an operator is watching a rollout.
     const live: RunnerLive[] = [];
     for (const reply of replies) {
       if (!reply.ok) continue;
-      for (const session of reply.value.live) live.push({ ...session, runner: reply.runner.name });
+      for (const session of asList(reply.value.live)) {
+        live.push({ ...session, runner: reply.runner.name });
+      }
     }
 
     return {
@@ -156,7 +164,10 @@ export class Aggregator {
     for (const reply of replies) {
       if (!reply.ok) continue;
       answered.push(reply.runner.name);
-      for (const record of reply.value.records) records.push({ ...record, runner: reply.runner.name });
+      // Defensive for the same reason as `live`: a mixed fleet mid-rollout is the normal
+      // state of affairs for this process, not an exceptional one.
+      const held = Array.isArray(reply.value.records) ? reply.value.records : [];
+      for (const record of held) records.push({ ...record, runner: reply.runner.name });
     }
 
     records.sort((a, b) => {
@@ -195,6 +206,19 @@ const lastIntakePass = (
     .sort((a, b) => b.at.localeCompare(a.at));
 
   return passes.find((pass) => pass.outcome === "ingested") ?? passes[0];
+};
+
+/**
+ * A list, whatever a runner of another vintage actually sent.
+ *
+ * `live` was `LiveSummary | undefined` before this change and is a list after it. Both are
+ * accepted here because both will be on the wire at once during a rollout, and the older
+ * shape carries the same fields.
+ */
+const asList = (value: unknown): readonly RunnerLive[] => {
+  if (Array.isArray(value)) return value as readonly RunnerLive[];
+  if (value === undefined || value === null) return [];
+  return [value as RunnerLive];
 };
 
 const failures = <T>(replies: readonly RunnerReply<T>[]): readonly Unreachable[] =>
