@@ -336,11 +336,17 @@ const count = (paths: readonly string[], pattern: RegExp): number =>
 /**
  * What the agent wrote in the journal inside the window.
  *
- * `journal.md` is append-only by design (DESIGN.md §4.1), so the window's entries are
- * exactly the suffix the earlier copy does not have — no parsing of session headings, and
- * nothing that breaks when their format changes. The prefix check is not a formality: if
- * the file ever stopped being append-only, taking a suffix blindly would attribute
- * rewritten history to today.
+ * The journal is one file per entry under `tasks/<id>/journal/` (DESIGN.md §4.1), so
+ * "what was added in the window" is literally "which shard files appeared between `from`
+ * and `to`" — a `--diff-filter=A` question. That is both simpler and more correct than
+ * subtracting a prefix: it cannot mis-attribute anything, it needs no assumption about
+ * how entries are punctuated, and two runners' entries interleave in name order rather
+ * than in whichever order the file happened to be appended to.
+ *
+ * The legacy `journal.md` path is kept and read the old way, by prefix subtraction, so a
+ * window that straddles the format change still reports both halves: tasks that ran
+ * before the change have their whole history in that one file, and a window ending just
+ * after it must show the last append to it as well as the first shard.
  */
 const journalOf = async (
   git: Git,
@@ -348,14 +354,15 @@ const journalOf = async (
   to: string,
   id: TaskId,
 ): Promise<{ journal?: string }> => {
-  const after = await blob(git, to, `tasks/${id}/journal.md`);
-  if (after === undefined) return {};
+  const parts = [
+    await legacyJournalAdded(git, from, to, id),
+    ...(await shardJournalAdded(git, from, to, id)),
+  ];
 
-  const before = from === undefined ? undefined : await blob(git, from, `tasks/${id}/journal.md`);
-  const added =
-    before !== undefined && after.startsWith(before) ? after.slice(before.length) : after;
-
-  const trimmed = added.trim();
+  const trimmed = parts
+    .flatMap((part) => (part === undefined ? [] : [part.trim()]))
+    .filter((part) => part !== "")
+    .join("\n\n");
   if (trimmed === "") return {};
 
   const points = [...trimmed];
@@ -365,6 +372,62 @@ const journalOf = async (
         ? trimmed
         : `… (earlier entries omitted)\n${points.slice(-JOURNAL_LIMIT).join("")}`,
   };
+};
+
+/**
+ * The suffix a pre-sharding `journal.md` grew inside the window.
+ *
+ * The prefix check is not a formality: the file is append-only, and if it ever stopped
+ * being so, taking a suffix blindly would attribute rewritten history to today.
+ */
+const legacyJournalAdded = async (
+  git: Git,
+  from: string | undefined,
+  to: string,
+  id: TaskId,
+): Promise<string | undefined> => {
+  const after = await blob(git, to, `tasks/${id}/journal.md`);
+  if (after === undefined) return undefined;
+
+  const before = from === undefined ? undefined : await blob(git, from, `tasks/${id}/journal.md`);
+  return before !== undefined && after.startsWith(before) ? after.slice(before.length) : after;
+};
+
+/**
+ * The shard files that first appeared inside the window, in name order.
+ *
+ * Added-only. A shard is never rewritten (`appendJournal` refuses to reuse a name), so
+ * anything modified between the two commits is not a journal entry the window produced
+ * — and with no starting commit the window is the whole history, so everything present
+ * counts as having appeared inside it.
+ */
+const shardJournalAdded = async (
+  git: Git,
+  from: string | undefined,
+  to: string,
+  id: TaskId,
+): Promise<readonly string[]> => {
+  const dir = `tasks/${id}/journal/`;
+  const listed =
+    from === undefined
+      ? await git.tryRun("ls-tree", "-r", "--name-only", to, dir)
+      : await git.tryRun("diff", "--name-only", "--diff-filter=A", from, to, "--", dir);
+  if (listed.code !== 0) return [];
+
+  const names = listed.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.endsWith(".md"))
+    // Shard names are built to sort chronologically as plain strings; git's own ordering
+    // is close but not promised, and the digest reads as a narrative.
+    .sort();
+
+  const bodies: string[] = [];
+  for (const name of names) {
+    const body = await blob(git, to, name);
+    if (body !== undefined) bodies.push(body);
+  }
+  return bodies;
 };
 
 const changesOf = async (

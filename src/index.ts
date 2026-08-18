@@ -184,13 +184,20 @@ const main = async (): Promise<void> => {
   // The salvage hook is how a runner says it had to set its own commits aside. At `error`
   // deliberately: it means two runners recorded the same task and one of them lost, which
   // is never routine — but the runner keeps working, so nothing else would raise it.
-  const store = new StateStore(config.stateRepo.path, git, (salvaged) => {
-    logger.error("state.salvaged", {
-      ref: salvaged.ref,
-      commit: salvaged.commit,
-      detail: salvaged.detail,
-    });
-  });
+  // The runner id goes in because it names every journal shard this runner writes; that
+  // is what makes two runners' journal commits commute instead of colliding (§4.3).
+  const store = new StateStore(
+    config.stateRepo.path,
+    git,
+    (salvaged) => {
+      logger.error("state.salvaged", {
+        ref: salvaged.ref,
+        commit: salvaged.commit,
+        detail: salvaged.detail,
+      });
+    },
+    config.runnerId,
+  );
   const metrics = new AgentMetrics();
 
   // Parsed once: every workspace's scope excludes the same state repo, and a task

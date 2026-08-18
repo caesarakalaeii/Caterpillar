@@ -247,7 +247,9 @@ export const taskDetail = async (
     specError = error instanceof Error ? error.message : String(error);
   }
 
-  const journal = await store.readIfPresent(id, "journal.md");
+  // Every shard plus any legacy `journal.md`, concatenated — the page renders the
+  // journal as one document, which is what it has always been to a reader.
+  const journal = await store.readJournal(id);
   const handoff = await store.readIfPresent(id, "handoff.md");
   const current = live.current();
   const running = current !== undefined && current.task === id ? current : undefined;

@@ -4,20 +4,28 @@
  * Layout per task:
  *   spec.md      immutable — front-matter + prose goal, written once at intake
  *   state.json   mutable control record
- *   journal.md   APPEND-ONLY — the audit trail, and the source of truth on recovery
+ *   journal/     APPEND-ONLY — one file per entry: the audit trail, and the source of
+ *                truth on recovery. `journal.md` is the legacy single-file form and is
+ *                still read, never written and never deleted.
  *   handoff.md   OVERWRITTEN each session — the baton, deliberately bounded
  *   questions/   NNN-question.md / NNN-answer.md
  *   sessions/    NNN.jsonl.gz — pi transcripts
  *
- * journal.md grows; handoff.md does not. That asymmetry is the point: an
+ * The journal grows; handoff.md does not. That asymmetry is the point: an
  * append-forever handoff document eventually consumes the context window it exists
  * to preserve.
+ *
+ * The journal is SHARDED — one file per entry rather than one file appended to —
+ * because a single append-only file is the worst possible shape for concurrent
+ * writers. Two runners that record the same task used to append to the same last line
+ * of `journal.md`, and no rebase can ever apply that; sharded, they write different
+ * paths and both commits apply. See DESIGN.md §4.1 and §4.3.
  *
  * Only the supervisor writes here, using its own credential. Task-scoped forge
  * tokens never cover the state repo, so the audit trail cannot be rewritten by the
  * thing being audited (DESIGN.md §9.3).
  */
-import { mkdir, readFile, readdir, rm, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -176,6 +184,31 @@ const parseToolchain = (value: unknown, task: TaskId): ToolchainSpec | undefined
   };
 };
 
+/**
+ * A runner id inside a file name.
+ *
+ * The id is a pod name in the fleet and an arbitrary string in a test, and it becomes a
+ * path segment — so it is reduced to characters that cannot climb out of `journal/` or
+ * confuse a sort. An id that reduces to nothing still gets a name, because the shard
+ * must be written regardless of what the operator called the runner.
+ */
+const sanitiseRunnerId = (id: string): string => {
+  const cleaned = id.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  return cleaned === "" ? "runner" : cleaned;
+};
+
+/**
+ * `<zero-padded-session>-<iso-ish-timestamp>-<runner>.md`.
+ *
+ * Sorts chronologically as a plain string sort, which is what `readJournal` and the
+ * digest's window query both rely on. The timestamp keeps ISO's field order and drops
+ * the punctuation git and shells would rather not see.
+ */
+const journalShardName = (session: number, at: Date, runner: string): string => {
+  const stamp = at.toISOString().replace(/[-:]/g, "").replace(/\.(\d{3})Z$/, "$1Z");
+  return `${String(session).padStart(4, "0")}-${stamp}-${runner}.md`;
+};
+
 /** What `pull` moved aside, and where it put it. */
 export interface SalvagedCommits {
   /** `refs/salvaged/<oid>` — local to this checkout, and on its volume. */
@@ -197,10 +230,27 @@ export class StateStore {
    */
   private readonly onSalvage: ((event: SalvagedCommits) => void) | undefined;
 
-  constructor(root: string, git: Git, onSalvage?: (event: SalvagedCommits) => void) {
+  /**
+   * Which runner this store writes as — it becomes part of every journal shard's name.
+   *
+   * That is the whole collision argument: two runners recording the same session of the
+   * same task at the same instant still write different paths, so their commits commute
+   * and rebase onto one another. Defaulted rather than required because the tests and
+   * the one-shot CLIs construct stores without a fleet around them; `config.runnerId` is
+   * threaded in wherever there is one.
+   */
+  private readonly runnerId: string;
+
+  constructor(
+    root: string,
+    git: Git,
+    onSalvage?: (event: SalvagedCommits) => void,
+    runnerId?: string,
+  ) {
     this.root = root;
     this.git = git;
     this.onSalvage = onSalvage;
+    this.runnerId = sanitiseRunnerId(runnerId ?? "local");
   }
 
   taskDir(task: TaskId): string {
@@ -501,17 +551,70 @@ export class StateStore {
     await writeFile(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
   }
 
-  /** Append-only. Never rewrite existing journal content. */
+  /**
+   * Append one journal entry, as its OWN file under `tasks/<id>/journal/`.
+   *
+   * Append-only is unchanged as an invariant — nothing here rewrites an entry that
+   * already exists — but the unit of appending is now a file rather than a line. A
+   * single append-only file is the one place the state repo violated the property
+   * `commitAndPush` relies on: runners touch disjoint paths, so their histories
+   * commute. Two runners appending to `journal.md` collided on the same line and no
+   * rebase could ever apply the loser's commit (§4.3). Two runners writing shards write
+   * two different files, and both commits apply.
+   *
+   * The name sorts chronologically and is collision-free: the zero-padded session
+   * orders entries the way a reader expects, the timestamp orders two entries of the
+   * same session, and the runner id separates two runners that managed both.
+   */
   async appendJournal(task: TaskId, session: number, body: string): Promise<void> {
-    const dir = this.taskDir(task);
+    const dir = join(this.taskDir(task), "journal");
     await mkdir(dir, { recursive: true });
-    const entry = [
-      `\n## Session ${session} — ${new Date().toISOString()}`,
-      "",
-      body.trim(),
-      "",
-    ].join("\n");
-    await appendFile(join(dir, "journal.md"), entry, "utf8");
+
+    const at = new Date();
+    const entry = [`## Session ${session} — ${at.toISOString()}`, "", body.trim(), ""].join("\n");
+
+    // Collision within a millisecond on ONE runner is still possible — two entries for
+    // the same session, written back to back — and overwriting would silently drop an
+    // entry from the audit trail. Suffix until the name is free; the sort order is
+    // unaffected because the suffix is the last component.
+    let name = journalShardName(session, at, this.runnerId);
+    for (let n = 2; existsSync(join(dir, name)); n += 1) {
+      name = journalShardName(session, at, `${this.runnerId}-${n}`);
+    }
+
+    await writeFile(join(dir, name), entry, "utf8");
+  }
+
+  /**
+   * The whole journal, as one markdown document — what `journal.md` used to be.
+   *
+   * Legacy content first, then the shards in name order. A state repo that predates the
+   * sharding still has a `journal.md`, and it is READ and never rewritten: rewriting it
+   * would put the same conflict back, this time in the migration.
+   *
+   * Undefined when the task has no journal at all, so callers can keep distinguishing
+   * "nothing written yet" from "empty" exactly as `readIfPresent` let them.
+   */
+  async readJournal(task: TaskId): Promise<string | undefined> {
+    const legacy = await this.readIfPresent(task, "journal.md");
+
+    const dir = join(this.taskDir(task), "journal");
+    const shards = existsSync(dir)
+      ? (await readdir(dir)).filter((name) => name.endsWith(".md")).sort()
+      : [];
+
+    if (legacy === undefined && shards.length === 0) return undefined;
+
+    const parts: string[] = [];
+    if (legacy !== undefined) parts.push(legacy.trimEnd());
+    for (const name of shards) {
+      parts.push((await readFile(join(dir, name), "utf8")).trim());
+    }
+
+    // One blank line between entries, and a leading one: the old file was written by
+    // appending `\n## Session …`, so every heading had a blank line above it and
+    // `journalForPrompt`'s parser and the digest's evidence both grew up against that.
+    return `\n${parts.filter((part) => part !== "").join("\n\n")}\n`;
   }
 
   /** Overwritten every handoff — this file must not grow without bound. */
@@ -893,10 +996,19 @@ export class StateStore {
     // indefinitely — claiming nothing, draining no chat, answering every probe — and a
     // restart does not help, because the commit is on the volume.
     //
-    // It is reachable whenever two runners record the same task: one has its push refused
-    // (a forge outage will do it), keeps the commit, and another takes the task over and
-    // pushes its own. `journal.md` is append-only, so the two appends collide on the same
-    // line and no rebase can ever apply.
+    // The conflict that caused THAT incident no longer exists. It was two runners
+    // recording the same task — one has its push refused (a forge outage will do it),
+    // keeps the commit, and another takes the task over and pushes its own — colliding
+    // on the last line of a single append-only `journal.md`. The journal is now one file
+    // per entry (`appendJournal`), so those two runners write different paths and both
+    // commits apply. Do not re-derive the old cause from an old comment: if a rebase
+    // conflicts here today, it is something else.
+    //
+    // The salvage below stays regardless, because it is the right backstop for whatever
+    // that something else turns out to be — a hand-edited file, a `state.json` written
+    // by two runners, a future format that forgets this lesson. It must never be removed
+    // in favour of trusting the sharding: the point is that the runner survives a
+    // conflict it has never seen before.
     //
     // Resetting unconditionally is not the alternative — `pull` did exactly that once and
     // destroyed five tasks' work (see its note). So the commits are moved aside to a ref

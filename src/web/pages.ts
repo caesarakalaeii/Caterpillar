@@ -391,7 +391,7 @@ export const taskPage = (detail: TaskDetail): Html => {
         </div>
       </details>
       <details>
-        <summary>journal.md — append-only, the audit trail</summary>
+        <summary>journal/ — append-only, the audit trail</summary>
         <div class="body">
           ${detail.journal === undefined ? html`<p class="empty">none</p>` : html`<div class="prose">${detail.journal}</div>`}
         </div>
