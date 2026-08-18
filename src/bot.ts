@@ -57,7 +57,7 @@ import { ThreadIndex } from "./notify/threads.ts";
 import { errorFields, JsonLogger, type Logger } from "./obs/log.ts";
 import type { RedisClient } from "./redis/client.ts";
 import { createEphemeralPlane, type EphemeralPlane } from "./redis/plane.ts";
-import type { ThreadBindingReader } from "./redis/threads.ts";
+import { THREADS_KEY, type ThreadBindingReader } from "./redis/threads.ts";
 import { SecretBundle } from "./secrets/load.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
@@ -153,7 +153,7 @@ const main = async (): Promise<void> => {
   // unready rather than absent — an unready pod is a fact an operator can see, and a pod
   // that never bound its port looks like a scheduling problem.
   const runtime: Runtime = {
-    stopHealth: startHealthServer({ config, metrics, gateway, plane, logger }),
+    stopHealth: startHealthServer({ config, metrics, gateway, redis: redisOf(plane), logger }),
     plane,
     lock,
   };
@@ -251,7 +251,13 @@ export interface HealthOptions {
   readonly config: RunnerConfig;
   readonly metrics: AgentMetrics;
   readonly gateway: { connected: () => boolean };
-  readonly plane: EphemeralPlane;
+  /**
+   * The raw client, NOT one of the plane's structures — see `readiness` for why.
+   *
+   * Taking the client rather than the plane also stops the next person reaching for
+   * `plane.threads.read()` here: the type no longer offers it.
+   */
+  readonly redis: Pick<RedisClient, "get">;
   readonly logger: Logger;
 }
 
@@ -277,7 +283,7 @@ export interface HealthOptions {
  * operator reads.
  */
 export const startHealthServer = (options: HealthOptions): (() => void) => {
-  const { config, metrics, gateway, plane, logger } = options;
+  const { config, metrics, gateway, redis, logger } = options;
 
   const server = createServer((request, response) => {
     if (request.url === "/metrics") {
@@ -294,7 +300,7 @@ export const startHealthServer = (options: HealthOptions): (() => void) => {
     }
 
     if (request.url === "/readyz") {
-      void readiness(gateway, plane).then((ready) => {
+      void readiness(gateway, redis).then((ready) => {
         response
           .writeHead(ready.ok ? 200 : 503, { "content-type": "application/json" })
           .end(JSON.stringify(ready));
@@ -312,18 +318,32 @@ export const startHealthServer = (options: HealthOptions): (() => void) => {
   return () => server.close();
 };
 
-/** The two facts that decide whether a human gets an answer. Never throws. */
+/**
+ * The two facts that decide whether a human gets an answer. Never throws.
+ *
+ * The Redis term goes through the RAW CLIENT and not through `plane.threads`, and that is
+ * the whole subtlety of this function. Every plane structure reaches Redis through
+ * `RedisGuard`, whose stated contract is that it converts every failure into a value and
+ * never rejects — so `plane.threads.read().catch(() => false)` is dead code: it reports
+ * `true` against a client whose every call rejects (proved in `bot.test.ts` with
+ * `FailingRedisClient`). It is also served from a 2s cache, so most probes would make no
+ * round trip at all. The result was the precise containment failure this probe exists to
+ * rule out: during a Redis outage the gateway is still connected, `/readyz` returns 200,
+ * the pod stays in the Service — while `RedisChatLock.refresh()` has honestly stepped
+ * down and the bot answers nothing.
+ *
+ * `client.get` does propagate: it is bounded by `commandTimeoutMs` and rejects on a dead
+ * socket, which is exactly the signal wanted here. Guarding is right for the hot path and
+ * wrong for the probe, because the probe's entire job is to notice.
+ */
 const readiness = async (
   gateway: { connected: () => boolean },
-  plane: EphemeralPlane,
+  redisClient: Pick<RedisClient, "get">,
 ): Promise<{ readonly ok: boolean; readonly gateway: boolean; readonly redis: boolean }> => {
   const connected = gateway.connected();
 
-  // A real round trip, not a flag: `RedisGuard` degrades every operation to a value, so
-  // the only honest way to ask "is Redis reachable" is to ask Redis something. `read()`
-  // is bounded by `commandTimeoutMs` and cannot throw.
-  const redis = await plane.threads
-    .read()
+  const redis = await redisClient
+    .get(THREADS_KEY)
     .then(() => true)
     .catch(() => false);
 

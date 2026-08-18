@@ -23,7 +23,7 @@ import { threadBindings, ThreadIndex } from "./notify/threads.ts";
 import { INTERACTION, type Interaction } from "./notify/interactions.ts";
 import { SILENT_LOGGER } from "./obs/log.ts";
 import { RedisChatQueue } from "./redis/inbox.ts";
-import { MemoryRedisClient } from "./redis/memory.ts";
+import { FailingRedisClient, MemoryRedisClient } from "./redis/memory.ts";
 import { RedisSnapshotStore } from "./redis/snapshot.ts";
 import { RedisThreadBindings } from "./redis/threads.ts";
 import { InMemoryChatQueue } from "./redis/inbox.ts";
@@ -354,14 +354,18 @@ const probe = async (port: number, path: string): Promise<{ status: number; body
   return { status: response.status, body: await response.text() };
 };
 
-/** A plane stub exposing only what the health check reads. */
-const planeWith = (redisUp: boolean): Parameters<typeof startHealthServer>[0]["plane"] =>
-  ({
-    threads: {
-      read: () =>
-        redisUp ? Promise.resolve([]) : Promise.reject(new Error("redis is unreachable")),
-    },
-  }) as unknown as Parameters<typeof startHealthServer>[0]["plane"];
+/**
+ * A REAL client, never a stub that rejects on cue.
+ *
+ * The distinction is the whole point of this group. An earlier version passed a plane
+ * stub whose `read()` rejected, and it passed — while the production path could not fail,
+ * because `plane.threads` reaches Redis through `RedisGuard`, which converts every failure
+ * into a value and never rejects. The probe reported `redis: true` with Redis entirely
+ * down. Driving these tests with `FailingRedisClient` is what keeps the check honest: it
+ * fails against anything that reads Redis through a guard or a cache.
+ */
+const redisWith = (redisUp: boolean): Parameters<typeof startHealthServer>[0]["redis"] =>
+  redisUp ? new MemoryRedisClient() : new FailingRedisClient();
 
 test("readiness reflects the gateway and redis, not merely that the port is bound", async () => {
   // `supervisor/loop.ts:~287`'s lesson: a process that answers probes while doing nothing
@@ -370,7 +374,7 @@ test("readiness reflects the gateway and redis, not merely that the port is boun
     config: config(19_311),
     metrics: new AgentMetrics(),
     gateway: { connected: () => false },
-    plane: planeWith(true),
+    redis: redisWith(true),
     logger: SILENT_LOGGER,
   });
 
@@ -396,7 +400,7 @@ test("an unreachable redis makes the bot unready, because it can answer nothing"
     config: config(19_312),
     metrics: new AgentMetrics(),
     gateway: { connected: () => true },
-    plane: planeWith(false),
+    redis: redisWith(false),
     logger: SILENT_LOGGER,
   });
 
@@ -417,7 +421,7 @@ test("a connected gateway and a reachable redis is ready, and metrics are served
     config: config(19_313),
     metrics: new AgentMetrics(),
     gateway: { connected: () => true },
-    plane: planeWith(true),
+    redis: redisWith(true),
     logger: SILENT_LOGGER,
   });
 
