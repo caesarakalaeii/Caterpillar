@@ -41,7 +41,21 @@ import {
   type Page,
 } from "./pages.ts";
 import { parseTranscript } from "./transcript.ts";
-import { digests, digestView, fleet, runnerExport, taskDetail } from "./view.ts";
+import { digests, digestView, diskView, fleet, runnerExport, taskDetail } from "./view.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
+
+/**
+ * The last work-volume measurement, if one has been taken. Implemented by `UsageMonitor`.
+ *
+ * A reader rather than the monitor itself, so the server depends on "something that can
+ * tell me the last snapshot" and cannot reach the method that STARTS a walk. A web request
+ * must never be able to trigger the expensive thing: it is idle-only for a reason, and a
+ * route that could kick it off would be a way for anyone with the page open to take the
+ * poll loop away from the fleet.
+ */
+export interface UsageSnapshotReader {
+  current(): WorkspaceUsage | undefined;
+}
 
 export interface WebServerOptions {
   readonly config: RunnerConfig;
@@ -49,6 +63,8 @@ export interface WebServerOptions {
   readonly live: LiveSession;
   readonly ring: LogRing;
   readonly logger: Logger;
+  /** Absent on a runner with the measurement disabled; the page then says so. */
+  readonly usage?: UsageSnapshotReader;
 }
 
 interface Reply {
@@ -156,7 +172,15 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
     return page(options, "logs", "logs", logsPage(ring.records(), config.web.logCapacity), 200, user);
   }
   if (path === "/runner") {
-    return page(options, "runner", config.runnerId, runnerPage(runnerExport(config)), 200, user);
+    const disk = options.usage?.current();
+    return page(
+      options,
+      "runner",
+      config.runnerId,
+      runnerPage(runnerExport(config), disk === undefined ? undefined : diskView(disk)),
+      200,
+      user,
+    );
   }
 
   // `/digests` and `/digests/<date>`. The date is validated by the store before it ever
@@ -178,7 +202,16 @@ const route = async (options: WebServerOptions, request: IncomingMessage): Promi
       ? notFound(options, user)
       : json(200, { date: view.date, body: view.body });
   }
-  if (path === "/api/runner") return json(200, runnerExport(config));
+  if (path === "/api/runner") {
+    // The disk is a sibling key rather than folded into the export: `runnerExport` is a
+    // pure function of the ConfigMap and stays that way, while this is a measurement that
+    // may simply not exist yet.
+    const disk = options.usage?.current();
+    return json(200, {
+      ...runnerExport(config),
+      ...(disk === undefined ? {} : { disk: diskView(disk) }),
+    });
+  }
   if (path === "/api/logs") return json(200, { records: ring.records() });
 
   const task = taskRoute(path);

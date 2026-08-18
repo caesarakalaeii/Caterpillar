@@ -56,6 +56,7 @@ import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
 import { ToolchainResolver } from "./workspace/toolchain.ts";
+import { nixStoreDir, UsageMonitor } from "./workspace/usage.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
 /** Where state-repo installation tokens are minted. Not a workspace forge. */
@@ -166,6 +167,22 @@ const main = async (): Promise<void> => {
     ...loaded,
     capabilities: await toolchain.capabilities(loaded.capabilities),
   };
+
+  // How much of the work volume this runner is using, measured on its own slow schedule
+  // from the poll loop's idle branch and read by the web view. ONE instance: the loop
+  // writes the snapshot and the page reads it, and two would have the page showing a
+  // measurement nobody ever refreshes.
+  const usage = new UsageMonitor({
+    workRoot: config.paths.root,
+    mirrorsDir: config.paths.mirrors,
+    tasksDir: config.paths.tasks,
+    // Only when this runner actually has nix. Without it there is no store to walk, and
+    // pointing the walk at `/nix/store` anyway would spend a `readdir` per pass learning
+    // that for the life of the pod.
+    ...(config.capabilities.includes("nix") ? { nixStoreDir: nixStoreDir() } : {}),
+    intervalHours: config.usage.intervalHours,
+    deadlineMs: config.usage.deadlineSeconds * 1000,
+  });
 
   // The state repo's own credential: minted from the App, never served over the
   // credential socket, and never inherited by task worktrees (DESIGN.md §9.3).
@@ -304,6 +321,7 @@ const main = async (): Promise<void> => {
       ...(cluster === undefined ? {} : { cluster }),
     }),
     toolchain,
+    usage,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
@@ -349,7 +367,7 @@ const main = async (): Promise<void> => {
   });
 
   const stopMetrics = startMetricsServer(metrics, METRICS_PORT);
-  const stopWeb = startWebView({ config, store, live, ring, logger });
+  const stopWeb = startWebView({ config, store, live, ring, logger, usage });
   const stopReceiver = await startAlertReceiver({
     config,
     sink: alertQueue,
@@ -523,6 +541,7 @@ const startWebView = (options: {
   readonly live: LiveSession;
   readonly ring: LogRing;
   readonly logger: Logger;
+  readonly usage: UsageMonitor;
 }): (() => void) => {
   const { web } = options.config;
   if (!web.enabled) {

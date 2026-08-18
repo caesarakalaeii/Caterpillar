@@ -25,6 +25,7 @@ import type {
 } from "../domain/task.ts";
 import type { LiveSession } from "../obs/live.ts";
 import type { StateStore } from "../state/store.ts";
+import type { WorkspaceUsage } from "../workspace/usage.ts";
 import { entriesOf, type TranscriptEntry } from "./transcript.ts";
 
 export interface TaskRow {
@@ -283,6 +284,90 @@ export const taskDetail = async (
 const headline = (goal: string | undefined): string | undefined =>
   goal === undefined ? undefined : goalHeadline(goal);
 
+/* --------------------------------------------------------------------- disk */
+
+/**
+ * The work volume, as the runner page shows it (`workspace/usage.ts`).
+ *
+ * A read model of a measurement rather than the measurement itself, because the page and
+ * `/api/runner` want two things the walk deliberately does not produce: the categories in
+ * ONE ordered list (a page renders rows, not four named fields) and a percentage of the
+ * volume for each. Computing them here keeps the numbers a human reads and the numbers
+ * Prometheus scrapes derived from the same snapshot, rather than from two arithmetics
+ * that can drift.
+ *
+ * Absent entirely until the first measurement completes. Measuring is idle-only and
+ * hourly, so a runner that has been busy since boot legitimately has nothing to say here,
+ * and a page that showed zeroes instead would read as "the disk is empty" rather than
+ * "nobody has looked yet".
+ */
+export interface DiskView {
+  readonly measuredAt: string;
+  readonly durationMs: number;
+  /** True when the deadline stopped the walk early, so every byte below is a floor. */
+  readonly partial: boolean;
+  readonly totalBytes: number;
+  readonly freeBytes: number;
+  readonly usedBytes: number;
+  /** `mirrors`, `tasks`, `nix`, `other` — largest first. */
+  readonly categories: readonly DiskCategory[];
+  /** Largest mirrors, capped by the walk's `TOP_N` with a remainder row. */
+  readonly mirrors: readonly DiskEntry[];
+  /** Largest task worktrees, capped the same way. */
+  readonly tasks: readonly DiskEntry[];
+}
+
+export interface DiskEntry {
+  readonly name: string;
+  readonly bytes: number;
+}
+
+export interface DiskCategory extends DiskEntry {
+  /**
+   * Share of the volume's total size, 0–1. Of the TOTAL rather than of the sum of the
+   * categories: the point of the row is "how much of the disk is this", and a share of
+   * the categories would read as 100% on a nearly empty volume.
+   */
+  readonly fraction: number;
+}
+
+/**
+ * Turn one measurement into the page's read model. Pure, and never throws.
+ *
+ * `usedBytes` comes from `statfs` (total minus free) rather than from summing the
+ * categories. They answer different questions and the difference is the point: the sum is
+ * what THIS runner can account for, `usedBytes` is what is actually gone, and a volume
+ * shared with another process makes the second larger. A page that showed only the sum
+ * would say the disk is fine while it fills.
+ */
+export const diskView = (usage: WorkspaceUsage): DiskView => {
+  const { totalBytes, freeBytes } = usage.fs;
+  const share = (bytes: number): number => (totalBytes > 0 ? bytes / totalBytes : 0);
+
+  const categories: readonly DiskCategory[] = [
+    { name: "mirrors", bytes: usage.mirrorBytes },
+    { name: "tasks", bytes: usage.taskBytes },
+    { name: "nix", bytes: usage.nixBytes },
+    { name: "other", bytes: usage.otherBytes },
+  ]
+    .map((category) => ({ ...category, fraction: share(category.bytes) }))
+    .sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name));
+
+  return {
+    measuredAt: usage.measuredAt,
+    durationMs: usage.durationMs,
+    partial: usage.partial,
+    totalBytes,
+    freeBytes,
+    // Clamped: a `statfs` that failed reports zeroes, and a negative "used" on a page is a
+    // measurement bug to whoever reads it rather than the missing answer it actually is.
+    usedBytes: Math.max(0, totalBytes - freeBytes),
+    categories,
+    mirrors: usage.mirrors.map((entry) => ({ name: entry.name, bytes: entry.bytes })),
+    tasks: usage.tasks.map((entry) => ({ name: entry.name, bytes: entry.bytes })),
+  };
+};
+
 /**
  * Everything this runner is willing to say about itself.
  *
@@ -319,7 +404,8 @@ export interface RunnerExport {
     readonly gcKeepDays: number;
   };
   readonly stateRepo: { readonly url: string; readonly branch: string; readonly path: string };
-  readonly paths: { readonly mirrors: string; readonly tasks: string };
+  readonly paths: { readonly mirrors: string; readonly tasks: string; readonly root: string };
+  readonly usage: { readonly intervalHours: number; readonly deadlineSeconds: number };
   readonly intake: { readonly intervalSeconds: number };
   readonly log: { readonly level: string };
   readonly workspaces: readonly {
@@ -375,7 +461,13 @@ export const runnerExport = (config: RunnerConfig): RunnerExport => ({
     branch: config.stateRepo.branch,
     path: config.stateRepo.path,
   },
-  paths: { mirrors: config.paths.mirrors, tasks: config.paths.tasks },
+  paths: { mirrors: config.paths.mirrors, tasks: config.paths.tasks, root: config.paths.root },
+  // Exported so the disk section can say how often the numbers above it are refreshed. An
+  // hourly measurement with no interval shown is a page whose staleness looks like a bug.
+  usage: {
+    intervalHours: config.usage.intervalHours,
+    deadlineSeconds: config.usage.deadlineSeconds,
+  },
   intake: { intervalSeconds: config.intake.intervalSeconds },
   log: { level: config.log.level },
   workspaces: [...config.workspaces.values()].map((profile) => ({

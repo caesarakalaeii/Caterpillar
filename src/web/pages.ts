@@ -12,7 +12,15 @@
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, safeUrl, type Html } from "./html.ts";
 import type { TranscriptEntry } from "./transcript.ts";
-import type { DigestView, FleetView, RunnerExport, TaskDetail, TaskRow } from "./view.ts";
+import type {
+  DigestView,
+  DiskEntry,
+  DiskView,
+  FleetView,
+  RunnerExport,
+  TaskDetail,
+  TaskRow,
+} from "./view.ts";
 
 export type Page = "fleet" | "digests" | "logs" | "runner";
 
@@ -515,7 +523,92 @@ const logLine = (record: LogRecord): Html => html`<div class="logline" data-leve
 
 /* ------------------------------------------------------------------- runner */
 
-export const runnerPage = (exported: RunnerExport): Html => html`<main>
+/**
+ * Bytes as a human reads them, in binary units — `1.4 GiB`, not `1.5 GB`.
+ *
+ * Binary because that is what `df`, the PVC request and every Kubernetes quantity in this
+ * repo mean by `Gi`, and a page that disagreed with the manifest by 7% would have somebody
+ * chasing a discrepancy that does not exist. One decimal place from MiB up: the walk is
+ * apparent size and hourly, so a third significant figure would be precision the number
+ * does not have.
+ */
+export const bytes = (value: number): string => {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${unit <= 1 ? Math.round(scaled) : scaled.toFixed(1)} ${units[unit]}`;
+};
+
+/** One `name — size` row of the mirror or task breakdown. */
+const diskRow = (entry: DiskEntry): Html =>
+  html`<tr><td>${entry.name}</td><td class="num">${bytes(entry.bytes)}</td></tr>`;
+
+const diskTable = (caption: string, entries: readonly DiskEntry[]): Html =>
+  entries.length === 0
+    ? html`<p class="empty">No ${caption} measured.</p>`
+    : html`<table class="ledger">
+        <thead><tr><th>${caption}</th><th class="num">size</th></tr></thead>
+        <tbody>${entries.map(diskRow)}</tbody>
+      </table>`;
+
+/**
+ * What is on the work volume, and when anyone last looked.
+ *
+ * `measuredAt` is rendered as prominently as the bytes on purpose. This measurement is
+ * idle-only and hourly (`workspace/usage.ts`), so on a busy runner the newest answer can
+ * be an hour old — and a disk figure with no timestamp is one somebody will act on as if
+ * it were live, which for the one number that says "is the volume about to fill" is the
+ * expensive mistake.
+ */
+const diskSection = (exported: RunnerExport, disk: DiskView | undefined): Html => html`<section>
+  <h2>Disk</h2>
+  ${
+    disk === undefined
+      ? html`<p class="empty">
+          Not measured yet. The walk runs only when this runner is idle, at most every
+          ${exported.usage.intervalHours}h.
+        </p>`
+      : html`<p class="crumb">
+            Measured ${timeTag(disk.measuredAt)}, in ${Math.round(disk.durationMs)}ms, at most
+            every ${exported.usage.intervalHours}h while idle. Apparent size, read-only.
+            ${
+              disk.partial
+                ? html`<strong
+                    >Partial: the ${exported.usage.deadlineSeconds}s deadline stopped the walk,
+                    so every figure below is a floor.</strong
+                  >`
+                : raw("")
+            }
+          </p>
+          <dl class="grid">
+            <div><dt>volume</dt><dd>${exported.paths.root}</dd></div>
+            <div><dt>capacity</dt><dd>${bytes(disk.totalBytes)}</dd></div>
+            <div><dt>used</dt><dd>${bytes(disk.usedBytes)}</dd></div>
+            <div><dt>free</dt><dd>${bytes(disk.freeBytes)}</dd></div>
+          </dl>
+          <table class="ledger">
+            <thead><tr><th>category</th><th class="num">size</th><th class="num">of volume</th></tr></thead>
+            <tbody>
+              ${disk.categories.map(
+                (category) => html`<tr>
+                  <td>${category.name}</td>
+                  <td class="num">${bytes(category.bytes)}</td>
+                  <td class="num">${(category.fraction * 100).toFixed(1)}%</td>
+                </tr>`,
+              )}
+            </tbody>
+          </table>
+          ${diskTable("largest tasks", disk.tasks)} ${diskTable("largest mirrors", disk.mirrors)}`
+  }
+</section>`;
+
+export const runnerPage = (exported: RunnerExport, disk?: DiskView): Html => html`<main>
   <div class="page-head">
     <div class="eyebrow">configuration · no credentials</div>
     <h1>${exported.runnerId}</h1>
@@ -568,6 +661,8 @@ export const runnerPage = (exported: RunnerExport): Html => html`<main>
       <div><dt>worktrees</dt><dd>${exported.paths.tasks}</dd></div>
     </dl>
   </section>
+
+  ${diskSection(exported, disk)}
 
   <section>
     <h2>State repo</h2>

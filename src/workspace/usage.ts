@@ -423,6 +423,15 @@ const directoryBytes = async (
 export class UsageMonitor {
   private readonly options: UsageOptions;
   private readonly intervalMs: number;
+  /**
+   * True when `intervalHours` is 0 or less, which turns the whole thing OFF.
+   *
+   * Off rather than "as often as possible", which is what a zero interval would
+   * otherwise mean and is the one setting that could actually hurt: a walk on every idle
+   * poll is a walk every `pollSeconds`, and the walk is the expensive thing here. An
+   * operator reaching for 0 is asking for less, never for more.
+   */
+  private readonly disabled: boolean;
   /** 0 until the first idle poll — see `maybeMeasure`. */
   private lastMeasuredAt = 0;
   private snapshot: WorkspaceUsage | undefined;
@@ -430,6 +439,7 @@ export class UsageMonitor {
 
   constructor(options: UsageOptions & { readonly intervalHours: number }) {
     this.options = options;
+    this.disabled = !(options.intervalHours > 0);
     this.intervalMs = Math.max(0, options.intervalHours) * 60 * 60 * 1000;
     this.now = options.now ?? Date.now;
   }
@@ -449,6 +459,7 @@ export class UsageMonitor {
    * moment.
    */
   async maybeMeasure(): Promise<WorkspaceUsage | undefined> {
+    if (this.disabled) return undefined;
     const now = this.now();
     if (this.lastMeasuredAt === 0) {
       this.lastMeasuredAt = now;
