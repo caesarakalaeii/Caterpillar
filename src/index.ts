@@ -29,6 +29,7 @@ import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
+import { registerCommandsOnce } from "./notify/register.ts";
 import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
 import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
@@ -460,6 +461,22 @@ const main = async (): Promise<void> => {
   // `we`. Keel rolls this pod on every push to main, which makes that window routine.
   await hydrateThreads(store, threads, logger);
 
+  // Once per change, across the fleet, ever (§7.1). NOT awaited: commands appearing a
+  // moment after boot is invisible to a human, whereas a Discord write between the pod
+  // starting and the first poll is a rollout that idles on someone else's API. It never
+  // throws — a runner whose registration is refused still runs the bridge, and `!answer`
+  // and the buttons do not depend on it.
+  if (discord.bot !== undefined) {
+    void registerCommandsOnce({
+      ...(discord.applicationId === undefined ? {} : { applicationId: discord.applicationId }),
+      ...(discord.guildId === undefined ? {} : { guildId: discord.guildId }),
+      token: discord.bot.token,
+      claims: leases,
+      runner: config.runnerId,
+      logger,
+    });
+  }
+
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
   const bridge =
@@ -789,11 +806,19 @@ const hydrateThreads = async (
 const loadDiscord = async (
   secretsDir: string,
   logger: Logger,
-): Promise<{ readonly bot?: DiscordBot; readonly notifier: Notifier }> => {
+): Promise<{
+  readonly bot?: DiscordBot;
+  readonly notifier: Notifier;
+  /** Where the slash commands are published, when both are sealed (§7.1). */
+  readonly applicationId?: string;
+  readonly guildId?: string;
+}> => {
   const bundle = new SecretBundle(secretsDir, "caterpillar-discord");
   const token = await bundle.readOptional("bot-token").catch(() => undefined);
   const channelId = await bundle.readOptional("channel-id").catch(() => undefined);
   const webhookUrl = await bundle.readOptional("webhook-url").catch(() => undefined);
+  const applicationId = await bundle.readOptional("application-id").catch(() => undefined);
+  const guildId = await bundle.readOptional("guild-id").catch(() => undefined);
 
   if (token === undefined || channelId === undefined) {
     logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
@@ -803,7 +828,12 @@ const loadDiscord = async (
   }
 
   const bot = new DiscordBot({ token, channelId });
-  return { bot, notifier: new BotNotifier(bot) };
+  return {
+    bot,
+    notifier: new BotNotifier(bot),
+    ...(applicationId === undefined ? {} : { applicationId }),
+    ...(guildId === undefined ? {} : { guildId }),
+  };
 };
 
 /**

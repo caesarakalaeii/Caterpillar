@@ -1140,11 +1140,40 @@ id addressing a different task. A button from an older deploy is refused rather 
 guessed at — Discord keeps message history forever, and every button in it outlives the
 code that rendered it.
 
-Commands are registered **per guild**, at deploy time, by `npm run discord:register`.
-Guild registration takes effect instantly where global registration is
-eventually-consistent, registration is a full replace so re-running it is a no-op, and it
-is not done at boot because the supervisor restarts on every deploy and would otherwise
-write the identical command set once per pod per rollout.
+Commands are registered **per guild**, and the runner does it **itself, at boot, once per
+change across the whole fleet, ever**. Guild registration takes effect instantly where
+global registration is eventually-consistent, and it is a full REPLACE — the `COMMANDS`
+array is the entire surface, so a command deleted from it disappears from the client.
+
+It used to be a deploy-time step run by hand, for one real reason: the supervisor restarts
+on every deploy and there are four of it, so a naive call in `main()` writes the identical
+command set once per pod per rollout. That objection is about redundant *writes*, not about
+who does it — and the cost of answering it with a human was paid in full when `/brainstorm`'s
+autocompleted `repo:` box (§9.1.1) shipped as code and stayed a plain text field in Discord,
+because the step was forgotten.
+
+So the write is claimed, on `refs/commands/<digest>`, where the digest covers the commands
+AND the guild. The same compare-and-swap as a task claim (§5), in the same shape the daily
+digest uses (§19), with the same four properties:
+
+- **the ref's existence IS the record** that this exact set has been published, so a restart
+  registers nothing and there is no in-memory flag to lose
+- **a changed set is a changed digest**, so the first boot after a deploy publishes it and
+  every boot after that does not
+- **a claim that errors is not a claim someone else won** — a rejected push is also what a
+  dead network looks like, and reading it as a win would mark a set published that nobody
+  published
+- **a failed write hands the claim back**, because a claimed-but-unregistered set is
+  invisible and nothing would ever revisit it
+
+It is fire-and-forget and cannot fail a boot. A registration Discord refuses is a 403 for a
+missing `applications.commands` scope, which no retry fixes and which stops nothing else: the
+bridge still runs, and `!answer` and the buttons never depended on it.
+
+`npm run discord:register` remains, and remains unconditional — it is the escape hatch for
+what a digest cannot see. Commands edited or deleted **in Discord** leave the ref saying
+"published" and the guild disagreeing, and it is also how a command set is iterated on
+against a test guild from a workstation, with no pod and no state repo.
 
 ### 7.2 The presence says what the fleet is working on
 
@@ -1584,8 +1613,8 @@ slugs when the token is repository-scoped and not permitted to list — so the b
 as what the credential can enumerate, and empty rather than wrong when it can enumerate
 nothing.
 
-`COMMANDS` changed, so **`npm run discord:register` has to be re-run** for the box to appear
-(§7.1: registration is a deploy-time step, never done at boot).
+`COMMANDS` changed, and nothing has to be remembered for the box to appear: the first runner
+to boot on the new image registers the new set and the rest of the fleet does not (§7.1).
 
 ### 9.2 Why the agent never holds the token
 
