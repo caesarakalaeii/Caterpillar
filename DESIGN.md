@@ -2277,24 +2277,93 @@ exists; none of them was reachable without `kubectl exec` and a `git log`.
 
 So: a read-only web view, one page per thing, behind the cluster's existing SSO.
 
-### It runs inside the supervisor
+### It ran inside the supervisor, and at four replicas that was reversed
 
-The obvious shape is a second Deployment that clones the state repo. It was rejected.
+**The original decision, kept because the reasoning still applies to the runners' own
+port.** The obvious shape was a second Deployment that clones the state repo, and it was
+rejected: such a process needs its own copy of the state-repo credential and its own clone
+to keep fresh — a second thing that can fall behind and a second place a token lives — and
+it still could not show the two things the view exists for, **the log this process is
+writing** and **the session it is running**, because both are in this process's memory and
+neither is in git until later. A transcript is written when a session ENDS, and pushed after
+that. So the view ran in the supervisor, next to the outbound notifier and the gateway
+websocket (§11.2, §7), with the consequence stated rather than hidden: *fleet-wide task data
+comes from git and is complete; logs and in-flight messages are this runner's only.*
 
-Such a process needs its own copy of the state-repo credential and its own clone to keep
-fresh, which is a second thing that can fall behind and a second place a token lives. And
-it still could not show the two things the view exists for: **the log this process is
-writing** and **the session it is running**. Both are in this process's memory, and
-neither is in git until later — a transcript is written when a session ENDS, and pushed
-after that.
+**That was right for one replica and became a broken page at four.** `caterpillar-ingress`
+points at a Service that balances across every pod, so the sentence above stopped describing
+a documented limitation and started describing a lie: the live panel showed whichever pod
+answered *this* request and a refresh showed a different one; `/logs` showed one ring of a
+thousand lines out of four thousand and said "this runner only" as though the reader had
+chosen which; three runners in four were invisible unless they happened to hold a running
+task, because membership was derived from task ownership. The only hint any of it was
+happening was the runner id in the rail.
 
-So the view runs in the supervisor, next to the outbound notifier and the gateway
-websocket, for the same reason those do (§11.2, §7).
+**Both objections dissolve when the second process aggregates instead of cloning.**
 
-The consequence is stated rather than hidden: **fleet-wide task data comes from git and is
-complete; logs and in-flight messages are this runner's only.** Another runner's tasks are
-visible here — the state repo is the fleet's shared surface — but its logs are in Loki and
-its live session is in its own process.
+> *"needs its own copy of the state-repo credential and its own clone"* — not if it never
+> reads git. Every runner already serves `/api/fleet`, `/api/tasks/<id>`, `/api/logs` and
+> the raw transcript route out of the checkout it maintains anyway. The viewer proxies
+> those. It holds **no state-repo credential, no forge token, no provider credential, no PVC
+> and no ServiceAccount token** — strictly less privilege than the process serving that page
+> before it existed.
+>
+> *"could not show the log this process is writing and the session it is running"* — not if
+> it asks each process for them. That is one HTTP GET per replica per refresh, and it turns
+> the weakness into the feature: **N live sessions and a merged log, instead of one at
+> random.**
+
+So `src/view/` is a second entrypoint on the same image (`caterpillar-view`, a different
+`command` — `dist/` already ships whole) running as a **Deployment**, not a StatefulSet:
+there are no volumes and nothing to keep. The runners keep serving `web` in-cluster,
+because those endpoints *are* the viewer's data source; what moves is the Ingress.
+
+This section is the record of a decision that was correct and was then reversed, kept in
+full so the next person to consider folding the view back into the supervisor finds the
+argument rather than repeating it. The condition that flipped it was `replicas: 4`; at
+`replicas: 1` the two shapes are equivalent and the in-process one is cheaper.
+
+### How the viewer aggregates
+
+**Discovery is DNS, not Kubernetes.** `caterpillar-headless` already exists with a named
+`web` port, so `_web._tcp.caterpillar-headless.<ns>.svc.cluster.local` enumerates exactly
+the ready pods, by stable name, and shrinks and grows with `kubectl scale`. No API access,
+no RBAC, no mounted token, and no replica count in a ConfigMap to fall out of step with the
+StatefulSet. `VIEW_RUNNERS=name=url,…` is the escape hatch for running it outside a cluster,
+which is what keeps the one thing worth testing by hand testable by hand.
+
+**Task data from any one runner; per-process data from all of them.** The state repo is
+identical everywhere, so a task list, a task's documents and a stored transcript come from
+the first healthy responder — asking four for the same bytes is four times the work for one
+answer. `live` and `logs` are unioned across every replica, each entry tagged with the
+runner it came from.
+
+**`FleetView.live` is a list.** `live?: LiveSummary` → `live: readonly (LiveSummary &
+{runner})[]`. A breaking change to `/api/fleet`, made while that route had no consumer
+outside this repo. A single runner answering for itself reports a list of at most one.
+
+**Failure is rendered, not swallowed.** A runner that times out or refuses appears next to
+its name as unreachable. A dashboard that silently drops a replica is worse than one that
+has none, because a missing runner reads as an idle runner — and "three of the four are
+idle" is a sentence an operator acts on. The per-runner timeout is a few seconds and the
+fan-out is parallel, so one wedged pod costs the page that timeout, not four of them.
+
+**Idle runners stop being invisible** without the registry §18 rejected twice below: the
+viewer asks each pod what it is doing instead of inferring it from lease mirrors in git.
+The objection to the registry was to a heartbeat file committed every poll, and it stands —
+asking over HTTP costs one GET per refresh and nothing durable.
+
+**The seatbelt is kept, not punched through.** The runners' `web.requireForwardedUser` is a
+fail-closed check on the Ingress losing its forward-auth annotations, so the viewer
+**forwards the `Remote-User` header it received** on every fan-out request rather than the
+runners relaxing the check. A runner's port stays useless to anything in the cluster that
+cannot present an identity Authelia vouched for, and the viewer authenticates nobody: it
+repeats what the proxy in front of *it* asserted.
+
+Everything in the read-only argument below survives verbatim in the new process — non-`GET`
+refused before routing, the same CSP, `html.ts` escaping by default, artifacts as
+`application/octet-stream` attachments, `isTaskId`/`isArtifactName` on every path segment —
+and its tests assert each of them again rather than trusting the shared module.
 
 ### Its own port
 
@@ -2419,9 +2488,14 @@ state repo every poll is a commit per runner per interval, forever, in a repo ev
 clones and pulls constantly — the same objection §17 makes to large artifacts.
 
 Who is running what is derived from task ownership instead, which costs nothing and is
-already true. The price is that an **idle** runner other than this one is invisible: it owns
-nothing, so nothing names it. That is the correct trade for a question ("where is this task
-running") that is only ever asked about tasks that are running.
+already true. On a runner's own page that still carries a price: an **idle** runner other
+than this one is invisible, because it owns nothing and nothing names it.
+
+**The viewer pays no such price and still writes nothing.** It asks each pod directly — the
+headless Service names them all, ready or idle — so "which runners exist" is answered by
+DNS and one HTTP GET per refresh rather than by a file in git. That is what makes the
+registry unnecessary rather than overdue: the objection was never to knowing, it was to a
+commit per runner per interval, forever.
 
 `state.owner` is a mirror of the lease and is never cleared (`transition` in
 `supervisor/loop.ts` stamps it and nothing unstamps it), so on a task that is not `running`

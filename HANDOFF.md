@@ -95,6 +95,7 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | Artifact channel, small path (§17) | merged; **never used** |
 | Runner installer (§8) | merged; **no second runner exists yet** |
 | **Web view (§18)** | implemented and deployed — fleet, task, session, logs, runner, digests, and **`/intake`**: what intake and the alert receiver refused, and when intake last ran |
+| **Aggregating viewer (§18)** | implemented and tested; **needs `caesar-deployment`**: a `caterpillar-view` Deployment (same image, `command: ["node", "/app/dist/cli/view.js"]`, no PVC, no secrets, `automountServiceAccountToken: false`) plus a Service, and `caterpillar-ingress` repointed at it with the Authelia annotations byte for byte. Until that lands, the Ingress balances across four pods and the live panel and `/logs` are one replica at random |
 | **Daily digest (§19)** | implemented and tested; **off until the ConfigMap enables it** — nothing is published yet |
 | Container image + CI | built and pushed by CI on every push to `main` |
 | Deployment | **LIVE** |
@@ -342,6 +343,7 @@ scripts this session used, which is strictly better than a commit per file.
 | Context | **`default`** in `~/.kube/config` |
 | ArgoCD app | `caterpillar`, `Synced` / `Healthy`, sync wave 6 |
 | Fleet | `StatefulSet/caterpillar`, `RollingUpdate`, `/healthz` + `/metrics` on 9090 |
+| Viewer | **not deployed yet** — `caterpillar-view` Deployment (1 replica, no volumes, no secrets), discovering runners through `_web._tcp.caterpillar-headless.caterpillar.svc.cluster.local`. Nothing is removed from the fleet: the runners' `web` port stays, in-cluster only |
 | Volumes | `work-caterpillar-N` (10Gi) + `nix-caterpillar-N` (15Gi), one pair per replica |
 | Singletons | `caterpillar-credentials` (1Gi) and `caterpillar-nix-cache` (50Gi), **1 replica each, never more** |
 | Legacy | `caterpillar-work` (20Gi) + `caterpillar-nix` (30Gi) — unused, retained until the credential is migrated |
