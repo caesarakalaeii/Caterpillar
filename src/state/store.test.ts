@@ -20,7 +20,7 @@ import {
 } from "../domain/task.ts";
 import { EMPTY_POLICY, lookupPolicy, PolicyParseError } from "../remediation/policy.ts";
 import { Git } from "./git.ts";
-import { StateStore } from "./store.ts";
+import { type SalvagedCommits, StateStore } from "./store.ts";
 
 const roots: string[] = [];
 
@@ -229,6 +229,8 @@ const sharedStateRepo = async (): Promise<{
   other: Git;
   /** A store on the SECOND checkout, writing as a different runner. */
   otherStore: StateStore;
+  /** Every salvage the first store reported, in order — what feeds the metric and log. */
+  salvaged: SalvagedCommits[];
   root: string;
   otherRoot: string;
 }> => {
@@ -260,12 +262,18 @@ const sharedStateRepo = async (): Promise<{
   await other.run("config", "user.email", "other@example.invalid");
   await other.run("config", "user.name", "other");
 
+  // The hook is captured rather than discarded: it is the ONLY way a salvage becomes
+  // visible — the runner recovers and carries on, so `caterpillar_salvaged_commits_total`
+  // and the `state.salvaged` error line are all an operator ever sees (§4.3).
+  const salvaged: SalvagedCommits[] = [];
+
   return {
-    store: new StateStore(root, git, undefined, "runner-a"),
+    store: new StateStore(root, git, (event) => salvaged.push(event), "runner-a"),
     git,
     bare,
     other,
     otherStore: new StateStore(otherRoot, other, undefined, "runner-b"),
+    salvaged,
     root,
     otherRoot,
   };
@@ -705,7 +713,7 @@ test("a local commit that can never rebase is salvaged, not retried forever", as
   // and it destroyed five tasks' worth of work (see the note on `pull`). So the commits
   // are moved aside to a ref and the runner carries on: nothing is lost, and a human has
   // something to look at.
-  const { store, git, other, root, otherRoot } = await sharedStateRepo();
+  const { store, git, other, salvaged, root, otherRoot } = await sharedStateRepo();
 
   // Both writers append a different line to the same file. Append-only plus two authors
   // is precisely the shape that cannot merge.
@@ -732,6 +740,14 @@ test("a local commit that can never rebase is salvaged, not retried forever", as
     stranded,
     "and the commit it could not merge must still exist somewhere",
   );
+
+  // A silent salvage is the failure mode this hook exists to prevent: the runner recovers,
+  // so without it an operator never learns the fleet disagreed about a task. This is the
+  // path that increments `caterpillar_salvaged_commits_total` and logs `state.salvaged`.
+  assert.equal(salvaged.length, 1, "the salvage must be reported, not swallowed");
+  assert.equal(salvaged[0]?.commit, stranded);
+  assert.equal(salvaged[0]?.ref, `refs/salvaged/${stranded.slice(0, 12)}`);
+  assert.notEqual(salvaged[0]?.detail, "", "git's own account of the conflict is carried");
   // Not mid-rebase: a checkout left in one fails every later git call with a message
   // about the rebase rather than about the conflict.
   assert.equal((await git.tryRun("rev-parse", "--verify", "REBASE_HEAD")).code !== 0, true);
@@ -847,7 +863,7 @@ test("two runners recording the same task produce commits that rebase cleanly", 
   // Sharded, the two runners write different paths, so the histories commute exactly as
   // `commitAndPush` has always assumed they do. Constructed with two real checkouts of a
   // real bare repo, because the claim is about git's behaviour and not about ours.
-  const { store, git, bare, otherStore, other, root } = await sharedStateRepo();
+  const { store, git, bare, otherStore, other, salvaged, root } = await sharedStateRepo();
   const task = asTaskId("SHARED-1");
 
   // Runner B gets there first and pushes.
@@ -867,6 +883,10 @@ test("two runners recording the same task produce commits that rebase cleanly", 
     true,
     "a rebase that applies has nothing to set aside",
   );
+  // The assertion the whole task reduces to: this is the exact scenario that used to
+  // salvage, and `caterpillar_salvaged_commits_total` is fed by this hook. Zero here means
+  // the journal conflict class is gone by construction rather than by better recovery.
+  assert.deepEqual(salvaged, [], "the journal must no longer be able to force a salvage");
 
   await store.commitAndPush("chore(state): runner A pushes after rebase", "origin", "main");
 
