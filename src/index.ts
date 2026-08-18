@@ -198,17 +198,29 @@ const main = async (): Promise<void> => {
     identity: config.identity,
     ...(stateCredentials !== undefined ? { envProvider: stateCredentials.gitEnv } : {}),
   });
-  // The salvage hook is how a runner says it had to set its own commits aside. At `error`
-  // deliberately: it means two runners recorded the same task and one of them lost, which
-  // is never routine — but the runner keeps working, so nothing else would raise it.
-  const store = new StateStore(config.stateRepo.path, git, (salvaged) => {
-    logger.error("state.salvaged", {
-      ref: salvaged.ref,
-      commit: salvaged.commit,
-      detail: salvaged.detail,
-    });
-  });
   const metrics = new AgentMetrics();
+
+  // The salvage hook is how a runner says it had to set its own commits aside. At `error`
+  // deliberately, and counted: the runner recovers and carries on, so nothing else would
+  // raise it. Its one known cause — two runners appending to a single `journal.md` — no
+  // longer exists now the journal is one file per entry, so a line here today is a
+  // conflict class the fleet has not met before and wants looking at (§4.1, §4.3).
+  //
+  // The runner id goes into the store because it names every journal shard this runner
+  // writes; that is what makes two runners' journal commits commute rather than collide.
+  const store = new StateStore(
+    config.stateRepo.path,
+    git,
+    (salvaged) => {
+      metrics.salvagedCommits.inc({ runner: config.runnerId });
+      logger.error("state.salvaged", {
+        ref: salvaged.ref,
+        commit: salvaged.commit,
+        detail: salvaged.detail,
+      });
+    },
+    config.runnerId,
+  );
 
   // Parsed once: every workspace's scope excludes the same state repo, and a task
   // credential that could reach it would make the audit trail agent-writable (§9.3).

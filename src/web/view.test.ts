@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -254,6 +254,30 @@ test("task detail gathers every document the state repo holds for a task", async
   assert.deepEqual(detail?.verdicts, [{ index: 1, body: "changes requested" }]);
   assert.deepEqual(detail?.artifacts, ["probe.txt"]);
   assert.deepEqual(detail?.sessions, [1]);
+});
+
+test("task detail renders a legacy journal.md alongside the shards that followed it", async () => {
+  // The page has always shown the journal as ONE document, and it must keep doing so
+  // across the format change: a task that started before the sharding has its history in
+  // `journal.md` and its recent entries in `journal/`, and an operator reading the page
+  // must see both without knowing either file exists.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-view-legacy-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root), undefined, "pod-7f3a");
+  const id = asTaskId("TASK-LEGACY");
+
+  await subject.writeSpec(spec("TASK-LEGACY", "# Legacy\n\nThe goal."));
+  await subject.writeState(state("TASK-LEGACY", { status: "running" }));
+  await writeFile(
+    join(root, "tasks", id, "journal.md"),
+    "\n## Session 1 — 2026-01-01T00:00:00.000Z\n\nthe old entry\n",
+    "utf8",
+  );
+  await subject.appendJournal(id, 2, "the new entry");
+
+  const detail = await taskDetail(subject, id, new LiveSession());
+  assert.match(detail?.journal ?? "", /the old entry/);
+  assert.match(detail?.journal ?? "", /the new entry/);
 });
 
 test("an unknown task is absent rather than an error", async () => {

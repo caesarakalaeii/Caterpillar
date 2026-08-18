@@ -168,16 +168,28 @@ await writeFile(
     "",
   ].join("\n"),
 );
+// Deliberately SPLIT across both journal formats: the entry that matters sits in a
+// legacy `journal.md` written before the sharding, and the retry storm arrives as
+// shards. A resumed session must be given the whole history regardless of which file
+// each entry happens to live in, so this test also pins the backward-compatible read.
 await writeFile(
   join(stateRepo, "tasks", JOURNAL_TASK, "journal.md"),
-  [
-    "\n## Session 1 — 2026-08-12T09:00:00.000Z\n\nthe decision that matters: use the fork point\n",
-    ...Array.from(
-      { length: JOURNAL_REPEATS },
-      (_, i) => `\n## Session 0 — 2026-08-12T10:${String(i % 60).padStart(2, "0")}:00.000Z\n\n**Parked:** lease lost\n`,
-    ),
-  ].join(""),
+  "\n## Session 1 — 2026-08-12T09:00:00.000Z\n\nthe decision that matters: use the fork point\n",
 );
+await mkdir(join(stateRepo, "tasks", JOURNAL_TASK, "journal"), { recursive: true });
+for (let i = 0; i < JOURNAL_REPEATS; i += 1) {
+  const minute = String(i % 60).padStart(2, "0");
+  await writeFile(
+    join(
+      stateRepo,
+      "tasks",
+      JOURNAL_TASK,
+      "journal",
+      `0002-20260812T10${minute}00${String(i).padStart(3, "0")}Z-pod-a.md`,
+    ),
+    `## Session 2 — 2026-08-12T10:${minute}:00.000Z\n\n**Parked:** lease lost\n`,
+  );
+}
 
 after(async () => {
   await rm(root, { recursive: true, force: true });

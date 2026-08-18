@@ -159,6 +159,23 @@ export class AgentMetrics {
   );
 
   /**
+   * Local commits this runner could not rebase and had to move to `refs/salvaged/`
+   * (DESIGN.md §4.3).
+   *
+   * **This series must stay at zero.** It used to have one cause — two runners appending
+   * to the same single-file `journal.md` — and that cause has been eliminated by giving
+   * the journal one file per entry (§4.1), so anything it counts now is a conflict the
+   * fleet has never seen before: a hand-edited file, a `state.json` two runners wrote, a
+   * format that forgot the lesson. The salvage itself is the backstop and stays; this is
+   * how an operator finds out it fired, because the runner recovers and carries on and
+   * nothing else would raise it.
+   */
+  readonly salvagedCommits = this.registry.counter(
+    "caterpillar_salvaged_commits_total",
+    "local state commits set aside because they could not rebase — must stay 0",
+  );
+
+  /**
    * Daily digests this runner published (DESIGN.md §19).
    *
    * Labelled by whether the day was quiet, because the two failures look identical

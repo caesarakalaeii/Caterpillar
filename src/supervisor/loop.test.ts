@@ -186,6 +186,28 @@ const pushedState = async (task: TaskId = TASK): Promise<TaskState | undefined> 
   return JSON.parse(result.stdout) as TaskState;
 };
 
+/**
+ * The journal as it exists ON THE REMOTE, every shard concatenated.
+ *
+ * The journal is one file per entry (§4.1), so "was the entry pushed" is a question
+ * about a directory rather than about a blob. Empty string when nothing was written,
+ * which is what lets a caller assert that a session which never ran wrote no history.
+ */
+const pushedJournal = async (task: TaskId): Promise<string> => {
+  const git = new Git(origin);
+  const listed = await git.tryRun("ls-tree", "-r", "--name-only", "main", `tasks/${task}/journal/`);
+  if (listed.code !== 0) return "";
+
+  const names = listed.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").sort();
+
+  const bodies: string[] = [];
+  for (const name of names) {
+    const shard = await git.tryRun("show", `main:${name}`);
+    if (shard.code === 0) bodies.push(shard.stdout);
+  }
+  return bodies.join("\n");
+};
+
 test("a task whose session throws is parked on the REMOTE, not just locally", async () => {
   // The bug: `workTask` released the lease in its `finally`, and only then did the
   // caller try to park. `park` -> `push` -> `assertHeld` therefore CAS'd against a
@@ -889,9 +911,9 @@ test("/resume puts a parked task back on the REMOTE, not just locally", async ()
   const pushed = await pushedState(RESUMED);
   assert.equal(pushed?.status, "ready", "a resumed task must be `ready` on the remote");
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${RESUMED}/journal.md`);
-  assert.equal(journal.code, 0, "the journal entry must be pushed, not just written");
-  assert.match(journal.stdout, /Resumed/);
+  const journal = await pushedJournal(RESUMED);
+  assert.notEqual(journal, "", "the journal entry must be pushed, not just written");
+  assert.match(journal, /Resumed/);
 });
 
 test("/resume refuses a task that is not parked, and writes nothing", async () => {
@@ -1019,9 +1041,9 @@ test("a provider outage releases the task and stops the runner claiming the next
     "one message per incident, not one per attempt",
   );
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${OUTAGE}/journal.md`);
+  const journal = await pushedJournal(OUTAGE);
   assert.doesNotMatch(
-    journal.stdout,
+    journal,
     /Interrupted|Exit:/,
     "a session that never ran writes no history",
   );
@@ -1079,10 +1101,10 @@ test("a session interrupted mid-work keeps its tokens and its history", async ()
   assert.equal(pushed?.usage.costUsd, 1.25, "spend is charged to the task that spent it");
   assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is the agent's, not the provider's");
 
-  const journal = await new Git(origin).tryRun("show", `main:tasks/${WORKED}/journal.md`);
-  assert.match(journal.stdout, /Interrupted/);
+  const journal = await pushedJournal(WORKED);
+  assert.match(journal, /Interrupted/);
   assert.doesNotMatch(
-    journal.stdout,
+    journal,
     /Parked/,
     "an outage never parks a task — a park needs a human to undo",
   );
@@ -1769,7 +1791,7 @@ test("/resume brings back a task that FAILED, not only one that parked", async (
   assert.equal(pushed?.progress.noProgressStreak, 0, "the streak is forgiven, as it is for a park");
   assert.equal(pushed?.progress.lastProgressSession, 1, "history is not");
 
-  const journal = await new Git(origin).run("show", `main:tasks/${BROKEN}/journal.md`);
+  const journal = await pushedJournal(BROKEN);
   assert.match(journal, /Resumed/);
 
   await retire(BROKEN);
