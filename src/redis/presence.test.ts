@@ -109,8 +109,9 @@ test("a runner changing its note leaves exactly one entry behind", async () => {
   await registry.heartbeat(ALPHA, "working GH-acme-widget-1");
   await registry.heartbeat(ALPHA, "polling");
 
-  // The note is part of the sorted-set member, so without the sweep each distinct note
-  // would be its own member and one runner would appear three times in the display.
+  // The note is part of the sorted-set member, so each distinct note is a distinct
+  // member. Without removing the previous one, a runner that changed its note twice would
+  // appear three times in the display for a whole TTL.
   const members = await redis.zrangeByScore(PRESENCE_KEY, 0);
   assert.equal(members.length, 1);
   assert.equal((await registry.alive()).length, 1);

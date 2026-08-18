@@ -141,15 +141,6 @@ export class RedisChatQueue implements ChatQueue {
   private readonly submitTimeoutMs: number;
   private readonly newId: () => string;
 
-  /**
-   * Requests this process has drained but not yet settled.
-   *
-   * `drain` is destructive — it has to be, or two supervisors would work the same intent
-   * — so the outcome has to be publishable after the entry is gone from the list. Holding
-   * the id here is what makes `settle` a plain publish rather than a second lookup.
-   */
-  private readonly pending = new Map<string, string>();
-
   constructor(options: RedisChatQueueOptions) {
     this.redis = options.redis;
     this.logger = options.logger;
@@ -261,7 +252,10 @@ export class RedisChatQueue implements ChatQueue {
         this.logger.warn("chat.unparseable-request", { bytes: entry.length });
         continue;
       }
-      this.pending.set(parsed.id, parsed.id);
+      // The id is captured in the closure rather than held in a map. `drain` is
+      // destructive — it has to be, or two supervisors would work the same intent — so by
+      // the time `settle` runs the entry is already gone from the list, and there is
+      // nothing left to look the id up in.
       requests.push({
         ...parsed.intent,
         settle: (outcome: ChatOutcome): void => void this.settle(parsed.id, outcome),
@@ -296,7 +290,6 @@ export class RedisChatQueue implements ChatQueue {
 
   /** Publish the outcome and leave a copy behind for a submitter that was not listening. */
   private async settle(id: string, outcome: ChatOutcome): Promise<void> {
-    this.pending.delete(id);
     const channel = `${REPLY_PREFIX}${id}`;
     const body = JSON.stringify(outcome);
 

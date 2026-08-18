@@ -112,6 +112,17 @@ export class RedisPresenceRegistry implements PresenceRegistry {
   private readonly ttlMs: number;
   private readonly now: () => number;
 
+  /**
+   * The exact member string this process last wrote, per runner id.
+   *
+   * The note is part of the member, so a runner whose note changes writes a DIFFERENT
+   * member and the old one would linger for a whole TTL — one runner appearing twice in
+   * the display, once per note it has had. Remembering what we wrote makes removing it
+   * one `ZREM` on a known string; the alternative is reading the whole set on every
+   * heartbeat to find our own entries, which is a poll-rate scan for a display.
+   */
+  private readonly written = new Map<RunnerId, string>();
+
   constructor(options: RedisPresenceRegistryOptions) {
     this.redis = options.redis;
     this.guard = new RedisGuard({ logger: options.logger });
@@ -126,13 +137,20 @@ export class RedisPresenceRegistry implements PresenceRegistry {
     // newline cannot forge one.
     const member = note === undefined ? runner : `${runner}\n${note.slice(0, MAX_NOTE)}`;
 
-    // Old members for the SAME runner would otherwise accumulate, one per distinct note.
-    // Removed before the add rather than after, so a crash between the two leaves the
-    // runner absent for one heartbeat rather than present twice.
-    await this.guard.attempt("presence.sweep", () => this.sweep(runner));
-    await this.guard.attempt("presence.heartbeat", () =>
+    // Written FIRST, so a crash between the two leaves the runner present twice for one
+    // TTL rather than absent. Both are wrong and only one of them is alarming: a display
+    // that briefly double-counts a runner is a cosmetic bug, and one that loses a runner
+    // that is demonstrably working invites someone to go looking for a pod that is fine.
+    const wrote = await this.guard.attempt("presence.heartbeat", () =>
       this.redis.zaddAndTrim(PRESENCE_KEY, member, at, at - this.ttlMs),
     );
+    if (!wrote) return;
+
+    const previous = this.written.get(runner);
+    this.written.set(runner, member);
+    if (previous === undefined || previous === member) return;
+
+    await this.guard.attempt("presence.replace", () => this.redis.zrem(PRESENCE_KEY, previous));
   }
 
   async alive(): Promise<readonly RunnerPresence[]> {
@@ -149,18 +167,18 @@ export class RedisPresenceRegistry implements PresenceRegistry {
       .sort((a, b) => b.seenAt - a.seenAt);
   }
 
+  /**
+   * Leave the display on a clean shutdown.
+   *
+   * Only what THIS process wrote. A runner that has never heartbeated here has nothing to
+   * remove, and scanning for one would be a process removing another process's entry — a
+   * decision about liveness, which is exactly what this structure is forbidden from
+   * making. A runner that dies without departing ages out on its score instead.
+   */
   async depart(runner: RunnerId): Promise<void> {
-    await this.guard.attempt("presence.depart", () => this.sweep(runner));
-  }
-
-  /** Remove every member belonging to `runner`, whatever note it carries. */
-  private async sweep(runner: RunnerId): Promise<void> {
-    const scored = await this.redis.zrangeByScore(PRESENCE_KEY, Number.NEGATIVE_INFINITY);
-    for (const { member } of scored) {
-      const split = member.indexOf("\n");
-      if ((split === -1 ? member : member.slice(0, split)) === runner) {
-        await this.redis.zrem(PRESENCE_KEY, member);
-      }
-    }
+    const member = this.written.get(runner);
+    if (member === undefined) return;
+    this.written.delete(runner);
+    await this.guard.attempt("presence.depart", () => this.redis.zrem(PRESENCE_KEY, member));
   }
 }
