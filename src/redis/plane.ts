@@ -1,7 +1,7 @@
 /**
  * Building the ephemeral plane, with or without a server. See DESIGN.md §21.
  *
- * One decision, made once, at boot: is `redis.enabled` set? If it is, the four structures
+ * One decision, made once, at boot: is `redis.enabled` set? If it is, the five structures
  * are the Redis ones; if it is not, they are the in-process classes that were there
  * before this directory existed. Everything downstream takes the interfaces and cannot
  * tell which it got — which is the property that keeps the whole test suite runnable with
@@ -39,9 +39,14 @@ import {
   RedisSnapshotStore,
   type SnapshotStore,
 } from "./snapshot.ts";
+import {
+  InMemoryThreadBindings,
+  RedisThreadBindings,
+  type ThreadBindingStore,
+} from "./threads.ts";
 
 /**
- * The four ephemeral structures, plus the raw in-process objects behind them.
+ * The five ephemeral structures, plus the raw in-process objects behind them.
  *
  * `inbox` and `snapshot` are the concrete `ChatInbox`/`TaskSnapshot` and are present ONLY
  * in the unconfigured case. The supervisor still wants them there: `takeWhere` and `some`
@@ -59,7 +64,15 @@ export interface EphemeralPlane {
    */
   readonly runners: PresenceRegistry;
   readonly cancels: CancelSignals;
-  /** True when a Redis client is behind the four above. For logs and the web view. */
+  /**
+   * Thread ↔ task, published by the supervisor and consumed by the standalone bot (§14.3).
+   *
+   * The fifth structure, and the only one that exists solely because the bot was split
+   * out: in one process the `ThreadIndex` is rebuilt from the state repo at boot, and a
+   * process with no state repo has nothing to rebuild it from.
+   */
+  readonly threads: ThreadBindingStore;
+  /** True when a Redis client is behind the structures above. For logs and the web view. */
   readonly backed: boolean;
   /** Present only when NOT `backed` — there is no Redis equivalent to hand back. */
   readonly inbox?: ChatInbox;
@@ -80,7 +93,7 @@ export interface EphemeralPlaneOptions {
   readonly client?: RedisClient;
 }
 
-/** The plane every runner had before Redis: four in-process objects, no IO. */
+/** The plane every runner had before Redis: in-process objects, no IO. */
 export const inMemoryPlane = (): EphemeralPlane => {
   const inbox = new ChatInbox();
   const tasks = new TaskSnapshot();
@@ -89,6 +102,7 @@ export const inMemoryPlane = (): EphemeralPlane => {
     snapshot: new InMemorySnapshotStore(tasks),
     runners: new InMemoryPresenceRegistry(),
     cancels: new InMemoryCancelSignals(),
+    threads: new InMemoryThreadBindings(),
     backed: false,
     inbox,
     tasks,
@@ -102,6 +116,7 @@ export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane =
   snapshot: new RedisSnapshotStore({ redis, logger }),
   runners: new RedisPresenceRegistry({ redis, logger }),
   cancels: new RedisCancelSignals({ redis, logger }),
+  threads: new RedisThreadBindings({ redis, logger }),
   backed: true,
   close: (): Promise<void> => redis.close(),
 });

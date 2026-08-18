@@ -33,6 +33,11 @@ import {
   RedisSnapshotStore,
   type SnapshotStore,
 } from "./snapshot.ts";
+import {
+  InMemoryThreadBindings,
+  RedisThreadBindings,
+  type ThreadBindingStore,
+} from "./threads.ts";
 
 const summary = (over: Partial<TaskSummary> = {}): TaskSummary => ({
   id: asTaskId("GH-acme-widget-1"),
@@ -164,6 +169,24 @@ const cancelContract = async (signals: CancelSignals): Promise<void> => {
   await signals.clear(task);
 };
 
+const threadsContract = async (store: ThreadBindingStore): Promise<void> => {
+  // Cold start: no supervisor has published, and the honest answer is "no threads" rather
+  // than a stale one. The bot turns this into a message, never into silence.
+  assert.deepEqual(await store.read(), []);
+
+  const bindings = [
+    { threadId: "1537785980415778816", task: asTaskId("BS-1537785980415778816") },
+    { threadId: "1537785980415778999", task: asTaskId("GH-acme-widget-42") },
+  ];
+  await store.publish(bindings);
+  assert.deepEqual(await store.read(), bindings);
+
+  // Publishing REPLACES. A task going terminal unbinds its thread (`threadBindings`), and
+  // a store that merged would keep listening to a conversation that is over.
+  await store.publish([bindings[1] as (typeof bindings)[number]]);
+  assert.deepEqual(await store.read(), [bindings[1]]);
+};
+
 /* ─────────────────────────────── running them ─────────────────────────────── */
 
 interface Implementations {
@@ -172,6 +195,7 @@ interface Implementations {
   readonly snapshot: () => SnapshotStore;
   readonly presence: () => PresenceRegistry;
   readonly cancels: () => CancelSignals;
+  readonly threads: () => ThreadBindingStore;
   readonly teardown?: () => Promise<void>;
 }
 
@@ -196,6 +220,11 @@ const runContracts = (impl: Implementations): void => {
       await cancelContract(impl.cancels());
       await impl.teardown?.();
     });
+
+    test("thread bindings: cold start is empty, publish replaces", async () => {
+      await threadsContract(impl.threads());
+      await impl.teardown?.();
+    });
   });
 };
 
@@ -205,6 +234,7 @@ runContracts({
   snapshot: () => new InMemorySnapshotStore(),
   presence: () => new InMemoryPresenceRegistry(),
   cancels: () => new InMemoryCancelSignals(),
+  threads: () => new InMemoryThreadBindings(),
 });
 
 /**
@@ -226,6 +256,12 @@ runContracts({
     }),
   presence: () => new RedisPresenceRegistry({ redis: new MemoryRedisClient(), logger: SILENT_LOGGER }),
   cancels: () => new RedisCancelSignals({ redis: new MemoryRedisClient(), logger: SILENT_LOGGER }),
+  threads: () =>
+    new RedisThreadBindings({
+      redis: new MemoryRedisClient(),
+      logger: SILENT_LOGGER,
+      cacheTtlMs: 0,
+    }),
 });
 
 /**
@@ -283,6 +319,13 @@ describe("a live redis server", { skip: liveUrl === undefined ? "REDIS_TEST_URL 
 
   test("cancel signals round trip", async () => {
     await cancelContract(new RedisCancelSignals({ redis: live(), logger: SILENT_LOGGER }));
+    await teardown();
+  });
+
+  test("thread bindings round trip", async () => {
+    await threadsContract(
+      new RedisThreadBindings({ redis: live(), logger: SILENT_LOGGER, cacheTtlMs: 0 }),
+    );
     await teardown();
   });
 });

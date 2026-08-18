@@ -46,7 +46,7 @@ export interface RedisSubscription {
  * Everything the ephemeral plane asks of Redis.
  *
  * Every method is allowed to reject. Callers MUST NOT let that reach the poll loop —
- * see `guarded.ts`, which is how all four structures actually reach a client.
+ * see `guarded.ts`, which is how all of them actually reach a client.
  */
 export interface RedisClient {
   get(key: string): Promise<string | undefined>;

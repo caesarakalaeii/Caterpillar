@@ -2,7 +2,7 @@
  * Failure containment for the ephemeral plane.
  *
  * The rule this file exists to make structural: **a Redis failure degrades, it never
- * throws.** Every one of the four structures reaches its client through `guard`, so
+ * throws.** Every one of the ephemeral structures reaches its client through `guard`, so
  * there is exactly one place where the decision is made and exactly one place to read to
  * know what happens when the server goes away.
  *
