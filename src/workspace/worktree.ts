@@ -5,7 +5,7 @@
  * Session starts cost a fetch rather than a clone, tasks stay isolated, and a
  * corrupted worktree is discardable without touching the mirror.
  */
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Git } from "../state/git.ts";
@@ -543,8 +543,7 @@ export class WorktreeManager {
       if (opts.live.has(task)) continue;
 
       const path = join(tasksDir, entry.name);
-      const info = await stat(path).catch(() => undefined);
-      if (info === undefined || info.mtimeMs > cutoff) continue;
+      if (await touchedSince(path, cutoff)) continue;
 
       bytes += await treeSize(path);
       await this.removeTree(path);
@@ -736,7 +735,11 @@ const treeSize = async (path: string): Promise<number> => {
         pending.push(child);
         continue;
       }
-      const info = await stat(child).catch(() => undefined);
+      // `lstat`, not `stat`: `readdir`'s dirents already refuse to call a symlink a
+      // directory, so nothing DESCENDS through one — but `stat` would still measure the
+      // target, which for a link into another task's worktree means counting bytes this
+      // reap is not about to free.
+      const info = await lstat(child).catch(() => undefined);
       total += info?.isFile() === true ? info.size : 0;
     }
   }
@@ -776,4 +779,38 @@ const findMirrors = async (mirrorsDir: string): Promise<readonly string[]> => {
   }
 
   return found;
+};
+
+/**
+ * Has anything at the top of `path` been modified since `cutoff`? Errors read as "yes".
+ *
+ * The directory's own mtime is not enough on its own, and the difference is the sort that
+ * only shows up in production. A directory's mtime moves when an entry is added to or
+ * removed from IT — not when a file three levels down is written — so a task worked over
+ * six sessions in the same checkout has a `<tasksDir>/<TASK-ID>` mtime from the moment the
+ * first repo was checked out, and nothing afterwards touches it. Judging that directory by
+ * that timestamp alone would call a task the runner is between sessions on "stale" purely
+ * because the layout stopped changing on day one.
+ *
+ * One level of children is enough to fix it and is deliberately where it stops: the repo
+ * worktrees and `.caterpillar` all sit directly under the task directory, a session that
+ * does anything at all moves at least one of their mtimes, and walking the whole tree to
+ * date a directory we are about to delete would cost more than the deletion.
+ *
+ * A `stat` that FAILS counts as recent. This function's answer only ever protects a
+ * directory from removal, so the safe direction is unambiguous: not being able to tell how
+ * old something is has to mean keeping it.
+ */
+const touchedSince = async (path: string, cutoff: number): Promise<boolean> => {
+  const own = await stat(path).catch(() => undefined);
+  if (own === undefined || own.mtimeMs > cutoff) return true;
+
+  const children = await readdir(path, { withFileTypes: true }).catch(() => undefined);
+  if (children === undefined) return true;
+
+  for (const child of children) {
+    const info = await stat(join(path, child.name)).catch(() => undefined);
+    if (info === undefined || info.mtimeMs > cutoff) return true;
+  }
+  return false;
 };

@@ -4,7 +4,7 @@
  * mirror path was broken.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -577,6 +577,33 @@ test("the sweep leaves a worktree that is younger than the keep-age", async () =
   const reaped = await subject.reapStaleWorktrees({ live: new Set(), keepHours: 72 });
 
   assert.ok(existsSync(join(root, "tasks", recent)), "a fresh worktree must survive a sweep");
+  assert.equal(reaped.worktrees, 0);
+});
+
+test("the sweep dates a task by its children, not just the directory git made", async () => {
+  // A directory's mtime moves when an entry is added to or removed from IT — not when a
+  // file inside one of its children is written. So `<tasksDir>/<TASK-ID>` carries the
+  // timestamp of the moment the first repo was checked out and never moves again, and a
+  // task worked over six sessions in the same checkout looks, from that one number, exactly
+  // as stale as one abandoned on day one.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("REAP-NESTED");
+  const subject = manager(root);
+  const worktree = await subject.ensureWorktree(REPO, task);
+
+  // Backdate the task directory itself past any keep-age, exactly as a long-lived checkout
+  // would be, while the worktree under it is current — a session wrote in it just now.
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  await utimes(join(root, "tasks", task), old, old);
+
+  const reaped = await subject.reapStaleWorktrees({ live: new Set(), keepHours: 24 });
+
+  assert.ok(
+    existsSync(worktree),
+    "a checkout whose CONTENTS are fresh must not be reaped for a stale parent directory",
+  );
   assert.equal(reaped.worktrees, 0);
 });
 
