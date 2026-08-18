@@ -13,6 +13,7 @@
  * separate objects even where one would compile.
  */
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { asRunnerId, asTaskId, type TaskState } from "./domain/task.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
@@ -524,4 +525,35 @@ test("an unreachable redis leaves the index exactly as it was", async () => {
   );
 
   assert.equal(threads.taskFor(THREAD), TASK);
+});
+
+/* ─────────────── the separation itself, asserted rather than asserted-about ─────────────── */
+
+test("the bot entrypoint constructs no state repo, forge or LLM dependency", async () => {
+  // `bot.ts`'s header claims this file holds no such credential and that a test checks it.
+  // It did not, and a property nobody checks is a property that lasts until the next
+  // refactor — so this reads the source and fails if one is constructed here.
+  //
+  // Deliberately about CONSTRUCTION, not reachability: `config/load.ts` pulls default
+  // constants out of some of those modules, so a few are reachable in the import graph.
+  // Reachable is not used, and the credential they would want is not mounted.
+  const source = await readFile(new URL("./bot.ts", import.meta.url), "utf8");
+
+  const forbidden = [
+    "StateStore",
+    "LeaseManager",
+    "WorktreeManager",
+    "CredentialService",
+    "createForge",
+    "createTracker",
+  ];
+
+  for (const name of forbidden) {
+    assert.equal(
+      new RegExp(`new\\s+${name}\\b|\\b${name}\\s*\\(`).test(source),
+      false,
+      `bot.ts must not construct ${name}: anything needing the state repo goes to the ` +
+        "supervisor over the Redis inbox, which is the whole point of the split",
+    );
+  }
 });

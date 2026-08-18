@@ -64,12 +64,28 @@ export class ThreadIndex {
    * Only ever a handful of entries — a brainstorm thread lives here for the seconds
    * between the bot creating it and the supervisor's next housekeeping pass publishing it.
    */
-  private readonly local = new Set<string>();
+  private readonly local = new Map<string, number>();
+
+  /**
+   * How many `replace` calls a pin survives before it is treated as ordinary.
+   *
+   * A pin covers ONE window: the gap between this process binding a thread and the first
+   * published mapping that mentions it. That is a refresh or two, so a small number is
+   * generous. It has to be finite, though, because the mapping might never mention the
+   * thread at all — a brainstorm whose task reaches a terminal status before the survey
+   * that would have published it (an immediate `/cancel`) is never named by any mapping,
+   * and a permanent pin would leave that dead thread bound for the life of the process,
+   * reading every message typed there as an answer to a finished task and saying nothing.
+   * That is the exact silent-swallowing failure `threadBindings` drops terminal tasks to
+   * avoid, so the pin must not be able to reintroduce it.
+   */
+  private static readonly PIN_GENERATIONS = 3;
 
   /**
    * Bind a thread this process knows about first-hand.
    *
-   * The binding is PINNED: it survives a `replace` that does not mention the thread. The
+   * The binding is PINNED: it survives the next few `replace` calls that do not mention the
+   * thread — a few, not forever, for the reason on `PIN_GENERATIONS`. The
    * bot creates a brainstorm's thread and binds it locally before the task exists
    * (`bridge.ts:startBrainstorm`), so for one refresh interval the supervisor's published
    * mapping legitimately has nothing to say about it. Without the pin, the 5-second
@@ -78,7 +94,7 @@ export class ThreadIndex {
    */
   bind(threadId: string, task: TaskId): void {
     this.byThread.set(threadId, task);
-    this.local.add(threadId);
+    this.local.set(threadId, ThreadIndex.PIN_GENERATIONS);
   }
 
   /** Stop listening to a thread. Takes effect immediately, before the next poll. */
@@ -103,8 +119,17 @@ export class ThreadIndex {
     const incoming = new Map(entries);
     for (const threadId of [...this.byThread.keys()]) {
       if (incoming.has(threadId)) continue;
-      // Never mentioned, and ours: keep it, still pinned.
-      if (this.local.has(threadId)) continue;
+
+      // Never mentioned, and ours: keep it, but spend one generation of the pin. A pin
+      // that never expired would strand a thread no mapping will ever name — see
+      // `PIN_GENERATIONS`.
+      const left = this.local.get(threadId);
+      if (left !== undefined && left > 1) {
+        this.local.set(threadId, left - 1);
+        continue;
+      }
+
+      this.local.delete(threadId);
       this.byThread.delete(threadId);
     }
     for (const [threadId, task] of incoming) {

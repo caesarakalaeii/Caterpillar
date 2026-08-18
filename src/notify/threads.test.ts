@@ -217,3 +217,37 @@ test("a thread that becomes bound is known synchronously by the router", () => {
   index.bind(THREAD, asTaskId("BS-1"));
   assert.equal(route.knows(THREAD), true);
 });
+
+test("a pin expires, so a thread no mapping will ever name does not stay bound forever", () => {
+  // The leak the generation counter closes. A brainstorm whose task goes terminal before
+  // the first survey that would have published it is never named by any mapping, and a
+  // permanent pin would leave the dead thread bound for the life of the process — where
+  // every message typed there is read as an answer to a finished task and gets silence.
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+
+  // Several passes that never mention it, as a cancelled brainstorm's never would.
+  for (let pass = 0; pass < 10; pass++) index.replace([]);
+
+  assert.equal(index.knows(THREAD), false, "an unnameable pinned thread must eventually unbind");
+});
+
+test("a pin still covers the window it exists for", () => {
+  // The property the expiry must not cost: the supervisor has not published yet, and the
+  // human was just invited to type in this thread.
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+
+  index.replace([]);
+  assert.equal(index.taskFor(THREAD), asTaskId("BS-1"), "the next refresh must not unbind it");
+});
+
+test("a mapping that names the thread refreshes nothing about the pin — it ends it", () => {
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+  index.replace([[THREAD, asTaskId("BS-1")]]);
+
+  // From here the publisher is the authority, so the very next mapping without it unbinds.
+  index.replace([]);
+  assert.equal(index.knows(THREAD), false, "a published thread unbinds on the pass that drops it");
+});

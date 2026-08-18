@@ -1114,10 +1114,25 @@ What moves with it, and what does not:
   *pinned* and survives a mapping that has not heard of it: a brainstorm's thread exists
   several refreshes before the task the mapping is derived from does, and unbinding it in
   that window would drop the thread a human was just invited to type in. The pin ends the
-  moment the mapping mentions the thread, so a terminal task still unbinds. A message in a
+  moment the mapping mentions the thread, so a terminal task still unbinds — and it also
+  **expires after a few passes**, because a mapping might never mention the thread at all:
+  a brainstorm cancelled before the first survey that would have published it is named by
+  nothing, and a permanent pin would leave that dead thread bound for the life of the
+  process, swallowing everything typed into it. A pin covers one window; it is not a lease. A message in a
   thread the bot cannot place produces an **honest reply**, never silence: in a bound thread
   every message *is* the answer, so saying nothing is indistinguishable from the agent being
   busy.
+- That honest reply needs the gateway to **deliver** the message the bridge has an answer
+  for, and for one revision it did not. The filter consulted the same `ThreadIndex` the
+  bridge would, so a thread the bridge would call unbound was one the gateway had already
+  dropped, and the branch was reachable only from a direct call in a test. **Routing and
+  delivery are therefore separate questions**: the index says which task owns a thread,
+  while `ThreadRouter` says whether the bridge sees the message at all. `MESSAGE_CREATE`
+  names no parent channel, so deciding "is this a thread of ours?" costs a REST lookup; the
+  router memoises it per channel — **both** answers, since a negative cache is what stops an
+  unrelated busy channel spending a lookup per message — and the main channel and every
+  bound thread stay on the synchronous path. The supervisor's in-process index supplies no
+  `deliverable`, so that path keeps today's behaviour and makes no REST call per message.
 - Redis is **required** for this process, unlike everywhere else in §21. It is the only
   route to the supervisor, so a bot without it would acknowledge every command and answer
   none. It refuses to start rather than come up and fail each command individually.
