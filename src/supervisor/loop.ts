@@ -128,7 +128,7 @@ export interface AlertIngester {
 }
 
 /**
- * The reaping half of `WorktreeManager`, as the loop needs it (DESIGN.md §2).
+ * The reaping half of `WorktreeManager`, as the loop needs it (DESIGN.md §3.1).
  *
  * Narrowed to two methods rather than taking the class, for the same reason `Verifier` and
  * `ProgressProbe` are interfaces: this is the one dependency in the loop whose failure mode
@@ -533,7 +533,7 @@ export class Supervisor {
   }
 
   /**
-   * Sweep orphaned worktrees off this runner's volume, if it is time (DESIGN.md §2).
+   * Sweep orphaned worktrees off this runner's volume, if it is time (DESIGN.md §3.1).
    *
    * Called only from the idle branch, and rate-limited exactly the way
    * `ToolchainResolver.maybeCollectGarbage` rate-limits itself — including the detail that

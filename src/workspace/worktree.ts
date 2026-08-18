@@ -422,16 +422,16 @@ export class WorktreeManager {
   /**
    * Throw away everything one task left on this runner's disk.
    *
-   * The targeted half of DESIGN.md §2's worktree reaping, called from the supervisor the
+   * The targeted half of DESIGN.md §3.1's worktree reaping, called from the supervisor the
    * moment a task reaches a state it will not resume from IN PLACE — done, failed, or a
    * lease another runner has taken. Deliberately not called on handoff or on
    * `awaiting-human`: those sessions resume against this very checkout, and reaping there
    * would trade a few gigabytes for a re-clone and a re-install on every single handoff,
    * which is the opposite of the trade this is making.
    *
-   * `removeWorktree` alone is not enough, and that is the part worth reading `checkout()`
-   * for. It removes `<tasksDir>/<task>/<repo.name>` for the repos it is handed, but a
-   * multi-repo task also has:
+   * `removeWorktree` alone is not enough, and that is the part worth reading
+   * `ensureTaskCheckout` for. It removes `<tasksDir>/<task>/<repo.name>` for the repos it
+   * is handed, but a multi-repo task also has:
    *
    *   - `<root>/repos/<name>` for every sibling, each a linked worktree of its own mirror
    *     with its own administrative record — `<root>` being the FIRST repo's worktree, so
@@ -450,10 +450,15 @@ export class WorktreeManager {
    * surprising, and a reap that leaves the biggest directory on the volume behind because
    * git had an opinion about it would fail silently and forever.
    *
-   * Idempotent by construction and never throws: `removeWorktree` uses `tryRun`, `rm`
-   * takes `force`, and `prune` is `tryRun`. Calling it twice does nothing the second
-   * time, which matters because the supervisor's terminal paths overlap — `applyOutcome`
-   * can return true from a branch that `parkFailed` also covers.
+   * Idempotent by construction and tolerant of a worktree that is already gone:
+   * `removeWorktree` uses `tryRun`, `rm` takes `force`, and `prune` is `tryRun`. Calling
+   * it twice does nothing the second time, which matters because a pod that dies between
+   * the removal and the state push comes back to a task whose status says reap it again.
+   *
+   * The ONE thing it throws for is a path that resolves outside `tasksDir` — see
+   * `removeTree`. That is not a tolerance worth having: a task id that escapes is a bug or
+   * an attack, and the caller catching it and carrying on is exactly what would let it
+   * happen again on the next poll, quietly.
    */
   async removeTaskWorktrees(task: TaskId, repos: readonly RepoRef[]): Promise<ReapResult> {
     const root = this.taskDir(task);
@@ -513,10 +518,15 @@ export class WorktreeManager {
    *     waiting to be re-claimed, or sitting behind a provider cooldown. Those are not live
    *     and must not be reaped for hours yet.
    *
-   * Everything it finds that is not a directory it leaves alone, and a directory whose name
-   * is not a task id it also leaves alone: `tasksDir` is the supervisor's, but it is on a
-   * volume an operator can reach, and a sweep is not the place to be inventive about
-   * unexpected files.
+   * Everything it finds that is not a directory it leaves alone: `tasksDir` is the
+   * supervisor's, but it is on a volume an operator can reach, and a sweep is not the place
+   * to be inventive about unexpected files.
+   *
+   * Names come from `readdir`, which never returns `.`, `..`, or anything containing a
+   * separator, so `removeTree`'s containment check cannot fire on this path — it is here
+   * for the TARGETED removal, whose task id comes from a state repo. Routing both through
+   * the same function anyway is deliberate: the guard being unreachable today is a fact
+   * about today's callers, and the next one will not read this comment first.
    */
   async reapStaleWorktrees(opts: {
     /** Tasks this runner is working, or otherwise refuses to have swept. */

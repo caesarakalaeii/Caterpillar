@@ -255,7 +255,8 @@ test("both reaping numbers can be set, and nonsense in either is refused", async
   // an operator who wrote "12" believing they had shortened it.
   await assert.rejects(
     () => load({ workspace: { reap: { keepHours: "12" } } }),
-    (error: unknown) => error instanceof ConfigError && /workspace\.reap\.keepHours/.test(error.message),
+    (error: unknown) =>
+      error instanceof ConfigError && /workspace\.reap\.keepHours/.test(error.message),
   );
   await assert.rejects(
     () => load({ workspace: { reap: { intervalHours: null } } }),

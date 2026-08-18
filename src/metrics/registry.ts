@@ -186,7 +186,7 @@ export class AgentMetrics {
   );
 
   /**
-   * Task worktrees this runner threw away, by which removal did it (DESIGN.md §2).
+   * Task worktrees this runner threw away, by which removal did it (DESIGN.md §3.1).
    *
    * `kind="targeted"` is a task finishing cleanly and being tidied up after; `kind="swept"`
    * is the periodic sweep finding a directory no task claims. The label is the whole value

@@ -323,7 +323,9 @@ export interface RunnerExport {
    * an operator looking at a full volume needs to see both without knowing which of the
    * two collectors they are looking for.
    */
-  readonly workspace: { readonly reap: { readonly intervalHours: number; readonly keepHours: number } };
+  readonly workspace: {
+    readonly reap: { readonly intervalHours: number; readonly keepHours: number };
+  };
   readonly stateRepo: { readonly url: string; readonly branch: string; readonly path: string };
   readonly paths: { readonly mirrors: string; readonly tasks: string };
   readonly intake: { readonly intervalSeconds: number };

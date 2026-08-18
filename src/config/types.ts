@@ -144,7 +144,8 @@ export interface WorkspacePathsConfig {
 }
 
 /**
- * When this runner throws a finished task's worktree away (DESIGN.md §2, Workspace).
+ * When this runner throws a finished task's worktree away — DESIGN.md §3.1, and the
+ * `Workspace` row of §2.
  *
  * The mirror of `ToolchainConfig.gcIntervalHours` / `gcKeepDays`, and it exists because
  * the store had a collector and the worktrees did not. A worktree is the thing that
