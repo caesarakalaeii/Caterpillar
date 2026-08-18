@@ -277,6 +277,11 @@ test("a connection error is logged at warn and never raised", async () => {
   // paging on it would be paging on something with no correctness effect.
   onError(new Error("ECONNREFUSED"));
 
+  // And once, not once per reconnect attempt. The retry strategy backs off to five
+  // seconds, so an hour of downtime is seven hundred identical lines in the same stream
+  // an operator is reading to find out what the fleet did.
+  for (let attempt = 0; attempt < 50; attempt += 1) onError(new Error("ECONNREFUSED"));
+
   assert.equal(lines.length, 1);
   const record = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
   assert.equal(record["event"], "redis.connection-error");

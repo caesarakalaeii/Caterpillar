@@ -168,17 +168,29 @@ const readPassword = async (
 /**
  * The ioredis instance, configured for a plane that must degrade rather than block.
  *
- * `enableOfflineQueue: false` is the load-bearing option. Its default, true, makes the
- * driver hold commands issued while disconnected until the connection returns — which
- * turns "Redis is down" into "every call hangs", and a hanging call in the poll loop is
- * precisely the failure `supervisor/loop.ts:~287` is written against. False makes them
- * reject immediately, and an immediate rejection is what `RedisGuard` converts into
- * today's in-memory behaviour.
+ * The offline queue is left ON, and that is a deliberate reversal of the obvious choice.
+ * Turning it off makes a command issued while disconnected reject immediately, which
+ * sounds exactly like the containment this plane wants — but "disconnected" includes the
+ * first few milliseconds of the process's life, before the initial handshake completes.
+ * With it off, every command the supervisor's FIRST poll issues fails with "Stream isn't
+ * writeable", so a perfectly healthy Redis looks unreachable until something happens to
+ * retry. Observed, not theorised: it is what the live contract run against a real server
+ * caught, and nothing in the in-memory suite could have.
+ *
+ * Leaving it on would ordinarily reintroduce the failure `supervisor/loop.ts:~287` is
+ * written against — a hanging call in the poll loop — except that `withTimeout` in
+ * `client.ts` bounds EVERY operation independently of the driver. So a command queued
+ * against a Redis that is genuinely down waits `commandTimeoutMs` and then degrades
+ * through `RedisGuard`, which is the behaviour we wanted from the flag and did not get.
  */
-const createDriver = (connection: RedisConnection): RedisDriver => {
+export const createDriver = (connection: RedisConnection): RedisDriver => {
+  // The return type is the assertion. ioredis's own instance satisfies `RedisDriver`
+  // structurally, so there is NO cast here on purpose: a driver upgrade that renames or
+  // re-signs one of the nine methods fails `npm run check` rather than at 3am in the
+  // cluster, which is the whole reason the interface is declared structurally.
   const client = new Redis(connection.url, {
     ...(connection.password === undefined ? {} : { password: connection.password }),
-    enableOfflineQueue: false,
+    enableOfflineQueue: true,
     // A second timer inside the driver, covering a command that HAS been written and is
     // waiting on a server that accepted the socket and then stopped answering.
     // `withTimeout` in `client.ts` covers the rest; see its docstring for why both.
@@ -187,12 +199,16 @@ const createDriver = (connection: RedisConnection): RedisDriver => {
     // Capped backoff. Unbounded retries with a growing delay would eventually mean a
     // Redis that came back an hour ago is still not being talked to.
     retryStrategy: (attempt: number): number => Math.min(attempt * 200, 5000),
-    // The driver retries forever at that interval rather than giving up: this plane is
+    // The driver reconnects forever at that interval rather than giving up: this plane is
     // optional, so there is no state in which "stop trying" is better than "keep trying
     // cheaply while everything degrades".
-    maxRetriesPerRequest: 0,
+    //
+    // `maxRetriesPerRequest` bounds how long ONE command sits in the offline queue before
+    // the driver gives up on it. 1 rather than 0: zero means "do not queue at all", which
+    // is the flag above under another name and brings back the cold-start failure.
+    maxRetriesPerRequest: 1,
     lazyConnect: false,
   });
 
-  return client as unknown as RedisDriver;
+  return client;
 };

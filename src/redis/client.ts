@@ -127,6 +127,9 @@ export const withTimeout = async <T>(
   }
 };
 
+/** Shortest gap between two socket-error lines about the same connection. */
+const ERROR_INTERVAL_MS = 30_000;
+
 export interface RedisClientOptions {
   readonly connection: RedisConnection;
   readonly logger: Logger;
@@ -194,6 +197,8 @@ export class IoRedisClient implements RedisClient {
   private readonly logger: Logger;
   private readonly subscribers = new Set<RedisDriver>();
   private closed = false;
+  /** Last time a socket error was logged, per channel. See `noteConnectionError`. */
+  private readonly lastErrorAt = new Map<string, number>();
 
   constructor(driver: RedisDriver, connection: RedisConnection, logger: Logger) {
     this.driver = driver;
@@ -204,11 +209,28 @@ export class IoRedisClient implements RedisClient {
     // The driver reconnects on its own; this only makes the transition visible. Logged at
     // warn and not error: an unreachable Redis degrades the plane, it does not fail the
     // runner, and paging on it would be paging on a thing that has no correctness effect.
-    driver.on("error", (error: unknown) => {
-      if (this.closed) return;
-      this.logger.warn("redis.connection-error", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+    driver.on("error", (error: unknown) => this.noteConnectionError("redis.connection-error", error));
+  }
+
+  /**
+   * One line per `ERROR_INTERVAL_MS`, per event.
+   *
+   * The retry strategy backs off to five seconds, so a Redis that is down for an hour is
+   * seven hundred identical lines otherwise — in the same stream an operator is reading
+   * to find out what the fleet did. `RedisGuard` throttles the operation side for the
+   * same reason; this is the socket side of it.
+   */
+  private noteConnectionError(event: string, error: unknown, channel?: string): void {
+    if (this.closed) return;
+
+    const at = Date.now();
+    const last = this.lastErrorAt.get(channel ?? event);
+    if (last !== undefined && at - last < ERROR_INTERVAL_MS) return;
+    this.lastErrorAt.set(channel ?? event, at);
+
+    this.logger.warn(event, {
+      ...(channel === undefined ? {} : { channel }),
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 
@@ -321,13 +343,9 @@ export class IoRedisClient implements RedisClient {
     const sub = this.driver.duplicate();
     this.subscribers.add(sub);
 
-    sub.on("error", (error: unknown) => {
-      if (this.closed) return;
-      this.logger.warn("redis.subscriber-error", {
-        channel: full,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
+    sub.on("error", (error: unknown) =>
+      this.noteConnectionError("redis.subscriber-error", error, full),
+    );
     sub.on("message", (received: string, message: string) => {
       if (received === full) onMessage(message);
     });

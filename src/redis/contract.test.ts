@@ -18,8 +18,7 @@ import { asRunnerId, asTaskId } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import type { ChatRequest } from "../supervisor/inbox.ts";
 import type { TaskSummary } from "../supervisor/snapshot.ts";
-import { Redis } from "ioredis";
-import { IoRedisClient, type RedisClient, type RedisConnection, type RedisDriver } from "./client.ts";
+import { IoRedisClient, type RedisClient, type RedisConnection } from "./client.ts";
 import { InMemoryCancelSignals, RedisCancelSignals, type CancelSignals } from "./cancel.ts";
 import { InMemoryChatQueue, RedisChatQueue, type ChatQueue } from "./inbox.ts";
 import { MemoryRedisClient } from "./memory.ts";
@@ -28,6 +27,7 @@ import {
   RedisPresenceRegistry,
   type PresenceRegistry,
 } from "./presence.ts";
+import { createDriver } from "./plane.ts";
 import {
   InMemorySnapshotStore,
   RedisSnapshotStore,
@@ -249,15 +249,13 @@ describe("a live redis server", { skip: liveUrl === undefined ? "REDIS_TEST_URL 
       commandTimeoutMs: 2000,
       keyPrefix: `caterpillar-test:${crypto.randomUUID()}:`,
     };
-    // The constructor dials immediately, which is why nothing in this block runs unless
-    // `REDIS_TEST_URL` named a server — `skip` above keeps it unregistered otherwise.
-    const driver = new Redis(connection.url, {
-      enableOfflineQueue: false,
-      commandTimeout: connection.commandTimeoutMs,
-      connectTimeout: connection.commandTimeoutMs,
-      maxRetriesPerRequest: 0,
-    });
-    const client = new IoRedisClient(driver as unknown as RedisDriver, connection, SILENT_LOGGER);
+    // The SAME construction the supervisor uses, not a copy of it. The reason this block
+    // exists is to catch what an in-memory client cannot, and a test that configured its
+    // own driver would have missed the offline-queue defect that `createDriver`'s
+    // docstring now records — the first commands of a fresh process failing against a
+    // perfectly healthy server. The constructor dials immediately, which is why nothing
+    // here runs unless `REDIS_TEST_URL` named one.
+    const client = new IoRedisClient(createDriver(connection), connection, SILENT_LOGGER);
     clients.push(client);
     return client;
   };
