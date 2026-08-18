@@ -67,6 +67,7 @@ import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
 import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
+import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { renderVerdict, summariseVerdict } from "../review/decide.ts";
@@ -317,6 +318,18 @@ export interface SupervisorDeps {
    * still records verdicts, and merging stays a human act.
    */
   readonly reviewers?: ReadonlyMap<WorkspaceName, ForgeFactory>;
+  /**
+   * Whether a repo somebody just named is one the workspace's credential can actually
+   * reach (DESIGN.md §9.1.1). The forge factories, narrowed to the one question the loop
+   * asks of them — it does not mint here, and it must not be able to.
+   *
+   * Optional, and its absence is not a loss of correctness: without it the fleet behaves
+   * exactly as it did before, which is to discover an unreachable repo when `git clone`
+   * fails inside a session. Every use FAILS OPEN for the same reason — a forge that cannot
+   * answer has told us nothing, and refusing work over that would be worse than the clone
+   * failure it is trying to pre-empt.
+   */
+  readonly forges?: ReadonlyMap<WorkspaceName, RepoReach>;
   /**
    * Re-checks a plan's dependency graph when one of its tasks finishes (§14.3).
    * Optional: without it a plan's edges stay exactly as they were proposed.
@@ -1238,6 +1251,21 @@ export class Supervisor {
         });
         if (verdict.kind === "park") {
           await this.park(heartbeat, spec, state, verdict.reason);
+          return;
+        }
+
+        // Before a session, not during one. A task whose repo the credential cannot reach
+        // cannot be worked at all: the first thing the session does is clone, and the
+        // failure there costs a session, a journal entry about git, and a park reason that
+        // names an installation id instead of the repo (§9.1.1).
+        //
+        // Re-asked every session rather than once per task, because the answer changes
+        // without the task changing — an App uninstalled mid-task, or one installed a
+        // minute ago by the human who read the last park reason. The listing behind it is
+        // cached, so asking again is free in the steady state.
+        const unreachable = await this.unreachableRepos(spec.workspace, spec.repos);
+        if (unreachable !== undefined) {
+          await this.park(heartbeat, spec, state, unreachable);
           return;
         }
 
@@ -2172,6 +2200,34 @@ export class Supervisor {
   }
 
   /**
+   * The repos this workspace cannot reach, as one sentence — or undefined when it can
+   * reach them all, and also when nobody could be asked.
+   *
+   * Those two are deliberately the same answer. A forge that throws has told us nothing
+   * about an installation: `/installation/repositories` behind a 500, a DNS blip, an
+   * expired key. Reading that as "unreachable" would refuse a `/brainstorm` or park a task
+   * over a hiccup, which is strictly worse than the mid-session clone failure this exists
+   * to pre-empt — that failure is at least self-explanatory now (`explainUnprocessable`).
+   *
+   * So: a refusal only ever comes from a forge that answered.
+   */
+  private async unreachableRepos(
+    workspace: WorkspaceName,
+    repos: readonly RepoRef[],
+  ): Promise<string | undefined> {
+    const reach = this.deps.forges?.get(workspace);
+    if (reach === undefined) return undefined;
+
+    try {
+      const unreachable = await reach.unreachable(repos);
+      return unreachable.length === 0 ? undefined : unreachableSummary(unreachable);
+    } catch (error) {
+      this.deps.logger.warn("repo.reach-unknown", { workspace, ...errorFields(error) });
+      return undefined;
+    }
+  }
+
+  /**
    * Park a task and tell whoever needs to know.
    *
    * Deliberately does NOT reap the worktree, and this is the boundary the reaping rules
@@ -2386,6 +2442,25 @@ export class Supervisor {
 
     const id = brainstormId(request.threadId);
     if (await store.hasTask(id)) return { kind: "started", task: id };
+
+    // The last thing a repo name is checked against, and the only one that involves the
+    // forge: can this workspace's credential reach it at all (§9.1.1)? Everything above is
+    // shape and configuration, and a name that satisfies both can still be a repo that does
+    // not exist — `caesarakalaeii/allchat` for `all-chat` parsed, resolved, became a task,
+    // was claimed, and died in `git clone --mirror` a session later.
+    //
+    // After the idempotency check, not before: a repeated `/brainstorm` in a thread that
+    // already has one is answered from the state repo, so it costs no request and cannot be
+    // refused after the fact. A task that already exists is the session preflight's problem.
+    const unreachable = await this.unreachableRepos(profile.name, repos);
+    if (unreachable !== undefined) {
+      return {
+        kind: "refused",
+        reason:
+          `${unreachable} Fix the name, or install the App on it, and run \`/brainstorm\` ` +
+          `again — nothing has been created.`,
+      };
+    }
 
     const spec = brainstormSpec({
       id,

@@ -50,6 +50,12 @@ Repos are bounded too: an item may only name repos on its workspace's own forge,
 never the state repo (§9.1). A `codeberg.org/...` sibling in a GitHub workspace is
 refused rather than half-working.
 
+A repo the workspace's credential cannot **reach** is refused the same way, with the near
+miss named: `acme/allchat` for a repo called `all-chat` used to become a task, get claimed,
+and die in `git clone` a session later on a 422 that named the App installation rather than
+the repo (§9.1.1). If the forge cannot be asked at that moment the item goes through
+anyway — a 500 from GitHub is not evidence that an App was uninstalled.
+
 In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
 *inside* a code block instead — intake accepts either position.
 
@@ -732,8 +738,9 @@ different places (DESIGN.md §9.7).
 npm run verify:github-app -- --pem <key.pem> --app-id <id> --repo <owner/name>
 ```
 
-Signs a JWT, prints the installation id, mints a repo-scoped token, and echoes the
-granted permissions. Never prints the token.
+Signs a JWT, prints the installation id, checks the installation can actually reach the
+repo you named — suggesting the near miss when it cannot (§9.1.1) — mints a repo-scoped
+token, and echoes the granted permissions. Never prints the token.
 
 ## Verifying the reviewer App
 
@@ -903,6 +910,12 @@ belong to the same workspace — one forge, one owner, one credential bundle —
 that crosses two is refused in the thread rather than quietly narrowed to one (§14.3). The
 extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
 child tasks inherit the whole list.
+
+A repo the App cannot reach is refused **before the task exists**, and the refusal names
+the near miss: `repo:caesarakalaeii/allchat` answers *"not one of the 65 repositories this
+workspace's GitHub App can see — did you mean `caesarakalaeii/all-chat`?"* rather than
+opening a thread that spends a session and parks on a git exit code (§9.1.1). Retype it and
+run the command again; nothing was created.
 
 Opens a thread and creates a brainstorm task in it. The agent reads the repos and asks one
 question at a time — answer in the thread, where the task id is implied, so `!answer yes`

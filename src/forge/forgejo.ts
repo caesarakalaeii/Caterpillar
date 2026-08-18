@@ -17,7 +17,8 @@
  * commit statuses, so the combined-status endpoint is the only CI signal, and it has
  * states GitHub does not (`error`, `warning`).
  */
-import type { RepoRef, TaskSpec } from "../domain/task.ts";
+import { repoSlug, type RepoRef, type TaskSpec } from "../domain/task.ts";
+import type { UnreachableRepo } from "./reach.ts";
 import {
   assertInScope,
   assertWorkspaceScope,
@@ -49,7 +50,12 @@ export interface ForgejoOptions {
    * changing how the rest are reached.
    */
   readonly tokensByRepo?: ReadonlyMap<string, string>;
+  /** Injected transport. Absent means the global `fetch`; only tests pass one. */
+  readonly fetch?: FetchLike;
 }
+
+/** As in `github-app.ts`, and declared here for the same reason: no transport import. */
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export class MissingRepoTokenError extends Error {
   constructor(slug: string, owner: string) {
@@ -143,6 +149,38 @@ export const summariseCombinedStatus = (body: CombinedStatusResponse): CheckStat
   return { conclusion: "success", summary: `${total} status(es) passed` };
 };
 
+/** The transport for one set of options: injected in tests, the global otherwise. */
+const http = (options: ForgejoOptions): FetchLike =>
+  options.fetch ?? ((input, init) => fetch(input, init));
+
+/**
+ * Resolve the token for a repo: a specific override first, then the owner-wide token.
+ *
+ * `assertWorkspaceScope` and `assertInScope` have both already run by the time the forge
+ * calls this. The first is the security boundary: the workspace's configured host, which
+ * the task did not choose. The second only narrows to what the task asked for, and the
+ * task's `repos` list is attacker-influenceable text — it was treated as the boundary
+ * once, and that is exactly how a Codeberg owner-wide token could be pointed at another
+ * host.
+ *
+ * On Forgejo the token cannot be narrowed at use time (there is no mint step), so what
+ * the token itself was created with is the last line rather than the first.
+ *
+ * Module-level rather than a method because the FACTORY asks the same question at the
+ * door (`unreachable`): a repo with no token configured is a repo no session will reach,
+ * and finding that out before one starts is the whole point.
+ */
+const tokenFor = (options: ForgejoOptions, repo: RepoRef): string => {
+  const slug = repoSlug(repo);
+  const specific = options.tokensByRepo?.get(slug);
+  if (specific !== undefined) return specific;
+
+  const byOwner = options.tokensByOwner.get(repo.owner);
+  if (byOwner !== undefined) return byOwner;
+
+  throw new MissingRepoTokenError(slug, repo.owner);
+};
+
 class ForgejoForge implements Forge {
   readonly kind = "forgejo";
 
@@ -162,7 +200,7 @@ class ForgejoForge implements Forge {
     // compromise rather than an hour's exposure.
     assertWorkspaceScope(repo, this.scope);
     assertInScope(repo, this.allowed);
-    const token = this.tokenFor(repo);
+    const token = tokenFor(this.options, repo);
 
     // No expiresAt: Forgejo tokens do not expire. Rotation is external.
     return { username: this.options.username, password: token };
@@ -233,36 +271,12 @@ class ForgejoForge implements Forge {
     // Nothing to revoke — these tokens are long-lived and externally rotated.
   }
 
-  /**
-   * Resolve the token for a repo: a specific override first, then the owner-wide
-   * token.
-   *
-   * `assertWorkspaceScope` and `assertInScope` have both already run. The first is the
-   * security boundary: the workspace's configured host, which the task did not choose.
-   * The second only narrows to what the task asked for, and the task's `repos` list is
-   * attacker-influenceable text — it was treated as the boundary once, and that is
-   * exactly how a Codeberg owner-wide token could be pointed at another host.
-   *
-   * On Forgejo the token cannot be narrowed at use time (there is no mint step), so
-   * what the token itself was created with is the last line rather than the first.
-   */
-  private tokenFor(repo: RepoRef): string {
-    const slug = `${repo.owner}/${repo.name}`;
-    const specific = this.options.tokensByRepo?.get(slug);
-    if (specific !== undefined) return specific;
-
-    const byOwner = this.options.tokensByOwner.get(repo.owner);
-    if (byOwner !== undefined) return byOwner;
-
-    throw new MissingRepoTokenError(slug, repo.owner);
-  }
-
   private async api<T>(repo: RepoRef, route: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(`${this.options.apiBase}${route}`, {
+    const response = await http(this.options)(`${this.options.apiBase}${route}`, {
       ...init,
       headers: {
         // Gitea/Forgejo's own scheme. Header only — never argv.
-        authorization: `token ${this.tokenFor(repo)}`,
+        authorization: `token ${tokenFor(this.options, repo)}`,
         accept: "application/json",
         "content-type": "application/json",
       },
@@ -287,5 +301,63 @@ export class ForgejoForgeFactory implements ForgeFactory {
   async forTask(spec: TaskSpec): Promise<Forge> {
     for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
     return new ForgejoForge(this.options, spec.repos, this.scope);
+  }
+
+  /**
+   * Which of these repos this workspace's tokens cannot reach, and why (DESIGN.md §9.1.1).
+   *
+   * Three questions, cheapest first, because the first two need no request at all:
+   *
+   *   - the CONFIGURED bound (`assertWorkspaceScope`) — another forge's host, or the
+   *     supervisor's own state repo
+   *   - whether a token covers it. There is no mint here, so a missing token is not a
+   *     refusal that arrives later: it is one that arrives never, as a clone prompting for
+   *     a username in a shell with prompts disabled
+   *   - whether the repo exists. `GET /repos/{owner}/{name}` answers 404 both for a repo
+   *     that is not there and for one this token may not see, which is the same conflation
+   *     GitHub's 422 makes and is reported the same way
+   *
+   * Throws when Forgejo cannot be asked, per `RepoReach`: every caller fails open, and a
+   * 500 is not evidence that a repo was deleted.
+   */
+  async unreachable(repos: readonly RepoRef[]): Promise<readonly UnreachableRepo[]> {
+    const failures: UnreachableRepo[] = [];
+
+    for (const repo of repos) {
+      try {
+        assertWorkspaceScope(repo, this.scope);
+        tokenFor(this.options, repo);
+      } catch (error) {
+        failures.push({ repo, reason: error instanceof Error ? error.message : String(error) });
+        continue;
+      }
+
+      const slug = repoSlug(repo);
+      const route = `/repos/${repo.owner}/${repo.name}`;
+      const response = await http(this.options)(`${this.options.apiBase}${route}`, {
+        headers: {
+          authorization: `token ${tokenFor(this.options, repo)}`,
+          accept: "application/json",
+        },
+      });
+
+      if (response.ok) continue;
+      if (response.status !== 404) {
+        throw new ForgejoApiError(response.status, route, await response.text());
+      }
+
+      // No installation to enumerate, so no candidate list and no near miss: Forgejo's
+      // equivalent would be listing every repo under the owner, which a repository-scoped
+      // token is not allowed to do. The name is still named, which is what was missing.
+      failures.push({
+        repo,
+        reason:
+          `\`${slug}\` is not there — ${this.options.apiBase} answers 404 for it, so either ` +
+          `it does not exist or this workspace's token may not see it. Check the spelling ` +
+          `and the token's repository list.`,
+      });
+    }
+
+    return failures;
   }
 }

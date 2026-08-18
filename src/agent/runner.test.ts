@@ -84,7 +84,11 @@ class FakeForge implements Forge {
 }
 
 const forge = new FakeForge();
-const forgeFactory: ForgeFactory = { forTask: async () => forge };
+const forgeFactory: ForgeFactory = {
+  forTask: async () => forge,
+  // Nothing under test here asks; the fake repo is reachable by construction.
+  unreachable: async () => [],
+};
 
 const root = await mkdtemp(join(tmpdir(), "caterpillar-e2e-"));
 const source = join(root, "source");

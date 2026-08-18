@@ -385,6 +385,11 @@ const main = async (): Promise<void> => {
     council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
+    // The workspaces' forge factories, for the one question the loop asks of them: can this
+    // credential reach the repo somebody just named (§9.1.1)? The same map the session runner
+    // holds — a repo checked at the `/brainstorm` door and again before a session, so the
+    // answer never has to come from a failing `git clone`.
+    forges,
     threads,
     ...(discord.bot === undefined
       ? {}
@@ -408,6 +413,7 @@ const main = async (): Promise<void> => {
       store,
       trackers,
       scopes,
+      forges,
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,

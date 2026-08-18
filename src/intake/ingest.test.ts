@@ -12,7 +12,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { asTaskId, asWorkspaceName, type TaskId, type TrackerRef, type WorkspaceName } from "../domain/task.ts";
+import {
+  asTaskId,
+  asWorkspaceName,
+  type RepoRef,
+  type TaskId,
+  type TrackerRef,
+  type WorkspaceName,
+} from "../domain/task.ts";
+import type { RepoReach } from "../forge/reach.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
@@ -100,6 +108,7 @@ const VALID = ["```agent", "acceptance:", '  - "npm test"', "```"].join("\n");
 const ingesterFor = (
   store: StateStore,
   trackers: ReadonlyMap<WorkspaceName, Tracker>,
+  forges?: ReadonlyMap<WorkspaceName, RepoReach>,
 ): Ingester =>
   new Ingester({
     store,
@@ -109,7 +118,27 @@ const ingesterFor = (
     scopes: new Map([...trackers.keys()].map((name) => [name, { host: "github.com" }])),
     logger: SILENT_LOGGER,
     maxSessionsPerTask: 20,
+    ...(forges === undefined ? {} : { forges }),
   });
+
+/** A forge that can reach everything except the repos it is told about. */
+const reachExcept = (missing: readonly string[]): ReadonlyMap<WorkspaceName, RepoReach> =>
+  new Map([
+    [
+      WORKSPACE,
+      {
+        unreachable: (repos: readonly RepoRef[]) =>
+          Promise.resolve(
+            repos
+              .filter((repo) => missing.includes(`${repo.owner}/${repo.name}`))
+              .map((repo) => ({
+                repo,
+                reason: `\`${repo.owner}/${repo.name}\` is not one of the repositories this workspace's GitHub App can see.`,
+              })),
+          ),
+      },
+    ],
+  ]);
 
 test("intake is due at boot, then only once per interval", async () => {
   // Intake must NOT ride the supervisor's poll interval. A GitHub pass costs ~66 requests
@@ -456,4 +485,44 @@ test("every decision reaches the observer, so Grafana can count them", async () 
   await subject.ingest("origin", "main");
   assert.deepEqual(observed, ["caesar:skipped", "caesar:skipped"]);
   assert.deepEqual(items, [2, 2], "the gauge is published even when nothing changes");
+});
+
+test("an item naming a repo the credential cannot reach is refused, not created", async () => {
+  // The same door as `/brainstorm`'s (§9.1), on the path a human cannot see the result of:
+  // an `agent` block's `repos` list is free text, and a task built from a repo nothing can
+  // clone dies in its first session with a git exit code and no explanation.
+  const { store } = await stateRepo();
+  const body = [
+    "```agent",
+    "repos:",
+    "  - acme/wigdet",
+    "acceptance:",
+    '  - "npm test"',
+    "```",
+  ].join("\n");
+  const tracker = new FakeTracker([item(body)]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), reachExcept(["acme/wigdet"]));
+
+  const pass = await subject.ingest("origin", "main");
+  assert.equal(pass.created, 0);
+  assert.equal(pass.rejected, 1);
+  assert.deepEqual(await store.listTasks(), []);
+  assert.match(tracker.comments[0]?.text ?? "", /acme\/wigdet/);
+
+  // And it is the SAME refusal as any other: recorded, so the item is not commented on
+  // again every five minutes (§14.2).
+  await subject.ingest("origin", "main");
+  assert.equal(tracker.comments.length, 1, "one comment, however many passes run");
+});
+
+test("a forge that cannot answer lets the item through rather than refusing it", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID)]);
+  const subject = ingesterFor(
+    store,
+    new Map([[WORKSPACE, tracker]]),
+    new Map([[WORKSPACE, { unreachable: () => Promise.reject(new Error("500")) }]]),
+  );
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "fail open, as everywhere");
 });

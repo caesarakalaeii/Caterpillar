@@ -1473,7 +1473,80 @@ With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec sa
   OAuth code).
 
 Run `npm run verify:github-app` after installing — it confirms the JWT signs, prints
-the installation id, and proves per-task repo scoping works, without printing a token.
+the installation id, proves the installation can reach the repo you name, and proves
+per-task repo scoping works, without printing a token.
+
+### 9.1.1 A repo the credential cannot reach is refused at the door
+
+Everything above bounds which repos a task is *allowed* to name. Nothing asked whether
+the credential can *reach* the ones it named — and the answer arrived at the worst
+possible moment.
+
+```
+BS-1539331435477860432 parked — session failed: git clone --mirror
+  https://github.com/caesarakalaeii/allchat.git failed (128):
+  caterpillar-cred: GitHub /app/installations/153385932/access_tokens failed with 422:
+    the App is not installed on one of the requested repositories
+  fatal: could not read Username for '…': terminal prompts disabled
+```
+
+The repo is called **`all-chat`**. Somebody typed `allchat` into `/brainstorm`, and every
+check on the way in passed: it parses as `owner/name` (§domain), it is on the workspace's
+host, it is not the state repo, so it resolved to a workspace and became a task. A runner
+claimed it, spent a session, and died on the first thing a session does. The park reason
+named an installation id and a git exit code; the one word that mattered — `all-chat` —
+appeared nowhere.
+
+**Why the mint cannot say it.** `POST /access_tokens` answers **422 for a repo that does
+not exist and 422 for a repo the App is not installed on**, with a body of
+`{"message": "Unprocessable Entity"}`, and it takes `repositories` as *names* — so it does
+not even echo which one it refused. A 422 is not evidence about an installation. Reading
+it as one sent the operator to the App's settings page for what was a dash.
+
+The question is therefore asked from the other side: **`GET /installation/repositories`**
+returns the list, so the difference can be computed here, and a list makes the useful
+sentence possible — *"`caesarakalaeii/allchat` is not one of the 65 repositories this
+workspace's GitHub App can see. Did you mean `caesarakalaeii/all-chat`?"* Near misses are
+ranked by a squashed comparison first (`-`, `_`, `.` and case are what people retype
+wrong: `AllChat`, `all_chat`, `allchat` are all one edit from nothing) and then by bounded
+edit distance. `ForgeFactory` answers it — one per workspace, which is the unit a
+credential belongs to — and Forgejo answers the same question from what it has: a token
+configured for the owner, and a `GET /repos/{owner}/{name}` that is not a 404.
+
+Asked in three places, each the first moment the answer is cheap:
+
+- **the `/brainstorm` door** (`applyBrainstorm`) — a refusal typed back into the channel
+  before a task exists. This is where the incident above was avoidable.
+- **intake** (`Ingester`) — an `agent` block's `repos` list is free text too, and on that
+  path nobody is watching: the refusal becomes a comment on the item, recorded and
+  suppressed exactly like every other intake refusal (§14.2).
+- **before every session** (`workTask`) — the net under both, and the only one that
+  catches a repo that became unreachable *after* the task was created, or one that arrived
+  through a plan (`materialise` resolves repos from agent free text and is synchronous, so
+  it does not ask; its children are caught here). The task parks with the sentence instead
+  of with a git exit code, and no session is spent.
+
+Re-asked per session rather than cached per task, because the answer changes without the
+task changing: an App uninstalled mid-task, or one installed a minute ago by the human who
+read the last park reason. The listing behind it is cached for five minutes, so the steady
+state costs one request per workspace per five minutes — the same budget §14.2 rations.
+
+A **hit is served from that cache and a miss is not**: an absence is re-read from GitHub
+before it becomes a refusal. A repo installed a minute ago is absent from a five-minute-old
+list, and "your brand-new repo does not exist" is the one wrong answer this check exists to
+stop being given. It is affordable exactly because misses are rare, and it is bounded to one
+re-read per call however many repos miss.
+
+**Every one of the three fails OPEN.** A forge that throws has told us nothing: a 500, a
+DNS blip, an expired key. Refusing a `/brainstorm`, or parking a task, over that would be
+strictly worse than the clone failure this exists to pre-empt — so a refusal only ever
+comes from a forge that *answered*, and a listing that could not be read to completion is
+an error rather than a short list (the same reasoning as the check-run cap in §12).
+
+**And the mint still explains itself**, because the check is a usability layer and not a
+boundary: a 422 now asks the installation what it *can* see and names the repos that are
+missing, with the same near miss. That is the message the credential helper prints into a
+failing `git clone`, so it is the last place a human is told anything at all.
 
 ### 9.2 Why the agent never holds the token
 
