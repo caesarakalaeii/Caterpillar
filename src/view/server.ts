@@ -35,16 +35,15 @@ import {
   errorPage,
   intakePage,
   layout,
-  runnerPage,
   sessionPage,
   taskPage,
   type Chrome,
   type Page,
 } from "../web/pages.ts";
 import { parseTranscript } from "../web/transcript.ts";
-import type { DigestView, IntakeView, RunnerExport, TaskDetail } from "../web/view.ts";
+import type { DigestView, DiskView, IntakeView, RunnerExport, TaskDetail } from "../web/view.ts";
 import type { Aggregator } from "./aggregate.ts";
-import { fleetWithRunners, viewerLogsPage } from "./pages.ts";
+import { fleetWithRunners, runnerFrom, viewerLogsPage } from "./pages.ts";
 
 export interface ViewServerOptions {
   readonly aggregator: Aggregator;
@@ -170,15 +169,25 @@ const route = async (options: ViewServerOptions, request: IncomingMessage): Prom
       : page(options, "intake", "intake", intakePage(value), 200, user);
   }
 
+  // One runner's configuration, from whichever answered first — and it says so on the page.
+  // Every replica runs the same ConfigMap, so this is the fleet's configuration in
+  // practice; the disk measurement is NOT, since each pod has its own volume. That is why
+  // the source is named rather than left implicit.
   if (path === "/runner" || path === "/api/runner") {
-    const { value, unreachable } = await aggregator.fromAny<RunnerExport & { disk?: never }>({
-      ...forward,
-      path: "/api/runner",
-    });
+    const { value, unreachable, source } = await aggregator.fromAny<
+      RunnerExport & { readonly disk?: DiskView }
+    >({ ...forward, path: "/api/runner" });
     if (value === undefined) return unreachablePage(options, user, unreachable);
     return path === "/api/runner"
-      ? json(200, value)
-      : page(options, "runner", value.runnerId, runnerPage(value, value.disk), 200, user);
+      ? json(200, { ...value, ...(source === undefined ? {} : { source }) })
+      : page(
+          options,
+          "runner",
+          value.runnerId,
+          runnerFrom(value, source),
+          200,
+          user,
+        );
   }
 
   if (path === "/digests" || path === "/api/digests") {

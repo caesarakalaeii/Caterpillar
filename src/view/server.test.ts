@@ -294,3 +294,86 @@ test("the log page merges the rings and tags each line with its process", async 
     "newest first, across rings rather than one ring after another",
   );
 });
+
+test("a task, its session and a digest are proxied from the runner that has them", async () => {
+  // The state repo is identical on every replica, so these come from the first healthy
+  // responder. What the viewer must not do is invent any of it: every one of these pages is
+  // the runner's own template rendering the runner's own view model.
+  const runner = await fakeRunner("caterpillar-0", {
+    "/api/fleet": FLEET,
+    "/api/tasks/TASK-1": {
+      id: "TASK-1",
+      title: "Fix the widget",
+      state: {
+        id: "TASK-1",
+        status: "running",
+        phase: "implementing",
+        requires: [],
+        sessions: 2,
+        limits: { maxSessions: 20 },
+        usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.5 },
+        progress: { lastProgressSession: 1, noProgressStreak: 0 },
+        createdAt: "2026-08-18T08:00:00.000Z",
+        updatedAt: "2026-08-18T09:00:00.000Z",
+      },
+      questions: [],
+      verdicts: [],
+      artifacts: [],
+      sessions: [1],
+    },
+    "/api/tasks/TASK-1/sessions/1": {
+      task: "TASK-1",
+      session: 1,
+      entries: [{ index: 0, role: "assistant", text: "hello from the transcript", calls: [] }],
+    },
+    "/api/tasks/TASK-1/sessions/1/raw": '{"role":"assistant"}\n',
+    "/api/digests": { dates: ["2026-08-17"] },
+    "/api/digests/2026-08-17": { date: "2026-08-17", body: "# Digest\n\nSomething happened." },
+    "/api/runner": {
+      runnerId: "caterpillar-0",
+      capabilities: ["linux"],
+      pollSeconds: 30,
+      lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
+      handoff: { thresholdFraction: 0.7 },
+      limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 3600 },
+      llm: {
+        auth: "proxy",
+        modelId: "claude-opus-5",
+        providerId: "anthropic",
+        contextWindow: 200000,
+        maxTokens: 32000,
+        cooldown: { initialSeconds: 60, maxSeconds: 3600 },
+      },
+      toolchain: { nixpkgs: "pin", timeoutSeconds: 900, gcIntervalHours: 24, gcKeepDays: 7 },
+      stateRepo: { url: "https://example.invalid/state.git", branch: "main", path: "/work/state" },
+      paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+      usage: { intervalHours: 1, deadlineSeconds: 120 },
+      intake: { intervalSeconds: 300 },
+      remediation: { enabled: true, port: 8081 },
+      cluster: { enabled: true, namespaces: ["caterpillar"], maxLogLines: 500 },
+      log: { level: "info" },
+      workspaces: [],
+    },
+  });
+  const url = await serve([runner.endpoint]);
+
+  const task = await (await fetch(`${url}/tasks/TASK-1`)).text();
+  assert.match(task, /Fix the widget/);
+
+  const session = await (await fetch(`${url}/tasks/TASK-1/sessions/1`)).text();
+  assert.match(session, /hello from the transcript/);
+
+  // The raw transcript keeps its bytes and its type: re-encoding it would change what an
+  // operator downloaded.
+  const rawTranscript = await fetch(`${url}/tasks/TASK-1/sessions/1/raw`);
+  assert.match(rawTranscript.headers.get("content-type") ?? "", /text\/plain/);
+  assert.equal(await rawTranscript.text(), '{"role":"assistant"}\n');
+
+  const digest = await (await fetch(`${url}/digests/2026-08-17`)).text();
+  assert.match(digest, /Something happened\./);
+
+  const runnerPageBody = await (await fetch(`${url}/runner`)).text();
+  assert.match(runnerPageBody, /Read from caterpillar-0/);
+  // The alert half of the page, which said nothing until `/intake` needed it.
+  assert.match(runnerPageBody, /listening<\/span> on port 8081/);
+});

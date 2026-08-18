@@ -13,7 +13,8 @@
  */
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, type Html } from "../web/html.ts";
-import { fleetPage } from "../web/pages.ts";
+import { fleetPage, runnerPage } from "../web/pages.ts";
+import type { DiskView, RunnerExport } from "../web/view.ts";
 import type { AggregateFleet, AggregateLogs, TaggedLog } from "./aggregate.ts";
 
 /**
@@ -52,6 +53,22 @@ const sourceNote = (merged: AggregateFleet): Html =>
         runner, so one answer is the whole fleet's. Live sessions and logs are asked of
         every replica, because those exist in one process's memory each.
       </p>`;
+
+/**
+ * One runner's configuration, with the runner it came from named.
+ *
+ * Every replica reads the same ConfigMap, so the configuration IS the fleet's — but the
+ * disk measurement below it is not: each pod has its own volume, and a page that showed one
+ * pod's bytes without saying whose would be read as the fleet's total.
+ */
+export const runnerFrom = (
+  exported: RunnerExport & { readonly disk?: DiskView },
+  source: string | undefined,
+): Html => html`${runnerPage(exported, exported.disk)}
+  <p class="crumb">
+    Read from ${source ?? "a runner"}. Every replica runs the same ConfigMap, so the
+    configuration above is the fleet's — the disk numbers are that pod's own volume.
+  </p>`;
 
 /**
  * Every runner's ring, merged newest-first, each line tagged with its process.
