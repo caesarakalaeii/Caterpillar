@@ -12,6 +12,7 @@ import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
 import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
+import { externalBot } from "./config/bot.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { MirrorChangeReader } from "./digest/changes.ts";
@@ -311,7 +312,7 @@ const main = async (): Promise<void> => {
   // here keeps the receiver's own startup a single decision about the port and the secret.
   const alertQueue = new AlertQueue();
   const threads = new ThreadIndex();
-  const discord = await loadDiscord(config.secretsDir, logger);
+  const discord = await loadDiscord(config.secretsDir, logger, externalBot(config, logger));
 
   // Shared by the implementation sessions and the review council — one provider, one
   // credential store, one place the model id is decided.
@@ -402,6 +403,13 @@ const main = async (): Promise<void> => {
     ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     runners: plane.runners,
+    // The supervisor→bot half of the thread index (§7.2). Always passed, never gated on
+    // the mode: with Redis off this is the in-memory store nobody else reads and the
+    // publish is an assignment, and with it on a supervisor that has NOT been told the bot
+    // is external still publishes — which is what makes a fleet mid-rollout, where the bot
+    // pod is already up and the supervisors have not restarted yet, route replies instead
+    // of dropping them.
+    threadBindings: plane.threads,
     metrics,
     logger,
     trackers,
