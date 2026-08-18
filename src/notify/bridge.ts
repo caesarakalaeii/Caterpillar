@@ -112,6 +112,28 @@ export class DiscordBridge {
   async handleMessage(content: string, author: string, channelId: string): Promise<void> {
     if (!this.acts()) return;
     const thread = this.deps.threads?.taskFor(channelId);
+
+    // A message in a thread we do not have a binding for. Ordinarily unreachable — the
+    // gateway only delivers from the channel and from threads the index knows — but
+    // routine for the STANDALONE bot (§7), whose index arrives over Redis from the
+    // supervisor and is therefore briefly stale: a thread bound seconds ago by a
+    // supervisor that has not yet published, or a bot that started before any supervisor.
+    //
+    // The answer must be a message rather than silence. In a bound thread everything typed
+    // IS the answer, so a human typing into one that looks unbound gets no reply at all,
+    // and cannot tell that from the agent being busy — which is the failure this whole
+    // split was meant to remove, arriving by a different door.
+    if (thread === undefined && channelId !== this.deps.bot.channelId) {
+      this.deps.logger.warn("bridge.unbound-thread", { channel: channelId, author });
+      await this.say(
+        "I do not know which task this thread belongs to yet — I am still catching up with " +
+          "the supervisor. Try again in a moment, or use `/answer <task-id>` from the main " +
+          "channel.",
+        channelId,
+      );
+      return;
+    }
+
     const command = parseCommand(content, thread);
     if (command === undefined) return;
 

@@ -358,3 +358,55 @@ test("a presence change after the socket is gone is not written to it", async ()
   assert.equal(socket.sent.length, before, "nothing may be sent on a closed connection");
   await stop();
 });
+
+test("connected() is false until IDENTIFY has been answered, and false again after close", async () => {
+  // The standalone bot's readiness probe reads this. An open socket that has not
+  // identified delivers nothing, so reporting it ready would keep a pod in the Service
+  // that answers no human — `supervisor/loop.ts:~287`'s lesson, one process along.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  assert.equal(built.gateway.connected(), false, "a dialled socket is not yet a working bot");
+
+  socket.emit(hello());
+  assert.equal(built.gateway.connected(), false, "IDENTIFY sent is still not IDENTIFY answered");
+
+  socket.emit({ op: 0, s: 1, t: "READY", d: { session_id: "sess-1" } });
+  assert.equal(built.gateway.connected(), true);
+
+  socket.fire("close");
+  assert.equal(built.gateway.connected(), false, "a closed socket must not report ready");
+
+  await stop();
+});
+
+test("a zombie socket reports disconnected, not merely logs", async () => {
+  // Open, and delivering nothing. This is the failure that looks identical to an idle
+  // channel, and the whole reason the probe cannot just be "the HTTP server is up".
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello(1_000));
+  socket.emit({ op: 0, s: 1, t: "READY", d: { session_id: "sess-1" } });
+  assert.equal(built.gateway.connected(), true);
+
+  // Two beats with no ACK between them is the zombie test the gateway already makes.
+  await new Promise((r) => setTimeout(r, 5));
+  socket.fire("close");
+
+  assert.equal(built.gateway.connected(), false);
+  await stop();
+});
+
+test("a RESUMED connection is connected again", async () => {
+  // A reconnect is the ordinary case during a rollout, and a bot that never reported
+  // ready again after resuming would be restarted forever by its own probe.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit({ op: 0, s: 1, t: "RESUMED", d: {} });
+
+  assert.equal(built.gateway.connected(), true);
+  await stop();
+});

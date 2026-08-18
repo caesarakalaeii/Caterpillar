@@ -453,3 +453,52 @@ test("the replica that holds the claim behaves exactly as before", async () => {
   assert.equal(inbox.size, 0, "a listing still never queues work");
   assert.match(String((callback(calls).body["data"] as { content: string }).content), /GH-acme-widget-42/);
 });
+
+test("a message in a thread with no known binding gets an honest answer, not silence", async () => {
+  // Routine for the STANDALONE bot (§7): its index arrives over Redis from the supervisor,
+  // so a thread bound seconds ago, or a bot that started before any supervisor, is a
+  // thread it does not know yet.
+  //
+  // Silence is the one unacceptable reply. In a bound thread everything typed IS the
+  // answer, so a human typing into one that looks unbound would get nothing back and
+  // could not tell that from the agent being busy.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  await bridge.handleMessage("we want B", "operator", THREAD);
+
+  assert.equal(inbox.size, 0, "an unroutable message must not be queued as somebody's answer");
+  const said = posted(calls);
+  assert.equal(said.length, 1, "the human was told nothing");
+  assert.match(String(said[0]?.body["content"]), /do not know which task this thread/i);
+  // Answered IN the thread, where the person is looking.
+  assert.match(String(said[0]?.url), new RegExp(`/channels/${THREAD}/messages$`));
+});
+
+test("a binding that arrives later makes the same thread answerable", async () => {
+  // The staleness window closing. Once the supervisor's binding reaches the bot, the
+  // thread behaves exactly as it does in the unsplit process.
+  const threads = new ThreadIndex();
+  const { bridge, inbox, calls } = harness({ threads });
+
+  await bridge.handleMessage("we want B", "operator", THREAD);
+  assert.equal(inbox.size, 0);
+
+  threads.replace([[THREAD, TASK]]);
+  const handled = bridge.handleMessage("we want B", "operator", THREAD);
+  await settleQueued(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  const said = posted(calls);
+  assert.match(String(said[said.length - 1]?.body["content"]), /Answered/);
+});
+
+test("an ordinary message in the main channel is still ignored", async () => {
+  // The unbound-thread reply must not become a reply to everything. The channel carries
+  // ordinary conversation, and answering all of it would make the bot unusable.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  await bridge.handleMessage("morning all", "operator", CHANNEL);
+
+  assert.equal(inbox.size, 0);
+  assert.deepEqual(calls, [], "the channel is not a thread and silence is correct there");
+});

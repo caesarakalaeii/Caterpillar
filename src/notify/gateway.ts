@@ -130,12 +130,36 @@ export class DiscordGateway {
   private sequence: number | null = null;
   private sessionId: string | undefined;
   private resumeUrl: string | undefined;
+  /**
+   * Whether a socket is currently identified and acking heartbeats.
+   *
+   * Exists for the standalone bot's health check (`src/bot.ts`). A bot process whose
+   * gateway is down is a bot that answers nothing, and `supervisor/loop.ts:~287`'s lesson
+   * is that a process which answers probes while doing nothing useful is worse than one
+   * that exits — so this has to be observable from outside, not merely logged.
+   *
+   * Set at READY/RESUMED rather than at dial: an open TCP connection that has not
+   * identified delivers nothing, and reporting it as healthy would be the exact lie this
+   * is here to prevent. Cleared on every teardown, including the zombie case.
+   */
+  private live = false;
 
   constructor(options: GatewayOptions) {
     this.options = options;
     this.open = options.socket ?? ((url) => new WebSocket(url) as unknown as SocketLike);
     this.pause = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.random = options.random ?? Math.random;
+  }
+
+  /**
+   * Is there a live, identified connection right now?
+   *
+   * Read by the bot's readiness probe. Deliberately not "has ever connected": a bot that
+   * connected at boot and has been reconnect-looping for ten minutes is not serving
+   * anyone, and reporting it ready keeps a broken pod in the Service.
+   */
+  connected(): boolean {
+    return this.live;
   }
 
   /** Connect, and keep reconnecting until `signal` aborts. Never throws. */
@@ -176,6 +200,9 @@ export class DiscordGateway {
       const shutdown = (why: string): void => {
         if (settled) return;
         settled = true;
+        // Before anything else: from here on this process is not connected, and a probe
+        // arriving during teardown must be told so rather than reading a stale `true`.
+        this.live = false;
         if (heartbeat !== undefined) clearInterval(heartbeat);
         // Before the close, so a presence change landing during teardown cannot be written
         // to a socket this function is about to dispose of.
@@ -315,6 +342,10 @@ export class DiscordGateway {
     }
 
     if (payload.t === "READY" || payload.t === "RESUMED") {
+      // Identified and receiving. This is the earliest point at which the bot can
+      // actually answer a human, which is what the readiness probe means by "up".
+      this.live = true;
+
       if (payload.t === "READY") {
         const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
         this.sessionId = ready.session_id;
