@@ -130,6 +130,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees. |
 | `src/workspace/toolchain.ts` | The one environment every task command runs in (§8.1). |
+| `src/workspace/usage.ts` | What is on the work volume, by category. Read-only, idle-only (§11). |
 | `src/llm/credentials.ts` | The rotating OAuth credential as a locked file (§9.6). |
 | `src/llm/credential-holder.ts` | The one pod that owns and refreshes it, over HTTP (§9.6). |
 | `src/llm/credential-client.ts` | A runner's read-only view of it. Never writes (§9.6). |
@@ -289,6 +290,44 @@ header — it is a fail-closed check on an Ingress whose forward-auth annotation
 dropped, which would otherwise publish every transcript and look like a working deployment.
 
 Locally: set `web.enabled`, run `npm start`, and open `http://localhost:8080`.
+
+## Where the disk went
+
+The scaling mechanisms — a bare mirror per repo, a worktree per task with its own
+`node_modules`, a nix store per replica — fill a volume, and for a long time nothing in
+this process could say which of them did it. Now the supervisor measures its own `work`
+volume and reports it in both places it reports anything else:
+
+```
+caterpillar_work_fs_bytes{runner,kind="total"|"free"}   # from statfs
+caterpillar_work_bytes{runner,category}                  # mirrors|tasks|nix|other
+caterpillar_work_entry_bytes{runner,category,name}       # the largest few, `other` for the rest
+caterpillar_work_partial{runner}                         # 1 when the walk ran out of time
+caterpillar_work_measured_timestamp_seconds{runner}      # how stale the numbers above are
+```
+
+and as a **Disk** section on `/runner` in the web view, with the largest tasks and mirrors
+named. Alert on `caterpillar_work_fs_bytes` — it is the only figure that also counts what
+another process on the volume is using — and use the categories to find out who.
+
+Three properties of the walk are deliberate and worth knowing before reading a graph:
+
+- **Idle-only and hourly.** It runs from the same branch of the poll loop as the nix store
+  collection, because it is one `stat` per file over a tree with a `node_modules` per task
+  and the loop is single-threaded. On a runner that is never idle it never runs, which is
+  why the page shows a timestamp as prominently as the bytes.
+- **Apparent size**, like `du --apparent-size`, not allocated blocks. It is what a human
+  means by "this checkout is 400 MB". The "is the volume full" question is answered exactly
+  by `kind="free"`, which needs no summing at all.
+- **Read-only**, without exception, and it can never fail a poll. A measurement that hits
+  its deadline reports what it has with `caterpillar_work_partial` set rather than throwing
+  the work away or blocking the loop.
+
+Both knobs default sensibly and `0` turns the whole thing off:
+
+```json
+"usage": { "intervalHours": 1, "deadlineSeconds": 120 }
+```
 
 ## The daily digest
 
