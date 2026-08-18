@@ -575,14 +575,21 @@ export class StateStore {
 
     // Collision within a millisecond on ONE runner is still possible — two entries for
     // the same session, written back to back — and overwriting would silently drop an
-    // entry from the audit trail. Suffix until the name is free; the sort order is
-    // unaffected because the suffix is the last component.
-    let name = journalShardName(session, at, this.runnerId);
-    for (let n = 2; existsSync(join(dir, name)); n += 1) {
-      name = journalShardName(session, at, `${this.runnerId}-${n}`);
+    // entry from the audit trail. `wx` fails rather than truncates, so the retry is on
+    // the file system's answer and not on a check that another write can race past.
+    // Suffixing leaves the sort order alone, because the suffix is the last component.
+    for (let n = 1; ; n += 1) {
+      const suffix = n === 1 ? this.runnerId : `${this.runnerId}-${n}`;
+      try {
+        await writeFile(join(dir, journalShardName(session, at, suffix)), entry, {
+          encoding: "utf8",
+          flag: "wx",
+        });
+        return;
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
     }
-
-    await writeFile(join(dir, name), entry, "utf8");
   }
 
   /**

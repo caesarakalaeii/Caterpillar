@@ -302,3 +302,97 @@ test("a spec that will not parse costs a title and nothing else", async () => {
   assert.equal(digest.changed[0]?.title, id, "falls back to the id");
   assert.equal(digest.changed[0]?.to, "failed");
 });
+
+/*
+ * The journal window, over shards (DESIGN.md §4.1).
+ *
+ * The journal is one file per entry, so "what was added in the window" is "which shard
+ * files appeared between the two commits" rather than "what suffix the earlier copy did
+ * not have". These pin both, because a window can straddle the format change.
+ */
+
+test("only the journal shards that appeared inside the window are reported", async () => {
+  const subject = await repo();
+  const id = asTaskId("TASK-SHARD");
+
+  await subject.commit(BEFORE, {
+    [`tasks/${id}/spec.md`]: SPEC("# Shard the journal"),
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "running", sessions: 1 })),
+    [`tasks/${id}/journal/0001-20260815T090000000Z-pod-a.md`]:
+      "## Session 1 — 2026-08-15T09:00:00.000Z\n\nYesterday's entry.\n",
+  });
+  await subject.commit(INSIDE, {
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "running", sessions: 2 })),
+    [`tasks/${id}/journal/0002-20260816T090000000Z-pod-a.md`]:
+      "## Session 2 — 2026-08-16T09:00:00.000Z\n\nToday's first entry.\n",
+  });
+  await subject.commit(LATER, {
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "done", sessions: 3 })),
+    [`tasks/${id}/journal/0003-20260816T110000000Z-pod-b.md`]:
+      "## Session 3 — 2026-08-16T11:00:00.000Z\n\nToday's second entry, by another runner.\n",
+  });
+
+  const change = (await collect(subject.root)).changed[0];
+  assert.match(change?.journal ?? "", /Today's first entry/);
+  assert.match(change?.journal ?? "", /another runner/);
+  assert.doesNotMatch(
+    change?.journal ?? "",
+    /Yesterday's entry/,
+    "a shard that existed before the window is not news",
+  );
+  assert.ok(
+    (change?.journal ?? "").indexOf("first entry") <
+      (change?.journal ?? "").indexOf("second entry"),
+    "shards concatenate in name order, which is chronological order",
+  );
+});
+
+test("a window straddling the format change reports both the legacy file and the shards", async () => {
+  // The live state repo has `journal.md` files written before the sharding. A window
+  // that contains the last append to one and the first shard after it must show both,
+  // or the day the format changed is the day the digest quietly lost half its evidence.
+  const subject = await repo();
+  const id = asTaskId("TASK-STRADDLE");
+
+  await subject.commit(BEFORE, {
+    [`tasks/${id}/spec.md`]: SPEC("# Straddle the change"),
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "running", sessions: 1 })),
+    [`tasks/${id}/journal.md`]: "\n## Session 1\n\nBefore the window.\n",
+  });
+  await subject.commit(INSIDE, {
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "running", sessions: 2 })),
+    [`tasks/${id}/journal.md`]:
+      "\n## Session 1\n\nBefore the window.\n\n## Session 2\n\nThe last legacy append.\n",
+  });
+  await subject.commit(LATER, {
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "done", sessions: 3 })),
+    [`tasks/${id}/journal/0003-20260816T110000000Z-pod-a.md`]:
+      "## Session 3 — 2026-08-16T11:00:00.000Z\n\nThe first shard.\n",
+  });
+
+  const change = (await collect(subject.root)).changed[0];
+  assert.match(change?.journal ?? "", /The last legacy append/);
+  assert.match(change?.journal ?? "", /The first shard/);
+  assert.doesNotMatch(
+    change?.journal ?? "",
+    /Before the window/,
+    "the legacy path still subtracts the prefix the earlier commit already had",
+  );
+});
+
+test("a first-ever digest with no starting commit reports every shard present", async () => {
+  // No `from` means the window is the repo's whole history, so everything present
+  // counts as having appeared inside it — the same rule `filesTouched` uses.
+  const subject = await repo();
+  const id = asTaskId("TASK-FIRST");
+
+  await subject.commit(INSIDE, {
+    [`tasks/${id}/spec.md`]: SPEC("# First day"),
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "running", sessions: 1 })),
+    [`tasks/${id}/journal/0001-20260816T090000000Z-pod-a.md`]:
+      "## Session 1 — 2026-08-16T09:00:00.000Z\n\nThe very first entry.\n",
+  });
+
+  const change = (await collect(subject.root)).changed[0];
+  assert.match(change?.journal ?? "", /The very first entry/);
+});
