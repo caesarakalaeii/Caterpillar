@@ -29,12 +29,18 @@ import type { FiringAlert } from "../remediation/receiver.ts";
 import type { Council } from "../review/council.ts";
 import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
-import { LeaseManager, leaseRef } from "../state/lease.ts";
+import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
-import { DEFAULT_REAP_CONFIG } from "../workspace/worktree.ts";
+import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
 import { ChatInbox, type ChatOutcome } from "./inbox.ts";
-import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
+import {
+  Supervisor,
+  type ProgressProbe,
+  type SessionRunner,
+  type Verifier,
+  type WorktreeReaper,
+} from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
 const DONE_TASK = asTaskId("SMOKE-2");
@@ -1716,4 +1722,352 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
   await running.catch(() => undefined);
 
   assert.deepEqual(passes, [1, 1], "every tick with a queued alert must produce exactly one pass");
+});
+
+/**
+ * A `WorktreeReaper` that records rather than deletes.
+ *
+ * Records instead of standing up a real `WorktreeManager` because the question these four
+ * tests ask is entirely about the LOOP: which terminal paths call the removal, and which
+ * deliberately do not. `worktree.test.ts` owns whether the removal removes the right
+ * things. Building a mirror per case here would test that twice and the wiring once.
+ */
+const recordingReaper = (): {
+  readonly reaper: WorktreeReaper;
+  readonly reaped: TaskId[];
+  readonly swept: (readonly TaskId[])[];
+} => {
+  const reaped: TaskId[] = [];
+  const swept: (readonly TaskId[])[] = [];
+  return {
+    reaped,
+    swept,
+    reaper: {
+      removeTaskWorktrees: (task: TaskId): Promise<ReapResult> => {
+        reaped.push(task);
+        return Promise.resolve({ worktrees: 1, bytes: 4096, tasks: [task] });
+      },
+      reapStaleWorktrees: (opts: { readonly live: ReadonlySet<TaskId> }): Promise<ReapResult> => {
+        swept.push([...opts.live]);
+        return Promise.resolve({ worktrees: 0, bytes: 0, tasks: [] });
+      },
+    },
+  };
+};
+
+test("a task that is done has its worktree reaped", async () => {
+  // The point of the whole feature. `removeWorktree` had no production caller at all, so
+  // every task the fleet ever finished left its checkout — plus `node_modules`, plus build
+  // output, per repo it declared — on a 20Gi ReadWriteOnce volume forever.
+  //
+  // Asserted after the lease is released rather than after the status flips, because the
+  // reap is deliberately the LAST thing `applyOutcome` does: a reap that fails must not be
+  // what stops a completed task from being recorded as one.
+  const REAPED = asTaskId("REAP-DONE");
+  await seedTask(REAPED);
+
+  const { reaper, reaped } = recordingReaper();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () => Promise.resolve({ passed: true, detail: "acceptance commands exited 0" }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if ((await pushedState(REAPED))?.status === "done") break;
+    await sleep(100);
+  }
+  // The reap follows the push, so give the same iteration a moment to finish.
+  while (Date.now() < deadline && reaped.length === 0) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(reaped, [REAPED], "a finished task's worktree must be thrown away");
+});
+
+test("a handoff keeps its worktree — the next session resumes in it", async () => {
+  // The counterweight, and the reason this is not simply "reap on every terminal path".
+  // A handoff is the same task on the same branch in the same directory; `ensureWorktree`
+  // reuses one precisely so a session that hands off does not pay for a clone and a
+  // dependency install. Reaping here would make every handoff cost both.
+  //
+  // Driven to a park so the test has a terminal state to wait for: the session hands off
+  // until the no-progress limit stops it, and NEITHER exit may reap.
+  const KEPT = asTaskId("REAP-HANDOFF");
+  await seedTask(KEPT, { progress: { lastProgressSession: 0, noProgressStreak: 2 } });
+
+  const { reaper, reaped } = recordingReaper();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "handoff",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "context is filling; the next session continues",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(KEPT);
+    // Past the first handoff at minimum — otherwise "it did not reap" is only true
+    // because nothing happened yet.
+    if (state !== undefined && state.sessions > 0 && state.status === "parked") break;
+    await sleep(100);
+  }
+  await sleep(500);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(
+    reaped,
+    [],
+    "a handoff — and the park that follows one — must keep the checkout the next " +
+      "session was going to resume in",
+  );
+});
+
+test("a task awaiting a human keeps its worktree", async () => {
+  // The clearest no-reap case in the switch. The session that answers the question is the
+  // same task on the same branch, claimed as often as not by this same runner, so
+  // deleting the checkout buys disk for exactly as long as it takes a human to type.
+  const ASKED = asTaskId("REAP-ASK");
+  await seedTask(ASKED);
+
+  const { reaper, reaped } = recordingReaper();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "ask-human",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          question: "which of the two migrations should this follow?",
+          summary: "asking",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if ((await pushedState(ASKED))?.status === "awaiting-human") break;
+    await sleep(100);
+  }
+  // Long enough for a reap to have happened if one were going to.
+  await sleep(500);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(reaped, [], "a question is not a reason to delete the work behind it");
+
+  await retire(ASKED);
+});
+
+test("losing the lease reaps this runner's copy, because another runner owns the task", async () => {
+  // The third reaping trigger, and the one that is easiest to argue with. Nothing about
+  // this runner's checkout is wrong — it may hold uncommitted work — but the task has
+  // moved: whoever holds the lease now is working it in their own `tasksDir`, from the
+  // branch on the remote. This copy will never be resumed and nothing will ever name it
+  // again, which is exactly the orphan the periodic sweep would find days later. Catching
+  // it here costs one `rm -rf` and saves the disk in between.
+  const STOLEN = asTaskId("REAP-LOST");
+  await seedTask(STOLEN);
+
+  // A heartbeat that always fails is what a stolen lease looks like from inside a session:
+  // the renewal's CAS finds a ref another runner has moved. Subclassed rather than faked
+  // wholesale so the CLAIM is still the real compare-and-swap.
+  class LosingLeases extends LeaseManager {
+    override renew(lease: Lease): Promise<Lease> {
+      return Promise.reject(new LeaseLostError(lease.task));
+    }
+  }
+
+  const { reaper, reaped } = recordingReaper();
+  const supervisor = new Supervisor({
+    config: { ...config, lease: { heartbeatSeconds: 1, staleAfterSeconds: 300 } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LosingLeases({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      // Runs until the heartbeat gives up on it, then returns something that is NOT
+      // `interrupted` — `workTask` returns early on that reason, and the throw this test
+      // is about happens at the top of the next iteration.
+      run: async (_spec, _state, signal) => {
+        while (!signal.aborted) await sleep(50);
+        return {
+          reason: "handoff",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "stopped",
+        } satisfies SessionOutcome;
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && reaped.length === 0) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(
+    reaped,
+    [STOLEN],
+    "a runner that has lost the lease is holding a checkout nothing will ever read",
+  );
+
+  await retire(STOLEN);
+});
+
+test("the idle sweep runs, and is told which tasks are live rather than guessing", async () => {
+  // The safety net's wiring, and the guard that makes it safe. Two properties in one test
+  // because they are one behaviour: the sweep must actually be reached from the idle
+  // branch — a collector nobody calls is the defect this whole task is about — and the
+  // live set it is handed must contain every task the state repo does not consider
+  // finished, because inferring that from mtimes is how a running session loses its work.
+  //
+  // `intervalHours: 0` so the second idle poll sweeps. The FIRST only starts the clock,
+  // deliberately, so that a runner crash-looping every few minutes does not sweep on every
+  // boot — which is the one moment its worktrees are most likely to be wanted.
+  const LIVE = asTaskId("REAP-SWEEP-LIVE");
+  const GONE = asTaskId("REAP-SWEEP-DONE");
+  await seedTask(LIVE, { status: "awaiting-human" });
+  await seedTask(GONE, { status: "done" });
+
+  const { reaper, swept } = recordingReaper();
+  const supervisor = new Supervisor({
+    config: { ...config, workspace: { reap: { intervalHours: 0, keepHours: 72 } } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no task should be claimed here")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    worktrees: reaper,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && swept.length === 0) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const live = swept[0];
+  assert.ok(live !== undefined, "the idle branch must reach the sweep at all");
+  assert.ok(
+    live.includes(LIVE),
+    "a task awaiting a human resumes against its checkout and must be declared live",
+  );
+  assert.ok(
+    !live.includes(GONE),
+    "a task the state repo calls done is not live, or the sweep can never remove anything",
+  );
 });
