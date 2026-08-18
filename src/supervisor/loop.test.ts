@@ -2724,6 +2724,15 @@ test("a survey that came back empty does not sweep the whole volume", async () =
  * supervisor arms for a session is unref'd, so a bare Supervisor with no metrics port and
  * no credential socket would otherwise let node end the test with the loop half-drained.
  */
+/**
+ * How long a test may wait for this runner to claim something and start a session.
+ *
+ * `npm test` also carries `--test-timeout`, which is the backstop for a wait that never
+ * ends; this is the budget for one that is merely slow. Both exist because the failure mode
+ * they cover is not a red test — it is a green-looking job that never finishes.
+ */
+const CLAIM_BUDGET_MS = 90_000;
+
 const hangingSession = (): { readonly runner: SessionRunner; started: () => boolean } => {
   let begun = false;
   return {
@@ -2732,8 +2741,10 @@ const hangingSession = (): { readonly runner: SessionRunner; started: () => bool
       run: (_spec, _state, signal) =>
         new Promise<SessionOutcome>((resolve) => {
           begun = true;
+          // Ref'd deliberately: it is what keeps the process alive while this fake session
+          // "runs", and an unref'd one would let node exit out from under the test.
           const keepalive = setInterval(() => {}, 1_000);
-          signal.addEventListener("abort", () => {
+          const stop = (): void => {
             clearInterval(keepalive);
             resolve({
               reason: "interrupted",
@@ -2741,7 +2752,19 @@ const hangingSession = (): { readonly runner: SessionRunner; started: () => bool
               contextTokens: 0,
               summary: "stopped from outside",
             });
-          });
+          };
+
+          // A signal that is ALREADY aborted never fires the event, and this promise is what
+          // `run()` awaits — so without this line an abort landing between the claim and this
+          // call left the supervisor unable to unwind, the keepalive holding the loop open,
+          // and the whole FILE hanging rather than failing. That is not hypothetical: it is
+          // what turned one failed assertion in the presence test into a 20-minute CI job,
+          // and because `build` needs `check` to pass, a deploy that silently did not happen.
+          if (signal.aborted) {
+            stop();
+            return;
+          }
+          signal.addEventListener("abort", stop, { once: true });
         }),
     },
   };
@@ -2794,7 +2817,11 @@ test("a /resume submitted during a long session is served without waiting for it
   const running = supervisor.run(controller.signal);
 
   // The session must genuinely be in flight, or this is a test of an idle poll.
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2843,7 +2870,11 @@ test("intake keeps running while a session holds the runner", async () => {
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2886,7 +2917,11 @@ test("the Discord holder claim is refreshed during a session, not after it", asy
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2926,7 +2961,11 @@ test("what Discord reads stays current while a session runs", async () => {
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3022,7 +3061,11 @@ test("housekeeping does not reset over a session's uncommitted state", async () 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3186,7 +3229,11 @@ test("a queue with no selective take is still drained during a session", async (
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3230,7 +3277,11 @@ test("a /cancel for the running task is served even when the queue cannot take s
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3324,11 +3375,15 @@ test("the Discord presence keeps up with a session it is describing", async () =
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < deadline && !published.some((name) => name.startsWith(`${BUSY} · `)))
     await sleep(100);
 
