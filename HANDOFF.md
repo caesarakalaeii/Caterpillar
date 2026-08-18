@@ -261,7 +261,8 @@ Three paths (§14):
 
 1. **Label a tracker item `agent`** with an `agent` block in the body. Within ~5 minutes
    intake renders a spec and the supervisor claims it.
-2. **`/brainstorm topic:… repo:owner/name`** in Discord (§14.3) — opens a thread, refines the
+2. **`/brainstorm topic:… repo:owner/name`** in Discord (§14.3), or several repos in one
+   workspace as `repo:owner/a, owner/b` — opens a thread, refines the
    idea one question at a time, and ends in a plan the council reviews and cuts into
    wave-tagged tasks. **Proven end to end.** This is the path that produces acceptance
    criteria rather than demanding them up front.

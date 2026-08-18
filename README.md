@@ -687,9 +687,16 @@ a checkbox, not something code can detect or fix.
 
 ```
 /brainstorm topic:"make intake accept Linear issues" repo:acme/widget
+/brainstorm topic:"split the client out of the server" repo:acme/widget, acme/api
 ```
 
-Opens a thread and creates a brainstorm task in it. The agent reads the repo and asks one
+The `repo:` option takes one repo or several, separated by commas or spaces. They must all
+belong to the same workspace — one forge, one owner, one credential bundle — and a list
+that crosses two is refused in the thread rather than quietly narrowed to one (§14.3). The
+extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
+child tasks inherit the whole list.
+
+Opens a thread and creates a brainstorm task in it. The agent reads the repos and asks one
 question at a time — answer in the thread, where the task id is implied, so `!answer yes`
 is the whole command. When the shape is settled it proposes a decomposition, the review
 council reads it with plan-specific lenses, and on a pass the tasks are created with a

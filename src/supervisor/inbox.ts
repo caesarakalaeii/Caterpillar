@@ -80,11 +80,15 @@ export type ChatIntent =
    * The thread already exists by the time this arrives — the bridge opened it, because
    * the task's id is derived from it. This is the one request that carries no task id:
    * it is the one that mints one.
+   *
+   * `repos` is raw, unparsed and plural: the loop parses it and enforces that every entry
+   * resolves to ONE workspace (§14.3), because that refusal needs the config the bridge
+   * does not have.
    */
   | {
       readonly kind: "brainstorm";
       readonly topic: string;
-      readonly repo: string;
+      readonly repos: readonly string[];
       readonly threadId: string;
       readonly author: string;
     };

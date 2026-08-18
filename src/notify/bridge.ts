@@ -266,7 +266,7 @@ export class DiscordBridge {
 
     switch (command.kind) {
       case "brainstorm":
-        return this.startBrainstorm(command.topic, command.repo, author);
+        return this.startBrainstorm(command.topic, command.repos, author);
       case "malformed":
         return command.reason;
       case "list": {
@@ -311,18 +311,26 @@ export class DiscordBridge {
    * the channel. That is the right way round: the alternative is a task whose thread does
    * not exist, which has nowhere to ask its first question.
    */
-  private async startBrainstorm(topic: string, repo: string, author: string): Promise<string> {
+  private async startBrainstorm(
+    topic: string,
+    repos: readonly string[],
+    author: string,
+  ): Promise<string> {
     const { bot, inbox, threads, logger } = this.deps;
+
+    const named = repos.join(", ");
 
     // Always in the main channel, never in whatever thread the command was typed in:
     // Discord does not nest threads, and a brainstorm inside a brainstorm is a plan
     // nobody can follow anyway.
     const opening = await bot.postMessage({
-      content: [`**Brainstorm** — ${repo}`, "", topic.trim(), "", `Raised by ${author}.`].join("\n"),
+      content: [`**Brainstorm** — ${named}`, "", topic.trim(), "", `Raised by ${author}.`].join(
+        "\n",
+      ),
     });
 
     const threadId = await bot.createThread(opening.id, threadName(topic));
-    logger.info("bridge.brainstorm", { thread: threadId, repo, author });
+    logger.info("bridge.brainstorm", { thread: threadId, repos: named, author });
 
     // Both BEFORE the loop is awaited, and both are free — a brainstorm's id is its
     // thread id (§14.3), so neither the greeting nor the binding needs anything written
@@ -342,7 +350,7 @@ export class DiscordBridge {
       threadId,
     );
 
-    const outcome = await inbox.submit({ kind: "brainstorm", topic, repo, threadId, author });
+    const outcome = await inbox.submit({ kind: "brainstorm", topic, repos, threadId, author });
 
     // A thread no task owns must not stay bound. `threadBindings` unbinds terminal tasks
     // for exactly this reason: a message in a bound thread is an ANSWER, so a binding

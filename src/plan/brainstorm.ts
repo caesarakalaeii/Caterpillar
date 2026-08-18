@@ -67,21 +67,61 @@ export const brainstormSpec = (options: {
   readonly id: TaskId;
   readonly workspace: WorkspaceName;
   readonly topic: string;
-  readonly repo: RepoRef;
+  readonly repos: readonly RepoRef[];
   readonly author: string;
-}): TaskSpec => ({
-  id: options.id,
-  workspace: options.workspace,
-  kind: "brainstorm",
-  goal: [
-    `# ${options.topic.split("\n")[0] ?? options.topic}`,
-    "",
-    options.topic.trim(),
-    "",
-    `Raised by ${options.author} in Discord. Refine it with them, in the thread this task ` +
-      `was created from, and end with \`submit_plan\`.`,
-  ].join("\n"),
-  repos: [options.repo],
-  requires: [],
-  acceptance: [],
-});
+}): TaskSpec => {
+  const repos = dedupeRepos(options.repos);
+  return {
+    id: options.id,
+    workspace: options.workspace,
+    kind: "brainstorm",
+    goal: [
+      `# ${options.topic.split("\n")[0] ?? options.topic}`,
+      "",
+      options.topic.trim(),
+      "",
+      // Named in the goal, not only in the spec's `repos`, because the agent reads the
+      // goal: a repo checked out under `repos/` that nothing tells it about is a repo it
+      // will not open (§9.4.1).
+      repos.length === 1
+        ? `The repo to read while refining: ${qualifiedSlug(repos[0] as RepoRef)}.`
+        : `The repos to read while refining: ${repos.map(qualifiedSlug).join(", ")}. The first is ` +
+          `your working directory; the rest are checked out beneath it as \`repos/<name>\`.`,
+      "",
+      `Raised by ${options.author} in Discord. Refine it with them, in the thread this task ` +
+        `was created from, and end with \`submit_plan\`.`,
+    ].join("\n"),
+    repos,
+    requires: [],
+    acceptance: [],
+  };
+};
+
+/**
+ * `host/owner/name`, or `owner/name` on GitHub — the form a human typed it in.
+ *
+ * Not `repoSlug` from §domain: that drops the host, which is fine for a log line keyed by
+ * workspace but ambiguous in prose the agent is meant to act on.
+ */
+export const qualifiedSlug = (repo: RepoRef): string =>
+  repo.host === "github.com"
+    ? `${repo.owner}/${repo.name}`
+    : `${repo.host}/${repo.owner}/${repo.name}`;
+
+/**
+ * The same repo named twice is one repo.
+ *
+ * Order is preserved because it is load-bearing: `repos[0]` is the workspace repo and
+ * becomes the agent's working directory (§9.4.1), so the first one typed wins.
+ */
+export const dedupeRepos = (repos: readonly RepoRef[]): readonly RepoRef[] => {
+  const seen = new Set<string>();
+  const out: RepoRef[] = [];
+  for (const repo of repos) {
+    const key = `${repo.host}/${repo.owner}/${repo.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(repo);
+  }
+  return out;
+};

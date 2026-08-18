@@ -9,7 +9,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { WorkspaceProfile } from "../config/types.ts";
 import { asWorkspaceName, isTaskId, type WorkspaceName } from "../domain/task.ts";
-import { brainstormId, brainstormSpec, parseRepo, resolveWorkspace } from "./brainstorm.ts";
+import {
+  brainstormId,
+  brainstormSpec,
+  dedupeRepos,
+  parseRepo,
+  qualifiedSlug,
+  resolveWorkspace,
+} from "./brainstorm.ts";
+
+const WIDGET = { host: "github.com", owner: "acme", name: "widget" } as const;
+const API = { host: "github.com", owner: "acme", name: "api" } as const;
+const EB = { host: "codeberg.org", owner: "eb", name: "api" } as const;
 
 const profile = (name: string, host: string, owner: string): WorkspaceProfile => ({
   name: asWorkspaceName(name),
@@ -86,7 +97,7 @@ test("a brainstorm spec declares no acceptance criteria, and says it is one", ()
     id: brainstormId("42"),
     workspace: asWorkspaceName("caesar"),
     topic: "Make intake accept a Linear issue",
-    repo: { host: "github.com", owner: "acme", name: "widget" },
+    repos: [{ host: "github.com", owner: "acme", name: "widget" }],
     author: "operator",
   });
 
@@ -95,4 +106,52 @@ test("a brainstorm spec declares no acceptance criteria, and says it is one", ()
   assert.deepEqual(spec.repos, [{ host: "github.com", owner: "acme", name: "widget" }]);
   assert.match(spec.goal, /Make intake accept a Linear issue/);
   assert.match(spec.goal, /submit_plan/, "the agent must be told how this ends");
+});
+
+test("a brainstorm spec carries every repo it was given, in order", () => {
+  // Order is load-bearing: `repos[0]` is the workspace repo and becomes the agent's
+  // working directory (§9.4.1), and plan children inherit the whole list unchanged.
+  const spec = brainstormSpec({
+    id: brainstormId("42"),
+    workspace: asWorkspaceName("caesar"),
+    topic: "Split the client out of the server",
+    repos: [WIDGET, API, EB],
+    author: "operator",
+  });
+
+  assert.deepEqual(spec.repos, [WIDGET, API, EB]);
+});
+
+test("the same repo named twice is one repo", () => {
+  const spec = brainstormSpec({
+    id: brainstormId("42"),
+    workspace: asWorkspaceName("caesar"),
+    topic: "Split the client out of the server",
+    repos: [WIDGET, API, WIDGET, { ...API }],
+    author: "operator",
+  });
+
+  assert.deepEqual(spec.repos, [WIDGET, API], "the first mention wins, so order survives");
+  assert.deepEqual(dedupeRepos([API, WIDGET, API]), [API, WIDGET]);
+});
+
+test("the goal names every repo the brainstorm may read", () => {
+  // The agent reads the GOAL. A sibling checked out under `repos/` that nothing tells it
+  // about is a repo it will not open, which is the whole payoff of the list going missing.
+  const spec = brainstormSpec({
+    id: brainstormId("42"),
+    workspace: asWorkspaceName("caesar"),
+    topic: "Split the client out of the server",
+    repos: [WIDGET, EB],
+    author: "operator",
+  });
+
+  assert.match(spec.goal, /acme\/widget/);
+  assert.match(spec.goal, /codeberg\.org\/eb\/api/, "a non-GitHub repo stays qualified");
+  assert.match(spec.goal, /repos\/<name>/, "and it must be told where the siblings are");
+});
+
+test("a repo is named the way a human typed it", () => {
+  assert.equal(qualifiedSlug(WIDGET), "acme/widget");
+  assert.equal(qualifiedSlug(EB), "codeberg.org/eb/api");
 });

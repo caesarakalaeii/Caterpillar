@@ -834,9 +834,10 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
 const resumeSupervisor = (
   store: StateStore,
   inbox: ChatInbox,
+  over: Partial<RunnerConfig> = {},
 ): Supervisor =>
   new Supervisor({
-    config,
+    config: { ...config, ...over },
     store,
     leases: new LeaseManager({
       git: stateGit,
@@ -862,9 +863,10 @@ const resumeSupervisor = (
 const throughInbox = async (
   store: StateStore,
   intent: Parameters<ChatInbox["submit"]>[0],
+  over: Partial<RunnerConfig> = {},
 ): Promise<ChatOutcome> => {
   const inbox = new ChatInbox();
-  const supervisor = resumeSupervisor(store, inbox);
+  const supervisor = resumeSupervisor(store, inbox, over);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
   const outcome = await inbox.submit(intent);
@@ -1563,7 +1565,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   const outcome = await inbox.submit({
     kind: "brainstorm",
     topic: "make the thing faster",
-    repo: "acme/widget",
+    repos: ["acme/widget"],
     threadId: "1538626232302960801",
     author: "caesar",
   });
@@ -1592,6 +1594,153 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
 
   await seedTask(BUSY, { status: "done" });
   await seedTask(BRAINSTORM, { status: "done" });
+});
+
+/**
+ * A brainstorm may read several repos, as long as they are all in ONE workspace.
+ *
+ * The payoff is downstream: `materialise` passes `defaultRepos: spec.repos` to every
+ * child, so a two-repo brainstorm cuts two-repo tasks. The bound is the containment one
+ * (§3.1/§9.1) — a workspace is one credential bundle, and a session holding two is the
+ * blast-radius expansion the workspace model exists to prevent.
+ */
+const workspace = (name: string, host: string, owner: string) => ({
+  name: asWorkspaceName(name),
+  forge: {
+    kind: (host === "codeberg.org" ? "forgejo" : "github") as "github" | "forgejo",
+    host,
+    owner,
+    apiBase: `https://${host}`,
+  },
+  secretRef: `caterpillar-${name}`,
+});
+
+const TWO_WORKSPACES: Partial<RunnerConfig> = {
+  workspaces: new Map(
+    [workspace("caesar", "github.com", "acme"), workspace("boogaloo", "codeberg.org", "eb")].map(
+      (profile) => [profile.name, profile],
+    ),
+  ),
+};
+
+test("a brainstorm over several repos in one workspace carries all of them", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "split the client out of the server",
+      repos: ["acme/widget", "acme/api", "acme/widget"],
+      threadId: "1538626232302960802",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  const BRAINSTORM = asTaskId("BS-1538626232302960802");
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+
+  const spec = await store.readSpec(BRAINSTORM);
+  assert.deepEqual(
+    spec.repos,
+    [
+      { host: "github.com", owner: "acme", name: "widget" },
+      { host: "github.com", owner: "acme", name: "api" },
+    ],
+    "both repos, in the order typed, and the duplicate collapsed",
+  );
+  assert.equal(spec.workspace, "caesar");
+  assert.match(spec.goal, /acme\/api/, "the agent is told what it may read");
+
+  await retire(BRAINSTORM);
+});
+
+test("a brainstorm that spans two workspaces is refused, and says which went where", async () => {
+  // Not narrowed to one workspace and not silently truncated: one session with
+  // credentials for two bundles is exactly what §9.1 bounds, and dropping a repo the
+  // human asked for produces a plan about half a system without saying so.
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "port the client to the other forge",
+      repos: ["acme/widget", "codeberg.org/eb/api"],
+      threadId: "1538626232302960803",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  const reason = outcome.kind === "refused" ? outcome.reason : "";
+  assert.match(reason, /caesar/);
+  assert.match(reason, /boogaloo/);
+  assert.match(reason, /acme\/widget/);
+  assert.match(reason, /codeberg\.org\/eb\/api/);
+
+  assert.equal(
+    await store.hasTask(asTaskId("BS-1538626232302960803")),
+    false,
+    "a refused brainstorm must not leave a task behind",
+  );
+});
+
+test("a brainstorm naming a repo no workspace owns is refused, not guessed at", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read someone else's code",
+      repos: ["acme/widget", "stranger/thing"],
+      threadId: "1538626232302960804",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /stranger/);
+});
+
+test("a brainstorm with no repos at all is refused by the loop too", async () => {
+  // The slash layer already refuses it, but the inbox is a public seam — anything that
+  // can submit a request can submit an empty list, and creating a brainstorm with nothing
+  // to read produces a plan about an imaginary codebase.
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read nothing",
+      repos: [],
+      threadId: "1538626232302960806",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /at least one repo/);
+});
+
+test("a brainstorm with an unparseable repo is refused by name", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "read the code",
+      repos: ["acme/widget", "widget"],
+      threadId: "1538626232302960805",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+  );
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(outcome.kind === "refused" ? outcome.reason : "", /`widget`/);
 });
 
 test("/resume brings back a task that FAILED, not only one that parked", async () => {

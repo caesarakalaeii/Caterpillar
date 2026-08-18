@@ -1188,6 +1188,15 @@ Because tasks span the ecosystem, `spec.repos[0]` is the **workspace repo** and 
 the agent's working directory; the rest are checked out beneath it as `repos/<name>`,
 each its own worktree on `agent/<task>`.
 
+The list comes from wherever the task did. Intake reads a `repos:` list out of the `agent`
+block (§14.1); `/brainstorm` takes several repos in one `repo:` option (§14.3); and a plan's
+children inherit their brainstorm's list through `materialise`'s `defaultRepos`, so a
+brainstorm that spanned two repos cuts tasks that span the same two. **Every repo in a
+spec must belong to the same workspace** — one forge, one owner, one credential bundle
+(§3.1) — and the entry points refuse a list that crosses two rather than narrowing it to
+one, because a checkout spanning two workspaces is a session holding two credential
+bundles, which is the blast radius §9.1 exists to bound.
+
 `repos/` is added to the workspace's **local** exclude (`$GIT_COMMON_DIR/info/exclude`)
 rather than trusting the repo's `.gitignore`, so a sibling repository can never be
 committed into the workspace even in a repo that has not thought to ignore it.
@@ -1795,9 +1804,9 @@ answer to that. It does not skip the criteria; it produces them, by refining the
 a human first.
 
 ```
-/brainstorm topic:… repo:…
+/brainstorm topic:… repo:owner/a, owner/b
    → thread opens, brainstorm task created
-   → agent reads the repo, asks one question at a time via ask_human
+   → agent reads the repos, asks one question at a time via ask_human
    → submit_plan
    → review council (plan lenses)
         ↘ changes → back to the same session
@@ -1810,6 +1819,31 @@ its tools are `read`, `bash`, `ask_human`, `handoff` and `submit_plan` — no `w
 `edit`, no `open_pr`, no `done` — and it is the **only** kind permitted to declare no
 acceptance criteria, because its gate is the council's verdict on its plan rather than
 §12's commands. That exception is narrow and deliberate; everything else still refuses.
+
+**A brainstorm may span several repos, within one workspace.** The `repo:` option takes a
+list — `owner/a, owner/b`, separated by commas or spaces, because Discord's single-line
+option box invites both. Everything downstream was already plural: `spec.repos` is a list,
+`WorktreeManager.checkout` lays the siblings out under `repos/<name>` (§9.4.1), and
+`materialise` hands `defaultRepos: spec.repos` to every child, so the plan a two-repo
+brainstorm produces cuts two-repo tasks. The entry point was the only thing that could not
+say it, which meant a change spanning a client and its server had to be refined blind on
+one side of it.
+
+The option keeps its singular NAME deliberately: renaming it re-registers the command and
+breaks the muscle memory of everyone using it, to no benefit — one repo is what a list of
+one looks like. Repeats collapse, and order survives, because `repos[0]` becomes the
+agent's working directory (§9.4.1) and so the first one typed wins.
+
+**Crossing workspaces is refused, not narrowed.** Every entry is resolved with
+`resolveWorkspace`, and if two land in different profiles the whole command is refused with
+a message naming which repos went where. This is a containment boundary (§3.1/§9.1) rather
+than a convenience check: a workspace is one forge, one owner, one credential bundle, and
+one session holding two is exactly the blast-radius expansion the workspace model exists to
+prevent. Silently dropping the repos from the second workspace would be worse than
+refusing — it produces a plan about half a system and does not say which half is missing.
+A repo no workspace owns is refused on the same terms rather than guessed at. The refusal
+comes back as a `refused` `ChatOutcome` and is posted into the thread, so the human reads
+why instead of watching a thread that never becomes a task.
 
 **Its id is its Discord thread id** (`BS-<threadId>`). Unique without coordination,
 collision-free across runners, and its own reverse index: a message in a thread resolves
