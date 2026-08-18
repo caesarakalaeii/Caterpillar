@@ -363,18 +363,18 @@ export class Supervisor {
     const records = await this.survey();
     const claimed = await this.claimNext(records);
     if (claimed === undefined) {
-        // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
-        // volume so collecting is a requirement rather than hygiene, but a collection
-        // racing a session on this same runner is a risk with no upside — there is always
-        // another idle poll.
-        await this.deps.toolchain.maybeCollectGarbage();
-        // The other half of the same janitor, in the same branch and for the same stated
-        // reason. The store had a collector and the worktrees — the thing that actually
-        // grows per task, a checkout plus its `node_modules` per repo — had nothing, so
-        // every task this runner ever worked was still on the volume. The survey we just
-        // did is what makes it safe to run at all: it is the only place in this process
-        // that knows which tasks are still going somewhere.
-        await this.maybeReapWorktrees(records);
+      // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
+      // volume so collecting is a requirement rather than hygiene, but a collection
+      // racing a session on this same runner is a risk with no upside — there is always
+      // another idle poll.
+      await this.deps.toolchain.maybeCollectGarbage();
+      // The other half of the same janitor, in the same branch and for the same stated
+      // reason. The store had a collector and the worktrees — the thing that actually
+      // grows per task, a checkout plus its `node_modules` per repo — had nothing, so
+      // every task this runner ever worked was still on the volume. The survey we just
+      // did is what makes it safe to run at all: it is the only place in this process
+      // that knows which tasks are still going somewhere.
+      await this.maybeReapWorktrees(records);
 
       // Debug, not info: at the default poll interval this is the single noisiest
       // line the supervisor could emit, and an idle runner is not news.
@@ -574,7 +574,7 @@ export class Supervisor {
     // hands the sweep an empty live set and every directory on the volume. A real state
     // repo always holds at least the task this runner has been working, so refusing to
     // sweep on an empty survey costs one interval and nothing else.
-    if (false) {
+    if (records.length === 0) {
       logger.debug("worktree.reap-skipped", { reason: "the task survey came back empty" });
       return;
     }
