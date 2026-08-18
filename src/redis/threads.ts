@@ -68,8 +68,19 @@ export interface ThreadBinding {
 
 /** The half the bot needs. */
 export interface ThreadBindingReader {
-  /** Every live binding. Never throws; never blanks the last good answer. */
-  read(): Promise<readonly ThreadBinding[]>;
+  /**
+   * Every live binding, or `undefined` when nobody has published one yet.
+   *
+   * The two are genuinely different events and collapsing them into `[]` pushed the
+   * distinction onto every caller: "the fleet has no live threads" must clear the index,
+   * and "no supervisor has spoken since this process started" must not — clearing then
+   * would unbind a brainstorm thread this bot created seconds ago. The reader already
+   * knows which it is, so it says so rather than making the bot keep a second flag in step.
+   *
+   * Never throws, and never blanks the last good answer: a Redis that is down keeps
+   * serving what was last read.
+   */
+  read(): Promise<readonly ThreadBinding[] | undefined>;
 }
 
 /** The half the supervisor needs, called once per housekeeping pass. */
@@ -88,14 +99,15 @@ export type ThreadBindingStore = ThreadBindingReader & ThreadBindingWriter;
  * conditional at every call site.
  */
 export class InMemoryThreadBindings implements ThreadBindingStore {
-  private bindings: readonly ThreadBinding[] = [];
+  private bindings: readonly ThreadBinding[] | undefined;
 
   publish(bindings: readonly ThreadBinding[]): Promise<void> {
     this.bindings = [...bindings];
     return Promise.resolve();
   }
 
-  read(): Promise<readonly ThreadBinding[]> {
+  /** `undefined` until something has been published, for the interface's reason. */
+  read(): Promise<readonly ThreadBinding[] | undefined> {
     return Promise.resolve(this.bindings);
   }
 }
@@ -114,8 +126,11 @@ export class RedisThreadBindings implements ThreadBindingStore {
   private readonly cacheTtlMs: number;
   private readonly now: () => number;
 
-  /** The cache and the last-good value in one — see the module docstring. */
-  private cached: readonly ThreadBinding[] = [];
+  /**
+   * The cache and the last-good value in one — see the module docstring. `undefined` means
+   * nothing has ever been read or written, which `read` reports as-is.
+   */
+  private cached: readonly ThreadBinding[] | undefined;
   private fetchedAt = 0;
   private everFetched = false;
   /** In-flight fetch, shared: a burst of messages must not be a burst of round trips. */
@@ -142,7 +157,7 @@ export class RedisThreadBindings implements ThreadBindingStore {
     );
   }
 
-  async read(): Promise<readonly ThreadBinding[]> {
+  async read(): Promise<readonly ThreadBinding[] | undefined> {
     await this.fresh();
     return this.cached;
   }
@@ -165,8 +180,10 @@ export class RedisThreadBindings implements ThreadBindingStore {
     this.fetchedAt = this.now();
 
     if (raw === undefined) {
-      // Absent is not empty. On a cold start no supervisor has published yet; serving []
-      // is right there and serving it FOREVER is not, which is what `everFetched` records.
+      // Absent is not empty. On a cold start no supervisor has published yet, so `cached`
+      // stays undefined and the caller is told "nobody has spoken" rather than "there are
+      // no threads". `everFetched` only gates the cache clock, so a missing key still
+      // costs one round trip per TTL rather than one per message.
       this.everFetched = true;
       return;
     }

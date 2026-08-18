@@ -1108,10 +1108,16 @@ What moves with it, and what does not:
   none, so the supervisor publishes the bindings its survey already derives (`chat:threads`)
   and the bot consumes them on a timer. Design consequences, both load-bearing: the bot may
   start **before** any supervisor has published, and a binding is always **briefly stale**.
-  Absent is therefore not empty — a failed read serves the last good mapping rather than
-  unbinding every live thread — and a message in a thread the bot cannot place produces an
-  **honest reply**, never silence. In a bound thread every message *is* the answer, so
-  saying nothing is indistinguishable from the agent being busy.
+  Absent is therefore not empty — a failed read and a cold start both resolve to
+  `undefined`, which leaves the last good mapping alone, while a published `[]` really does
+  mean the last live task went terminal and clears it. A thread the **bot itself** bound is
+  *pinned* and survives a mapping that has not heard of it: a brainstorm's thread exists
+  several refreshes before the task the mapping is derived from does, and unbinding it in
+  that window would drop the thread a human was just invited to type in. The pin ends the
+  moment the mapping mentions the thread, so a terminal task still unbinds. A message in a
+  thread the bot cannot place produces an **honest reply**, never silence: in a bound thread
+  every message *is* the answer, so saying nothing is indistinguishable from the agent being
+  busy.
 - Redis is **required** for this process, unlike everywhere else in §21. It is the only
   route to the supervisor, so a bot without it would acknowledge every command and answer
   none. It refuses to start rather than come up and fail each command individually.

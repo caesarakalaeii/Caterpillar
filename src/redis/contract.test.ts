@@ -170,9 +170,11 @@ const cancelContract = async (signals: CancelSignals): Promise<void> => {
 };
 
 const threadsContract = async (store: ThreadBindingStore): Promise<void> => {
-  // Cold start: no supervisor has published, and the honest answer is "no threads" rather
-  // than a stale one. The bot turns this into a message, never into silence.
-  assert.deepEqual(await store.read(), []);
+  // Cold start: no supervisor has published, and both implementations must say so rather
+  // than claim the fleet has no threads. The difference is load-bearing — empty CLEARS the
+  // bot's index and undefined leaves it alone, which is what stops a refresh unbinding a
+  // brainstorm thread the bot opened seconds ago.
+  assert.equal(await store.read(), undefined);
 
   const bindings = [
     { threadId: "1537785980415778816", task: asTaskId("BS-1537785980415778816") },
@@ -185,6 +187,12 @@ const threadsContract = async (store: ThreadBindingStore): Promise<void> => {
   // a store that merged would keep listening to a conversation that is over.
   await store.publish([bindings[1] as (typeof bindings)[number]]);
   assert.deepEqual(await store.read(), [bindings[1]]);
+
+  // ...and once something HAS been published, empty is a real answer: the last live task
+  // went terminal. This is the case that must not collapse back into the cold-start one,
+  // or a finished conversation stays bound and silently swallows what is typed into it.
+  await store.publish([]);
+  assert.deepEqual(await store.read(), []);
 };
 
 /* ─────────────────────────────── running them ─────────────────────────────── */

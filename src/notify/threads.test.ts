@@ -67,6 +67,49 @@ test("a task with no thread contributes nothing", () => {
   assert.deepEqual(threadBindings([owner("GH-acme-widget-42", "ready")]), []);
 });
 
+test("a locally bound thread survives a rebuild that has not heard of it yet", () => {
+  // The standalone bot creates a brainstorm's thread and binds it HERE, seconds before any
+  // task exists for the supervisor to publish. A `replace` that dropped it would unbind the
+  // thread a human was just invited to type in — and an unbound thread is filtered out by
+  // the gateway before the bridge can even answer honestly, so the failure is pure silence.
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+
+  index.replace([["other-thread", asTaskId("BS-2")]]);
+
+  assert.equal(index.taskFor(THREAD), asTaskId("BS-1"), "the local binding must survive");
+  assert.equal(index.taskFor("other-thread"), asTaskId("BS-2"));
+});
+
+test("once the publisher speaks about a thread, the publisher wins", () => {
+  // The pin is only a stand-in for a mapping that has not arrived. The moment the
+  // authoritative mapping mentions the thread it takes over, value and all — otherwise a
+  // stale local guess would outlive the truth.
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+
+  index.replace([[THREAD, asTaskId("BS-1-01")]]);
+  assert.equal(index.taskFor(THREAD), asTaskId("BS-1-01"));
+
+  // ...and having been spoken for, it is no longer pinned: the task going terminal drops
+  // it from the mapping, and the thread must then unbind. A pin that outlived this would
+  // leave a finished conversation swallowing every message typed into it.
+  index.replace([]);
+  assert.equal(index.taskFor(THREAD), undefined, "a terminal task's thread must unbind");
+});
+
+test("unbinding beats the pin, so a failed brainstorm stops routing at once", () => {
+  // `startBrainstorm` unbinds when the intent did not start a task. That has to win over
+  // the pin it set moments earlier, or a thread with no task behind it keeps reading
+  // everything typed into it as an answer to nothing.
+  const index = new ThreadIndex();
+  index.bind(THREAD, asTaskId("BS-1"));
+  index.unbind(THREAD);
+
+  index.replace([]);
+  assert.equal(index.knows(THREAD), false);
+});
+
 test("unbinding takes effect before the next rebuild", () => {
   // The rebuild runs once per poll; a cancel has to stop routing immediately, or a
   // message racing it is queued as an answer to a task that was just parked.

@@ -42,16 +42,17 @@ test("a binding published by the supervisor is visible to a separate reader", as
   assert.deepEqual(await bot.read(), BINDINGS);
 });
 
-test("a bot that starts before any supervisor has published reads empty, not stale", async () => {
+test("a bot that starts before any supervisor has published reads 'nobody has spoken'", async () => {
   const bot = new RedisThreadBindings({
     redis: new MemoryRedisClient(),
     logger: SILENT_LOGGER,
     cacheTtlMs: 0,
   });
 
-  // Cold start. The honest answer is "I know of no threads", which the bridge turns into
-  // a message saying so — never silence.
-  assert.deepEqual(await bot.read(), []);
+  // Cold start, and undefined rather than [] on purpose: the caller must be able to tell
+  // it from "the fleet has no live threads", which DOES clear the index. A message typed
+  // meanwhile still gets an honest answer from the bridge rather than silence.
+  assert.equal(await bot.read(), undefined);
 });
 
 test("a failed read serves the last good mapping rather than unbinding every thread", async () => {
@@ -74,7 +75,9 @@ test("a Redis that is down degrades rather than throwing", async () => {
     cacheTtlMs: 0,
   });
 
-  assert.deepEqual(await bot.read(), []);
+  // Indistinguishable from a cold start, and deliberately so: both mean "I have been told
+  // nothing", and both must leave a live index alone.
+  assert.equal(await bot.read(), undefined);
   // A write that cannot land is dropped with a warn, not raised: nothing here is
   // authoritative, and a housekeeping pass must not fail because Redis blinked.
   await bot.publish(BINDINGS);
@@ -121,7 +124,7 @@ test("a corrupt key is logged and keeps the last good mapping", async () => {
 test("the in-memory store is the same contract, for the unsplit path", async () => {
   const store = new InMemoryThreadBindings();
 
-  assert.deepEqual(await store.read(), []);
+  assert.equal(await store.read(), undefined, "nothing published yet is not an empty fleet");
   await store.publish(BINDINGS);
   assert.deepEqual(await store.read(), BINDINGS);
 });

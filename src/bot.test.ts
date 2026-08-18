@@ -238,11 +238,12 @@ test("a binding published by the supervisor becomes routable in the bot", async 
   );
 
   // ...and the bot pulls them in, which is what `refreshThreads` does on its timer.
-  const bindings = await new RedisThreadBindings({
-    redis,
-    logger: SILENT_LOGGER,
-    cacheTtlMs: 0,
-  }).read();
+  const bindings =
+    (await new RedisThreadBindings({
+      redis,
+      logger: SILENT_LOGGER,
+      cacheTtlMs: 0,
+    }).read()) ?? [];
   bot.threads.replace(bindings.map((binding) => [binding.threadId, binding.task] as const));
 
   assert.equal(bot.threads.knows(THREAD), true);
@@ -278,6 +279,39 @@ test("a thread the bot has no binding for gets an honest message, never silence"
   assert.match(String(said[0]?.body["content"]), /do not know which task this thread/i);
   // In the thread, where the person is looking.
   assert.match(String(said[0]?.url), new RegExp(`/channels/${THREAD}/messages$`));
+});
+
+test("a brainstorm thread the bot just opened survives the next refresh", async () => {
+  // The window between creating a thread and the supervisor publishing a binding for it is
+  // several refreshes wide: the task does not exist until the intent is drained, and the
+  // mapping only carries tasks. A refresh in that window says nothing about the thread, and
+  // if that unbound it the human invited to type there would get silence — the gateway
+  // drops messages from threads the index does not know, so not even the honest message
+  // above would be reached.
+  const redis = new MemoryRedisClient();
+  const bot = botProcess(redis);
+
+  // What `startBrainstorm` does the moment the thread exists, before any task does.
+  bot.threads.bind(THREAD, asTaskId("BS-1537785980415778816"));
+
+  // Meanwhile the supervisor publishes the fleet's OTHER threads, knowing nothing of this
+  // one yet, and the bot's timer pulls them in.
+  const supervisorSide = new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 });
+  const botSide = new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 });
+  await supervisorSide.publish([{ threadId: "9999", task: TASK }]);
+  await refreshThreads(botSide, bot.threads, SILENT_LOGGER);
+
+  assert.equal(bot.threads.knows(THREAD), true, "the fresh brainstorm thread was unbound");
+  assert.equal(bot.threads.knows("9999"), true, "the published binding never arrived");
+
+  // ...and once the task exists and the supervisor publishes it, the published value wins.
+  await supervisorSide.publish([
+    { threadId: "9999", task: TASK },
+    { threadId: THREAD, task: asTaskId("BS-1537785980415778816-01") },
+  ]);
+  await refreshThreads(botSide, bot.threads, SILENT_LOGGER);
+
+  assert.equal(bot.threads.taskFor(THREAD), asTaskId("BS-1537785980415778816-01"));
 });
 
 /* ────────────────────────── one process acts, during a rollout ────────────────────────── */
@@ -444,13 +478,11 @@ test("an empty publish before any supervisor has spoken does not unbind a local 
   const redis = new MemoryRedisClient();
   const threads = new ThreadIndex();
   threads.bind(THREAD, TASK);
-  const state = { seeded: false };
 
   await refreshThreads(
     new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 }),
     threads,
     SILENT_LOGGER,
-    state,
   );
 
   assert.equal(threads.taskFor(THREAD), TASK, "a cold-start empty read must not unbind");
@@ -463,15 +495,14 @@ test("an empty publish AFTER a real one clears, so a finished thread stops swall
   const redis = new MemoryRedisClient();
   const store = new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 });
   const threads = new ThreadIndex();
-  const state = { seeded: false };
 
   await store.publish([{ threadId: THREAD, task: TASK }]);
-  await refreshThreads(store, threads, SILENT_LOGGER, state);
+  await refreshThreads(store, threads, SILENT_LOGGER);
   assert.equal(threads.taskFor(THREAD), TASK);
 
   // The task finishes; `threadBindings` drops it and the supervisor publishes nothing.
   await store.publish([]);
-  await refreshThreads(store, threads, SILENT_LOGGER, state);
+  await refreshThreads(store, threads, SILENT_LOGGER);
 
   assert.equal(threads.taskFor(THREAD), undefined, "a terminal task's thread must unbind");
 });
@@ -486,7 +517,6 @@ test("an unreachable redis leaves the index exactly as it was", async () => {
     { read: () => Promise.reject(new Error("redis is unreachable")) },
     threads,
     SILENT_LOGGER,
-    { seeded: true },
   );
 
   assert.equal(threads.taskFor(THREAD), TASK);

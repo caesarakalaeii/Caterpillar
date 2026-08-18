@@ -63,7 +63,7 @@ export interface RedisClient {
    * `renew` is the same call for a holder that already believes it holds the key: it must
    * NOT be NX, or a renewal would fail against the holder's own value, and it must check
    * the value still belongs to the caller, or a process that lost the key to an expiry
-   * would take it back from whoever won it in the meantime. See `RedisLock`.
+   * would take it back from whoever won it in the meantime. See `RedisChatLock`.
    */
   setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean>;
   /**

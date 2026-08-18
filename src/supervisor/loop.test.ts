@@ -3284,13 +3284,13 @@ test("the survey publishes thread bindings for a bot that is not in this process
   // real remote, and this file runs alongside every other suite. A tight budget here fails
   // as "the binding was never published" when the truth is "the machine was busy", which is
   // the least useful failure a test can produce.
-  for (let attempt = 0; attempt < 1000 && (await published.read()).length === 0; attempt += 1) {
+  for (let attempt = 0; attempt < 1000 && ((await published.read()) ?? []).length === 0; attempt++) {
     await sleep(10);
   }
   controller.abort();
   await running.catch(() => undefined);
 
-  const bindings = await published.read();
+  const bindings = (await published.read()) ?? [];
   assert.notEqual(bindings.length, 0, "the survey never published any thread binding");
   assert.deepEqual(
     bindings.find((binding) => binding.task === BOUND),
