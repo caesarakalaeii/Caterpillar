@@ -52,7 +52,10 @@ import {
 export interface EphemeralPlane {
   readonly chat: ChatQueue;
   readonly snapshot: SnapshotStore;
-  readonly presence: PresenceRegistry;
+  /** Named `runners` and not `presence`: the supervisor already has a `presence`, and it
+   * is the Discord typing indicator. Two fields with one name in the same deps object is
+   * how one silently shadows the other. */
+  readonly runners: PresenceRegistry;
   readonly cancels: CancelSignals;
   /** True when a Redis client is behind the four above. For logs and the web view. */
   readonly backed: boolean;
@@ -82,7 +85,7 @@ export const inMemoryPlane = (): EphemeralPlane => {
   return {
     chat: new InMemoryChatQueue(inbox),
     snapshot: new InMemorySnapshotStore(tasks),
-    presence: new InMemoryPresenceRegistry(),
+    runners: new InMemoryPresenceRegistry(),
     cancels: new InMemoryCancelSignals(),
     backed: false,
     inbox,
@@ -95,7 +98,7 @@ export const inMemoryPlane = (): EphemeralPlane => {
 export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane => ({
   chat: new RedisChatQueue({ redis, logger }),
   snapshot: new RedisSnapshotStore({ redis, logger }),
-  presence: new RedisPresenceRegistry({ redis, logger }),
+  runners: new RedisPresenceRegistry({ redis, logger }),
   cancels: new RedisCancelSignals({ redis, logger }),
   backed: true,
   close: (): Promise<void> => redis.close(),

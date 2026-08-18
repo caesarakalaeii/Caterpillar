@@ -33,7 +33,8 @@ import { LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
-import { ChatInbox, type ChatOutcome } from "./inbox.ts";
+import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { type ChatOutcome } from "./inbox.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -378,7 +379,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
   await store.writeState(parked);
   await store.commitAndPush(`chore(${ANSWERED}): awaiting human`, "origin", "main");
 
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const runner: SessionRunner = {
     // Claiming it is proof enough that the answer took effect; the session itself is
     // not what this test is about.
@@ -432,7 +433,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
 });
 
 test("an answer for a task that is not waiting is refused, not written", async () => {
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const store = new StateStore(statePath, stateGit);
   const supervisor = new Supervisor({
     config,
@@ -863,7 +864,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
  */
 const resumeSupervisor = (
   store: StateStore,
-  inbox: ChatInbox,
+  inbox: InMemoryChatQueue,
   over: Partial<RunnerConfig> = {},
 ): Supervisor =>
   new Supervisor({
@@ -892,10 +893,10 @@ const resumeSupervisor = (
 /** Run one inbox request against a live supervisor and stop it again. */
 const throughInbox = async (
   store: StateStore,
-  intent: Parameters<ChatInbox["submit"]>[0],
+  intent: Parameters<InMemoryChatQueue["submit"]>[0],
   over: Partial<RunnerConfig> = {},
 ): Promise<ChatOutcome> => {
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
   const supervisor = resumeSupervisor(store, inbox, over);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
@@ -1361,7 +1362,7 @@ test("/cancel stops a session running on this runner instead of refusing it", as
   await seedTask(CANCELLED);
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // A session that runs until something aborts it — a hung `bash` call, in effect.
   //
@@ -1522,7 +1523,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
   await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
 
   const store = new StateStore(statePath, stateGit);
-  const inbox = new ChatInbox();
+  const inbox = new InMemoryChatQueue();
 
   // Hands off forever: without a yield this task never gives the runner back.
   let sessions = 0;
