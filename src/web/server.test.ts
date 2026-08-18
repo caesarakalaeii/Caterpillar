@@ -510,6 +510,36 @@ test("/intake renders the refusals nobody could see, and /api/intake says the sa
   assert.equal(json.policyMissing, true);
 });
 
+test("an alertname and its reason are agent-adjacent prose, escaped like any other", async () => {
+  // The alert ledger is written from what Alertmanager delivered, and an annotation is
+  // free text an operator (or whatever generated the rule) chose. Rendering it is the same
+  // trust boundary as a task goal: `/intake` is a front door to bytes this fleet did not
+  // author, so a backtick fence stays text and a script tag stays text.
+  const harness = await serve();
+  const hostile = "```\n<script>alert(1)</script>\n```";
+  await harness.store.writeAlertRefusal("f00", {
+    fingerprint: "f00",
+    alertname: `<script>alert('name')</script>`,
+    reason: hostile,
+  });
+
+  const response = await fetch(`${harness.url}/intake`);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+
+  // Neither the alertname's tag nor the one buried in the fenced annotation may survive as
+  // markup; both must appear as the characters they are.
+  assert.ok(!body.includes("<script>alert(1)</script>"), "the annotation's tag must not survive");
+  assert.ok(
+    !body.includes("<script>alert('name')</script>"),
+    "the alertname's tag must not survive",
+  );
+  assert.match(body, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(body, /&lt;script&gt;alert\(&#39;name&#39;\)&lt;\/script&gt;/);
+  // The fence is shown as source rather than rendered — DESIGN §18, markdown stays source.
+  assert.match(body, /```/);
+});
+
 test("/intake is refused a write and refused an unauthenticated request, like every other page", async () => {
   // A new front door inherits every rule §18 states rather than being trusted to have
   // been added behind them.
