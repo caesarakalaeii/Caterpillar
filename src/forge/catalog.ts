@@ -35,10 +35,14 @@ const bounded = async <T>(work: Promise<T>, ms: number, fallback: T): Promise<T>
     return await Promise.race([
       work,
       new Promise<T>((resolve) => {
-        // Unref'd deliberately, unlike the Redis plane's: this timer only ever resolves to
-        // a fallback, so a process exiting with it pending loses nothing.
+        // NOT unref'd, for the reason `redis/client.ts`'s `withTimeout` gives: this timer is
+        // the only thing that will settle a race against a forge that never answers, and an
+        // unref'd one lets the loop go idle with the caller's promise still pending. Node 22
+        // fails that outright ("Promise resolution is still pending but the event loop has
+        // already resolved") where 26 happens to tolerate it, and in the runner it would be
+        // an autocomplete that is never answered — exactly what the budget exists to stop.
+        // The `finally` clears it, so it can never hold a finished process open.
         timer = setTimeout(() => resolve(fallback), ms);
-        timer.unref();
       }),
     ]);
   } finally {
