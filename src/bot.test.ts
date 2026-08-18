@@ -30,7 +30,7 @@ import { InMemoryChatQueue } from "./redis/inbox.ts";
 import { InMemorySnapshotStore } from "./redis/snapshot.ts";
 import { summarise } from "./supervisor/snapshot.ts";
 import type { ChatOutcome } from "./supervisor/inbox.ts";
-import { startHealthServer } from "./bot.ts";
+import { refreshThreads, startHealthServer } from "./bot.ts";
 import type { RunnerConfig } from "./config/types.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
@@ -435,4 +435,59 @@ test("with redis unconfigured the in-process wiring behaves exactly as before", 
   assert.equal(inbox.size, 0, "a read still never queues work for the loop");
   const data = callback(calls).body["data"] as { readonly content: string };
   assert.match(data.content, /GH-acme-widget-42/);
+});
+
+test("an empty publish before any supervisor has spoken does not unbind a local thread", async () => {
+  // The bot binds a brainstorm thread the moment it creates one, before any task exists.
+  // Clearing on a cold-start empty read would unbind the thread a human was just invited
+  // to type in, between the invitation and their first message.
+  const redis = new MemoryRedisClient();
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const state = { seeded: false };
+
+  await refreshThreads(
+    new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 }),
+    threads,
+    SILENT_LOGGER,
+    state,
+  );
+
+  assert.equal(threads.taskFor(THREAD), TASK, "a cold-start empty read must not unbind");
+});
+
+test("an empty publish AFTER a real one clears, so a finished thread stops swallowing", async () => {
+  // The other half of the same shape: once the fleet has published, empty means the last
+  // task went terminal. Leaving it bound means every message in a finished conversation is
+  // still read as an answer, and silently goes nowhere.
+  const redis = new MemoryRedisClient();
+  const store = new RedisThreadBindings({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 });
+  const threads = new ThreadIndex();
+  const state = { seeded: false };
+
+  await store.publish([{ threadId: THREAD, task: TASK }]);
+  await refreshThreads(store, threads, SILENT_LOGGER, state);
+  assert.equal(threads.taskFor(THREAD), TASK);
+
+  // The task finishes; `threadBindings` drops it and the supervisor publishes nothing.
+  await store.publish([]);
+  await refreshThreads(store, threads, SILENT_LOGGER, state);
+
+  assert.equal(threads.taskFor(THREAD), undefined, "a terminal task's thread must unbind");
+});
+
+test("an unreachable redis leaves the index exactly as it was", async () => {
+  // Neither branch: a failed read is not an empty one. Unbinding on a Redis blip would
+  // make the bot stop listening to every live thread until it recovered.
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+
+  await refreshThreads(
+    { read: () => Promise.reject(new Error("redis is unreachable")) },
+    threads,
+    SILENT_LOGGER,
+    { seeded: true },
+  );
+
+  assert.equal(threads.taskFor(THREAD), TASK);
 });

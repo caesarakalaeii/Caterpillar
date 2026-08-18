@@ -123,12 +123,15 @@ const main = async (): Promise<void> => {
   });
 
   const threads = new ThreadIndex();
+  // Tracks whether a non-empty mapping has ever been seen, so an empty publish can be told
+  // from a cold start. See `refreshThreads`.
+  const threadState = { seeded: false };
   // BEFORE the gateway connects, for `index.ts:~448`'s reason: the index is what tells a
   // message in a thread which task it belongs to. Unlike the supervisor's, this one comes
   // from Redis rather than the state repo, and on a cold start it may legitimately be
   // empty — no supervisor has published yet. That is why the bridge answers an unknown
   // thread with a message rather than silence.
-  await refreshThreads(plane.threads, threads, logger);
+  await refreshThreads(plane.threads, threads, logger, threadState);
 
   const controller = new AbortController();
   const bridge = new DiscordBridge({
@@ -161,7 +164,7 @@ const main = async (): Promise<void> => {
   await lock.start();
 
   const refresh = setInterval(() => {
-    void refreshThreads(plane.threads, threads, logger);
+    void refreshThreads(plane.threads, threads, logger, threadState);
   }, THREAD_REFRESH_MS);
   // Never the reason the process stays alive.
   refresh.unref?.();
@@ -221,22 +224,36 @@ const loadBot = async (config: RunnerConfig, logger: Logger): Promise<DiscordBot
  * and a merge would keep listening to a conversation that is over — where every message
  * is read as an answer to a task that has finished.
  *
- * One exception is load-bearing: an EMPTY published set does not clear the index. A
- * brainstorm thread is created by this process and bound locally before any task exists,
- * so a supervisor that has not published yet would otherwise unbind the thread a human is
- * being invited to type in, between the invitation and their first message.
+ * The empty case is the awkward one, and it is genuinely two different events wearing one
+ * shape:
+ *
+ *   BEFORE the first successful read, empty means "no supervisor has published yet". The
+ *   index must not be cleared then, because this process binds a brainstorm thread LOCALLY
+ *   the moment it creates one — clearing would unbind the thread a human was just invited
+ *   to type in, between the invitation and their first message.
+ *
+ *   AFTER one, empty means the fleet really has no live threads: the last task went
+ *   terminal. That must clear, or a finished conversation stays bound forever and silently
+ *   swallows everything typed into it — the exact failure `threadBindings` unbinds
+ *   terminal tasks to prevent.
+ *
+ * `seeded` is what tells them apart. A failed read returns undefined rather than empty, so
+ * an unreachable Redis never reaches either branch.
  */
-const refreshThreads = async (
+export const refreshThreads = async (
   source: ThreadBindingReader,
   threads: ThreadIndex,
   logger: Logger,
+  state: { seeded: boolean },
 ): Promise<void> => {
   const bindings = await source.read().catch((error: unknown) => {
     logger.warn("threads.refresh-failed", errorFields(error));
     return undefined;
   });
-  if (bindings === undefined || bindings.length === 0) return;
+  if (bindings === undefined) return;
+  if (bindings.length === 0 && !state.seeded) return;
 
+  state.seeded = true;
   threads.replace(bindings.map((binding) => [binding.threadId, binding.task] as const));
   logger.debug("threads.refreshed", { count: bindings.length });
 };
