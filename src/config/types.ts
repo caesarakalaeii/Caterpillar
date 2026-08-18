@@ -365,6 +365,19 @@ export interface RunnerConfig {
   readonly workspaces: ReadonlyMap<WorkspaceName, WorkspaceProfile>;
   /** Seconds between claim attempts when no task is available. */
   readonly pollSeconds: number;
+  /**
+   * Seconds between housekeeping passes — pull, chat drain, intake, alerts, digest,
+   * leadership (DESIGN.md §6.4).
+   *
+   * Its own interval because housekeeping runs on its own loop, independent of whether a
+   * session is in flight. `pollSeconds` is a floor on how often an IDLE runner looks for
+   * work, which is a throughput question; this is a ceiling on how long a human waits for
+   * `/resume` to be noticed, which is a latency one, and the two have no reason to agree.
+   *
+   * Defaults at or below `pollSeconds` for that reason: making housekeeping slower than
+   * claiming would reintroduce the very latency the split exists to remove.
+   */
+  readonly housekeepingSeconds: number;
   /** Directory of mounted secret files, keyed by `secretRef`. */
   readonly secretsDir: string;
   readonly log: LogConfig;

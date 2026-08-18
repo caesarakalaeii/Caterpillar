@@ -36,7 +36,9 @@ import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolch
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { InMemoryChatQueue } from "../redis/inbox.ts";
+import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { type ChatOutcome } from "./inbox.ts";
+import { TaskSnapshot } from "./snapshot.ts";
 import { Supervisor, type ProgressProbe, type SessionRunner, type Verifier } from "./loop.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -138,6 +140,7 @@ const config: RunnerConfig = {
   },
   workspaces: new Map(),
   pollSeconds: 1,
+  housekeepingSeconds: 1,
   secretsDir: join(root, "secrets"),
   // No web view in the loop's tests: these exercise the supervisor, and a listening
   // socket per fixture is a port collision waiting for a parallel run.
@@ -2152,4 +2155,434 @@ test("a measurement that comes back is published to the metrics the scrape reads
   // Its own series rather than a label on the bytes: a label that changed value would
   // start a new time series and break every byte graph at the moment it went partial.
   assert.match(rendered, /caterpillar_work_partial\{[^}]*\} 1/);
+});
+
+/**
+ * Housekeeping on its own timer (DESIGN.md §6.4).
+ *
+ * Everything below shares one shape, because the defect had one shape: a session runs for
+ * hours, and while it does, something a human or a tracker is waiting on must still happen.
+ * Before the split it did not — `pollOnce` ran `store.pull` → `chat.refresh` →
+ * `applyChatRequests` → `maybeIngest` → `drainAlerts` → `maybeDigest` → `claimNext` →
+ * `workTask` in one `while`, so every step before `workTask` was blocked for the whole of it.
+ *
+ * Each test therefore occupies the runner with a session that does not end on its own, and
+ * asserts the housekeeping step happens ANYWAY. A test that only proves the step runs at
+ * all passes with the bug in place, so the "is the session actually in flight" wait before
+ * each assertion is load-bearing rather than defensive.
+ */
+
+/**
+ * A session that runs until aborted — a task that takes hours, in one stub.
+ *
+ * `keepalive` is the same load-bearing interval `/cancel`'s test documents: every timer the
+ * supervisor arms for a session is unref'd, so a bare Supervisor with no metrics port and
+ * no credential socket would otherwise let node end the test with the loop half-drained.
+ */
+const hangingSession = (): { readonly runner: SessionRunner; started: () => boolean } => {
+  let begun = false;
+  return {
+    started: () => begun,
+    runner: {
+      run: (_spec, _state, signal) =>
+        new Promise<SessionOutcome>((resolve) => {
+          begun = true;
+          const keepalive = setInterval(() => {}, 1_000);
+          signal.addEventListener("abort", () => {
+            clearInterval(keepalive);
+            resolve({
+              reason: "interrupted",
+              usage: EMPTY_USAGE,
+              contextTokens: 0,
+              summary: "stopped from outside",
+            });
+          });
+        }),
+    },
+  };
+};
+
+/** Everything the loop tests fill in identically, so each test only states its subject. */
+const busySupervisor = (
+  store: StateStore,
+  runner: SessionRunner,
+  extra: Partial<ConstructorParameters<typeof Supervisor>[0]> = {},
+): Supervisor =>
+  new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner,
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    ...extra,
+  });
+
+test("a /resume submitted during a long session is served without waiting for it", async () => {
+  // The headline case. `/resume` and `/answer` are the two commands a human types and then
+  // watches for, and before the split both sat unread in the ChatInbox for the whole of a
+  // session — hours, for a task that keeps handing off. The Discord interaction hung with
+  // them.
+  const BUSY = asTaskId("HK-BUSY-1");
+  const WAITING = asTaskId("HK-PARKED-1");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+  await seedTask(WAITING, { status: "parked", sessions: 2 });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner, { inbox });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // The session must genuinely be in flight, or this is a test of an idle poll.
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  // No timeout dance: `submit` resolves when the loop has dealt with it, so if
+  // housekeeping were still behind the session this would simply never settle and the
+  // test runner would fail on the pending promise.
+  const outcome = await inbox.submit({ kind: "resume", task: WAITING });
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(outcome, { kind: "resumed", from: "parked" });
+  assert.equal(
+    (await pushedState(WAITING))?.status,
+    "ready",
+    "and it must be pushed, not merely answered",
+  );
+
+  await seedTask(BUSY, { status: "done" });
+  await seedTask(WAITING, { status: "done" });
+});
+
+test("intake keeps running while a session holds the runner", async () => {
+  // `maybeIngest` has always had its own interval, but the interval was only CONSULTED
+  // when the one loop reached it — so a labelled GitHub issue was not ingested until the
+  // current session ended. An interval nothing checks is not an interval.
+  const BUSY = asTaskId("HK-BUSY-2");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const session = hangingSession();
+  let passes = 0;
+  const supervisor = busySupervisor(store, session.runner, {
+    // One second, so several buckets pass inside the test's window. `intakeRef` keys the
+    // fleet-wide claim on the bucket, so a longer interval would make this a test of
+    // whether one pass happened to fall before the session started.
+    config: { ...config, intake: { intervalSeconds: 1 } },
+    intake: {
+      ingest: () => {
+        passes += 1;
+        return Promise.resolve({ seen: 0, created: 0, rejected: 0, failed: 0 });
+      },
+    },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  // Passes from BEFORE the session do not count: the first one fires at boot, and the
+  // question is whether a LATER one does.
+  const before = passes;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && passes <= before) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(passes > before, `intake must run during a session (${before} -> ${passes})`);
+
+  await seedTask(BUSY, { status: "done" });
+});
+
+test("the Discord holder claim is refreshed during a session, not after it", async () => {
+  // Per `ChatLeadership`'s own docstring this is refreshed from the supervisor's loop, and
+  // both halves of it — renewing and STEPPING DOWN — happen in the one `refresh` call. So
+  // a replica that took the claim and then started a four-hour session did neither for
+  // four hours: it kept believing it was the holder while the claim went stale, and the
+  // bot sat online answering nothing. Nothing about that is fixed by the claim itself; it
+  // is fixed by the loop that renews it also being the loop that answers.
+  const BUSY = asTaskId("HK-BUSY-3");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const session = hangingSession();
+  let refreshes = 0;
+  const supervisor = busySupervisor(store, session.runner, {
+    chat: {
+      refresh: () => {
+        refreshes += 1;
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  const before = refreshes;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && refreshes <= before + 1) await sleep(50);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    refreshes > before + 1,
+    `the claim must keep being refreshed during a session (${before} -> ${refreshes})`,
+  );
+
+  await seedTask(BUSY, { status: "done" });
+});
+
+test("what Discord reads stays current while a session runs", async () => {
+  // `/tasks`, `/task` and autocomplete are served from an in-memory snapshot rather than
+  // through the inbox, precisely so a read never waits on a session (DESIGN.md §7). The
+  // snapshot is published by `survey`, and `survey` is what the WORK loop calls on its way
+  // to claiming — so leaving it there alone would have reintroduced the defect through the
+  // reader instead of the writer: a session claims, the sweep never comes round again, and
+  // `/tasks` answers for hours from a view taken before the session started. It would still
+  // answer in milliseconds, which is what makes it worth pinning.
+  const BUSY = asTaskId("HK-SNAP-1");
+  const LATER = asTaskId("HK-SNAP-2");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const view = new TaskSnapshot();
+  const snapshot = new InMemorySnapshotStore(view);
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner, { snapshot });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  // A task that did not exist when the session began. Only a sweep that runs DURING the
+  // session can ever put it in front of a human.
+  await seedTask(LATER, { status: "awaiting-human" });
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && view.find(LATER) === undefined) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(view.find(LATER) !== undefined, "`/task` must see a task created mid-session");
+  assert.ok(
+    view.suggest("HK-SNAP").some((task) => task.id === LATER),
+    "and autocomplete, which is the whole reason the snapshot exists",
+  );
+  // The running task's status moved too, so this is a live view rather than one stale
+  // entry appended to a frozen one.
+  assert.equal(view.find(BUSY)?.status, "running");
+
+  await seedTask(BUSY, { status: "done" });
+  await seedTask(LATER, { status: "done" });
+});
+
+test("a failing housekeeping pass belongs to that pass, never to the process", async () => {
+  // The containment the single loop already had, now needed twice — and the reason it
+  // matters is unchanged: a throw out of `run()` reaches main's `finally`, which closes
+  // /healthz and the credential socket and then blocks forever on `await bridge`. A live
+  // process, still answering Discord from a frozen snapshot, that polls nothing and that
+  // systemd never restarts because it never exited.
+  //
+  // Asserted through the WORK loop, not just by counting failures: the two loops are
+  // awaited together, so a housekeeping throw that escaped would take claiming with it.
+  const SURVIVOR = asTaskId("HK-SURVIVE-1");
+  await seedTask(SURVIVOR);
+
+  const store = new StateStore(statePath, stateGit);
+  let refreshes = 0;
+  const supervisor = busySupervisor(
+    store,
+    { run: () => Promise.reject(new Error("session not under test")) },
+    {
+      chat: {
+        refresh: () => {
+          refreshes += 1;
+          return Promise.reject(new Error("ls-remote: could not read from remote repository"));
+        },
+      },
+    },
+  );
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Both conditions, and neither may short-circuit the other. The work loop parks the
+  // task — which it cannot, if the housekeeping throw killed `run` — and housekeeping
+  // keeps coming round after throwing, which is only visible over more than one interval.
+  let parked: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && (parked === undefined || refreshes <= 1)) {
+    const state = await pushedState(SURVIVOR);
+    if (state?.status === "parked") parked = state;
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(refreshes > 1, "housekeeping must keep going round after a throw");
+  assert.ok(parked !== undefined, "and the work loop must be unaffected by it");
+});
+
+test("housekeeping does not reset over a session's uncommitted state", async () => {
+  // The half the mutex does not cover, at the level the two loops actually meet.
+  // `store.pull` does `reset --hard` and `clean -ffdq` over `tasks/`; before the split it
+  // could only run between sessions, and now it runs on a timer that knows nothing about
+  // them. The window between a session's `writeState` and the `commitAndPush` that
+  // persists it is minutes wide and contains no git at all, so serialising git calls says
+  // nothing about it. `StateStore.pull` therefore declines while the tree is dirty.
+  //
+  // Driven through a real supervisor with a real remote that MOVES, so a pull that ran
+  // would genuinely have something to reset to.
+  const BUSY = asTaskId("HK-DIRTY-1");
+  const OTHER = asTaskId("HK-DIRTY-2");
+  await seedTask(BUSY, { limits: { maxSessions: 1_000_000 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const session = hangingSession();
+  const supervisor = busySupervisor(store, session.runner);
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const busy = Date.now() + 30_000;
+  while (Date.now() < busy && !session.started()) await sleep(50);
+  assert.ok(session.started(), "the fixture must actually occupy the runner");
+
+  // What a session writes between its commit points: a journal entry, and state the
+  // supervisor has not pushed yet. Written directly, because the point is the CONTENT
+  // being on disk and uncommitted — which is exactly what it looks like mid-`recordSession`.
+  await store.appendJournal(BUSY, 1, "half a session's work, not yet committed");
+
+  // And the remote moves, so there is something for a pull to reset onto.
+  await seedTask(OTHER);
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const journal = await store.readJournal(BUSY);
+    assert.match(
+      journal ?? "",
+      /not yet committed/,
+      "a housekeeping pull must not destroy a session's uncommitted work",
+    );
+    await sleep(200);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  await seedTask(BUSY, { status: "done" });
+  await seedTask(OTHER, { status: "done" });
+});
+
+test("two concurrent store writes are serialised, not interleaved", async () => {
+  // The mutex, asserted on ORDER rather than on the absence of a crash. Two writers
+  // interleaving `git add` and `git commit` in one checkout produce `index.lock` at best
+  // and a commit carrying the other writer's half-written state at worst, and only the
+  // first of those two throws — so "nothing blew up" is exactly the assertion that would
+  // have passed while the real damage happened.
+  //
+  // Observed through `Git`, because that is where interleaving is visible: the sequence of
+  // subcommands must contain no other writer's `commit` between one writer's `add` and its
+  // own `commit`.
+  const A = asTaskId("SERIAL-A");
+  const B = asTaskId("SERIAL-B");
+  await seedTask(A);
+  await seedTask(B);
+
+  const calls: string[] = [];
+  const traced = new Git(statePath);
+  const realRun = traced.run.bind(traced);
+  Object.defineProperty(traced, "run", {
+    value: async (...args: string[]): Promise<string> => {
+      const [subcommand] = args;
+      if (subcommand === "add" || subcommand === "commit") calls.push(String(subcommand));
+      return realRun(...args);
+    },
+  });
+
+  const store = new StateStore(statePath, traced);
+  await store.pull("origin", "main");
+
+  // Both started in the same tick, which is the case the mutex has to get right: if the
+  // chain's tail were advanced after an await rather than synchronously, both would see
+  // the same predecessor and both would run at once.
+  //
+  // Each writer takes the tree for its WHOLE write-then-commit unit, which is the atomic
+  // shape a session has and the reason `exclusively` exists. Writing outside the lock and
+  // committing inside it would serialise the git calls and still lose: `git add -A` stages
+  // the whole tree, so whichever writer commits first carries both journals under its own
+  // message and the second commits nothing. Serialising the git is necessary and is not
+  // sufficient — that distinction is the subject here.
+  const sleepy = async (ms: number): Promise<void> => sleep(ms);
+  await Promise.all([
+    store.exclusively(async (tree) => {
+      await store.appendJournal(A, 1, "writer A");
+      // A real session's gap between its write and its commit is minutes. One tick is
+      // enough to hand control to the other writer if the lock were not held across it.
+      await sleepy(20);
+      await tree.commitAndPush(`chore(${A}): writer A`, "origin", "main");
+    }),
+    store.exclusively(async (tree) => {
+      await store.appendJournal(B, 1, "writer B");
+      await sleepy(1);
+      await tree.commitAndPush(`chore(${B}): writer B`, "origin", "main");
+    }),
+  ]);
+
+  // Each unit stages up to four paths and commits once. Interleaving shows up as an `add`
+  // after the first `commit` but before the second — the second writer entering while the
+  // first was still between its stage and its commit.
+  const firstCommit = calls.indexOf("commit");
+  assert.ok(firstCommit > 0, "both writers must have staged and committed");
+  assert.ok(
+    calls.slice(0, firstCommit).every((call) => call === "add"),
+    `nothing may commit while another writer is staging: ${calls.join(",")}`,
+  );
+  assert.equal(
+    calls.filter((call) => call === "commit").length,
+    2,
+    "two writers, two commits — a merged one would mean a mixed commit",
+  );
+
+  // And the two commits say what each writer wrote, rather than one of them carrying the
+  // other's file. This is the assertion that fails when only the git calls are serialised.
+  const log = await stateGit.run("log", "-2", "--name-only", "--format=%s");
+  assert.match(log, new RegExp(`chore\\(${A}\\): writer A`));
+  assert.match(log, new RegExp(`chore\\(${B}\\): writer B`));
+
+  await seedTask(A, { status: "done" });
+  await seedTask(B, { status: "done" });
 });

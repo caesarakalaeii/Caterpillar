@@ -69,6 +69,26 @@ export interface LeaseManagerOptions {
   readonly staleAfterSeconds: number;
 }
 
+/**
+ * Leases, over the same `Git` object `StateStore` uses — and deliberately NOT behind that
+ * store's mutex.
+ *
+ * Worth stating, because since the supervisor split into a housekeeping loop and a work
+ * loop (DESIGN.md §6.4) sharing one checkout is exactly what needed a mutex, and the
+ * obvious reading is that this shares it too. It does not, and the reason is that every
+ * git call here is index-free and working-tree-free: `hash-object` and `commit-tree`
+ * against the empty tree, `ls-remote`, `push` of an oid to a ref, and `fetch` of one
+ * object. None of them takes `index.lock`, stages anything or moves `HEAD`, so none can
+ * interleave with a `git add` into a mixed commit — which is the only thing the mutex
+ * protects against.
+ *
+ * That is a property of these commands, not a convention, so it is load-bearing here: a
+ * future method on this class that runs `add`, `commit`, `checkout` or `reset` breaks it
+ * and must take the store's `Serial` instead. There is a second reason not to take it
+ * anyway — the heartbeat renews on its own interval while a session holds the tree dirty,
+ * and putting it behind the same lock would make lease renewal wait on a commit, which is
+ * how a lease is lost.
+ */
 export class LeaseManager {
   private readonly git: Git;
   private readonly remote: string;

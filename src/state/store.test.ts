@@ -676,8 +676,8 @@ test("commitAndPush stages alert records, and pull sweeps unpushed ones", async 
   const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
   assert.match(listed, /^alerts\/refusals\/a1b2c3\.json$/m);
 
-  // Now force the reset path, with an unpushed refusal on disk. The other clone has to
-  // catch up first, or its push is the one that gets rejected.
+  // Now force the reset path, with a refusal on disk that reached no commit. The other
+  // clone has to catch up first, or its push is the one that gets rejected.
   await other.run("pull", "--quiet", "--ff-only", "origin", "main");
   await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
   await other.run("push", "--quiet", "origin", "HEAD:main");
@@ -686,8 +686,32 @@ test("commitAndPush stages alert records, and pull sweeps unpushed ones", async 
     alertname: "CaterpillarPodCrashLooping",
     reason: "no policy entry",
   });
-  await subject.pull("origin", "main");
 
+  // The pull DECLINES, because that write has not been committed yet and the sweep cannot
+  // tell it apart from a session's half-written state (see `pull`). It is not a weakening
+  // of the rule below — it is the rule arriving one commit later.
+  assert.equal(
+    await subject.pull("origin", "main"),
+    "skipped",
+    "a pull must not sweep a write that has not reached a commit yet",
+  );
+  assert.ok(existsSync(join(root, "alerts", "refusals", "ff9900.json")));
+
+  // Now the case the sweep is actually FOR: an untracked leftover that no write of this
+  // store's produced, so nothing marked the tree dirty — an `applyPlan` whose push was
+  // rejected and whose commit was then salvaged away, or a pod that died between the two.
+  // Written past the store on purpose: going through `writeAlertRefusal` again would set
+  // the flag and, correctly, defer the pull once more.
+  await subject.commitAndPush("chore(alerts): record the second refusal", "origin", "main");
+  await rm(join(root, "alerts", "refusals", "ff9900.json"));
+  await subject.commitAndPush("chore(alerts): withdraw it again", "origin", "main");
+  await writeFile(
+    join(root, "alerts", "refusals", "ff9900.json"),
+    '{"fingerprint":"ff9900","alertname":"CaterpillarPodCrashLooping","reason":"orphaned"}\n',
+    "utf8",
+  );
+
+  assert.equal(await subject.pull("origin", "main"), "pulled");
   assert.equal(
     existsSync(join(root, "alerts", "refusals", "ff9900.json")),
     false,
@@ -905,4 +929,102 @@ test("two runners recording the same task produce commits that rebase cleanly", 
   assert.equal(theirs, journal, "both runners must agree on the journal");
   assert.ok(existsSync(join(root, "tasks", task, "journal")));
   await other.run("rev-parse", "HEAD");
+});
+
+test("a commit from either loop leaves nothing of the other's uncommitted", async () => {
+  // Why clearing `dirty` on ANY commit is safe, now that two loops write this checkout
+  // (DESIGN.md §6.4). The worry is the obvious one: housekeeping commits a `/resume` while
+  // a session is halfway through writing its own task, `dirty` goes false on the strength
+  // of housekeeping's commit, and a pull one tick later resets over the rest.
+  //
+  // It cannot happen, and the reason is a property of `stageCommitPush` rather than of the
+  // flag: it stages `tasks`, `intake`, `digests` and `alerts` with `add -A`, which is the
+  // WHOLE tree the supervisor ever writes. So a commit by either writer necessarily carries
+  // the other's pending files too — the tree really is clean afterwards, and `dirty` is
+  // telling the truth. The cost is attribution, not durability: one commit message
+  // undersells its contents. Losing a task would be worse than an inaccurate subject line,
+  // and this is the assertion that says which one we got.
+  //
+  // If `add -A` is ever narrowed to per-task pathspecs, this test fails and `dirty` must
+  // become a counter rather than a boolean. That is the point of pinning it here.
+  const { store: subject, git } = await sharedStateRepo();
+  const session = asTaskId("MIXED-SESSION");
+  const housekeeping = asTaskId("MIXED-HOUSEKEEPING");
+
+  // The session's half: written, not yet committed. Exactly mid-`recordSession`.
+  await subject.appendJournal(session, 1, "the session's uncommitted work");
+  assert.equal(subject.hasUncommittedState, true);
+
+  // Housekeeping writes something unrelated and commits it, as `applyChatRequests` does.
+  await subject.writeHandoff(housekeeping, "a /resume served while the session ran");
+  await subject.commitAndPush(`chore(${housekeeping}): resumed`, "origin", "main");
+
+  // The flag is clear — and it is entitled to be, because the tree is.
+  assert.equal(subject.hasUncommittedState, false);
+  assert.equal(
+    (await git.run("status", "--porcelain")).trim(),
+    "",
+    "`dirty` may only go false when the tree genuinely has nothing left in it",
+  );
+
+  // Which is to say the session's journal went along with housekeeping's commit, rather
+  // than being left behind for a pull to sweep away.
+  assert.match(
+    await git.run("show", "--name-only", "--format=", "HEAD"),
+    new RegExp(`tasks/${session}/journal/`),
+    "the session's file must be IN the commit, not merely survive it",
+  );
+
+  // So the pull that follows is safe, and the session's work is on the remote.
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(session)) ?? "", /uncommitted work/);
+});
+
+test("a pull will not reset over state a session has written but not committed", async () => {
+  // The incident `pull` records — five destroyed tasks — with a new way to reach it. Since
+  // the supervisor split housekeeping onto its own timer (DESIGN.md §6.4), `pull` runs on a
+  // clock that knows nothing about the session: it can land in the window between a
+  // session's `writeState` and the `commitAndPush` that was going to persist it, and
+  // `reset --hard` plus `clean -ffdq` over `tasks/` inside that window destroys the lot.
+  //
+  // Mutual exclusion does not cover this. The mutex only guarantees the pull is not inside
+  // a `git add`; the window here is minutes wide and contains no git at all.
+  const { store: subject, other, root } = await sharedStateRepo();
+  const task = asTaskId("PULL-GUARD-1");
+
+  // Something for the remote to be ahead by, so a pull that DID run would visibly reset.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await subject.writeState({
+    id: task,
+    status: "running",
+    phase: "implementing",
+    requires: [],
+    sessions: 3,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 3, noProgressStreak: 0 },
+    createdAt: "2026-08-13T00:00:00Z",
+    updatedAt: "2026-08-13T00:00:00Z",
+  });
+  await subject.appendJournal(task, 3, "work the housekeeping loop must not destroy");
+
+  assert.equal(await subject.pull("origin", "main"), "skipped");
+  assert.equal((await subject.readState(task)).sessions, 3, "the state must survive");
+  assert.match(
+    (await subject.readJournal(task)) ?? "",
+    /must not destroy/,
+    "the journal must survive too — `clean -ffdq` would have taken the whole directory",
+  );
+  assert.ok(
+    existsSync(join(root, "tasks", task, "state.json")),
+    "and the directory itself, which the sweep removes wholesale",
+  );
+
+  // And the deferral is exactly that: once the session commits, the very next pull runs.
+  await subject.commitAndPush(`chore(${task}): session 3`, "origin", "main");
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.equal((await subject.readState(task)).sessions, 3);
 });

@@ -12,9 +12,22 @@
  * shares, so it is the only place a fleet-wide decision can be made. No new coordination
  * mechanism, and nothing to run when there is one replica.
  *
- * Refreshed from the poll loop rather than on a timer of its own. The loop already runs
- * on the interval this wants, and a timer would keep renewing the claim while a session
- * blocked the loop — advertising a holder that cannot currently answer anything.
+ * Refreshed from the supervisor's HOUSEKEEPING loop (DESIGN.md §6.4), on that loop's
+ * interval.
+ *
+ * It used to be refreshed from the single poll loop, and the reason given was that a timer
+ * of its own "would keep renewing the claim while a session blocked the loop — advertising
+ * a holder that cannot currently answer anything". That objection was correct and is now
+ * void, because the thing on the other side of the claim moved with it: the housekeeping
+ * loop IS what drains the inbox, applies `/resume` and `/answer`, and ingests. It runs
+ * whether or not a session is in flight, so a replica that renews here is by construction
+ * a replica that can answer.
+ *
+ * The arrangement it replaces had the worse failure in practice, because renewing and
+ * STEPPING DOWN are both this method. A replica that took the claim and then started a
+ * four-hour session did neither for four hours: it went on believing it was the holder
+ * while its claim went stale, and another replica eventually stole it. In the meantime
+ * the bot was online, `held()` said yes, and nothing was answered.
  */
 import type { RunnerId } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";

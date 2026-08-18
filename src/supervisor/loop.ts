@@ -80,8 +80,22 @@ import { summarise } from "./snapshot.ts";
 /**
  * How often a running session checks for a `/cancel`.
  *
- * A human is waiting on the reply, so this is seconds rather than a poll interval; it
- * costs one array filter over a queue that is almost always empty.
+ * **This stays separate from the housekeeping loop, and it is not redundant with it.**
+ * Housekeeping now drains the inbox during a session (DESIGN.md §6.4), which removes the
+ * original reason every other request kind needed a workaround — but a `/cancel` for the
+ * task running ON THIS RUNNER is the one request housekeeping structurally cannot serve.
+ * `applyPark` writes the state repo, and to write it must claim the lease; the lease is
+ * held by the session it is being asked to stop, so `claim` returns undefined and the
+ * request comes back `not-parkable: running`. Only code inside `workTask` can abort the
+ * session, so only code inside `workTask` may take that request.
+ *
+ * `applyChatRequests` therefore leaves those requests queued for this watcher, and this
+ * watcher takes nothing else — the rest write the state repo and housekeeping serves them.
+ *
+ * It also wants a tighter interval than housekeeping does, for a reason that survives the
+ * split: a human is waiting on the Discord reply. Two seconds costs one array filter over
+ * a queue that is almost always empty; the housekeeping interval is tuned against a git
+ * fetch and a tracker sweep and has no business bounding an interaction.
  */
 const CANCEL_POLL_MS = 2000;
 
@@ -96,9 +110,14 @@ export interface SessionRunner {
    * Runs one session and returns why it stopped. Never mutates task state.
    *
    * `signal` aborts the session in flight — pod shutdown, a lost lease, a human
-   * `/cancel`, or the wall clock. Honouring it is what stops a hung tool call from
-   * wedging the whole runner: everything here is single-threaded, so a `bash` call that
-   * never returns used to stop the poll, the chat drain and intake along with it.
+   * `/cancel`, or the wall clock. Honouring it is what stops a hung tool call from wedging
+   * the runner's ability to work anything ELSE: a `bash` call that never returns blocks
+   * the work loop for as long as it hangs, and the work loop is where claiming lives.
+   *
+   * It no longer stops the chat drain, intake or leadership — those moved to the
+   * housekeeping loop (§6.4) and keep running through a hung session. That is a reason the
+   * signal matters MORE rather than less: a wedged runner now looks entirely healthy from
+   * outside, because it is still answering.
    */
   run(spec: TaskSpec, state: TaskState, signal: AbortSignal): Promise<SessionOutcome>;
 }
@@ -211,9 +230,10 @@ export interface SupervisorDeps {
    */
   readonly inbox?: ChatDrainer;
   /**
-   * Which replica acts on Discord (DESIGN.md §7). Refreshed here rather than on a timer
-   * of its own: a timer would keep renewing the claim while a session blocked the loop,
-   * advertising a holder that cannot answer anything.
+   * Which replica acts on Discord (DESIGN.md §7). Refreshed on the HOUSEKEEPING loop,
+   * which is the loop that also answers — so a renewed claim is now a claim backed by a
+   * replica that can serve it. See `ChatLeadership`'s docstring for why that sentence is
+   * the whole justification.
    */
   readonly chat?: { readonly refresh: () => Promise<void> };
   /**
@@ -310,12 +330,56 @@ export class Supervisor {
    */
   private readonly cooldown: ProviderCooldown;
 
+  /**
+   * Whether `workTask` is running right now.
+   *
+   * Set by the work loop, read only by housekeeping, and only for the two things that
+   * genuinely must not happen beside a session: collecting the nix store, and logging
+   * "idle". It is deliberately NOT a lock — housekeeping is supposed to run during a
+   * session; that is the whole point of it existing separately.
+   */
+  private sessionInFlight = false;
+
+  /**
+   * The task the work loop is running right now, if any.
+   *
+   * Read by `applyChatRequests` for one narrow purpose: leaving that task's `/cancel`
+   * requests in the queue for the in-session watcher, which is the only code that can
+   * actually stop a session. See `CANCEL_POLL_MS`.
+   */
+  private inFlightTask: TaskId | undefined;
+
   constructor(deps: SupervisorDeps) {
     this.deps = deps;
     this.cooldown = new ProviderCooldown(deps.config.llm.cooldown);
   }
 
-  /** Runs until `signal` aborts. Restart-safe: all state comes from the repo. */
+  /**
+   * Runs until `signal` aborts. Restart-safe: all state comes from the repo.
+   *
+   * TWO loops, not one (DESIGN.md §6.4). Housekeeping — pull, chat drain, intake, alerts,
+   * digest, leadership — runs on `housekeepingSeconds` whether or not a session is in
+   * flight; work — cooldown, claim, session — runs on its own and blocks for as long as
+   * the session takes.
+   *
+   * They were one loop, and every housekeeping step therefore lived in the session's
+   * shadow: a labelled issue was not ingested until the session ended, a `/resume` sat
+   * unread in the inbox, and the Discord holder claim could neither be renewed nor stood
+   * down from — the bot was online and answered nothing. `CANCEL_POLL_MS` and
+   * `yieldToBrainstorm` were both built to work around exactly that, one request kind and
+   * one session boundary at a time.
+   *
+   * This does NOT make the runner concurrent in the sense §6 rules out: there is still
+   * exactly one `workTask` at a time, because there is still exactly one work loop. What
+   * is now concurrent is housekeeping against a session, and the two of them share one git
+   * checkout — which is why `StateStore` took a mutex, and why `pull` declines while a
+   * session holds uncommitted state. Read that class's docstring before adding a third
+   * caller here.
+   *
+   * Both loops are awaited together so that a throw escaping either — which should be
+   * impossible; each contains its own — still ends `run`, rather than leaving one loop
+   * turning and the process looking healthy.
+   */
   async run(signal: AbortSignal): Promise<void> {
     const { config, logger } = this.deps;
 
@@ -323,79 +387,136 @@ export class Supervisor {
       runner: config.runnerId,
       capabilities: config.capabilities.join(","),
       pollSeconds: config.pollSeconds,
+      housekeepingSeconds: config.housekeepingSeconds,
     });
 
+    await Promise.all([this.housekeepingLoop(signal), this.workLoop(signal)]);
+  }
+
+  /**
+   * Everything that must keep happening while a session runs.
+   *
+   * Containment is identical to the work loop's, and for the identical reason: a failure
+   * belongs to ONE pass, never to the process. `store.pull` throws on any non-zero git
+   * exit and `chat.refresh` reaches the network, so a blip in either used to unwind out of
+   * `run()` into main's `finally`, which closes /healthz and the credential socket and
+   * then blocks forever on `await bridge` — a live process, still answering Discord from a
+   * frozen snapshot, that polled nothing and that systemd would never restart because it
+   * never exited. Splitting the loop doubled the number of places that can happen, not
+   * halved it.
+   */
+  private async housekeepingLoop(signal: AbortSignal): Promise<void> {
+    const { config, logger } = this.deps;
+
     while (!signal.aborted) {
-      // The whole iteration, for the same reason `workTask` below is wrapped: a failure
-      // here belongs to one poll, not to the process. `store.pull` throws on any non-zero
-      // git exit, `resolveEnv` awaits a token mint over an untimed fetch roughly hourly,
-      // and `claimNext` reaches the network through `ls-remote` — so a blip in any of
-      // them used to unwind out of `run()` into main's `finally`, which closes /healthz
-      // and the credential socket and then blocks forever on `await bridge`. The result
-      // was a live process, still answering Discord from a frozen snapshot, that polled
-      // nothing and that systemd would never restart because it never exited.
       try {
-        await this.pollOnce(signal);
+        await this.housekeepOnce(signal);
       } catch (error) {
-        if (signal.aborted) throw error;
-        logger.error("poll.failed", errorFields(error));
-        await sleep(config.pollSeconds * 1000);
+        if (signal.aborted) return;
+        logger.error("housekeeping.failed", errorFields(error));
       }
+      await this.nap(config.housekeepingSeconds * 1000, signal);
     }
   }
 
-  /** One iteration of the poll loop. Throws only what the caller should log and retry. */
-  private async pollOnce(signal: AbortSignal): Promise<void> {
+  /** One housekeeping pass. Throws only what the caller should log and retry. */
+  private async housekeepOnce(signal: AbortSignal): Promise<void> {
     const { config, store, logger } = this.deps;
 
-    await store.pull("origin", config.stateRepo.branch);
+    // Declines while a session holds uncommitted state, rather than resetting over it —
+    // see `StateStore.pull`. Worth a line at debug when it does: a runner whose pulls are
+    // all skipped is one whose `dirty` flag never got cleared, and the symptom otherwise
+    // is a checkout that quietly stops tracking the remote.
+    if ((await store.pull("origin", config.stateRepo.branch)) === "skipped") {
+      logger.debug("housekeeping.pull-deferred", { reason: "session holds uncommitted state" });
+    }
 
-    // Advertise that this runner is alive (DESIGN.md §21). Here rather than on a timer,
-    // for `ChatLeadership.refresh`'s reason: a timer would keep announcing presence while
-    // a session blocked the loop, which is the one case where "alive" and "able to do
-    // anything" come apart. ADVISORY — nothing routes or claims from it, and it never
-    // throws (`redis/presence.ts`, `redis/guarded.ts`).
+    // Advertise that this runner is alive (DESIGN.md §21). On the housekeeping loop and
+    // not the work loop, for `ChatLeadership.refresh`'s reason inverted: the old objection
+    // to a timer was that it would keep announcing presence while a session blocked the
+    // loop — "alive" and "able to do anything" coming apart. Housekeeping IS the thing
+    // that stays able to do something during a session, so a heartbeat from here means
+    // what it says. ADVISORY — nothing routes or claims from it, and it never throws
+    // (`redis/presence.ts`, `redis/guarded.ts`).
     await this.deps.runners?.heartbeat(asRunnerId(config.runnerId));
 
-    // Both before claiming, so a task unparked by either is claimable on this same
-    // iteration rather than sitting idle until the next poll. Both also run DURING a
-    // provider cooldown: answering a question and ingesting an issue cost no tokens,
-    // and a queue that keeps filling while the provider is down is the correct
-    // behaviour — it is only starting sessions that has to stop.
     // Before the drain, because the drain is the holder's job: a replica that just lost
     // the claim must not serve the requests it collected while it had it.
     await this.deps.chat?.refresh();
 
+    // All of these run DURING a provider cooldown and during a session: answering a
+    // question, ingesting an issue and filing an alert cost no tokens, and a queue that
+    // keeps filling while the provider is down — or while this runner is busy — is the
+    // correct behaviour. It is only STARTING sessions that has to stop.
     await this.applyChatRequests();
     await this.maybeIngest();
     await this.drainAlerts();
     await this.maybeDigest(signal);
 
-    if (await this.coolingDown()) return;
+    // AFTER the writes above, so the snapshot a human reads includes what this pass just
+    // did rather than lagging it by an interval. This is the only thing keeping `/tasks`,
+    // `/task`, autocomplete and the thread bindings current during a session — the work
+    // loop's own call is inside the claim it is about to make, and does not come round
+    // again until the session ends. See `survey`.
+    await this.survey();
+
+    // Only when IDLE, and this is the one housekeeping step that has to ask. The store is
+    // shared with every worktree and mirror on a 20Gi volume so collecting is a
+    // requirement rather than hygiene, but a collection racing a session on this same
+    // runner is a risk with no upside — there is always another idle pass.
+    if (!this.sessionInFlight) await this.deps.toolchain.maybeCollectGarbage();
+  }
+
+  /**
+   * Claim and work one task, forever, one at a time.
+   *
+   * Deliberately holds no housekeeping. The sleep here is a claim BACKOFF — how long an
+   * idle runner waits before looking for work again — and nothing a human is waiting on
+   * depends on it any more.
+   */
+  private async workLoop(signal: AbortSignal): Promise<void> {
+    const { config, logger } = this.deps;
+
+    while (!signal.aborted) {
+      try {
+        await this.workOnce(signal);
+      } catch (error) {
+        if (signal.aborted) return;
+        logger.error("poll.failed", errorFields(error));
+        await this.nap(config.pollSeconds * 1000, signal);
+      }
+    }
+  }
+
+  /** One iteration of the work loop. Throws only what the caller should log and retry. */
+  private async workOnce(signal: AbortSignal): Promise<void> {
+    const { config, logger } = this.deps;
+
+    if (await this.coolingDown(signal)) return;
 
     const claimed = await this.claimNext(await this.survey());
     if (claimed === undefined) {
-        // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
-        // volume so collecting is a requirement rather than hygiene, but a collection
-        // racing a session on this same runner is a risk with no upside — there is always
-        // another idle poll.
-        await this.deps.toolchain.maybeCollectGarbage();
-
-      // Idle-only for the same reason, and throttled harder still. The collection above
-      // spends its time inside nix; this spends it inside THIS process — a `stat` per file
-      // over a tree with one `node_modules` per task — and the loop is single-threaded, so
-      // every millisecond here is a millisecond no task is claimed in. There is always
-      // another idle poll, and disk fills over hours rather than seconds.
+      // Idle-only, and left on the WORK loop rather than moved to housekeeping with the
+      // nix collection. It spends its time inside THIS process — a `stat` per file over a
+      // tree with one `node_modules` per task — and housekeeping is what a human waiting
+      // on `/resume` is waiting for. Blocking it for a directory walk would reintroduce,
+      // at a smaller scale, exactly the latency this split removed. The work loop when
+      // idle has nothing better to do, and disk fills over hours rather than seconds.
       await this.maybeMeasureUsage();
 
       // Debug, not info: at the default poll interval this is the single noisiest
       // line the supervisor could emit, and an idle runner is not news.
       logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
-      await sleep(config.pollSeconds * 1000);
+      await this.nap(config.pollSeconds * 1000, signal);
       return;
     }
 
     try {
+      // Around the whole of it, cleared in a `finally`: a flag left set by a session that
+      // threw would stop this runner ever collecting the nix store again, and the symptom
+      // would be a full volume weeks later with nothing in the logs pointing here.
+      this.sessionInFlight = true;
+      this.inFlightTask = claimed.spec.id;
       await this.workTask(claimed.lease, claimed.spec, signal);
     } catch (error) {
       if (error instanceof LeaseLostError) {
@@ -417,18 +538,42 @@ export class Supervisor {
         task: claimed.spec.id,
         ...errorFields(error),
       });
+    } finally {
+      this.sessionInFlight = false;
+      this.inFlightTask = undefined;
     }
+  }
+
+  /**
+   * Sleep, but wake at once when the pod is shutting down.
+   *
+   * Both loops sleep, and with the split there are now two of them to wait for on the way
+   * out: a plain `sleep` would make SIGTERM take up to a poll interval to be noticed by
+   * each, and `run` awaits both. `AbortSignal` rather than a timer handle so the wakeup is
+   * the same signal everything else in the supervisor already honours.
+   *
+   * The rejection is swallowed. An abort here is not a failure — it is the loop being told
+   * to stop, and the `while` condition above is what acts on it.
+   */
+  private async nap(ms: number, signal: AbortSignal): Promise<void> {
+    await sleep(ms, undefined, { signal }).catch(() => undefined);
   }
 
   /**
    * Sit out a provider outage, if one is in progress. See DESIGN.md §6.3.
    *
-   * Returns true when this poll must not claim anything. The wait is capped at ONE poll
-   * interval per iteration rather than slept through in one go, so the loop keeps
-   * pulling, answering chat and ingesting while it waits, and an abort is honoured
-   * within a poll rather than within the cooldown.
+   * Returns true when the WORK loop must not claim anything. Housekeeping is unaffected
+   * and always was: pulling, answering a question and ingesting an issue cost no tokens,
+   * so a provider outage is no reason to stop any of them — it is only starting sessions
+   * that has to wait. That used to be arranged by ordering, with everything cheap placed
+   * ahead of this gate in the one loop; now it is arranged by the loops being separate,
+   * which is the same guarantee without depending on statement order.
+   *
+   * The wait is still capped at ONE poll interval per iteration rather than slept through
+   * in one go, so an abort is honoured within a poll rather than within the cooldown, and
+   * the metric is re-published on the way round.
    */
-  private async coolingDown(): Promise<boolean> {
+  private async coolingDown(signal: AbortSignal): Promise<boolean> {
     const { config, metrics, logger } = this.deps;
 
     const remaining = this.cooldown.remainingMs(Date.now());
@@ -436,7 +581,7 @@ export class Supervisor {
     if (remaining === 0) return false;
 
     logger.info("provider.cooling", { remainingSeconds: Math.ceil(remaining / 1000) });
-    await sleep(Math.min(remaining, config.pollSeconds * 1000));
+    await this.nap(Math.min(remaining, config.pollSeconds * 1000), signal);
     return true;
   }
 
@@ -577,9 +722,24 @@ export class Supervisor {
   /**
    * Read every task's state once, and publish the result to the chat snapshot.
    *
-   * One pass serves both readers. Claiming already had to read every state to find a
-   * `ready` one, so the snapshot rides along for free rather than costing a second
-   * sweep of the task tree on every poll.
+   * One pass serves several readers. Claiming has to read every state to find a `ready`
+   * one, and `/tasks`, `/task` and autocomplete are served from the snapshot it publishes
+   * on the way past (DESIGN.md §7), so the snapshot rides along rather than costing a
+   * second sweep of the task tree.
+   *
+   * **Called from housekeeping as well as from the work loop, and that is not redundant.**
+   * The work loop calls it because it is about to claim; housekeeping calls it because the
+   * two things it publishes are things a human reads. Left on the work loop alone they
+   * would freeze for the whole of a session — `/tasks` would answer from a snapshot taken
+   * hours ago, still showing the running task as `ready`, and `threads` would not learn
+   * about a task created since, so an `!answer` typed into its thread would find no
+   * binding and be swallowed. That is the same defect the loop split exists to fix,
+   * arriving through the reader rather than through the writer.
+   *
+   * It is only a read, so running it from both loops is safe without the store's mutex:
+   * `listTasks` and `readState` touch the filesystem and never git. The two publishes are
+   * whole-snapshot `replace` calls, so the loser of a race publishes a complete and
+   * slightly older view rather than a torn one.
    *
    * A state that fails to parse is skipped rather than fatal — it is one task the
    * runner cannot see, not a runner that cannot run.
@@ -708,10 +868,11 @@ export class Supervisor {
     const stopOnShutdown = (): void => interrupt.abort();
     signal.addEventListener("abort", stopOnShutdown, { once: true });
 
-    // The poll loop — and with it the inbox drain — is blocked for the whole duration of
-    // a session, so a `/cancel` submitted while the agent is working would otherwise sit
-    // in the queue until the session it was meant to stop had already ended, with the
-    // operator's Discord reply hanging until then. Both watches below exist for that.
+    // Housekeeping drains everything else during a session, but not this: a `/cancel` for
+    // THIS task cannot be served from there, because serving it means writing the state
+    // repo, writing means claiming the lease, and the lease is held by the session being
+    // cancelled. So this watches for that one request kind and `applyChatRequests` leaves
+    // it alone. See `CANCEL_POLL_MS`.
     let cancelled = false;
     const stop = (): void => {
       if (cancelled) return;
@@ -917,11 +1078,21 @@ export class Supervisor {
   /**
    * Hand the runner back when someone is waiting on a brainstorm (DESIGN.md §14.3).
    *
-   * `workTask` drives ONE task through as many sessions as it needs, and the poll loop —
-   * and with it the chat drain and the next claim — is blocked for all of them. A task
-   * that keeps handing off therefore owns the runner indefinitely, which is how a human
-   * typing `/brainstorm` got a thread that opened and then said nothing: twenty minutes
-   * and six sessions, in the run this was written from.
+   * `workTask` drives ONE task through as many sessions as it needs, and the WORK loop —
+   * and with it the next claim — is blocked for all of them. A task that keeps handing off
+   * therefore owns the runner indefinitely, which is how a human typing `/brainstorm` got
+   * a thread that opened and then said nothing: twenty minutes and six sessions, in the
+   * run this was written from.
+   *
+   * The housekeeping split (§6.4) does NOT make this redundant, and it is worth being
+   * precise about what each fixes. Housekeeping means the brainstorm request is drained,
+   * the task created and the thread answered while this session runs — so the human is no
+   * longer talking to silence. But the runner still works one task at a time, so the
+   * brainstorm cannot be CLAIMED until this task lets go, and that is what this does.
+   * Draining without yielding would produce a task that exists and never starts.
+   *
+   * The check is `some`, not `takeWhere`, precisely because housekeeping now owns the
+   * serving of it: taking the request to look at it would strand the human it exists for.
    *
    * Deliberately NOT an interrupt. `/cancel` aborts a session because the human's whole
    * intent is to stop it; here the session is doing legitimate work, and an interrupted
@@ -934,9 +1105,8 @@ export class Supervisor {
    * writes a journal entry about a runner that "stopped without parking or finishing it",
    * which would be a lie told once per brainstorm, in the task's permanent record.
    *
-   * The request itself is left in the queue. This code cannot serve it — creating the
-   * task writes the state repo, and that is the loop's to do — so it only gets out of
-   * the way, and `applyChatRequests` drains it on the very next poll.
+   * The request itself is left in the queue for `applyChatRequests` on the housekeeping
+   * loop, which may well have drained it already. This code only gets out of the way.
    */
   private async yieldToBrainstorm(
     lease: LeaseHandle,
@@ -1722,16 +1892,38 @@ export class Supervisor {
   /**
    * Apply requests submitted by the inbound bridge (DESIGN.md §7).
    *
-   * Runs HERE, on the loop's thread of control, because the loop owns the state repo —
-   * a websocket handler writing it concurrently would interleave git invocations in one
-   * working copy. Each request is settled with what actually happened, so the human who
-   * typed or clicked it gets told rather than guessing from silence.
+   * Runs on the HOUSEKEEPING loop, which is independent of whether a session is in flight
+   * — that is the point of the split (§6.4). It used to run on the one poll loop, which
+   * was blocked for the whole of every session, so a `/resume` or an `/answer` submitted
+   * at the start of a four-hour task sat unread for four hours.
+   *
+   * It still runs on exactly ONE thread of control, and it must: it writes the state repo,
+   * and a websocket handler doing the same thing concurrently would interleave git
+   * invocations in one working copy. What changed is which loop that thread belongs to,
+   * not that there is one. `StateStore`'s mutex is what keeps it honest against the work
+   * loop's writes.
+   *
+   * Each request is settled with what actually happened, so the human who typed or clicked
+   * it gets told rather than guessing from silence.
    */
   private async applyChatRequests(): Promise<void> {
     const { logger, inbox } = this.deps;
     if (inbox === undefined) return;
 
-    for (const request of await inbox.drain()) {
+    // Everything EXCEPT a `/cancel` for the task this runner is running right now. That
+    // one is left queued for the in-session watcher, which is the only code that can stop
+    // a session; serving it here would claim-and-fail against the session's own lease and
+    // tell the human "not-parkable: running" about a task this very process is running.
+    // See `CANCEL_POLL_MS`.
+    const mine = this.inFlightTask;
+    const taken =
+      mine === undefined
+        ? await inbox.drain()
+        : await inbox.takeWhere(
+            (request) => !(request.kind === "park" && request.task === mine),
+          );
+
+    for (const request of taken) {
       try {
         request.settle(await this.applyChatRequest(request));
       } catch (error) {

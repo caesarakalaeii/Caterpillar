@@ -94,6 +94,7 @@ const CONFIG: RunnerConfig = {
     ],
   ]),
   pollSeconds: 30,
+  housekeepingSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   cluster: {

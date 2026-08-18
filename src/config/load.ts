@@ -72,6 +72,7 @@ interface RawConfig {
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
+  readonly housekeepingSeconds?: unknown;
   readonly secretsDir?: unknown;
   readonly log?: { readonly level?: unknown };
   readonly intake?: { readonly intervalSeconds?: unknown };
@@ -534,6 +535,15 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     llm: llmConfig(llm),
     workspaces,
     pollSeconds: num(raw.pollSeconds, "pollSeconds", 30),
+    // Defaulted to `pollSeconds` rather than to a constant, and then clamped to it: the
+    // guarantee the split is worth having for is "chat, intake and leadership are never
+    // slower than they were before", and a config that set `pollSeconds: 5` and left this
+    // alone would silently break it. Faster is allowed — housekeeping costs a fetch and a
+    // few array filters, and a human waiting on `/resume` is the thing being optimised.
+    housekeepingSeconds: Math.min(
+      num(raw.housekeepingSeconds, "housekeepingSeconds", num(raw.pollSeconds, "pollSeconds", 30)),
+      num(raw.pollSeconds, "pollSeconds", 30),
+    ),
     secretsDir: str(raw.secretsDir, "secretsDir"),
     log: { level: logLevel(raw.log?.level) },
     intake: {
