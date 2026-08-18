@@ -683,6 +683,21 @@ export interface RunnerExport {
     readonly gcIntervalHours: number;
     readonly gcKeepDays: number;
   };
+  /**
+   * Next to the toolchain's numbers deliberately: they are two halves of one janitor, and
+   * an operator looking at a full volume needs to see both without knowing which of the
+   * two collectors they are looking for.
+   *
+   * OPTIONAL only because of who reads it. `exportRunner` on a live runner always sets it,
+   * but the aggregating viewer (§18) renders a REMOTE runner's export with this same
+   * template, and a replica still on the previous image has no `workspace` key at all —
+   * reaping is newer than the viewer. `asList` in `view/aggregate.ts` accepts two vintages
+   * of `live` for exactly this reason. Required here would mean a rollout in which the
+   * viewer answers `/runner` with an error page for every pod it has not yet reached.
+   */
+  readonly workspace?: {
+    readonly reap: { readonly intervalHours: number; readonly keepHours: number };
+  };
   readonly stateRepo: { readonly url: string; readonly branch: string; readonly path: string };
   readonly paths: { readonly mirrors: string; readonly tasks: string; readonly root: string };
   readonly usage: { readonly intervalHours: number; readonly deadlineSeconds: number };
@@ -749,6 +764,12 @@ export const runnerExport = (config: RunnerConfig): RunnerExport => ({
     timeoutSeconds: config.toolchain.timeoutSeconds,
     gcIntervalHours: config.toolchain.gcIntervalHours,
     gcKeepDays: config.toolchain.gcKeepDays,
+  },
+  workspace: {
+    reap: {
+      intervalHours: config.workspace.reap.intervalHours,
+      keepHours: config.workspace.reap.keepHours,
+    },
   },
   stateRepo: {
     url: config.stateRepo.url,

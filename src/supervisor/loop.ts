@@ -54,6 +54,7 @@ import {
   startHeartbeat,
 } from "../state/lease.ts";
 import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
+import type { ReapResult } from "../workspace/worktree.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
@@ -139,6 +140,19 @@ export interface AlertIngester {
   ): Promise<AlertPass>;
 }
 
+/**
+ * The reaping half of `WorktreeManager`, as the loop needs it (DESIGN.md §3.1).
+ *
+ * Narrowed to two methods rather than taking the class, for the same reason `Verifier` and
+ * `ProgressProbe` are interfaces: this is the one dependency in the loop whose failure mode
+ * is destructive, and a structural type that names exactly the two calls makes the loop's
+ * tests able to record them without standing up a git mirror per case.
+ */
+export interface WorktreeReaper {
+  removeTaskWorktrees(task: TaskId, repos: readonly RepoRef[]): Promise<ReapResult>;
+  reapStaleWorktrees(opts: { readonly live: ReadonlySet<TaskId> }): Promise<ReapResult>;
+}
+
 /** The idle-time work-volume measurement (§11). Implemented by `UsageMonitor`. */
 export interface UsageReporter {
   /** Measures if the interval has elapsed; returns the fresh snapshot, or nothing. */
@@ -172,6 +186,19 @@ export interface SupervisorDeps {
    * runner has no task in flight.
    */
   readonly toolchain: ToolchainResolver;
+  /**
+   * The per-task checkouts on this runner's volume, so finished ones can be thrown away.
+   *
+   * Here for exactly the reason `toolchain` is: the loop owns the only moment it is safe
+   * to remove a worktree — when the task that owns it has reached a state it will not
+   * resume from in place, or when nothing on this runner has a claim on it at all. Every
+   * other holder of a `WorktreeManager` (the session runner, the verifier, the probe, the
+   * council) creates them and must never be the thing that deletes one.
+   *
+   * Optional so a `Supervisor` can be built without one, which the older tests in
+   * `loop.test.ts` do. A runner without it simply never reaps, exactly as before.
+   */
+  readonly worktrees?: WorktreeReaper;
   /**
    * Measures the work volume (`workspace/usage.ts`). Optional: without one the supervisor
    * behaves exactly as it did before this existed, which is what the tests build.
@@ -306,6 +333,14 @@ export class Supervisor {
   /** 0 means "never ran", so the first pass happens at boot. */
   private lastIntakeAt = 0;
 
+  /**
+   * 0 means "never swept", and unlike `lastIntakeAt` that does NOT mean sweep at boot —
+   * see `maybeReapWorktrees`, which only starts the clock on its first call. The
+   * difference is deliberate: a missed intake pass is a task that arrives a few minutes
+   * late, and a premature sweep is a directory that is gone.
+   */
+  private lastReapAt = 0;
+
   private readonly deps: SupervisorDeps;
 
   /**
@@ -380,13 +415,21 @@ export class Supervisor {
 
     if (await this.coolingDown()) return;
 
-    const claimed = await this.claimNext(await this.survey());
+    const records = await this.survey();
+    const claimed = await this.claimNext(records);
     if (claimed === undefined) {
-        // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
-        // volume so collecting is a requirement rather than hygiene, but a collection
-        // racing a session on this same runner is a risk with no upside — there is always
-        // another idle poll.
-        await this.deps.toolchain.maybeCollectGarbage();
+      // Only when IDLE. The store is shared with every worktree and mirror on a 20Gi
+      // volume so collecting is a requirement rather than hygiene, but a collection
+      // racing a session on this same runner is a risk with no upside — there is always
+      // another idle poll.
+      await this.deps.toolchain.maybeCollectGarbage();
+      // The other half of the same janitor, in the same branch and for the same stated
+      // reason. The store had a collector and the worktrees — the thing that actually
+      // grows per task, a checkout plus its `node_modules` per repo — had nothing, so
+      // every task this runner ever worked was still on the volume. The survey we just
+      // did is what makes it safe to run at all: it is the only place in this process
+      // that knows which tasks are still going somewhere.
+      await this.maybeReapWorktrees(records);
 
       // Idle-only for the same reason, and throttled harder still. The collection above
       // spends its time inside nix; this spends it inside THIS process — a `stat` per file
@@ -408,6 +451,12 @@ export class Supervisor {
       if (error instanceof LeaseLostError) {
         // Another runner owns this task now. Drop everything without writing.
         logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
+        // And drop the checkout with it. Whoever holds the lease now is working the task
+        // in their OWN `tasksDir`, from the branch on the remote; this runner's copy will
+        // never be resumed and nothing will ever name it again, which is precisely the
+        // orphan the periodic sweep exists to catch days later. Catching it here costs
+        // one `rm -rf` and saves the disk in between.
+        await this.reapTask(claimed.spec, "lease-lost");
         return;
       }
       if (signal.aborted) throw error;
@@ -606,6 +655,114 @@ export class Supervisor {
     } catch (error) {
       logger.warn("digest.pass-failed", errorFields(error));
     }
+  }
+
+  /**
+   * Sweep orphaned worktrees off this runner's volume, if it is time (DESIGN.md §3.1).
+   *
+   * Called only from the idle branch, and rate-limited exactly the way
+   * `ToolchainResolver.maybeCollectGarbage` rate-limits itself — including the detail that
+   * looks like an off-by-one and is not: the FIRST call only starts the clock. Stamping at
+   * construction instead would make a runner that is crash-looping every few minutes sweep
+   * on every boot, which is the one moment its worktrees are most likely to be wanted, by
+   * the very tasks it is about to re-claim.
+   *
+   * **The live set is stated, never inferred.** It comes from the survey this poll already
+   * did, and it is every task the state repo does not consider finished: `ready`,
+   * `running` and `awaiting-human` all resume against a checkout that may be this one. A
+   * `running` task on another replica is in the set too, and that is correct rather than
+   * merely safe — this runner cannot tell from a status whether the directory it is
+   * looking at belongs to the session that is happening elsewhere, and the cost of being
+   * wrong in that direction is one directory surviving a few more days.
+   *
+   * Never throws. A sweep that fails is a disk-space problem for later; a sweep that
+   * unwound into `pollOnce` would cost the runner a poll for a chore nobody asked for.
+   */
+  private async maybeReapWorktrees(records: readonly TaskRecord[]): Promise<void> {
+    const { worktrees, config, logger } = this.deps;
+    if (worktrees === undefined) return;
+
+    const now = Date.now();
+    if (this.lastReapAt === 0) {
+      this.lastReapAt = now;
+      return;
+    }
+    if (now < this.lastReapAt + config.workspace.reap.intervalHours * 60 * 60 * 1000) return;
+    // Stamped BEFORE the sweep, like the intake pass: a sweep that throws must still wait
+    // out the interval rather than being retried on every idle poll.
+    this.lastReapAt = now;
+
+    // A survey that saw NOTHING is not a fleet with no tasks — it is a state repo this
+    // runner could not read. `survey` skips a state that fails to parse and `listTasks`
+    // walks a checkout that a failed pull can leave empty, so an empty result and "every
+    // task is finished" are indistinguishable from here, and one of those two readings
+    // hands the sweep an empty live set and every directory on the volume. A real state
+    // repo always holds at least the task this runner has been working, so refusing to
+    // sweep on an empty survey costs one interval and nothing else.
+    if (records.length === 0) {
+      logger.debug("worktree.reap-skipped", { reason: "the task survey came back empty" });
+      return;
+    }
+
+    const live = new Set(
+      records.filter((record) => !isTerminal(record.state.status)).map((record) => record.id),
+    );
+
+    try {
+      const reaped = await worktrees.reapStaleWorktrees({ live });
+      this.recordReap(reaped, "swept");
+    } catch (error) {
+      logger.warn("worktree.reap-failed", errorFields(error));
+    }
+  }
+
+  /**
+   * Throw away one task's checkout, now that this runner is finished with it.
+   *
+   * Called only from the terminal paths that will not resume IN PLACE — see the call
+   * sites. `handoff` and `awaiting-human` deliberately do not call it: both resume against
+   * this very directory, and reaping there would trade a few gigabytes for a re-clone and
+   * a re-install on every handoff, which costs more of everything than it saves.
+   *
+   * Never throws, for the same reason `parkFailed` does not: this runs after the task's
+   * state has already been pushed, so a failure here can only turn a completed task into
+   * a supervisor error. Disk is worth a warn and nothing more.
+   */
+  private async reapTask(spec: TaskSpec, reason: string): Promise<void> {
+    const { worktrees, logger } = this.deps;
+    if (worktrees === undefined) return;
+
+    try {
+      const reaped = await worktrees.removeTaskWorktrees(spec.id, spec.repos);
+      this.recordReap(reaped, "targeted", reason);
+    } catch (error) {
+      logger.warn("worktree.reap-failed", { task: spec.id, reason, ...errorFields(error) });
+    }
+  }
+
+  /**
+   * One log line and two counters per reap that removed something.
+   *
+   * Silent when it removed nothing, which is the overwhelmingly common case for the sweep:
+   * a healthy runner reaps everything targeted, so a sweep that finds nothing is the
+   * system working and a line a day saying so is noise. A reap that DID remove something
+   * is always worth a line at info — it is the only record that a number of gigabytes
+   * left this volume, and "where did the disk go" is asked after the fact, from logs.
+   */
+  private recordReap(reaped: ReapResult, kind: "targeted" | "swept", reason?: string): void {
+    const { metrics, logger } = this.deps;
+    if (reaped.worktrees === 0) return;
+
+    metrics.worktreesReaped.inc({ kind }, reaped.worktrees);
+    metrics.worktreeBytesReaped.inc({ kind }, reaped.bytes);
+    logger.info("worktree.reaped", {
+      kind,
+      ...(reason === undefined ? {} : { reason }),
+      worktrees: reaped.worktrees,
+      approxBytes: reaped.bytes,
+      approxMegabytes: Math.round(reaped.bytes / (1024 * 1024)),
+      tasks: reaped.tasks.join(","),
+    });
   }
 
   /**
@@ -1064,7 +1221,9 @@ export class Supervisor {
 
     switch (outcome.reason) {
       case "handoff":
-        // Same task, fresh session. Nothing to notify — Discord stays a signal channel.
+        // Same task, fresh session. Nothing to notify — Discord stays a signal channel,
+        // and nothing to reap: the next session resumes against this exact worktree, which
+        // is the entire reason `ensureWorktree` reuses one rather than re-creating it.
         return false;
 
       case "blocked": {
@@ -1081,6 +1240,10 @@ export class Supervisor {
         // The question TEXT is deliberately not logged: it is agent-authored prose that
         // can quote anything it read, including a file it should not have. The index
         // locates it in `tasks/<id>/questions/` for anyone who needs it.
+        // No reap. `awaiting-human` is the clearest case in the whole switch: the session
+        // that answers this question is the same task on the same branch, and it will be
+        // claimed by this runner as often as not. Deleting the checkout while a human
+        // types would buy disk for exactly as long as it takes them to answer.
         logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
         await store.writeQuestion(spec.id, index, question);
         await this.transition(lease, state, "awaiting-human");
@@ -1150,6 +1313,12 @@ export class Supervisor {
         // After the task is recorded as done, never before: a maintenance pass that
         // fails must not be able to unmake a completed task.
         await this.maintainPlan(lease, spec, reviewed.state);
+        // And last of all, the disk. `done` is the one terminal status nothing comes back
+        // from — `/resume` explicitly refuses it, because the work passed every gate and
+        // merged — so the checkout has no further reader on this runner or any other.
+        // After the push and after the notification, so a reap that somehow fails cannot
+        // be what stops a completed task from being recorded as one.
+        await this.reapTask(spec, "done");
         return true;
       }
 
@@ -1198,6 +1367,15 @@ export class Supervisor {
           task: spec.id,
           error: outcome.error ?? outcome.summary,
         });
+        // `failed` IS resumable by a human (see `RESUMABLE`), and this still reaps. The
+        // difference from a park is what the next session would find: a task that failed
+        // did so because a session raised an error the supervisor could not attribute, and
+        // the checkout that produced it is as likely to be the cause as the cure — a
+        // half-applied patch, a corrupted index, a dependency tree installed against the
+        // wrong toolchain. `/resume` on a failed task re-creates the worktree from the
+        // mirror and the branch on the remote, which is every byte of the work and none of
+        // the wreckage.
+        await this.reapTask(spec, "failed");
         return true;
     }
   }
@@ -1707,6 +1885,21 @@ export class Supervisor {
     return workspaceScopeOf(profile, stateRepoRef(this.deps.config.stateRepo));
   }
 
+  /**
+   * Park a task and tell whoever needs to know.
+   *
+   * Deliberately does NOT reap the worktree, and this is the boundary the reaping rules
+   * turn on. `parked` is terminal in the sense that nothing moves the task without a
+   * human, but it is resumable IN PLACE: `/resume` puts it back to `ready` and the next
+   * session claims the same branch in the same directory. Every park has a human in its
+   * future — a question to answer, a limit to raise, a decision to make — and throwing
+   * the checkout away would charge that human's answer a full clone and a full dependency
+   * install for a directory that was going to be used within the day.
+   *
+   * The sweep is what covers the park nobody ever answers. `workspace.reap.keepHours`
+   * outlives a weekend by design, and a task parked longer than that has stopped being a
+   * question anyone is about to answer.
+   */
   private async park(
     lease: LeaseHandle,
     spec: TaskSpec,
@@ -1730,6 +1923,10 @@ export class Supervisor {
    * Best-effort by design: if parking ITSELF fails — an unreachable state repo, a lost
    * network — this logs and returns rather than throwing. Propagating here would exit
    * the process and reintroduce exactly the crash loop it exists to prevent.
+   *
+   * It reaps nothing, because it parks: see `park` for why a park keeps its checkout. The
+   * most common reason to reach here is a toolchain that would not build, and the human
+   * who fixes the flake wants the very next session to be a resolve and not a re-clone.
    */
   private async parkFailed(lease: LeaseHandle, spec: TaskSpec, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);

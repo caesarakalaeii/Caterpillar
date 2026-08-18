@@ -235,6 +235,38 @@ export class AgentMetrics {
   );
 
   /**
+   * Task worktrees this runner threw away, by which removal did it (DESIGN.md §3.1).
+   *
+   * `kind="targeted"` is a task finishing cleanly and being tidied up after; `kind="swept"`
+   * is the periodic sweep finding a directory no task claims. The label is the whole value
+   * of the metric: a healthy runner reaps almost everything targeted, so a `swept` series
+   * that keeps climbing says the supervisor's terminal paths are not reaching the removal
+   * — pods being killed mid-session, or a branch nobody wired up — and the volume is only
+   * staying under its limit because a timer is cleaning up after a bug.
+   */
+  readonly worktreesReaped = this.registry.counter(
+    "caterpillar_worktrees_reaped_total",
+    "task worktrees removed from this runner's volume, by which removal did it",
+  );
+
+  /**
+   * Bytes those removals reclaimed, same labels.
+   *
+   * A counter rather than a gauge of free space, because free space is the node exporter's
+   * to report and this is the only series that attributes a change in it to the fleet. It
+   * is the number that answers "is reaping worth anything" — the question this whole path
+   * exists to answer — and, divided by `caterpillar_worktrees_reaped_total`, says what one
+   * task actually costs on disk.
+   *
+   * Apparent size summed over regular files, so it under-reports a sparse file and
+   * over-reports a hard-linked one. Neither is worth a `du` before every removal.
+   */
+  readonly worktreeBytesReaped = this.registry.counter(
+    "caterpillar_worktree_bytes_reaped_total",
+    "approximate bytes reclaimed by removing task worktrees",
+  );
+
+  /**
    * What intake did with each item it saw, by workspace (DESIGN.md §14).
    *
    * Intake had no metric at all until this existed, which made the fourth intake path the

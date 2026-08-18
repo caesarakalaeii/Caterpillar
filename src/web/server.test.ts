@@ -51,6 +51,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     secretRef: "caterpillar-github-app",
   },
   paths: { mirrors: "/work/mirrors", tasks: "/work/tasks", root: "/work" },
+  workspace: { reap: { intervalHours: 24, keepHours: 72 } },
   usage: { intervalHours: 1, deadlineSeconds: 120 },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },

@@ -15,6 +15,7 @@ import {
 } from "../domain/task.ts";
 import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
+import { DEFAULT_REAP_CONFIG as REAP_DEFAULTS } from "../workspace/worktree.ts";
 import { DEFAULT_USAGE_CONFIG as USAGE_DEFAULTS, defaultWorkRoot } from "../workspace/usage.ts";
 import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
 import type {
@@ -70,6 +71,12 @@ interface RawConfig {
     readonly trustedPublicKeys?: unknown;
     readonly minFreeGb?: unknown;
     readonly maxFreeGb?: unknown;
+  };
+  readonly workspace?: {
+    readonly reap?: {
+      readonly intervalHours?: unknown;
+      readonly keepHours?: unknown;
+    };
   };
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
@@ -513,6 +520,24 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         "toolchain.trustedPublicKeys",
       ),
       ...nixFreeSpace(raw.toolchain),
+    },
+    // The worktree half of the same janitor. Both entirely defaulted, because the numbers
+    // that are right for a 20Gi PVC are right for every runner on one and an operator who
+    // has to tune a garbage collector before the disk stops filling has not been given a
+    // garbage collector.
+    workspace: {
+      reap: {
+        intervalHours: num(
+          raw.workspace?.reap?.intervalHours,
+          "workspace.reap.intervalHours",
+          REAP_DEFAULTS.intervalHours,
+        ),
+        keepHours: num(
+          raw.workspace?.reap?.keepHours,
+          "workspace.reap.keepHours",
+          REAP_DEFAULTS.keepHours,
+        ),
+      },
     },
     stateRepo: {
       url: str(raw.stateRepo?.url, "stateRepo.url"),

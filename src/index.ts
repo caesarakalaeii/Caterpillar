@@ -268,6 +268,7 @@ const main = async (): Promise<void> => {
     helperPath: CRED_HELPER,
     socketPath: CRED_SOCKET,
     identity: config.identity,
+    reap: config.workspace.reap,
   });
 
   const credentials = new CredentialService();
@@ -351,6 +352,9 @@ const main = async (): Promise<void> => {
       ...(cluster === undefined ? {} : { cluster }),
     }),
     toolchain,
+    // The same manager every other consumer holds, but only the loop is given it under a
+    // name that can delete: it owns the one moment a worktree is safe to remove (§2).
+    worktrees,
     usage,
     verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
     progress: new GitProgressProbe({ worktrees }),
