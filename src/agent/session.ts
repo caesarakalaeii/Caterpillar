@@ -23,6 +23,7 @@ import type { Api, Context, Model, MutableModels, SimpleStreamOptions, Usage } f
 import { EMPTY_USAGE, type SessionOutcome, type UsageTotals } from "../domain/task.ts";
 import { classifyProviderFailure } from "../llm/outage.ts";
 import { ContextBudget } from "./limits.ts";
+import type { SteeringFeed } from "./steering.ts";
 import type { ControlSink } from "./tools.ts";
 
 /**
@@ -37,6 +38,19 @@ import type { ControlSink } from "./tools.ts";
  * of the resulting message.
  */
 const MAX_PROVIDER_RETRIES = 2;
+
+/**
+ * How a steer is framed for the model.
+ *
+ * Attributed, because an unattributed sentence dropped into a transcript mid-run reads like
+ * something the agent said to itself, and an agent that mistakes its own note for an
+ * instruction from a human has no way to weigh it. Marked as an interruption too: the model
+ * is mid-task and the useful reading of "use the existing migration path" is "change course
+ * now", not "here is some background".
+ */
+const steeringPrompt = (text: string): string =>
+  `[Message from the operator, sent while you are working. Take it into account from here ` +
+  `on — it may change what you should do next.]\n\n${text}`;
 
 export interface SessionOptions {
   readonly models: MutableModels;
@@ -80,6 +94,15 @@ export interface SessionOptions {
    * take this away, and the next call site cannot quietly omit it.
    */
   readonly timeoutSeconds: number;
+  /**
+   * Where a human's mid-session guidance comes from (DESIGN.md §7.3).
+   *
+   * Optional, and absent is a session nobody can talk to — which is what every session was
+   * until this existed. The council, the plan maintainer and the digest summariser all pass
+   * nothing, deliberately: they are not the agent, they run for minutes rather than hours,
+   * and a verdict a human leaned on is not a verdict.
+   */
+  readonly steering?: SteeringFeed;
 }
 
 export interface SessionResult {
@@ -123,6 +146,12 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
         maxRetries: streamOptions?.maxRetries ?? MAX_PROVIDER_RETRIES,
       }),
   });
+
+  // `all`, not `one-at-a-time`. Refining an idea is many short replies (§14.3), so several
+  // messages routinely arrive inside one turn; draining them one per turn would spend a
+  // whole provider request on each and deliver the last one several turns after it was
+  // typed — by which time it is advice about work already done.
+  agent.steeringMode = "all";
 
   let sessionUsage: UsageTotals = EMPTY_USAGE;
   let handoffTriggered = false;
@@ -172,6 +201,18 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
     options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline]);
   signal.addEventListener("abort", abort, { once: true });
 
+  // Human input, queued rather than injected: pi drains the queue at a turn boundary, so
+  // the agent always finishes the tool calls it started before it reads anything new. The
+  // backlog goes in first and in order — it was typed before whatever arrives next.
+  //
+  // `steer` is not awaited and cannot be: it is called from a Redis subscription callback
+  // (§21), and a queue push is synchronous anyway.
+  const enqueue = (text: string): void => {
+    agent.steer({ role: "user", content: steeringPrompt(text), timestamp: Date.now() });
+  };
+  for (const text of options.steering?.take() ?? []) enqueue(text);
+  const unsubscribe = options.steering?.subscribe(enqueue);
+
   let error: string | undefined;
   try {
     // Already aborted before we started: do not spend a request to find out.
@@ -180,6 +221,10 @@ export const runSession = async (options: SessionOptions): Promise<SessionResult
     error = cause instanceof Error ? cause.message : String(cause);
   } finally {
     signal.removeEventListener("abort", abort);
+    // Before anything else in the unwind. The feed outlives this session — it belongs to
+    // the slot, which may run many — so a listener left behind would deliver the next
+    // human's sentence into an `Agent` that has already finished.
+    unsubscribe?.();
   }
 
   // The failure pi swallowed, if the throw did not happen. `errorMessage` is cleared at

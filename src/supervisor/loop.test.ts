@@ -461,7 +461,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
   assert.match(answer.stdout, /existing migration path/);
 });
 
-test("an answer for a task that is not waiting is refused, not written", async () => {
+test("a message for a task that is not waiting is RECORDED, not refused", async () => {
   const inbox = new InMemoryChatQueue();
   const store = new StateStore(statePath, stateGit);
   const supervisor = new Supervisor({
@@ -489,16 +489,93 @@ test("an answer for a task that is not waiting is refused, not written", async (
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  // TASK is `parked` from the first test in this file — a real state, and not one an
-  // answer may resurrect: nothing asked a question.
-  const outcome = await inbox.submit({ kind: "answer", task: TASK, text: "please continue" });
+  // TASK is `parked` from the first test in this file, and nothing asked it a question. The
+  // old behaviour read the text, matched it against `awaiting-human`, and DISCARDED it — while
+  // the park notification that brought the human here said "say what to change in this
+  // thread". The text now becomes guidance the next session reads, and the reply says so.
+  const outcome = await inbox.submit({ kind: "answer", task: TASK, text: "the criteria are unmeasurable" });
   const unknown = await inbox.submit({ kind: "answer", task: asTaskId("NO-SUCH-TASK"), text: "hello?" });
 
   controller.abort();
   await running.catch(() => undefined);
 
-  assert.equal(outcome.kind, "not-waiting");
+  assert.equal(outcome.kind, "guided");
+  assert.equal(outcome.kind === "guided" ? outcome.resumable : undefined, true, "parked needs a resume");
   assert.deepEqual(unknown, { kind: "unknown-task" });
+
+  // In the journal, which is what the next session's prompt is built from — the assertion
+  // that matters, because a reply saying "noted" over a journal that was never written is the
+  // failure this replaced with extra steps.
+  const journal = await store.readJournal(TASK);
+  assert.match(String(journal), /Guidance from the operator/);
+  assert.match(String(journal), /the criteria are unmeasurable/);
+
+  // And the streak is forgiven, for `applyAnswer`'s reason: a task resumed at the no-progress
+  // limit parks again on the very next claim having run nothing at all.
+  const state = await store.readState(TASK);
+  assert.equal(state.progress.noProgressStreak, 0);
+});
+
+test("guidance resets the council's round count, and a bare resume does not", async () => {
+  // The whole reason the guidance path exists. BS-1539374658363854934 was sent back 13 times
+  // against a cap of 3: park at 3, `/resume`, one more rejection, park at 4, and so on ten
+  // times over — because `/resume` deliberately forgives no budget (§12.1) and there was no
+  // way to put anything new into the loop. Guidance IS something new in the loop, which is
+  // exactly what the cap exists to detect the absence of.
+  const STALLED = asTaskId("SMOKE-ROUNDS-1");
+  await seedTask(STALLED);
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  const seeded = await store.readState(STALLED);
+  await store.writeState({
+    ...seeded,
+    status: "parked",
+    review: { rounds: 3, last: "changes", reason: "**Criteria** — unmeasurable." },
+  });
+  await store.commitAndPush(`chore(${STALLED}): stalled`, "origin", config.stateRepo.branch);
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const guided = await inbox.submit({ kind: "answer", task: STALLED, text: "cut it into two tasks" });
+  assert.equal(guided.kind, "guided");
+  assert.equal(guided.kind === "guided" ? guided.roundsCleared : undefined, true);
+
+  const resumed = await inbox.submit({ kind: "resume", task: STALLED });
+  assert.equal(resumed.kind, "resumed");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const after = await store.readState(STALLED);
+  assert.equal(after.review?.rounds, 0, "the plan gets a full set of attempts at the new advice");
+  // The verdict itself is NOT erased: a human resuming wants to see what they are answering,
+  // and `/task` reads both fields from here.
+  assert.equal(after.review?.last, "changes");
+  assert.match(String(after.review?.reason), /unmeasurable/);
 });
 
 test("a blocking verdict sends the task back, and a stalemate parks it", async () => {
@@ -4127,4 +4204,149 @@ test("two slots writing state at once commit their own content, not each other's
 
   await retire(A);
   await retire(B);
+});
+
+test("a park talks in the task's own thread, not in the channel", async () => {
+  // THE routing bug. Every other outcome of a review round reached the thread through
+  // `notifyTask`; `park` was the one call site that dropped the thread id, so a plan sent back
+  // for the third time appeared in the thread and the park that ENDED it appeared in
+  // #caterpillar. Read from the thread, the conversation simply stopped — and `plan-stalled`'s
+  // own prose says "say what to change — here in this thread", which was being posted
+  // somewhere that is not the thread.
+  const THREADED = asTaskId("SMOKE-THREAD-1");
+  const THREAD_ID = "1539374658363854934";
+  // Seeded AT its session limit, so `checkLimits` parks it before any session runs. The
+  // routing under test is `park`'s, and driving a real session to reach it would only add
+  // ways for the test to be slow.
+  await seedTask(THREADED, {
+    chat: { threadId: THREAD_ID },
+    sessions: 20,
+    limits: { maxSessions: 20 },
+  });
+
+  const targets: (string | undefined)[] = [];
+  const kinds: string[] = [];
+  const notifier: Notifier = {
+    notify: (notification, target) => {
+      kinds.push(notification.kind);
+      targets.push(target?.threadId);
+      return Promise.resolve();
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session should run")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier,
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  for (let attempt = 0; attempt < 200 && kinds.length === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(kinds.length > 0, "nothing was notified at all");
+  assert.deepEqual(
+    [...new Set(targets)],
+    [THREAD_ID],
+    "every notification about a task with a thread belongs in that thread",
+  );
+});
+
+test("a steer typed while a session runs reaches it, and lands in the journal", async () => {
+  // Issue 4 end to end, through the real inbox and the real slot routing. What the session
+  // gets is asserted from inside the fake runner, and what SURVIVES is asserted from the
+  // journal — because the journal is what the next session reads, and a steer that reached a
+  // session and left no trace is one an interrupted session loses silently.
+  const STEERED_TASK = asTaskId("SMOKE-STEER-1");
+  await seedTask(STEERED_TASK);
+
+  const inbox = new InMemoryChatQueue();
+  const seen: string[] = [];
+  let started: (() => void) | undefined;
+  const firstTurn = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: async (spec, _state, _signal, steering) => {
+        if (spec.id !== STEERED_TASK) throw new Error("session not under test");
+        // Stand in for pi's turn boundary: subscribe, tell the test we are live, and wait for
+        // something to arrive.
+        steering?.subscribe((text) => seen.push(text));
+        started?.();
+        for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return {
+          reason: "handoff" as const,
+          usage: EMPTY_USAGE,
+          contextTokens: 10,
+          summary: "took the advice",
+        };
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await firstTurn;
+
+  const outcome = await inbox.submit({
+    kind: "answer",
+    task: STEERED_TASK,
+    text: "use the existing migration path",
+  });
+  assert.deepEqual(outcome, { kind: "steered" }, "a running task is steered, never journalled here");
+
+  for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.deepEqual(seen, ["use the existing migration path"], "the live session never got it");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  const journal = await store.readJournal(STEERED_TASK);
+  assert.match(String(journal), /Steered by the operator/);
+  assert.match(String(journal), /use the existing migration path/);
 });

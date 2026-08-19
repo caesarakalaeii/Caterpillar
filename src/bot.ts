@@ -153,25 +153,30 @@ const main = async (): Promise<void> => {
   // autocomplete never hangs. The box is therefore typed by hand here rather than
   // completed — the brainstorm still starts, because the supervisor validates the repo
   // when it drains the intent, where the credential actually lives.
-  const bridge = new DiscordBridge({
-    bot,
-    inbox: plane.chat,
-    snapshot: plane.snapshot,
-    threads,
-    logger,
-    leadership: lock,
-  });
-
   // The index decides ROUTING; the router decides DELIVERY, and they are not the same
   // question here. The bot's index arrives over Redis and is legitimately behind, so a
   // thread bound seconds ago — or one this process has never heard of — must still reach
   // the bridge to be answered honestly. Without this the gateway filter consulted the same
   // index the bridge would, and dropped precisely the messages the bridge had an answer
   // for. See `ThreadRouter`.
+  //
+  // Built BEFORE the bridge, because the bridge takes it too now: an interaction from a
+  // thread no binding names — `/resume` on a parked task is always one — was refused outright
+  // until the gate could ask this instead of asking the index (§7.1).
   const router = new ThreadRouter({
     channelId: bot.channelId,
     index: threads,
     parentOf: (channelId) => bot.parentChannel(channelId),
+  });
+
+  const bridge = new DiscordBridge({
+    bot,
+    inbox: plane.chat,
+    snapshot: plane.snapshot,
+    threads,
+    router,
+    logger,
+    leadership: lock,
   });
 
   const gateway = new DiscordGateway({
@@ -179,7 +184,8 @@ const main = async (): Promise<void> => {
     channelId: bot.channelId,
     threads: router,
     logger,
-    onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
+    onMessage: (content, author, channelId, messageId) =>
+      bridge.handleMessage(content, author, channelId, messageId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
   });
 

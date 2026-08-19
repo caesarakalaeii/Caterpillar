@@ -18,14 +18,16 @@
  * snapshot, inside the acknowledgement budget, because going through the loop for a
  * listing would mean waiting on a session to end before finding out what it is doing.
  */
+import type { TaskId } from "../domain/task.ts";
 import type { RepoCatalog } from "../forge/reach.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import { brainstormId } from "../plan/brainstorm.ts";
 import type { ChatSubmitter } from "../redis/inbox.ts";
 import type { SnapshotReader } from "../redis/snapshot.ts";
+import type { ChatOutcome } from "../supervisor/inbox.ts";
 import type { DiscordBot } from "./bot.ts";
 import { parseCommand, type Command } from "./commands.ts";
-import { answerModal, disableAll, type ActionRow } from "./components.ts";
+import { answerModal, button, BUTTON_STYLE, disableAll, row, rows, type ActionRow } from "./components.ts";
 import type { FetchLike } from "./http.ts";
 import {
   autocomplete,
@@ -60,6 +62,20 @@ export interface BridgeDeps {
   /** Thread ↔ task, so a reply in a thread needs no task id (§14.3). */
   readonly threads?: ThreadIndex;
   /**
+   * "Is this channel a thread of ours", for a channel no binding names.
+   *
+   * The gateway has had this for MESSAGES since `ThreadRouter` was written; interactions did
+   * not, and the gap is what made `/resume` unusable in the one place it is wanted. The gate
+   * below consulted `ThreadIndex.knows`, bindings dropped a task the moment it parked, and
+   * `/resume` only ever addresses a parked or failed task — so the command was refused with
+   * "I only act in #caterpillar and its threads" in the thread of the very task it names.
+   *
+   * Mostly unreached now, because an INTERACTION carries `channel.parent_id` and the check is
+   * therefore free (see `fromOurChannel`). It is the fallback for a client or an event that
+   * does not send it, and for the same honesty reason the message path has one.
+   */
+  readonly router?: { deliverable(channelId: string): Promise<boolean> };
+  /**
    * Whether THIS replica is the one that acts on Discord (DESIGN.md §7).
    *
    * Absent means yes, which keeps a single-replica runner and every test that predates
@@ -86,6 +102,26 @@ export interface BridgeDeps {
   readonly repos?: RepoCatalog;
   readonly fetch?: FetchLike;
 }
+
+/**
+ * The reaction that says a steer reached the session (§7.3).
+ *
+ * Eyes rather than a tick: a tick claims the agent has acted on it, and all that is actually
+ * known at this point is that it is queued for the next turn boundary.
+ */
+const STEERED = "\u{1F440}";
+
+/**
+ * The Resume button under a reply that recorded guidance, or nothing.
+ *
+ * Only for a task that needs a human to restart it. On a `ready` or `running` task a Resume
+ * button is an act with no effect, offered to somebody who was told to press it — and
+ * `describeOutcome` says "the next session reads it" for exactly those.
+ */
+const resumeRow = (task: TaskId, outcome: ChatOutcome): readonly ActionRow[] | undefined =>
+  outcome.kind === "guided" && outcome.resumable
+    ? rows(row(button({ action: { verb: "res", task }, label: "Resume", style: BUTTON_STYLE.primary })))
+    : undefined;
 
 /** Discord caps a thread name at 100 characters, and a long one reads badly anyway. */
 const threadName = (topic: string): string => {
@@ -120,15 +156,26 @@ export class DiscordBridge {
    * refining an idea means many short answers, and retyping `BS-1537…` before each of
    * them is exactly the friction this set out to remove.
    */
-  async handleMessage(content: string, author: string, channelId: string): Promise<void> {
+  async handleMessage(
+    content: string,
+    author: string,
+    channelId: string,
+    /**
+     * The message's own id, when the caller has it — the gateway always does.
+     *
+     * Only used to react to it (§7.3). Optional so that every existing caller and test keeps
+     * working, and its absence degrades to saying the acknowledgement in words.
+     */
+    messageId?: string,
+  ): Promise<void> {
     if (!this.acts()) return;
-    const thread = this.deps.threads?.taskFor(channelId);
+    const thread = await this.resolveThread(channelId);
 
-    // A message in a thread we do not have a binding for. Ordinarily unreachable — the
-    // gateway only delivers from the channel and from threads the index knows — but
-    // routine for the STANDALONE bot (§7), whose index arrives over Redis from the
-    // supervisor and is therefore briefly stale: a thread bound seconds ago by a
-    // supervisor that has not yet published, or a bot that started before any supervisor.
+    // A message in a thread nothing can name. Ordinarily unreachable — the gateway delivers
+    // from the channel, from threads the index knows, and from threads whose parent is ours —
+    // but routine for the STANDALONE bot (§7), whose index arrives over Redis from the
+    // supervisor and is therefore briefly stale: a thread bound seconds ago by a supervisor
+    // that has not yet published, or a bot that started before any supervisor.
     //
     // The answer must be a message rather than silence. In a bound thread everything typed
     // IS the answer, so a human typing into one that looks unbound gets no reply at all,
@@ -156,16 +203,78 @@ export class DiscordBridge {
         task: command.task,
         text: command.text,
       });
-      // Talking in a thread while the agent is working is ORDINARY, not an error. Every
-      // line here is now an answer, so replying "not waiting on an answer" to each one
-      // would turn a conversation into a wall of refusals. The typing indicator is what
-      // says the agent is busy.
-      if (outcome.kind === "not-waiting") return;
-      await this.say(describeOutcome(command.task, outcome), channelId);
+
+      // Talking in a thread while the agent is working is ORDINARY, not an error, and
+      // answering each line with a message would turn a conversation into a wall of receipts
+      // (§14.3: refining an idea is many short replies). §7.1 chose silence for that reason.
+      //
+      // Silence was still the wrong answer, because the two things it covered were not alike:
+      // "the session has it" and "it was thrown away" looked identical, and until §7.3 the
+      // second was what actually happened. So a steer is acknowledged on the human's OWN
+      // message with a reaction — no new line in the thread — and everything else, which is
+      // one message rather than one per reply, is answered in words.
+      if (outcome.kind === "steered") {
+        const reacted =
+          messageId === undefined
+            ? false
+            : await this.deps.bot.react(channelId, messageId, STEERED).catch(() => false);
+        // Only when the reaction could not be added. A silent failure here would put us back
+        // where we started, with a human unable to tell delivery from discard.
+        if (!reacted) await this.say(describeOutcome(command.task, outcome), channelId);
+        return;
+      }
+
+      await this.say(describeOutcome(command.task, outcome), channelId, resumeRow(command.task, outcome));
       return;
     }
 
     await this.say(await this.execute(command, author), channelId);
+  }
+
+  /**
+   * Which task a channel is the thread of, if any.
+   *
+   * Two sources, in order of authority:
+   *
+   * The published binding, which is the only one that can speak for a task whose thread it
+   * does not own outright — a plan's children inherit their brainstorm's thread, and which of
+   * them a message belongs to is a decision (`threadBindings`) rather than a derivation.
+   *
+   * Then the derivation. A brainstorm's id IS its thread id (§14.3), so `BS-<channel>` names
+   * the task without a lookup table, and the snapshot is asked only whether that task exists.
+   * This covers the two cases a binding cannot: an index that has not caught up, and a
+   * brainstorm that is `done` — deliberately unbound, because there is nothing to ask a
+   * finished task, but still owed an honest answer rather than "I am still catching up".
+   */
+  private async resolveThread(channelId: string): Promise<TaskId | undefined> {
+    const bound = this.deps.threads?.taskFor(channelId);
+    if (bound !== undefined) return bound;
+    if (channelId === this.deps.bot.channelId) return undefined;
+
+    const derived = brainstormId(channelId);
+    const known = await this.deps.snapshot.find(derived).catch(() => undefined);
+    return known === undefined ? undefined : derived;
+  }
+
+  /**
+   * Is this channel the one we act in, or a thread of it?
+   *
+   * Three answers in cost order, and the first is why this is cheap enough to sit in front of
+   * every interaction: Discord sends a partial `channel` on an interaction and it carries
+   * `parent_id`, so a thread of our channel is provable from the payload — no binding, no REST
+   * call, nothing that can be stale, and nothing that spends any of the three seconds an
+   * interaction has. `MESSAGE_CREATE` carries no parent, which is why the message path needs
+   * `ThreadRouter` and this mostly does not.
+   *
+   * The binding is second because it is the one that can be WRONG in the safe direction only:
+   * a thread it names is certainly ours. The router is last and is the fallback for a payload
+   * with no `channel` object, which is what a component interaction from an older client sends.
+   */
+  private async fromOurChannel(channelId: string, interaction: Interaction): Promise<boolean> {
+    if (channelId === this.deps.bot.channelId) return true;
+    if (interaction.channel?.parent_id === this.deps.bot.channelId) return true;
+    if (this.deps.threads?.knows(channelId) === true) return true;
+    return (await this.deps.router?.deliverable(channelId).catch(() => false)) ?? false;
   }
 
   /**
@@ -218,12 +327,18 @@ export class DiscordBridge {
     // restricts it to one channel deliberately: a bot that acts anywhere it is visible
     // is a bot anyone in the guild can drive.
     //
-    // OUR THREADS COUNT. They were not on this list at first, and the effect was that
-    // every button posted into a brainstorm thread answered "I only act in #caterpillar"
-    // — the Answer button under a question was dead on arrival, in the one place
-    // questions are asked.
+    // OUR THREADS COUNT, and getting that right has taken three goes. First they were not on
+    // the list at all, so every button posted into a brainstorm thread answered "I only act in
+    // #caterpillar" — the Answer button under a question was dead on arrival, in the one place
+    // questions are asked. Then the list was `ThreadIndex.knows`, which is a BINDING, and
+    // bindings dropped a task the moment it went terminal: `/resume` addresses nothing but
+    // parked and failed tasks, so the command was refused in the thread of the very task it
+    // names, and the park notification asking for it was posted to the channel besides.
+    //
+    // The test is now "is this a thread of our channel", which is what §7's rule actually
+    // means and is a question about the CHANNEL rather than about any task's status.
     const from = interaction.channel_id;
-    if (from !== undefined && from !== bot.channelId && this.deps.threads?.knows(from) !== true) {
+    if (from !== undefined && !(await this.fromOurChannel(from, interaction))) {
       await this.answer(
         interaction,
         reply(`I only act in <#${bot.channelId}> and its threads.`, { ephemeral: true }),
@@ -231,8 +346,16 @@ export class DiscordBridge {
       return;
     }
 
-    const intent = parseInteraction(interaction);
-    logger.info("bridge.interaction", { kind: intent.kind, type: interaction.type, author: who });
+    // Resolved before parsing, so `/resume` and `/cancel` in a thread need no task id — the
+    // same friction `parseCommand` removed for messages (§7.1).
+    const thread = from === undefined ? undefined : await this.resolveThread(from);
+    const intent = parseInteraction(interaction, thread === undefined ? {} : { thread });
+    logger.info("bridge.interaction", {
+      kind: intent.kind,
+      type: interaction.type,
+      author: who,
+      ...(thread === undefined ? {} : { thread }),
+    });
 
     switch (intent.kind) {
       case "ignored":
@@ -431,9 +554,17 @@ export class DiscordBridge {
   }
 
   /** Say something in the channel. Never throws — a lost reply must not unwind a click. */
-  private async say(content: string, channelId?: string): Promise<void> {
+  private async say(
+    content: string,
+    channelId?: string,
+    components?: readonly ActionRow[],
+  ): Promise<void> {
     await this.deps.bot
-      .postMessage({ content, ...(channelId === undefined ? {} : { channelId }) })
+      .postMessage({
+        content,
+        ...(channelId === undefined ? {} : { channelId }),
+        ...(components === undefined ? {} : { components }),
+      })
       .catch((error: unknown) => {
         this.deps.logger.warn("bridge.reply-failed", {
           error: error instanceof Error ? error.message : String(error),

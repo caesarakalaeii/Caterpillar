@@ -16,6 +16,7 @@ import { createModels, type Api, type Model } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { ContextBudget } from "./limits.ts";
 import { runSession } from "./session.ts";
+import { SlotSteering } from "./steering.ts";
 
 /** Verbatim from `tasks/BS-…-01/sessions/005.jsonl.gz` in the state repo. */
 const SPEND_LIMIT =
@@ -26,6 +27,7 @@ const SPEND_LIMIT =
 const run = async (
   responses: readonly ReturnType<typeof fauxAssistantMessage>[],
   signal?: AbortSignal,
+  steering?: SlotSteering,
 ) => {
   const faux = fauxProvider({ models: [{ id: "faux-model", contextWindow: 200_000, maxTokens: 4096 }] });
   const models = createModels();
@@ -49,6 +51,7 @@ const run = async (
     // test that is about the ceiling builds its own session below.
     timeoutSeconds: 3600,
     ...(signal === undefined ? {} : { signal }),
+    ...(steering === undefined ? {} : { steering }),
   });
 };
 
@@ -154,4 +157,59 @@ test("a session whose provider never answers is stopped by its own wall clock", 
   assert.equal(result.outcome.reason, "interrupted", "the wall clock must stop it");
   assert.ok(elapsed >= 200, `it must not stop before its ceiling (${elapsed}ms)`);
   assert.ok(elapsed < 15_000, `nor run on past it (${elapsed}ms)`);
+});
+
+test("a steer typed before the session starts reaches the transcript", async () => {
+  // The backlog path: a previous session was interrupted between the message arriving and
+  // the turn boundary that would have read it. The session replacing it is the one that
+  // should act on it, so `take()` is drained into pi's queue before the first request.
+  const steering = new SlotSteering();
+  steering.push("use the existing migration path");
+
+  const result = await run(
+    [fauxAssistantMessage("looking"), fauxAssistantMessage("adjusted")],
+    undefined,
+    steering,
+  );
+
+  const users = result.messages.filter((m) => m.role === "user");
+  assert.equal(users.length, 2, "the steer should be a second user message, not a lost one");
+  assert.match(
+    JSON.stringify(users[1]),
+    /use the existing migration path/,
+    "the operator's own words have to survive the framing",
+  );
+});
+
+test("a steer is attributed to the operator, never left to read as the agent's own note", async () => {
+  const steering = new SlotSteering();
+  steering.push("drop the third task");
+
+  const result = await run(
+    [fauxAssistantMessage("one"), fauxAssistantMessage("two")],
+    undefined,
+    steering,
+  );
+
+  const steered = result.messages.filter((m) => m.role === "user").at(-1);
+  assert.match(JSON.stringify(steered), /Message from the operator/);
+});
+
+test("the feed is unsubscribed when the session ends", async () => {
+  // The feed belongs to the SLOT and outlives the session. A listener left behind delivers
+  // the next human sentence into an `Agent` that has already finished, which loses it.
+  const steering = new SlotSteering();
+  await run([fauxAssistantMessage("done")], undefined, steering);
+
+  steering.push("after the session");
+  assert.deepEqual(
+    steering.take(),
+    ["after the session"],
+    "a message arriving after the session must be buffered for the next one",
+  );
+});
+
+test("a session with no feed runs exactly as it did", async () => {
+  const result = await run([fauxAssistantMessage("done")]);
+  assert.equal(result.messages.filter((m) => m.role === "user").length, 1);
 });

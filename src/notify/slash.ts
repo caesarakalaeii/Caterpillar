@@ -94,9 +94,11 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
     options: [
       {
         name: "id",
-        description: "Task id",
+        description: "Task id. Optional in a task's own thread.",
         type: OPTION_STRING,
-        required: true,
+        // `required: true` is enforced by the CLIENT, so an option the thread can supply
+        // has to be declared optional here or the default below is unreachable.
+        required: false,
         autocomplete: true,
       },
     ],
@@ -129,27 +131,28 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
     options: [
       {
         name: "task",
-        description: "Task id",
+        description: "Task id. Optional in a task's own thread.",
         type: OPTION_STRING,
-        required: true,
+        required: false,
         autocomplete: true,
       },
     ],
   },
   {
     name: "resume",
-    description: "Put a parked task back in the queue",
+    description: "Put a parked or failed task back in the queue",
     options: [
       {
         name: "task",
-        description: "Task id",
+        description: "Task id. Optional in a task's own thread.",
         type: OPTION_STRING,
-        required: true,
+        required: false,
         autocomplete: true,
       },
     ],
   },
 ];
+
 
 /**
  * What an interaction asks for.
@@ -170,10 +173,33 @@ export type Intent =
   /** Not ours, or no longer ours. Acknowledged and dropped. */
   | { readonly kind: "ignored"; readonly reason: string };
 
-export const parseInteraction = (interaction: Interaction): Intent => {
+/**
+ * What the surrounding conversation already says, so a command need not repeat it.
+ *
+ * `thread` is the task the channel this was typed in belongs to, resolved by the bridge
+ * before parsing. Kept as a parameter rather than read out of the payload because this
+ * module is pure: the resolution needs the thread index, which needs a socket and a REST
+ * client, and neither belongs in a function whose whole value is being testable without
+ * them.
+ *
+ * `/task`, `/cancel` and `/resume` take it. `/answer` deliberately does NOT, and that is
+ * not an oversight: in a task's own thread every message is already the answer
+ * (`parseCommand`), so the command only exists there to answer a DIFFERENT task and its id
+ * has to stay explicit. Defaulting it would also force `text` ahead of it in the option
+ * order, reshaping the one command people type from muscle memory. `/brainstorm` mints an
+ * id rather than naming one, and `/tasks` names none.
+ */
+export interface InteractionContext {
+  readonly thread?: TaskId;
+}
+
+export const parseInteraction = (
+  interaction: Interaction,
+  context: InteractionContext = {},
+): Intent => {
   switch (interaction.type) {
     case INTERACTION.command:
-      return fromCommand(interaction);
+      return fromCommand(interaction, context);
     case INTERACTION.component:
       return fromComponent(interaction);
     case INTERACTION.modalSubmit:
@@ -224,9 +250,21 @@ const unlabelled = (value: string): string => {
  * constraint, and Discord submits whatever was typed. The id becomes a directory name
  * under `tasks/`, so a `../` reaching the store is the failure this prevents.
  */
-const taskOption = (interaction: Interaction, name: string): TaskId | string => {
+const taskOption = (
+  interaction: Interaction,
+  name: string,
+  context: InteractionContext = {},
+): TaskId | string => {
   const raw = optionValue(interaction, name);
-  if (raw === undefined || raw.trim().length === 0) return `\`${name}\` is required.`;
+  if (raw === undefined || raw.trim().length === 0) {
+    // The thread is the id. An explicit option still wins — answering or resuming a
+    // DIFFERENT task from inside a thread has to stay possible, or the option is decoration.
+    if (context.thread !== undefined) return context.thread;
+    return (
+      `\`${name}\` is required outside a task's own thread — type it there and I can ` +
+      `tell which task you mean.`
+    );
+  }
   const trimmed = unlabelled(raw.trim());
   return isTaskId(trimmed) ? asTaskId(trimmed) : `\`${trimmed}\` is not a task id.`;
 };
@@ -278,7 +316,7 @@ const splitRepos = (raw: string): readonly string[] =>
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
 
-const fromCommand = (interaction: Interaction): Intent => {
+const fromCommand = (interaction: Interaction, context: InteractionContext): Intent => {
   const name = interaction.data?.name;
 
   switch (name) {
@@ -306,15 +344,15 @@ const fromCommand = (interaction: Interaction): Intent => {
       };
     }
     case "task": {
-      const task = taskOption(interaction, "id");
+      const task = taskOption(interaction, "id", context);
       return isTaskId(task) ? { kind: "run", command: { kind: "show", task } } : malformed(task);
     }
     case "cancel": {
-      const task = taskOption(interaction, "task");
+      const task = taskOption(interaction, "task", context);
       return isTaskId(task) ? { kind: "run", command: { kind: "park", task } } : malformed(task);
     }
     case "resume": {
-      const task = taskOption(interaction, "task");
+      const task = taskOption(interaction, "task", context);
       return isTaskId(task) ? { kind: "run", command: { kind: "resume", task } } : malformed(task);
     }
     case "brainstorm": {
@@ -358,6 +396,8 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "run", command: { kind: "park", task: action.task } };
     case "merge":
       return { kind: "run", command: { kind: "merge", task: action.task } };
+    case "res":
+      return { kind: "run", command: { kind: "resume", task: action.task } };
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }

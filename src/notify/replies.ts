@@ -28,7 +28,13 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
           // run nothing. Saying otherwise sends the human away expecting work to happen.
           `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again on the next claim, without running, unless the limit is raised.`;
     case "not-resumable":
-      return `**${task}** is \`${outcome.status}\`, not \`parked\` — nothing was written.`;
+      // Names both, because `failed` was added to `RESUMABLE` and this line was not: it told
+      // a human that a `running` task was "not parked", which is true and answers a question
+      // nobody asked.
+      return (
+        `**${task}** is \`${outcome.status}\` — only \`parked\` and \`failed\` tasks come back. ` +
+        `Nothing was written.`
+      );
     case "merged":
       return `Merged **${task}** — ${outcome.prUrl}`;
     case "started":
@@ -39,8 +45,24 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return `Could not merge **${task}**: ${outcome.reason}`;
     case "unknown-task":
       return `No task **${task}** in the state repo. Check the id from its notification.`;
+    case "guided":
+      return guidedReply(task, outcome);
+    case "steered":
+      // Deliberately not a message the bridge posts. A steer is acknowledged with a reaction
+      // on the human's own message (§7.3) — refining an idea is many short replies, and a
+      // line of confirmation under each one turns a conversation into a wall of receipts.
+      // This wording exists for `/answer`, which is a command and does expect a reply.
+      return `Sent to the session working **${task}**. It reads it at the end of its current step.`;
+    case "finished":
+      return (
+        `**${task}** is \`done\` — it passed every gate and merged, so there is nothing to ` +
+        `send back to. \`/brainstorm\` is how new work starts from here.`
+      );
     case "not-waiting":
-      return `**${task}** is \`${outcome.status}\`, not waiting on an answer — nothing was written.`;
+      return (
+        `**${task}** is \`${outcome.status}\` and I could not reach the runner working it, so ` +
+        `nothing was recorded. Try again in a moment.`
+      );
     case "not-parkable":
       return `**${task}** is already \`${outcome.status}\` — nothing was written.`;
     case "cancelling":
@@ -51,6 +73,33 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
     case "failed":
       return `Could not act on **${task}**: ${outcome.error}`;
   }
+};
+
+/**
+ * What was done with guidance, and what is left for the human to do.
+ *
+ * Three things have to be in it, and all three were missing from the surface this replaces —
+ * which said nothing at all. That it was RECORDED, because the alternative reading of silence
+ * is that it was discarded, and for a long time that reading was correct. That the council's
+ * round budget was forgiven, because a resume that did not forgive it buys one more round and
+ * parks again, and a human who is not told that concludes the guidance was ignored. And the
+ * way back, once, at the end — a Resume button rides on this reply, so the text names the
+ * command for the case where a button cannot be attached.
+ */
+const guidedReply = (
+  task: TaskId,
+  outcome: ChatOutcome & { readonly kind: "guided" },
+): string => {
+  const noted =
+    outcome.notes <= 1 ? "Noted" : `Noted — ${outcome.notes} notes on **${task}** now`;
+  const cleared = outcome.roundsCleared
+    ? " The council's round count is back to zero, so it gets a full set of attempts."
+    : "";
+  const next = outcome.resumable
+    ? ` Nothing runs until it is resumed: press the button, or \`/resume ${task}\`.`
+    : " The next session reads it before it starts.";
+
+  return `${noted}.${cleared}${next}`;
 };
 
 /** Statuses in the order the header counts them — the arc a task travels. */
@@ -162,12 +211,15 @@ const reviewLines = (task: TaskSummary): readonly string[] => {
     "",
     // Keyed on status, not on the task's kind, because the summary does not carry the kind
     // and guessing it from the id prefix would be wrong for exactly the tasks a plan cut.
-    task.status === "parked"
-      ? `It will not be picked up again on its own. Say what to change — in its thread, or ` +
-        `\`/answer ${task.id} <what to change>\` — then \`/resume ${task.id}\`` +
+    task.status === "parked" || task.status === "failed"
+      ? `It will not be picked up again on its own. Say what to change in its thread — that ` +
+        `resets the round count — then \`/resume ${task.id}\`` +
         (task.prUrl === undefined ? "." : `, or \`/merge ${task.id}\` to take the PR as it stands.`)
-      : `It goes back to the agent by itself. To steer it, say what to change in its thread ` +
-        `before the next session starts.`,
+      : task.status === "running"
+        ? `Say what to change in its thread and the session picks it up at the end of its ` +
+          `current step — it does not have to be restarted.`
+        : `It goes back to the agent by itself. Say what to change in its thread and the next ` +
+          `session reads it before it starts.`,
   ];
 };
 

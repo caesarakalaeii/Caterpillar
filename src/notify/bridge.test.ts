@@ -28,6 +28,14 @@ import { ANSWER_FIELD } from "./slash.ts";
 const TASK = asTaskId("GH-acme-widget-42");
 const CHANNEL = "1537550186388258866";
 const THREAD = "1537785980415778816";
+/**
+ * A brainstorm thread whose task is PARKED, and whose id is derived from it.
+ *
+ * `BS-<threadId>` is a brainstorm's id by construction (§14.3), which is what lets the bridge
+ * resolve a thread the index has no binding for — the case `/resume` is always in.
+ */
+const PARKED_THREAD = "1539374658363854934";
+const PARKED_TASK = asTaskId(`BS-${PARKED_THREAD}`);
 const API = "https://discord.test/api/v10";
 
 interface Call {
@@ -55,6 +63,9 @@ const harness = (
     readonly threads?: ThreadIndex;
     readonly leadership?: { readonly held: () => boolean };
     readonly repos?: { reachable: () => Promise<readonly string[]> };
+    /** False makes every reaction fail, as an installation without `ADD_REACTIONS` does. */
+    readonly reactions?: boolean;
+    readonly router?: { deliverable: (channelId: string) => Promise<boolean> };
   } = {},
 ): {
   readonly bridge: DiscordBridge;
@@ -68,11 +79,20 @@ const harness = (
       method: init?.method ?? "GET",
       body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
     });
+    // Discord's own answer to a bot without `ADD_REACTIONS`, so the fallback is exercised
+    // against the status the real API returns rather than a thrown stub.
+    if (over.reactions === false && url.includes("/reactions/")) {
+      return Promise.resolve(new Response(JSON.stringify({ message: "Missing Permissions" }), { status: 403 }));
+    }
     return Promise.resolve(new Response(JSON.stringify({ id: "999" }), { status: 200 }));
   };
 
   const snapshot = new InMemorySnapshotStore();
-  void snapshot.replace([summarise(state()), summarise(state({ id: asTaskId("GH-acme-widget-7"), status: "ready" }))]);
+  void snapshot.replace([
+    summarise(state()),
+    summarise(state({ id: asTaskId("GH-acme-widget-7"), status: "ready" })),
+    summarise(state({ id: PARKED_TASK, status: "parked", chat: { threadId: PARKED_THREAD } })),
+  ]);
 
   const inbox = new InMemoryChatQueue();
   const bridge = new DiscordBridge({
@@ -84,6 +104,7 @@ const harness = (
     // Absent means "act", so every test written before the fleet existed still applies.
     ...(over.leadership === undefined ? {} : { leadership: over.leadership }),
     ...(over.repos === undefined ? {} : { repos: over.repos }),
+    ...(over.router === undefined ? {} : { router: over.router }),
     fetch,
   });
 
@@ -335,18 +356,78 @@ test("plain chat in a thread is submitted as that task's answer", async () => {
   assert.match(String((posted(calls)[0]?.body ?? {})["content"]), /Answered/);
 });
 
-test("chatting while the agent is busy says nothing at all", async () => {
-  // Every line in a thread is an answer now, so replying "not waiting on an answer" to
-  // each one would turn a conversation into a wall of refusals.
+test("chatting while the agent is busy is acknowledged on the message, not in the thread", async () => {
+  // §7.1 chose SILENCE here, to stop a conversation of many short replies becoming a wall of
+  // receipts. It was right about the noise and wrong about the silence: "the session has it"
+  // and "it was discarded" looked identical, and until §7.3 the second was what happened.
+  //
+  // So the acknowledgement moves onto the human's OWN message. No new line in the thread, and
+  // no ambiguity about whether anything received it.
   const threads = new ThreadIndex();
   threads.bind(THREAD, TASK);
   const { bridge, inbox, calls } = harness({ threads });
 
-  const handled = bridge.handleMessage("actually, hold on", "operator", THREAD);
-  await settleQueued(inbox, { kind: "not-waiting", status: "running" });
+  const handled = bridge.handleMessage("actually, hold on", "operator", THREAD, "5551212");
+  await settleQueued(inbox, { kind: "steered" });
   await handled;
 
-  assert.equal(posted(calls).length, 0, "silence is the correct reply to ordinary chat");
+  assert.equal(posted(calls).length, 0, "a steer must not add a line to the conversation");
+  const reaction = calls.find((call) => call.url.includes("/reactions/"));
+  assert.ok(reaction !== undefined, "the human's own message should carry the acknowledgement");
+  assert.equal(reaction?.method, "PUT");
+  assert.match(reaction?.url ?? "", /messages\/5551212\/reactions/);
+});
+
+test("a steer the bot cannot react to is acknowledged in words instead", async () => {
+  // Reactions need `ADD_REACTIONS`, which an existing installation may never have granted. An
+  // ack that silently does not happen is the exact failure this replaced, so the fallback is
+  // not optional.
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, inbox, calls } = harness({ threads, reactions: false });
+
+  const handled = bridge.handleMessage("actually, hold on", "operator", THREAD, "5551212");
+  await settleQueued(inbox, { kind: "steered" });
+  await handled;
+
+  const body = posted(calls)[0]?.body["content"];
+  assert.match(String(body), /current step/);
+});
+
+test("guidance for a parked task comes back with the way out attached", async () => {
+  // The thread of a parked task used to be unbound, so this whole path answered nothing at
+  // all — while the park notification that sent the human here asked them to type in it.
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleMessage("the criteria are unmeasurable", "operator", THREAD, "1");
+  await settleQueued(inbox, { kind: "guided", notes: 1, resumable: true, roundsCleared: true });
+  await handled;
+
+  const message = posted(calls)[0];
+  assert.match(String(message?.body["content"]), /round count/);
+  const attached = message?.body["components"] as readonly { components: { label?: string }[] }[];
+  assert.deepEqual(
+    attached?.flatMap((r) => r.components.map((c) => c.label)),
+    ["Resume"],
+    "a parked task's guidance should not require the human to go and find the command",
+  );
+});
+
+test("guidance for a task that is already claimable offers no button to press", () => {
+  // It is going to run by itself. A Resume button here is an act with no effect, offered to
+  // somebody who was told to press it.
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  const { bridge, inbox, calls } = harness({ threads });
+
+  const handled = bridge.handleMessage("one more thing", "operator", THREAD, "1");
+  return settleQueued(inbox, { kind: "guided", notes: 2, resumable: false, roundsCleared: false })
+    .then(() => handled)
+    .then(() => {
+      assert.equal(posted(calls)[0]?.body["components"], undefined);
+    });
 });
 
 test("a brainstorm thread starts talking before the loop has settled anything", async () => {
@@ -563,4 +644,89 @@ test("a runner with no catalogue still answers the box", async () => {
   );
 
   assert.equal(callback(calls).body["type"], RESPONSE.autocomplete);
+});
+
+test("/resume works in a thread NO binding names, and needs no task id", async () => {
+  // THE `/resume` bug, and both halves of it at once. `/resume` addresses nothing but parked
+  // and failed tasks; bindings used to drop a task the moment it went terminal; and the gate
+  // consulted the bindings. So the command was refused with "I only act in #caterpillar and
+  // its threads" inside a thread of #caterpillar — the thread of the very task it names.
+  //
+  // The gate now reads `channel.parent_id`, which Discord sends on every interaction, so this
+  // works with an EMPTY index: no binding, no REST call, and nothing that can be stale.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      channel_id: PARKED_THREAD,
+      channel: { id: PARKED_THREAD, parent_id: CHANNEL },
+      data: { name: "resume" },
+    }),
+  );
+  await settleQueued(inbox, { kind: "resumed", from: "parked" });
+  await handled;
+
+  // Acknowledged first, as every write is.
+  assert.equal(callback(calls).body["type"], RESPONSE.message);
+  // And the id came from the thread. `BS-<threadId>` is a brainstorm's id by construction
+  // (§14.3), so the thread resolves to a task with no lookup table at all.
+  assert.match(String((posted(calls)[0]?.body ?? {})["content"]), /Resumed/);
+});
+
+test("a thread of our channel is ours even with no binding and no parent_id", async () => {
+  // The fallback for a payload with no `channel` object. Without it the gate would be back to
+  // asking the index, which is the question that was wrong.
+  const looked: string[] = [];
+  const { bridge, inbox, calls } = harness({
+    threads: new ThreadIndex(),
+    router: {
+      deliverable: (channelId) => {
+        looked.push(channelId);
+        return Promise.resolve(true);
+      },
+    },
+  });
+
+  const handled = bridge.handleInteraction(
+    interaction({ channel_id: PARKED_THREAD, data: { name: "resume" } }),
+  );
+  await settleQueued(inbox, { kind: "resumed", from: "parked" });
+  await handled;
+
+  assert.deepEqual(looked, [PARKED_THREAD]);
+  assert.notEqual(inbox.size + posted(calls).length, 0);
+});
+
+test("a command in an unrelated channel is still refused when it has a parent", async () => {
+  // The gate got wider, not absent. A thread of somebody ELSE's channel is not ours, and the
+  // parent is exactly what proves it.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  await bridge.handleInteraction(
+    interaction({
+      channel_id: "8888",
+      channel: { id: "8888", parent_id: "7777" },
+      data: { name: "resume", options: [{ name: "task", value: TASK }] },
+    }),
+  );
+
+  assert.equal(inbox.size, 0);
+  const data = callback(calls).body["data"] as { readonly content: string };
+  assert.match(data.content, /I only act in/);
+});
+
+test("a message in the thread of a task that is DONE says so instead of stalling", async () => {
+  // `threadBindings` keeps `done` out deliberately — there is nothing to ask a task that
+  // passed every gate and merged. Without resolving it anyway, the reply was "I do not know
+  // which task this thread belongs to yet — I am still catching up with the supervisor",
+  // which is a promise that will never be kept.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  const handled = bridge.handleMessage("what happened to the third task?", "operator", PARKED_THREAD, "1");
+  await settleQueued(inbox, { kind: "finished" });
+  await handled;
+
+  const content = String((posted(calls)[0]?.body ?? {})["content"]);
+  assert.doesNotMatch(content, /catching up/);
+  assert.match(content, /brainstorm/);
 });

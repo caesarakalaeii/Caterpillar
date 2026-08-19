@@ -1312,15 +1312,27 @@ to retype. And ordinary chat while the agent is working is answered with **silen
 rather than "not waiting on an answer", which would turn a conversation into a wall of
 refusals.
 
+**§7.3 keeps the first and corrects the second.** Silence was the right answer to the noise
+and the wrong answer to the question, because "the session has it" and "it was discarded"
+looked identical from the thread — and it was discarded. Chat while the agent works is now a
+steer, acknowledged with a reaction on the human's own message, so the conversation gains no
+line and loses no ambiguity. The same argument extends the id-free reading to commands:
+`/resume`, `/cancel` and `/task` take their task from the thread when it is not typed.
+
 **A cancelled task's thread is closed, and stops being listened to.** `/cancel` parks the
-task, says so in the thread, and archives it. The binding rule is what makes that safe:
-only a NON-TERMINAL task's thread is bound, so a finished conversation cannot keep
-accepting messages — and since a message in a bound thread is now an answer, leaving one
-bound means an abandoned thread silently swallows everything typed into it. Several tasks
-can share a thread (a plan's children inherit their brainstorm's), so a parent going
-`done` does not close the thread its children still talk in, and when more than one is
-live the task AWAITING an answer owns it. Nothing is deleted: parking stops the work, and
-the journal is the audit trail.
+task, says so in the thread, and archives it. Several tasks can share a thread (a plan's
+children inherit their brainstorm's), so a parent going `done` does not close the thread its
+children still talk in, and when more than one is live the task AWAITING an answer owns it.
+Nothing is deleted: parking stops the work, and the journal is the audit trail.
+
+**Amended by §7.3.** The binding rule this paragraph relied on — only a NON-TERMINAL task's
+thread is bound — was written because a bound thread with nothing behind it swallows what is
+typed into it. That reasoning was about swallowing rather than about terminality, and it cost
+more than it bought: `parked` is terminal, so the thread of a stalled task was unbound at the
+exact moment its park notification asked the human to type in it. A thread is now bound unless
+the only thing behind it is `done`, and nothing is swallowed because a message to a parked task
+is guidance the loop acts on. `/cancel` still archives, which is a stronger statement than
+unbinding and the one the human actually made.
 
 **`/resume` brings back `parked` AND `failed`, but never `done`.** `failed` was left out
 of the original command, and it was an oversight rather than a decision — the argument for
@@ -1586,6 +1598,166 @@ Published from `survey` (`supervisor/loop.ts`) — the one place in the process 
 read every task's state — which since §6.4's split runs on the **housekeeping** loop. That
 matters more than it looks: on the old single loop the presence would have frozen for the
 whole of a session, which is precisely the interval it exists to describe.
+
+### 7.3 A session can be steered, and a parked task can be argued with
+
+§7 gave a human one way in: the agent calls `ask_human`, the task parks, an answer is
+committed, and the NEXT session reads it out of a file. That is the right shape for a
+question the agent chose to ask. It is the wrong shape — and for a long time it was the
+ONLY shape — for the case a human actually finds themselves in, which is watching a thread
+and being able to see that the session is going the wrong way.
+
+`BS-1539374658363854934` is what that cost. The plan was sent back **13 times** against a
+cap of 3, and every mechanism that was supposed to prevent that worked exactly as designed:
+
+- The council rejected the plan on `feasibility`, `decomposition` and `criteria`.
+- The round cap parked it at 3, as §12.1 says it should.
+- The park notification said: *"Say what to change — here in this thread — then `/resume`."*
+- The human resumed. The same session proposed a similar plan. It was rejected again.
+- Ten times.
+
+Four separate defects, and the reason they are one section rather than four is that each one
+on its own is invisible: a human who cannot type anywhere useful cannot find out that the
+typing was going nowhere.
+
+**The park was posted in the channel, and it named the thread.** Every other outcome of a
+review round reached the thread through `notifyTask`; `park` was the one call site that
+called a `notify(notification, threadId?)` whose thread argument was optional, and omitted
+it. So rounds 1 and 2 appeared in the thread and the park that ENDED the loop appeared in
+`#caterpillar` — read from the thread, the conversation simply stopped. The fix is not that
+`park` now passes the id, it is that **there is no longer a way to send a task notification
+without its thread**: `notifyTask(state, notification)` is the only method, it takes the
+state because every caller has one, and the optional-argument version is gone.
+
+**A parked task's thread was unbound.** `threadBindings` dropped every task `isTerminal`
+called terminal, which includes `parked`, and the argument for it was sound: a bound thread
+with nothing behind it swallows what is typed into it, because the loop answered
+`not-waiting` and the bridge — correctly, under §7.1 — said nothing. But that argument is
+about SWALLOWING, not about terminality, and the two coincided only because there was
+nothing a parked task could be told. Now there is. A thread is bound unless the only thing
+behind it is `done`, which is the one status `/resume` refuses and so the one where a
+message genuinely has nothing to ask for. Where several tasks share a thread, `rank`
+decides: the task awaiting an answer, then one that can still move on its own, then one
+waiting to be resumed — so guidance meant for a running child is not filed against a parked
+sibling.
+
+**`/resume` was refused in the thread of the task it names.** The interaction gate tested
+`ThreadIndex.knows`, which is a BINDING, and `/resume` addresses nothing but parked and
+failed tasks — so the command was refused with *"I only act in #caterpillar and its
+threads"* in a thread of `#caterpillar`. The gate now asks whether the channel is a thread
+of ours, which is what §7's containment rule actually means and is a question about the
+CHANNEL rather than about any task's status. It is answered from
+`interaction.channel.parent_id`, which Discord sends on every interaction and which costs
+nothing — no binding, no REST call, nothing that can be stale, and none of the three seconds
+an interaction has. `MESSAGE_CREATE` carries no parent, which is why the message path still
+needs `ThreadRouter` and this mostly does not.
+
+While the gate was wrong, so were the ergonomics behind it: `/resume`, `/cancel` and `/task`
+required a task id typed into a thread that already identifies one. Their id is now optional
+and defaults to the thread's task. `/answer` deliberately does not — in a task's own thread
+every message is already the answer, so the command only exists there to answer a DIFFERENT
+task, and defaulting it would also force `text` ahead of it in the option order, reshaping
+the one command people type from muscle memory.
+
+**Nothing carried the text anywhere.** `applyAnswer` required `awaiting-human` with an open
+question and returned `not-waiting` otherwise, and the bridge dropped that outcome without a
+word. The human's sentence was read, matched, and discarded — while three separate surfaces
+(`plan-stalled`, `verdict`, and `/task`) told them to type it. So there is now one entry
+point and four answers, decided by what the task is doing rather than by what the bridge can
+see:
+
+| the task is | what a message in its thread does |
+|---|---|
+| `awaiting-human`, question open | the answer file, exactly as §7 always did |
+| `running` | a **steer**, delivered to the live session |
+| `ready`, `parked`, `failed` | **guidance**, journalled for the next session |
+| `done` | nothing to say to it; the reply says so and names `/brainstorm` |
+
+#### Steering, and why pi already had it
+
+A steer is not a restart. `Agent.steer` queues a message and pi's loop drains it at the next
+turn boundary — after the current assistant turn's tool calls finish — so the session keeps
+its context, its worktree and its work, and the message lands within one turn. The
+alternative shape, which is what `ask_human` does, costs a park, a release, a fresh claim and
+a whole context rebuilt from the journal.
+
+`steeringMode` is `all` rather than `one-at-a-time`. Refining an idea is many short replies
+(§14.3), so several messages routinely arrive inside one turn; draining them one per turn
+would spend a provider request on each and deliver the last several turns after it was
+typed, by which point it is advice about work already done.
+
+**What arrives is journalled, not what is consumed.** `shouldStopAfterTurn` exits pi's loop
+BEFORE it polls the steering queue, so a sentence that lands in the same turn as an
+`ask_human` or a handoff is queued and never seen. The journal is what the next session's
+prompt is built from, so recording what arrived puts the guidance back in front of the agent.
+Being wrong that way costs one repeated instruction; being wrong the other way loses a
+human's correction between two sessions, which is the failure this whole section is about.
+
+It is written in `recordSession` and it can only be written there. Writing the state repo
+needs the lease, the session holds it for its whole run, and `recordSession` is the first
+point after the session where the lease is still held and a journal shard is already being
+written. That is also why guidance for a `running` task writes nothing at the time —
+`applyPark` has the same constraint for the same reason — and why the reply for it is
+`steered` rather than `guided`.
+
+**The feed belongs to the SLOT, not the session.** `workTask` drives a task through as many
+sessions as it needs, and a sentence typed during a changeover has nowhere else to wait, so
+`SlotSteering` buffers with nobody subscribed and hands the backlog to the next session's
+`take()`. On the slot rather than on the supervisor for `slot.cancel`'s reason one step
+further: at N slots a steer has to reach ONE session, and the routing is by task id.
+
+Crossing a process boundary is `redis/steering.ts`, which is `cancel.ts` with one difference
+that matters. A cancel is idempotent — the second says nothing the first did not — so a
+single key is a complete record of it. Guidance is not: *"use the existing migration path"*
+and *"and skip the second wave"* are two sentences and losing either loses half of what was
+said. So it is a LIST, drained by the session and by nobody else, expiring after four hours
+— long enough to survive a handoff or a park-and-answer, short of a working day so nothing
+typed today ambushes the session that claims the task tomorrow.
+
+#### The acknowledgement is a reaction
+
+§7.1 answered ordinary chat in a busy thread with SILENCE, to stop a conversation of many
+short replies becoming a wall of receipts. It was right about the noise and wrong about the
+silence: "the session has it" and "it was discarded" looked identical, and until this section
+the second was what actually happened.
+
+So a steer is acknowledged with 👀 on the human's OWN message — no new line in the thread,
+and no ambiguity. Reactions need `ADD_REACTIONS`, which an existing installation may never
+have granted, so `react` returns whether it landed and the bridge says it in words when it
+did not. An acknowledgement that silently fails to happen is the exact defect being fixed.
+
+#### Guidance resets the review rounds, and a bare resume still does not
+
+A deliberate departure from §12.1, which says the round budget is a budget and `/resume` does
+not forgive it. That rule is right for a bare resume and wrong for guidance, and the
+distinction is **information**. The cap exists because the agent and the council can trade a
+task forever with nothing new entering the loop; guidance is precisely something new entering
+the loop, and it is the only thing that is.
+
+Without this the fix does not work. Guidance would land, `/resume` would put the task back at
+13 rounds against a cap of 3, and the next rejection would park it again immediately — so the
+advice would never be tested, and the human would conclude, correctly, that nothing they
+typed had any effect. The argument §7 already makes about `noProgressStreak` ("answering IS
+the progress") reaches the same answer here, and `describeOutcome` states which of the two
+happened rather than letting a human discover it when the task parks itself thirty seconds
+later.
+
+`sessions` is still not forgiven, and neither is `review.last` or `review.reason` — those are
+the record of what the council said, and a human resuming wants to see what they are
+answering.
+
+#### What is deliberately absent
+
+**No `/steer` command.** Every message in a task's thread already is one, and a command
+language in the one place §7.1 removed it would be the same friction arriving under a new
+name.
+
+**Steering is not offered to the council, the plan maintainer or the digest summariser.**
+They all call `runSession` and all pass nothing. They are not the agent, they run for minutes
+rather than hours, and a verdict a human leaned on is not a verdict.
+
+**No steering without a thread.** A task nobody is watching has nobody to steer it, and
+`/answer <id> <text>` from the channel reaches the same code path for the case that needs it.
 
 ---
 
@@ -2722,6 +2894,13 @@ again. Without a ceiling the two can trade a task until the session limit, which
 outside is indistinguishable from a task that is working. At `limits.maxReviewRounds`
 (default 3) the task parks and Discord says so.
 
+**Operator guidance resets the count; a bare `/resume` still does not (§7.3).** The cap
+detects a loop with nothing new entering it, and guidance is the one thing that is new. Left
+unforgiven it made the park unrecoverable rather than terminal: a resume bought exactly one
+more round, so `BS-1539374658363854934` reached 13 rounds against a cap of 3 by being resumed
+ten times with nothing to say. `sessions` is still never forgiven, for this paragraph's
+original reason — that one is a budget, and raising it is a decision.
+
 **Merging needs a second identity.** §9.1 established that "no merging" cannot be a token
 property, and that what actually stops an unreviewed merge is branch protection requiring
 an approving review the App cannot give its own PR. That constraint is unchanged — so the
@@ -2819,6 +2998,12 @@ a human first.
         ↘ changes → back to the same session
         ↘ pass    → child tasks, tagged wave + blockedBy
 ```
+
+A human watching that thread can talk into it at any point, and what a message does depends on
+what the brainstorm is doing: it answers an open `ask_human`, steers the session that is
+proposing, or — once the round cap has parked it — becomes guidance that resets the count and
+offers a Resume button. See §7.3, which exists because none of that was true and the
+notification asking for it said otherwise.
 
 **A brainstorm is a task kind, not a special case.** `kind: brainstorm` in the spec. It
 gets the same lease, the same journal, the same park-and-resume cycle. Two things differ:
@@ -3862,6 +4047,7 @@ So Redis carries what has to cross a process boundary, and only that:
 | task snapshot — the `TaskSummary[]` an autocomplete reads | ✔ | |
 | presence — which runners are alive, for display | ✔ | |
 | cancel signals — reaching a session already running | ✔ | |
+| steering — a human's guidance, reaching that same session (§7.3) | ✔ | |
 | **leases** | | ✔ |
 | **task state** — `state.json`, phase, sessions, usage | | ✔ |
 | **journal, transcripts, artifacts, audit** | | ✔ |
@@ -3934,6 +4120,37 @@ disposable, safe to be wrong. Nothing may route, claim, steal, or decide a lease
 from it. A runner missing from the display is a runner whose last heartbeat did not land,
 which happens for reasons that have nothing to do with whether it is working: a paused pod,
 a slow node, a clock. Those answers come from the lease refs and only from there.
+
+### Steering rides the same crossing, and is a list rather than a key
+
+§7.3's guidance has the same problem a cancel has and one extra property. The problem: the
+submitter is the bot and the reader is a session in the supervisor, and with a separate bot
+those are different pods. The extra property: guidance is not idempotent. A second cancel says
+nothing the first did not, so one key with a timestamp records it completely; *"use the
+existing migration path"* and *"and skip the second wave"* are two sentences, and a key would
+keep whichever arrived last. So `steer:<task>` is a LIST — pushed with a TTL that is refreshed
+on every push, so the clock measures silence rather than age and an active conversation is
+never cut off mid-way.
+
+Drained by the SESSION and by nobody else, which is what makes it correct rather than merely
+delivered: a steer that is read is gone, so a task that hands off five times is not told the
+same thing five times, and a steer that is never read expires after four hours rather than
+ambushing whoever claims the task tomorrow. The channel is only a wake-up — it carries the
+string `steer` and not the text — so a publish delivered twice costs a wasted drain instead of
+a duplicated sentence in the agent's context.
+
+Its loss is a degraded conversation and never a lost task, which is the line this section
+draws: the durable record of guidance is the journal in git, written by the session that
+consumed it or by the housekeeping pass that recorded it for a task nothing is running.
+
+**`crossesProcesses` is declared, for `ChatDrainer.selective`'s reason.** The in-memory inbox
+accepts every push, so without the flag `applyGuidance` would report "sent to the session" for a
+task running on a machine this heap cannot reach — and two runners sharing a state repo with no
+Redis is a supported arrangement, not a hypothetical one. A structure that answers "recorded" to
+a question it cannot serve is indistinguishable from one that served it, and the caller is the
+only place that can decide what to say about the difference. With it false, the human is told the
+runner could not be reached; the local slot path is unaffected, because that is the case the
+in-memory inbox actually covers.
 
 ### Cancels get a channel because the loop is blocked
 

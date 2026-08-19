@@ -28,6 +28,11 @@ import {
   type RedisDriver,
 } from "./client.ts";
 import { InMemoryCancelSignals, RedisCancelSignals, type CancelSignals } from "./cancel.ts";
+import {
+  InMemorySteeringInbox,
+  RedisSteeringInbox,
+  type SteeringInbox,
+} from "./steering.ts";
 import { InMemoryChatQueue, RedisChatQueue, type ChatQueue } from "./inbox.ts";
 import {
   InMemoryPresenceRegistry,
@@ -64,6 +69,15 @@ export interface EphemeralPlane {
    */
   readonly runners: PresenceRegistry;
   readonly cancels: CancelSignals;
+  /**
+   * A human's guidance, reaching a session that is already running (DESIGN.md §7.3).
+   *
+   * `cancels`' counterpart and the sixth structure, here for the same reason: a message typed
+   * at the standalone bot has a process boundary to cross before it can reach a live session,
+   * and its loss is a degraded conversation rather than a lost task — which is the line §21
+   * draws for what may live here at all.
+   */
+  readonly steering: SteeringInbox;
   /**
    * Thread ↔ task, published by the supervisor and consumed by the standalone bot (§14.3).
    *
@@ -113,6 +127,7 @@ export const inMemoryPlane = (): EphemeralPlane => {
     snapshot: new InMemorySnapshotStore(tasks),
     runners: new InMemoryPresenceRegistry(),
     cancels: new InMemoryCancelSignals(),
+    steering: new InMemorySteeringInbox(),
     threads: new InMemoryThreadBindings(),
     backed: false,
     inbox,
@@ -127,6 +142,7 @@ export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane =
   snapshot: new RedisSnapshotStore({ redis, logger }),
   runners: new RedisPresenceRegistry({ redis, logger }),
   cancels: new RedisCancelSignals({ redis, logger }),
+  steering: new RedisSteeringInbox({ redis, logger }),
   threads: new RedisThreadBindings({ redis, logger }),
   backed: true,
   client: redis,

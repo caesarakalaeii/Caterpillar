@@ -28,7 +28,7 @@
  *     message, because the supervisor logs those verbatim.
  */
 import type { TaskId } from "../domain/task.ts";
-import { button, BUTTON_STYLE, linkButton, row, rows, type ActionRow } from "./components.ts";
+import { button, BUTTON_STYLE, linkButton, row, rows, type ActionRow, type Button } from "./components.ts";
 import { type FetchLike, postJson } from "./http.ts";
 
 export type Notification =
@@ -533,6 +533,18 @@ const hardSplit = (line: string, budget: number): readonly string[] => {
  * task's OWN thread there is no id to retype — the next message is the answer — so the
  * button is pure friction there: a modal to open, for something a keystroke already does.
  */
+/**
+ * The way back from a park, as a button.
+ *
+ * Undefined when the task id will not fit a `custom_id` — one missing button, never a message
+ * that fails to send (`row` drops it). Which is why the prose of every notification carrying
+ * this also names `/resume <id>`: a tracker-derived id can be long enough to lose the button,
+ * and a park whose only stated way forward has silently vanished is the failure this whole
+ * section is about.
+ */
+const resumeButton = (task: TaskId): Button | undefined =>
+  button({ action: { verb: "res", task }, label: "Resume", style: BUTTON_STYLE.primary });
+
 export const componentsFor = (
   notification: Notification,
   options: { readonly inThread?: boolean } = {},
@@ -566,19 +578,26 @@ export const componentsFor = (
                 style: BUTTON_STYLE.danger,
               })
             : undefined,
+          resumeButton(notification.task),
           notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
         ),
       );
+    // A stalled plan has no PR to link and nothing to merge. What it needs is prose and then
+    // a restart, and the restart is the one thing a message can carry: the notification is
+    // posted in the thread the prose will be typed in, so the way back belongs in the same
+    // place rather than as a command to be retyped underneath it.
+    case "plan-stalled":
+      return rows(row(resumeButton(notification.task)));
+    // Every other park, for the same reason. `/resume` on something parked is the single most
+    // predictable next act in the system, and until now it was the only one with no button.
     case "parked":
     case "failed":
+      return rows(row(resumeButton(notification.task)));
     // An alert notification is a statement, not a prompt. Creating the task has already
     // happened, and a refusal is fixed by committing a policy entry rather than by
     // pressing anything here.
     case "alert-task":
     case "alert-refused":
-    // A stalled plan has no PR to link and nothing to merge — what it needs is prose, and
-    // the reply that carries it is the next message in the thread.
-    case "plan-stalled":
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -645,8 +664,9 @@ const frame = (notification: Notification, hint: boolean): string => {
           "",
           text,
           "",
-          `Back to the agent by itself — no action needed. To steer the next attempt, say ` +
-            `what to change in this thread${hint ? ` or \`!answer ${task} <what to change>\`` : ""}.`,
+          `Back to the agent by itself — no action needed. Or say what to change in this ` +
+            `thread${hint ? ` or with \`!answer ${task} <what to change>\`` : ""}: the session ` +
+            `reads it at the end of its current step, and the round count resets with it.`,
         ].join("\n"),
       );
     case "review-stalled":
@@ -657,9 +677,10 @@ const frame = (notification: Notification, hint: boolean): string => {
           text,
           "",
           notification.canMerge
-            ? `Merge it as it stands, or say what to change and \`/resume ${task}\`.`
+            ? `Merge it as it stands, or say what to change here — then Resume, or ` +
+              `\`/resume ${task}\`.`
             : `No reviewer identity is configured, so merging is yours to do. Otherwise say ` +
-              `what to change and \`/resume ${task}\`.`,
+              `what to change here — then Resume, or \`/resume ${task}\`.`,
         ].join("\n"),
       );
     case "plan-stalled":
@@ -672,8 +693,15 @@ const frame = (notification: Notification, hint: boolean): string => {
           // Named explicitly, because this is the park where a human most reliably assumed
           // there was nothing they could do: no PR, no change, and a reason that used to
           // read "the plan was rejected 3 times" and stop there.
-          `The council and the agent are not converging on their own. Say what to change — ` +
-            `here in this thread — then \`/resume ${task}\` to try again.`,
+          //
+          // And it has to be an instruction that WORKS. Every clause of the wording this
+          // replaced was broken at once: the notification was posted in the channel rather
+          // than the thread it pointed at, the thread was unbound the moment the task parked
+          // so nothing typed there was read, and `/resume` in it was refused outright. Saying
+          // it more clearly would not have helped. What follows is now true.
+          `The council and the agent are not converging on their own — resuming on its own ` +
+            `will not get past this. Say what to change here in this thread: I record it and ` +
+            `reset the round count, then Resume — or \`/resume ${task}\` — tries again with it.`,
         ].join("\n"),
       );
     case "plan-ready": {

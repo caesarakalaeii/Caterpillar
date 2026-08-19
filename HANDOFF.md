@@ -92,6 +92,7 @@ both versions because the failure is asymmetric (DESIGN.md §16). If you write
 | **Reviewer identity / autonomous merge** | **PROVEN** — approved and merged a protected branch |
 | **Brainstorm → plan → waves (§14.3)** | **PROVEN** — a plan was cut into 5 wave-tagged children |
 | Thread chat + typing indicator | deployed; thread answering exercised (3 answers) |
+| Steering a live session from a thread (§7.3) | built, tested end to end, not yet exercised in production |
 | Artifact channel, small path (§17) | merged; **never used** |
 | Runner installer (§8) | merged; **no second runner exists yet** |
 | **Web view (§18)** | implemented and deployed — fleet, task, session, logs, runner, digests, and **`/intake`**: what intake and the alert receiver refused, and when intake last ran |
@@ -311,13 +312,19 @@ No adapter creates them, deliberately. A missing one does not fail the task: `mi
 `tracker.mirror-failed` and continues. It fails the tracker VIEW silently, which is worse to
 debug than a crash.
 
-### Answering a question
+### Answering a question, steering a session, unsticking a park
 
-- **In a task's own thread: just type the answer.** No `!answer`, no id — the thread IS the
-  task (§7.1). Proven: three answers drove `BS-1537785980415778816` through to a plan.
+- **In a task's own thread: just type.** No `!answer`, no id — the thread IS the task (§7.1).
+  Proven: three answers drove `BS-1537785980415778816` through to a plan.
+- **What typing DOES depends on the task's status** (§7.3): it answers an open question, steers
+  a session that is running (👀 on your message, read at the end of its current step), or — on
+  a `parked`/`failed` task — is journalled, resets the review round count, and comes back with a
+  **Resume** button. A `done` task says so and points at `/brainstorm`.
 - **The Answer button** on a question notification opens a modal, deliberately absent inside
   threads where there is no id to retype.
 - **`/answer <task> <text>`**, or `!answer <task-id> <text>` in the watched channel.
+- **`/resume`, `/cancel` and `/task` need no id inside a thread.** They did, and that plus an
+  unbound parked thread is what made a stalled plan unreachable — see §7.3.
 
 `/cancel <task>` parks a task and closes its thread. Nothing deletes a task; to reclaim disk,
 `git rm -r tasks/<id>` in the state repo by hand once no lease is held.
@@ -665,9 +672,11 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
   lease is held, using the heartbeat's current lease.
 - **`checkLimits` runs BEFORE a claim's first session.** So any limit still met when a
   task returns to `ready` parks it again having run nothing, and any command that puts a
-  task back must clear whatever limit parked it or say plainly that it did not. `/resume`
-  and `/answer` both clear `noProgressStreak`; neither clears `sessions`, and the reply
-  says so.
+  task back must clear whatever limit parked it or say plainly that it did not. `/resume`,
+  `/answer` and operator guidance all clear `noProgressStreak`; guidance additionally clears
+  `review.rounds`, because a resume that did not buys exactly one more council round and parks
+  again (§7.3, and how `BS-1539374658363854934` reached 13 rounds against a cap of 3). Nothing
+  clears `sessions`, and the reply says so.
 - **A first-session commit needs a baseline that exists.** The fallback is the branch's fork
   point, resolved locally — but do **not** use the fork point always, or every session after
   the first commit looks productive and thrashing never parks.

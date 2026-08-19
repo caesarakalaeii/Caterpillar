@@ -10,7 +10,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskStatus } from "../domain/task.ts";
 import { TaskSnapshot, type TaskSummary } from "../supervisor/snapshot.ts";
-import { describeList, describeTask } from "./replies.ts";
+import { describeList, describeOutcome, describeTask } from "./replies.ts";
+
+const TASK = asTaskId("BS-1539374658363854934");
+
+const summary = (over: Partial<TaskSummary> = {}): TaskSummary => ({
+  id: TASK,
+  status: "parked",
+  phase: "planning",
+  sessions: 4,
+  costUsd: 24.73,
+  updatedAt: "2026-08-19T10:00:00.000Z",
+  ...over,
+});
 
 const at = (id: string, status: TaskStatus, updatedAt: string): TaskSummary => ({
   id: asTaskId(id),
@@ -229,4 +241,57 @@ test("a task the council passed does not keep quoting an answered objection", ()
 
   assert.match(rendered, /2 rounds, last passed/);
   assert.doesNotMatch(rendered, /sent back/);
+});
+
+test("guidance says it was recorded, that the budget was forgiven, and the way back", () => {
+  // All three, because the surface this replaces said nothing at all — and silence read as
+  // "discarded", which for a long time it was.
+  const reply = describeOutcome(TASK, {
+    kind: "guided",
+    notes: 2,
+    resumable: true,
+    roundsCleared: true,
+  });
+
+  assert.match(reply, /2 notes/, "the human should be able to see their earlier note landed");
+  assert.match(reply, /round count/, "a forgiven budget that is not stated reads as ignored");
+  assert.match(reply, new RegExp(`/resume ${TASK}`), "the way back has to be named once");
+});
+
+test("guidance for a task that is not parked does not offer to resume it", () => {
+  // It is already claimable. A resume would be a no-op the human was told to perform.
+  const reply = describeOutcome(TASK, {
+    kind: "guided",
+    notes: 1,
+    resumable: false,
+    roundsCleared: false,
+  });
+
+  assert.doesNotMatch(reply, /resume/);
+  assert.match(reply, /next session/);
+});
+
+test("a steer says the session picks it up without being restarted", () => {
+  const reply = describeOutcome(TASK, { kind: "steered" });
+  assert.match(reply, /current step/);
+  assert.doesNotMatch(reply, /resume/, "restarting a session that is working is not the answer");
+});
+
+test("a done task is told to be done, and pointed somewhere that works", () => {
+  const reply = describeOutcome(TASK, { kind: "finished" });
+  assert.match(reply, /brainstorm/);
+});
+
+test("a running task's review lines say guidance needs no restart", () => {
+  // The wording that was wrong: it told a human to say what to change "before the next
+  // session starts", which is advice for a mechanism that did not exist and a session that
+  // was already running.
+  const lines = describeTask(TASK, summary({ status: "running", review: { rounds: 1, last: "changes" } }));
+  assert.match(lines, /current step/);
+});
+
+test("a failed task is offered the same way back as a parked one", () => {
+  // `failed` is in `RESUMABLE` and was left out of every reply that named the recovery.
+  const lines = describeTask(TASK, summary({ status: "failed", review: { rounds: 2, last: "changes" } }));
+  assert.match(lines, new RegExp(`/resume ${TASK}`));
 });

@@ -75,10 +75,12 @@ import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
+import { SlotSteering, type SteeringFeed } from "../agent/steering.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
 import type { ChatDrainer } from "../redis/inbox.ts";
 import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
+import type { SteeringInbox } from "../redis/steering.ts";
 import type { ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
@@ -124,8 +126,18 @@ export interface SessionRunner {
    * housekeeping loop (§6.4) and keep running through a hung session. That is a reason the
    * signal matters MORE rather than less: a wedged runner now looks entirely healthy from
    * outside, because it is still answering.
+   *
+   * `steering` is the other direction: what a human types in the task's thread while this
+   * is running (DESIGN.md §7.3). Optional because the interface has implementations that are
+   * not the agent — and because a session that ignores it behaves exactly as every session
+   * did before it existed.
    */
-  run(spec: TaskSpec, state: TaskState, signal: AbortSignal): Promise<SessionOutcome>;
+  run(
+    spec: TaskSpec,
+    state: TaskState,
+    signal: AbortSignal,
+    steering?: SteeringFeed,
+  ): Promise<SessionOutcome>;
 }
 
 export interface Verifier {
@@ -300,6 +312,17 @@ export interface SupervisorDeps {
    */
   readonly cancels?: CancelSignals;
   /**
+   * Human input reaching a session already in flight (DESIGN.md §7.3).
+   *
+   * `cancels`' counterpart, and optional on the same terms: with no Redis the bot and this
+   * loop are one process, so `applyAnswer` reaches the slot's own feed directly. This exists
+   * for the separate bot, which can no more push into this heap than it can into its inbox.
+   *
+   * Absent entirely, a session simply cannot be steered — which is what every session was
+   * before this, and the reason a rejected plan could only ever be re-run unchanged.
+   */
+  readonly steering?: SteeringInbox;
+  /**
    * Advisory display of which runners are alive (DESIGN.md §21). Optional and, crucially,
    * never load-bearing: routing and claiming stay on leases in git (§5).
    */
@@ -441,6 +464,15 @@ interface TaskSlot {
   cancelled: boolean;
   /** Set by this slot's heartbeat when its own lease goes; never by any other slot's. */
   lost: LeaseLostError | undefined;
+  /**
+   * Human input for THIS task, for as long as the runner holds it (DESIGN.md §7.3).
+   *
+   * On the slot for `cancel`'s reason, one step further: a steer has to reach ONE session,
+   * and the routing is by task id through `this.slots`. It outlives each individual session
+   * because `workTask` drives a task through as many as it needs, and a sentence typed
+   * during the changeover has nowhere else to wait.
+   */
+  readonly steering: SlotSteering;
   /**
    * The outage ANOTHER slot met, if one has been fanned out to this one (§6.3).
    *
@@ -799,6 +831,7 @@ export class Supervisor {
     spec: TaskSpec,
     state: TaskState,
     signal: AbortSignal,
+    steering: SteeringFeed,
   ): Promise<SessionOutcome> {
     if (signal.aborted) {
       return {
@@ -808,7 +841,7 @@ export class Supervisor {
         summary: "the session was stopped before it started",
       };
     }
-    return this.deps.runner.run(spec, state, signal);
+    return this.deps.runner.run(spec, state, signal, steering);
   }
 
   /** Slots this runner could still fill. Never negative. */
@@ -1239,10 +1272,11 @@ export class Supervisor {
     // promise here would let the poll finish before the bot could see the new list.
     // Never throws — `RedisSnapshotStore` degrades — so it cannot fail the survey.
     await snapshot?.replace(records.map((record) => summarise(record.state)));
-    // Terminal tasks drop out: a message in a bound thread is an ANSWER, so leaving a
-    // finished conversation bound means an abandoned thread silently swallows whatever
-    // is typed into it. `threadBindings` also settles who owns a thread several tasks
-    // share — a plan's children inherit their brainstorm's.
+    // `done` tasks drop out and nothing else does. A message in a bound thread is acted on
+    // whatever the task's status, so a `parked` or `failed` task stays bound — that is where
+    // guidance goes (§7.3), and unbinding it was what made a stalled brainstorm unreachable
+    // from the very thread its park notification pointed at. `threadBindings` also settles
+    // who owns a thread several tasks share — a plan's children inherit their brainstorm's.
     const bindings = threadBindings(
       records.map((record) => ({
         id: record.id,
@@ -1447,6 +1481,10 @@ export class Supervisor {
       interrupt,
       cancelled: false,
       lost: undefined,
+      // From this instant too, and for `cancel`'s reason: a slot is registered the moment
+      // its CAS wins, and `applyChatRequests` can route a steer to it before the first turn
+      // has run. With nothing subscribed yet it buffers, and the first session takes it.
+      steering: new SlotSteering(),
       outage: undefined,
       cancel: () => {
         if (slot.cancelled) return;
@@ -1548,6 +1586,19 @@ export class Supervisor {
     // this session starting and the subscription being established is not lost. Without
     // Redis this is the in-process implementation and costs nothing.
     const cancelWatch = await this.deps.cancels?.watch(spec.id, stop);
+
+    // The same crossing, in the opposite direction (DESIGN.md §7.3). A message typed in the
+    // task's thread at a SEPARATE bot process has no path into this heap, so it arrives here
+    // — over pub/sub within a round trip, plus a drain on subscribe for anything published
+    // in the gap while this was being established.
+    //
+    // Scoped to the whole of `workTask` rather than to one session, because a task runs as
+    // many sessions as it needs and a sentence typed during a changeover has nowhere else to
+    // wait. `SlotSteering` buffers it and the next session's `take()` finds it.
+    const steerWatch = await this.deps.steering?.watch(spec.id, (text) => {
+      logger.info("task.steered", { task: spec.id, chars: text.length });
+      slot.steering.push(text);
+    });
 
     // **One heartbeat per slot, renewing one lease.** The renewal is a CAS on
     // `refs/leases/<task>`, so the fencing `assertHeld` performs is per lease and stays so
@@ -1689,7 +1740,7 @@ export class Supervisor {
 
         let outcome: SessionOutcome;
         try {
-          outcome = await this.runSession(spec, state, interrupt.signal);
+          outcome = await this.runSession(spec, state, interrupt.signal, slot.steering);
         } finally {
           clearTimeout(deadline);
           stopTyping();
@@ -1785,7 +1836,7 @@ export class Supervisor {
           await this.notifyTask(state, { kind: "provider-recovered", task: spec.id });
         }
 
-        state = await this.recordSession(heartbeat, spec, state, outcome);
+        state = await this.recordSession(heartbeat, spec, state, outcome, slot.steering);
 
         const done = await this.applyOutcome(heartbeat, spec, state, outcome);
         if (done) return;
@@ -1822,6 +1873,7 @@ export class Supervisor {
       // ever run. Swallowed, because a failure to unsubscribe from a socket that is
       // already gone must not be the thing that fails a finished session.
       await cancelWatch?.close().catch(() => undefined);
+      await steerWatch?.close().catch(() => undefined);
       signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
@@ -1896,12 +1948,27 @@ export class Supervisor {
     return true;
   }
 
-  /** Persist the journal and usage for a finished session. */
+  /**
+   * Persist the journal and usage for a finished session.
+   *
+   * `steering` is journalled here and nowhere else, and this is the only place it can be:
+   * writing the state repo needs the lease, the session holds it for its whole run, and this
+   * is the first point after the session where the lease is still held and a journal shard is
+   * already being written (DESIGN.md §7.3).
+   *
+   * What ARRIVED is recorded, not what the model read. `shouldStopAfterTurn` exits pi's loop
+   * before it polls the steering queue, so a sentence that landed in the same turn as an
+   * `ask_human` was queued and never seen — and the journal is what the next session reads,
+   * so recording it puts the guidance back in front of the agent. The cost of being wrong
+   * that way is one repeated instruction; the cost of the other way is a human's correction
+   * disappearing between two sessions.
+   */
   private async recordSession(
     lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
     outcome: SessionOutcome,
+    steering?: SlotSteering,
   ): Promise<TaskState> {
     const { store, config, metrics, logger } = this.deps;
 
@@ -1943,6 +2010,8 @@ export class Supervisor {
     // unit stops a sibling session writing INTO this window, and `StateStore.pending` stops
     // its already-written files being staged by this commit. The probe above stays outside:
     // it runs git in the task's own worktree and has nothing to do with the state checkout.
+    const steered = steering?.arrived() ?? [];
+
     await this.unit(async () => {
       await store.appendJournal(
         spec.id,
@@ -1955,6 +2024,22 @@ export class Supervisor {
         ].join("\n"),
       );
 
+      // Its own shard, after the exit rather than inside it: the exit summary is the agent's
+      // prose about its own session, and a human's instruction filed inside it would read as
+      // something the agent decided. Separate entries also survive a `handoff` overwriting
+      // `handoff.md`, which is the file the summary above competes with.
+      if (steered.length > 0) {
+        await store.appendJournal(
+          spec.id,
+          session,
+          [
+            `**Steered by the operator** during session ${session}:`,
+            "",
+            ...steered.map((text) => `> ${text.replace(/\n/g, "\n> ")}`),
+          ].join("\n"),
+        );
+      }
+
       if (outcome.reason === "handoff" || outcome.reason === "blocked") {
         await store.writeHandoff(spec.id, outcome.summary);
       }
@@ -1962,6 +2047,12 @@ export class Supervisor {
       await store.writeState(next);
       await this.push(lease, `chore(${spec.id}): session ${session} — ${outcome.reason}`);
     });
+    // AFTER the push, so a failed commit leaves the guidance to be recorded by the next
+    // session rather than dropping it on a write that never landed.
+    if (steered.length > 0) {
+      logger.info("task.steered-recorded", { task: spec.id, session, messages: steered.length });
+      steering?.clearArrived();
+    }
     void config;
     return next;
   }
@@ -2889,7 +2980,15 @@ export class Supervisor {
       await this.push(lease, `chore(${spec.id}): parked`);
     });
     await this.mirror(spec, { kind: "parked", reason });
-    await this.notify(notification ?? { kind: "parked", task: spec.id, reason });
+    // `notifyTask`, not `notify`. This was the ONE task-scoped notification that dropped the
+    // thread, and it was the one that could least afford to: every other outcome of a review
+    // round reaches the thread through `notifyTask`, so a plan sent back for the third time
+    // appeared in the thread and the park that ENDED it appeared in the channel — read from
+    // the thread, the conversation simply stopped. Worse, `plan-stalled`'s own prose says
+    // "say what to change — here in this thread — then `/resume`", and it was being posted
+    // somewhere that is not the thread. The class of bug is the argument for routing by task
+    // rather than by call site; `park` is the last call site that did not.
+    await this.notifyTask(state, notification ?? { kind: "parked", task: spec.id, reason });
   }
 
   /**
@@ -3151,19 +3250,43 @@ export class Supervisor {
     return { kind: "started", task: id };
   }
 
+  /**
+   * Everything a human types at a task, routed by what the task is currently doing.
+   *
+   * One entry point deliberately: in a task's own thread every message is this request
+   * (§7.1), and the bridge has no way to know — and no business knowing — whether the task
+   * is mid-session or parked. So the decision is made HERE, where the state is, and there are
+   * four answers rather than the two there used to be:
+   *
+   *   `awaiting-human` with a question open → the answer file, exactly as before.
+   *   `running`                             → a steer, delivered to the live session (§7.3).
+   *   `ready`/`parked`/`failed`             → guidance, journalled for the next session.
+   *   `done`                                → nothing to say to it, and `/resume` refuses it.
+   *
+   * What this replaced returned `not-waiting` for everything but the first, and the bridge
+   * dropped that outcome without a word. The text was READ and then discarded — while a park
+   * notification, a verdict notification and `/task` were all telling the human to "say what
+   * to change in this thread". Three surfaces documented a path that ended in a `return`.
+   */
   private async applyAnswer(request: ChatRequest & { readonly kind: "answer" }): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
     const state = await store.tryReadState(request.task);
     if (state === undefined) return { kind: "unknown-task" };
-    if (state.status !== "awaiting-human") return { kind: "not-waiting", status: state.status };
 
-    const pending = await store.pendingQuestion(request.task);
-    if (pending === undefined) {
-      // `awaiting-human` with nothing unanswered is a state repo someone edited by
-      // hand. Refusing beats inventing an index and burying the answer.
-      return { kind: "not-waiting", status: state.status };
-    }
+    // Not `isTerminal`: `parked` and `failed` are exactly the statuses guidance exists for.
+    // `done` is the one where there is nothing to ask for — it passed every gate and merged,
+    // and `/resume` refuses it for the same reason (`RESUMABLE`).
+    if (state.status === "done") return { kind: "finished" };
+
+    const pending =
+      state.status === "awaiting-human" ? await store.pendingQuestion(request.task) : undefined;
+
+    // Everything that is not an answer to an open question. Note that `awaiting-human` with
+    // nothing unanswered lands here rather than being refused: that is a state repo someone
+    // edited by hand, and recording the text as guidance loses nothing, where the refusal it
+    // replaced lost the human's sentence.
+    if (pending === undefined) return this.applyGuidance(request, state);
 
     // One unit — see `unit`. The answer FILE is the record of the answer (§4.1), and a
     // sibling slot's commit sweeping it up while this one commits nothing is how an answer
@@ -3192,6 +3315,144 @@ export class Supervisor {
 
     logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
     return { kind: "applied", index: pending.index };
+  }
+
+  /**
+   * Record what a human said about a task that was not waiting to be asked (DESIGN.md §7.3).
+   *
+   * The path that did not exist, and whose absence is what made a stalled brainstorm
+   * unfixable. BS-1539374658363854934 was sent back 13 times against a cap of 3: the park
+   * notification asked for guidance, the guidance was discarded, `/resume` bought exactly one
+   * more round, and the same plan was refused by the same lens. Ten times.
+   *
+   * Two destinations, decided by whether a session is holding the lease:
+   *
+   * **Running.** Nothing is written here — it CANNOT be, since writing means claiming the
+   * lease and the session holds it (`applyPark` has the same constraint for the same reason).
+   * The message goes on the steering plane instead. A slot on this runner has its feed
+   * reached directly; a session on ANOTHER runner is reached through Redis, and with no Redis
+   * there is only one runner so the direct path is the whole mechanism. The journal entry is
+   * written later, by that session's own `recordSession`.
+   *
+   * **Anything else.** The journal, which is what the next session's prompt is built from
+   * (`agent/prompt.ts`), plus two counters:
+   *
+   *   `noProgressStreak` is cleared, for `applyAnswer`'s reason word for word — a task
+   *   resumed at the limit parks again on the very next claim having run nothing, so the
+   *   command would report success and do nothing.
+   *
+   *   `review.rounds` is cleared, and this is a DEPARTURE from §12.1, which says the round
+   *   budget is not forgiven by a resume. That rule is right for a bare resume and wrong
+   *   here, and the distinction is information: the cap exists because the agent and the
+   *   council can trade a task forever with nothing new entering the loop, and guidance is
+   *   precisely something new entering the loop. Without this the fix does not work — the
+   *   next rejection is round 14 against a cap of 3, so the task parks again immediately and
+   *   the guidance is never tested. A bare `/resume` still forgives nothing, and `describeOutcome`
+   *   says which of the two happened rather than letting a human find out by watching.
+   */
+  private async applyGuidance(
+    request: ChatRequest & { readonly kind: "answer" },
+    state: TaskState,
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    if (state.status === "running") {
+      const slot = this.slots.get(request.task);
+      if (slot !== undefined) {
+        slot.steering.push(request.text);
+        logger.info("guidance.steered", { task: request.task, where: "local" });
+        return { kind: "steered" };
+      }
+      // Running somewhere this heap cannot reach. Only the fleet-wide plane can carry it, and
+      // `crossesProcesses` is why that is checked rather than assumed: the in-memory inbox
+      // accepts every push and would report "sent to the session" for a task on another
+      // machine, which is the report-success-and-do-nothing failure this whole path replaced.
+      const reachable = this.deps.steering?.crossesProcesses === true;
+      const delivered = reachable && (await this.deps.steering?.push(request.task, request.text));
+      logger.info("guidance.steered", {
+        task: request.task,
+        where: "fleet",
+        reachable,
+        delivered: delivered === true,
+      });
+      return delivered === true ? { kind: "steered" } : { kind: "not-waiting", status: state.status };
+    }
+
+    // Taken for the write and released immediately, exactly as `applyPark` and `applyResume`
+    // do: every push verifies lease ownership first (§5.1). Unclaimable means another runner
+    // got there first, which for a task the state says is not running means it has just been
+    // claimed — so it IS about to read the journal, and steering is the honest answer.
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) {
+      // Another runner got there first, which for a task the state says is not running means it
+      // has just been CLAIMED — so it is about to read whatever it is given. The local inbox is
+      // enough when the claimant is this process (its `steerWatch` drains what is pending on
+      // subscribe); anything else needs the plane, for the reason above.
+      const local = this.slots.has(request.task) || this.deps.steering?.crossesProcesses === true;
+      const delivered = local && (await this.deps.steering?.push(request.task, request.text));
+      return delivered === true ? { kind: "steered" } : { kind: "not-waiting", status: state.status };
+    }
+
+    const rounds = state.review?.rounds ?? 0;
+    const roundsCleared = rounds > 0;
+
+    try {
+      const handle = heldLease(lease);
+      await this.unit(async () => {
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          `**Guidance from the operator:**\n\n${request.text}`,
+        );
+        await store.writeState({
+          ...state,
+          progress: { ...state.progress, noProgressStreak: 0 },
+          // `rounds` only. `last` and `reason` are the record of what the council actually
+          // said and stay put — a human who resumes wants to see what they are answering,
+          // and `/task` reads both from here.
+          ...(state.review === undefined ? {} : { review: { ...state.review, rounds: 0 } }),
+        });
+        await this.push(handle, `chore(${request.task}): guidance from chat`);
+      });
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+
+    logger.info("guidance.recorded", {
+      task: request.task,
+      status: state.status,
+      chars: request.text.length,
+      reviewRounds: rounds,
+    });
+
+    // Counted from the journal rather than remembered, so the number is right after a restart
+    // and right when two people are typing. Best-effort: the guidance is already committed,
+    // and a reply that says "1" when it was the third costs nothing next to not replying.
+    const notes = await this.guidanceCount(request.task);
+
+    return {
+      kind: "guided",
+      notes,
+      resumable: RESUMABLE.includes(state.status),
+      roundsCleared,
+    };
+  }
+
+  /**
+   * How many pieces of guidance a task carries, by reading the journal back.
+   *
+   * One on failure, not zero: the entry this is counting has just been committed, so zero is
+   * the one answer that is certainly wrong, and "at least yours" is what a reader needs.
+   */
+  private async guidanceCount(task: TaskId): Promise<number> {
+    try {
+      const journal = await this.deps.store.readJournal(task);
+      return journal === undefined
+        ? 1
+        : Math.max(1, journal.split("**Guidance from the operator:**").length - 1);
+    } catch {
+      return 1;
+    }
   }
 
   /**
@@ -3439,11 +3700,24 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Tell Discord about a task, in the task's own thread when it has one.
+   *
+   * The ONLY way this loop notifies, and that is structural rather than tidy. It replaced a
+   * pair — this and a `notify(notification, threadId?)` whose thread argument was optional —
+   * and the optional argument was the whole defect: `park` omitted it, so the park at the end
+   * of a review loop went to the channel while every round before it went to the thread, and
+   * `plan-stalled`'s own prose ("say what to change — here in this thread") was posted
+   * somewhere that is not the thread. A call site that CANNOT forget the thread cannot
+   * reintroduce that, and taking the state rather than the id is what makes it impossible:
+   * every caller already has the state, and nowhere else knows where a task talks.
+   *
+   * Fleet-scoped notifications — the digest (§19) and a refused alert (§20) — do not come
+   * through here at all. They belong to no task, so they have no thread, and they are sent by
+   * `digest/publish.ts` and `remediation/queue.ts` against the notifier directly.
+   */
   private async notifyTask(state: TaskState, notification: Notification): Promise<void> {
-    await this.notify(notification, state.chat?.threadId);
-  }
-
-  private async notify(notification: Notification, threadId?: string): Promise<void> {
+    const threadId = state.chat?.threadId;
     try {
       await this.deps.notifier.notify(
         notification,

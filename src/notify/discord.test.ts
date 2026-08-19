@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
-import { CONTENT_LIMIT, DiscordNotifier, type Notification, render } from "./discord.ts";
+import { componentsFor, CONTENT_LIMIT, DiscordNotifier, type Notification, render } from "./discord.ts";
 
 const TASK = asTaskId("SMOKE-1");
 
@@ -347,4 +347,54 @@ test("a stalled review keeps the merge, and names the alternative to it", () => 
   assert.match(content, /throws on an empty repo list/);
   assert.match(content, /Merge it as it stands/);
   assert.match(content, /\/resume SMOKE-1/);
+});
+
+test("a stalled plan says that resuming ALONE will not get past it", () => {
+  // The failure mode the wording exists for: a human reads "parked", presses Resume, the
+  // council refuses the same plan for the same reason, and it parks again. That happened ten
+  // times to BS-1539374658363854934. The notification has to say that guidance is the part
+  // that matters, not the restart.
+  const content = render({
+    kind: "plan-stalled",
+    task: TASK,
+    rounds: 13,
+    summary: "blocked by feasibility, decomposition, criteria",
+    detail: "**Criteria** — none of the five tasks declares a measurable command.",
+  });
+
+  assert.match(content, /sent back 13 times/);
+  assert.match(content, /will not get past this/);
+  assert.match(content, /round count/, "the reader has to know the budget is what resuming keeps");
+});
+
+test("every park a human is expected to act on carries the way back twice", () => {
+  // Once as a button, because a park in a thread is read on a phone; once as prose, because
+  // `resumeButton` returns undefined for an id too long to encode and a park with no stated
+  // way forward is the failure this section is about.
+  const parks: readonly Notification[] = [
+    { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
+    { kind: "failed", task: TASK, error: "the dev environment could not be prepared" },
+    {
+      kind: "plan-stalled",
+      task: TASK,
+      rounds: 3,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — unmeasurable.",
+    },
+  ];
+
+  for (const park of parks) {
+    const attached = componentsFor(park);
+    const labels = (attached ?? []).flatMap((r) => r.components.map((c) => ("label" in c ? c.label : "")));
+    assert.ok(labels.includes("Resume"), `${park.kind} should offer a Resume button`);
+  }
+});
+
+test("a resume button refuses to encode rather than address the wrong task", () => {
+  // `custom_id` is capped at 100 characters and a task id is tracker-derived. A clipped id is
+  // still a valid-looking id, so the button is dropped instead — and the prose is what is
+  // left, which is why it names the command.
+  const long = asTaskId(`GH-acme-${"x".repeat(120)}`);
+  const attached = componentsFor({ kind: "parked", task: long, reason: "no progress" });
+  assert.equal(attached, undefined);
 });

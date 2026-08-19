@@ -390,3 +390,77 @@ test("the repo option is registered as autocompleted", () => {
   const repo = options.find((option) => option["name"] === "repo");
   assert.equal(repo?.["autocomplete"], true, "an unautocompleted box is where the typo came from");
 });
+
+test("in a thread a command needs no task id — the thread is the id", () => {
+  // The friction this removes is the same one `parseCommand` removed for messages: a task
+  // whose thread you are already reading should not have to be named again. It matters
+  // most for `/resume`, whose whole audience is a parked task with a thread open on it.
+  for (const [name, kind] of [
+    ["resume", "resume"],
+    ["cancel", "park"],
+    ["task", "show"],
+  ] as const) {
+    assert.deepEqual(
+      parseInteraction(interaction({ data: { name } }), { thread: TASK }),
+      { kind: "run", command: { kind, task: TASK } },
+      name,
+    );
+  }
+});
+
+test("an explicit id beats the thread's own task", () => {
+  // `/answer` from inside a thread is how a different task is answered without leaving it
+  // (§7.1), and the same has to hold for every other command or the option is a lie.
+  const other = asTaskId("BS-999");
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ data: { name: "resume", options: [{ name: "task", value: other }] } }),
+      { thread: TASK },
+    ),
+    { kind: "run", command: { kind: "resume", task: other } },
+  );
+});
+
+test("outside a thread and with no id, the refusal says where the id comes from", () => {
+  const intent = parseInteraction(interaction({ data: { name: "resume" } }));
+  assert.equal(intent.kind, "run");
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+  assert.match(
+    command?.kind === "malformed" ? command.reason : "",
+    /thread/,
+    "a human who omitted the id needs to be told the one place it is optional",
+  );
+});
+
+test("a Resume button produces the same command as /resume", () => {
+  // Convergence, and the reason the button exists: the park notification that asks for
+  // guidance is posted into the thread, so the way back should be in the same message.
+  const customId = encodeCustomId({ verb: "res", task: TASK });
+  assert.ok(customId !== undefined);
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+    ),
+    { kind: "run", command: { kind: "resume", task: TASK } },
+  );
+});
+
+test("every command that names one task can be told which by its thread", () => {
+  // A registered option that is `required: true` is refused by the CLIENT before an
+  // interaction is ever sent, so the thread default is unreachable unless the surface says
+  // it is optional. This asserts the two halves agree.
+  const optional = new Map([
+    ["resume", "task"],
+    ["cancel", "task"],
+    ["task", "id"],
+  ]);
+  for (const command of COMMANDS) {
+    const name = command["name"] as string;
+    const expected = optional.get(name);
+    if (expected === undefined) continue;
+    const options = command["options"] as readonly Record<string, unknown>[];
+    const option = options.find((o) => o["name"] === expected);
+    assert.equal(option?.["required"], false, `/${name} ${expected} must be optional`);
+  }
+});

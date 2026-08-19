@@ -34,6 +34,11 @@ import {
   type SnapshotStore,
 } from "./snapshot.ts";
 import {
+  InMemorySteeringInbox,
+  RedisSteeringInbox,
+  type SteeringInbox,
+} from "./steering.ts";
+import {
   InMemoryThreadBindings,
   RedisThreadBindings,
   type ThreadBindingStore,
@@ -169,6 +174,46 @@ const cancelContract = async (signals: CancelSignals): Promise<void> => {
   await signals.clear(task);
 };
 
+const steeringContract = async (inbox: SteeringInbox): Promise<void> => {
+  const task = asTaskId("GH-acme-widget-5");
+  // Declared, never inferred. `applyGuidance` tells a human "I could not reach the runner
+  // working it" rather than "sent to the session" when this is false, so an implementation that
+  // got it wrong would put the silent-loss failure back (§21, `ChatDrainer.selective`).
+  assert.equal(typeof inbox.crossesProcesses, "boolean");
+  assert.deepEqual(await inbox.drain(task), []);
+
+  // Queued with nobody listening: the task is between sessions, and the next one must find
+  // it. This is where a cancel-shaped single key would already have lost a sentence.
+  assert.equal(await inbox.push(task, "use the existing migration path"), true);
+  assert.equal(await inbox.push(task, "and skip the second wave"), true);
+  assert.deepEqual(await inbox.drain(task), [
+    "use the existing migration path",
+    "and skip the second wave",
+  ]);
+  assert.deepEqual(await inbox.drain(task), [], "a steer read once is not read again");
+
+  // A watcher subscribing AFTER the push still gets it, off the durable half.
+  await inbox.push(task, "said before anyone was listening");
+  const heard: string[] = [];
+  const watch = await inbox.watch(task, (text) => heard.push(text));
+  await flush();
+  assert.deepEqual(heard, ["said before anyone was listening"]);
+
+  // …and then live, within a round trip rather than a poll interval.
+  await inbox.push(task, "live");
+  await flush();
+  assert.deepEqual(heard, ["said before anyone was listening", "live"]);
+
+  // A steer for a DIFFERENT task must not reach this session. At N slots this is the
+  // difference between steering the task you are watching and steering somebody else's.
+  await inbox.push(asTaskId("GH-acme-widget-9"), "not for you");
+  await flush();
+  assert.equal(heard.length, 2);
+
+  await watch.close();
+  assert.deepEqual(await inbox.drain(asTaskId("GH-acme-widget-9")), ["not for you"]);
+};
+
 const threadsContract = async (store: ThreadBindingStore): Promise<void> => {
   // Cold start: no supervisor has published, and both implementations must say so rather
   // than claim the fleet has no threads. The difference is load-bearing — empty CLEARS the
@@ -203,6 +248,9 @@ interface Implementations {
   readonly snapshot: () => SnapshotStore;
   readonly presence: () => PresenceRegistry;
   readonly cancels: () => CancelSignals;
+  readonly steering: () => SteeringInbox;
+  /** What `crossesProcesses` must say for this implementation. See the test that reads it. */
+  readonly steeringCrosses: boolean;
   readonly threads: () => ThreadBindingStore;
   readonly teardown?: () => Promise<void>;
 }
@@ -229,6 +277,19 @@ const runContracts = (impl: Implementations): void => {
       await impl.teardown?.();
     });
 
+    test("steering: queued between sessions, live within a round trip, per-task", async () => {
+      await steeringContract(impl.steering());
+      await impl.teardown?.();
+    });
+
+    test("steering: says whether it can reach another process, and is right about it", async () => {
+      // The one property the two implementations must NOT share. The in-memory inbox is a heap,
+      // so a steer for a session in a different pod is a steer nothing will read — and a `true`
+      // here would have the supervisor report it as delivered.
+      assert.equal(impl.steering().crossesProcesses, impl.steeringCrosses);
+      await impl.teardown?.();
+    });
+
     test("thread bindings: cold start is empty, publish replaces", async () => {
       await threadsContract(impl.threads());
       await impl.teardown?.();
@@ -242,6 +303,8 @@ runContracts({
   snapshot: () => new InMemorySnapshotStore(),
   presence: () => new InMemoryPresenceRegistry(),
   cancels: () => new InMemoryCancelSignals(),
+  steering: () => new InMemorySteeringInbox(),
+  steeringCrosses: false,
   threads: () => new InMemoryThreadBindings(),
 });
 
@@ -264,6 +327,9 @@ runContracts({
     }),
   presence: () => new RedisPresenceRegistry({ redis: new MemoryRedisClient(), logger: SILENT_LOGGER }),
   cancels: () => new RedisCancelSignals({ redis: new MemoryRedisClient(), logger: SILENT_LOGGER }),
+  steering: () =>
+    new RedisSteeringInbox({ redis: new MemoryRedisClient(), logger: SILENT_LOGGER }),
+  steeringCrosses: true,
   threads: () =>
     new RedisThreadBindings({
       redis: new MemoryRedisClient(),
@@ -327,6 +393,11 @@ describe("a live redis server", { skip: liveUrl === undefined ? "REDIS_TEST_URL 
 
   test("cancel signals round trip", async () => {
     await cancelContract(new RedisCancelSignals({ redis: live(), logger: SILENT_LOGGER }));
+    await teardown();
+  });
+
+  test("steering round trips", async () => {
+    await steeringContract(new RedisSteeringInbox({ redis: live(), logger: SILENT_LOGGER }));
     await teardown();
   });
 

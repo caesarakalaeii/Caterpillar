@@ -64,6 +64,7 @@ const stubDriver = (
       record("eval", script, numKeys, ...args),
     del: (key) => record("del", key),
     rpush: (key, value) => record("rpush", key, value),
+    expire: (key, seconds) => record("expire", key, seconds),
     ltrim: (key, start, stop) => record("ltrim", key, start, stop),
     lrange: (key, start, stop) => record("lrange", key, start, stop) as Promise<string[]>,
     zrangebyscore: (key, min, max, withScores) =>

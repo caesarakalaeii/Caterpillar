@@ -56,7 +56,16 @@ export interface GatewayOptions {
     knows(channelId: string): boolean;
     deliverable?(channelId: string): Promise<boolean>;
   };
-  readonly onMessage: (content: string, author: string, channelId: string) => Promise<void>;
+  /**
+   * A message for us. `messageId` is what a reaction needs (§7.3) — the acknowledgement for a
+   * steer is put on the human's own message rather than as a new line in the thread.
+   */
+  readonly onMessage: (
+    content: string,
+    author: string,
+    channelId: string,
+    messageId: string,
+  ) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
    *
@@ -121,6 +130,8 @@ interface Payload {
 }
 
 interface MessageCreate {
+  /** The message's own id, for reacting to it (§7.3). */
+  readonly id?: string;
   readonly channel_id?: string;
   readonly content?: string;
   readonly webhook_id?: string;
@@ -405,7 +416,7 @@ export class DiscordGateway {
     if (content.length === 0) return;
 
     const deliver = (): void => {
-      void onMessage(content, message.author?.username ?? "someone", from).catch(
+      void onMessage(content, message.author?.username ?? "someone", from, message.id ?? "").catch(
         (error: unknown) => {
           logger.error("gateway.handler-failed", {
             error: error instanceof Error ? error.message : String(error),
