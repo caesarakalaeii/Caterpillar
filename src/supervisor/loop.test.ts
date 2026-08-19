@@ -66,6 +66,14 @@ after(async () => {
 
 const setup = new Git(root);
 await setup.run("init", "--bare", "--initial-branch=main", origin);
+// **No automatic gc in the fixture origin.** Every test in this file pushes to it and several
+// supervisors push concurrently, so it accumulates loose objects fast — and once it crosses
+// git's threshold a `gc --auto` fires DURING somebody else's push, prunes the quarantine
+// directory out from under it, and the push fails with `unable to migrate objects to permanent
+// storage`. Observed in CI on the node 26 job, in `seedTask`, for a test that has nothing to do
+// with the one whose objects triggered it. Nothing here is testing gc, and a hosted origin does
+// not collect mid-push.
+await setup.run("--git-dir", origin, "config", "gc.auto", "0");
 await setup.run("clone", origin, statePath);
 
 const stateGit = new Git(statePath);
@@ -3118,8 +3126,15 @@ test("what Discord reads stays current while a session runs", async () => {
   // session can ever put it in front of a human.
   await seedTask(LATER, { status: "awaiting-human" });
 
+  // BOTH conditions, and waited for BEFORE the abort — the sweep that first publishes `LATER`
+  // need not be the one that has already seen `BUSY` go `running`, because those are two
+  // independent pushes and two independent reads. Sampling the view at the instant `LATER`
+  // appears is asserting on which order they landed in, and it failed in CI as
+  // `'ready' !== 'running'` for exactly that reason. The property is "the view catches up".
+  const caughtUp = (): boolean =>
+    view.find(LATER) !== undefined && view.find(BUSY)?.status === "running";
   const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline && view.find(LATER) === undefined) await sleep(100);
+  while (Date.now() < deadline && !caughtUp()) await sleep(100);
 
   controller.abort();
   await running.catch(() => undefined);
