@@ -767,6 +767,49 @@ export class Supervisor {
     await this.nap(config.pollSeconds * 1000, signal);
   }
 
+  /**
+   * Run one session, and refuse to start one against a signal that has ALREADY aborted.
+   *
+   * A `SessionRunner` is handed the signal and is expected to honour it — every test in
+   * `loop.test.ts` that pins "the abort must reach the session" is asserting exactly that,
+   * and this deliberately does not weaken it: a signal that aborts DURING a session goes to
+   * the runner and nowhere else, so a runner that ignores one is still a bug and still
+   * visible as one.
+   *
+   * What it will not do is hand over a signal that aborted before the call. `AbortSignal`
+   * fires a listener added after the abort exactly never, so a runner that subscribes to the
+   * event — which is the obvious way to write one — waits forever for something that has
+   * already happened. `workTask` then awaits a promise that will never settle, holding a
+   * slot and a lease, with `/healthz` green: the runner-that-looks-healthy of §6.4, reached
+   * through a dependency instead of through a hung command.
+   *
+   * **The window is real and this task widened it.** A `/cancel` may arrive between the CAS
+   * that won the lease and the first turn — `openSlot` installs the cancel hook precisely so
+   * that it can — and pushing the `running` transition put another network round trip in
+   * there, which is also what makes the task visible as `running` early enough for an
+   * operator to cancel it that fast. It is checked HERE, at the last statement before the
+   * call, rather than at the top of the session loop, because everything in between (the
+   * limits check, the reachability check, the transition and its push) is an await.
+   *
+   * `interrupted` is the right outcome to synthesise: it is what all four abort reasons
+   * already produce, and `workTask` reads the slot's own flags to tell which one it was.
+   */
+  private async runSession(
+    spec: TaskSpec,
+    state: TaskState,
+    signal: AbortSignal,
+  ): Promise<SessionOutcome> {
+    if (signal.aborted) {
+      return {
+        reason: "interrupted",
+        usage: EMPTY_USAGE,
+        contextTokens: 0,
+        summary: "the session was stopped before it started",
+      };
+    }
+    return this.deps.runner.run(spec, state, signal);
+  }
+
   /** Slots this runner could still fill. Never negative. */
   private free(): number {
     return Math.max(0, this.deps.config.concurrency - this.slots.size);
@@ -1543,6 +1586,40 @@ export class Supervisor {
 
         let state = await store.readState(spec.id);
 
+        // **Nothing is started against a signal that has already aborted.** The loop's own
+        // condition watches the POD's signal; this watches THIS SLOT's, and they are not the
+        // same question — a `/cancel`, a lost lease and the wall clock all abort the slot
+        // while the pod is perfectly healthy.
+        //
+        // The window is real and this task widened it. A cancel can arrive between the CAS
+        // that won the lease and the first turn (`openSlot` installs the hook precisely so
+        // that it can), and everything in between — the reclaim journal, the reachability
+        // check, and now the `running` push below — is a network round trip. Without this,
+        // the session was started anyway and `SessionRunner.run` was handed an
+        // already-aborted signal: correct implementations return at once, but one that only
+        // subscribes to `abort` waits for an event that has already happened and never
+        // fires. That is not a hypothetical implementation — it is what the fixture in
+        // `loop.test.ts` does, and it hung the file rather than failing it.
+        //
+        // Treated exactly like a session that ran and was interrupted, because that is what
+        // it is from the task's point of view: nothing is recorded (no session count, no
+        // journal entry — §6.4), and a cancel still parks, because stopping a session is
+        // not the same as cancelling a task and an interrupted task is left claimable.
+        if (interrupt.signal.aborted) {
+          logger.info("session.pre-empted", {
+            task: spec.id,
+            session: state.sessions + 1,
+            cancelled: slot.cancelled,
+            leaseLost: slot.lost !== undefined,
+            providerOutage: slot.outage !== undefined,
+          });
+          if (slot.cancelled && slot.lost === undefined) {
+            await this.deps.cancels?.clear(spec.id);
+            await this.park(heartbeat, spec, state, "cancelled from chat");
+          }
+          return;
+        }
+
         const verdict = checkLimits(state, state.limits, {
           noProgressLimit: config.limits.noProgressLimit,
         });
@@ -1566,6 +1643,21 @@ export class Supervisor {
           return;
         }
 
+        // Written and NOT pushed, deliberately — whatever this session commits next
+        // carries it. Pushing it here was tried and reverted: it makes the task visible as
+        // `running` before the session it names has started, and a `/cancel` arriving in
+        // that window is then answered by a park with no session to stop. `loop.test.ts`
+        // pins that ("a cancel from another process reaches a session in flight"), and it
+        // is pinning something real rather than an accident of timing.
+        //
+        // The cost is that `StateStore.dirty` — one flag for the whole checkout — stays set
+        // for the length of every session, so at `concurrency: N` the tree is clean only
+        // when every slot is momentarily between commits and `pull` declines more often
+        // than it used to. That is a REFRESH RATE, not a correctness property: the state
+        // repo is authoritative but never urgent, skipping is the safe direction (see
+        // `StateStore.pull`), and a slot commits several times per session. It is worth
+        // knowing about, and §6.5 records it as the one thing about slots that gets worse
+        // rather than better with N.
         state = await this.transition(heartbeat, state, "running");
         metrics.sessions.inc({ task: spec.id });
 
@@ -1596,7 +1688,7 @@ export class Supervisor {
 
         let outcome: SessionOutcome;
         try {
-          outcome = await this.deps.runner.run(spec, state, interrupt.signal);
+          outcome = await this.runSession(spec, state, interrupt.signal);
         } finally {
           clearTimeout(deadline);
           stopTyping();

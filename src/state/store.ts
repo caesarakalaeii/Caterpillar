@@ -1638,6 +1638,28 @@ export class StateStore {
    * commits at defined points (`Supervisor.recordSession`, `Supervisor.push`) and the very
    * next tick after one of those finds a clean tree. The failure mode of the alternative
    * is not symmetrical — it is a destroyed task.
+   *
+   * **One flag for the whole checkout, so a runner working several tasks at once skips more
+   * often** (DESIGN.md §6.5). `transition("running")` leaves an uncommitted `state.json` for
+   * the length of a session, so at `concurrency: N` the tree is clean only when every slot
+   * is momentarily between commits. That is a refresh RATE rather than a correctness
+   * property — skipping is the safe direction, per the asymmetry above — but it is worth
+   * knowing, because the work loop's pre-claim pull is what stops this runner opening a
+   * session on already-merged work (§6.2) and it is the same call.
+   *
+   * What keeps it bounded is that a slot commits several times per session and empties at
+   * the end of one, so a runner whose slots are not all permanently occupied still refreshes.
+   * Two fixes were considered and both rejected, which is why this is written down rather
+   * than solved:
+   *
+   *   - **Per-path dirtiness.** `reset --hard` and `clean -ffdq` are whole-tree, so a
+   *     narrower check would let a pull revert a directory another session is mid-write in.
+   *     That is a task destroyed to save an interval.
+   *   - **Pushing the `running` transition.** It clears the flag promptly and it makes the
+   *     fleet's view of a running task honest — but it also makes the task visible as
+   *     `running` before the session it names exists, so a `/cancel` arriving in that window
+   *     is answered by a park with no session to stop. `loop.test.ts` pins that, and it is
+   *     pinning something real.
    */
   pull(remote: string, branch: string): Promise<"pulled" | "skipped"> {
     return this.exclusive(async () => {

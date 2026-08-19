@@ -1108,6 +1108,40 @@ supervisor leaves a `state.json` uncommitted for the whole of a session, so broa
 means the first session to finish commits every other in-flight task's state under its own
 message while their own commits find a clean tree and record nothing.
 
+#### The one thing that gets worse with N, and is left that way on purpose
+
+`StateStore.dirty` is one flag for the whole checkout, and `pull` declines while it is set.
+That same `transition("running")` write keeps it set for the length of a session, so at
+`concurrency: N` the tree is clean only when every slot is momentarily between commits, and
+the runner refreshes its view of `tasks/` less often than it used to.
+
+This is a refresh **rate**, not a correctness property. Skipping is the safe direction — a
+deferred refresh costs an interval and a taken one can cost a task (§6.4) — and a slot
+commits several times per session, so a runner whose slots are not all permanently occupied
+still pulls. It is worth stating because the same call is the work loop's pre-claim pull,
+which is what stops this runner opening a session on already-merged work (§6.2).
+
+Two fixes were tried and both rejected, which is why this is written down rather than
+solved:
+
+- **Per-path dirtiness.** `reset --hard` and `clean -ffdq` are whole-tree, so a narrower
+  check would let a pull revert a directory another session is mid-write in. That is a task
+  destroyed to save an interval — the wrong side of the asymmetry §6.4 is built on.
+- **Pushing the `running` transition.** It clears the flag promptly and it would make the
+  fleet's view of a running task honest, which is independently attractive. It also makes a
+  task visible as `running` *before the session it names exists*, so a `/cancel` arriving in
+  that window is answered by a park with no session to stop — and the abort never reaches a
+  session, because there is not one yet. `loop.test.ts` pins exactly that, and it is pinning
+  something real rather than an accident of timing.
+
+What did come out of trying the second one is worth keeping: a session is no longer started
+against a signal that has **already** aborted. A `/cancel` can land between the CAS that won
+the lease and the first turn — the slot's cancel hook is installed at the CAS precisely so
+that it can — and `AbortSignal` never fires a listener added after the abort, so a
+`SessionRunner` that subscribes to the event waits forever for something that has already
+happened. That is a slot and a lease held by a promise that will never settle, with
+`/healthz` green.
+
 #### What it is observable as
 
 `caterpillar_tasks_in_flight` and `caterpillar_slots_free`, both labelled `runner`, and
