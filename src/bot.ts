@@ -45,6 +45,7 @@
  */
 import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
+import { botModeMismatched } from "./config/bot.ts";
 import { loadConfig } from "./config/load.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { asRunnerId } from "./domain/task.ts";
@@ -78,6 +79,27 @@ const main = async (): Promise<void> => {
   const logger = new JsonLogger({ level: config.log.level });
 
   logger.info("bot.starting", { runner: config.runnerId, mode: config.bot.mode });
+
+  // The mirror of `externalBot`'s interlock, from this side of the split. That function
+  // makes the supervisor keep the gateway unless the config says a separate process owns
+  // it; running this binary anyway means BOTH processes hold it. Nothing downstream
+  // catches that, because the two arbitrate by different mechanisms — the supervisor by
+  // the git CAS in `notify/leadership.ts`, this process by a Redis TTL lock — so each is
+  // alone in its own scheme and both act, double-answering every command.
+  //
+  // A warning rather than a refusal, matching `bot.mode-ignored`: the operator who starts
+  // this binary means to run a bot, and the duplicate is visible and recoverable, whereas
+  // exiting here during a config rollout would take the bot down entirely. What matters is
+  // that the misconfiguration is diagnosable from EITHER half rather than only from the
+  // supervisor's log, which is where the asymmetry used to hide it.
+  if (botModeMismatched(config)) {
+    logger.warn("bot.mode-mismatch", {
+      mode: config.bot.mode,
+      reason:
+        'the standalone bot is running but bot.mode is not "external", so the supervisor ' +
+        "keeps the Discord gateway too — both processes will answer every command",
+    });
+  }
 
   // Refused rather than degraded. Redis is how this process reaches the supervisor at
   // all: without it `/tasks` has no snapshot to read and `/resume` has no inbox to go to,

@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { SILENT_LOGGER, type LogFields, type Logger } from "../obs/log.ts";
 import { loadDiscord } from "../index.ts";
-import { externalBot } from "./bot.ts";
+import { botModeMismatched, externalBot } from "./bot.ts";
 import { loadConfig } from "./load.ts";
 
 const roots: string[] = [];
@@ -124,6 +124,38 @@ test("in-process with Redis still keeps the gateway", async () => {
 
   assert.equal(externalBot(config, logger), false);
   assert.deepEqual(warnings, []);
+});
+
+/* ────────────────────── the same interlock, seen from the bot process ────────────────────── */
+
+test("the standalone bot is content when the config hands it the gateway", async () => {
+  const config = await load({
+    bot: { mode: "external" },
+    redis: { enabled: true, url: "redis://localhost:6379" },
+  });
+
+  assert.equal(botModeMismatched(config), false, "this is the configuration the bot is for");
+});
+
+test("a standalone bot running under in-process mode is a diagnosable mismatch", async () => {
+  // The asymmetry this closes. `externalBot` keeps the gateway on the supervisor for this
+  // config, so starting the bot binary anyway leaves BOTH holding it. Neither stops the
+  // other: the supervisor arbitrates with the git CAS in `notify/leadership.ts` and the bot
+  // with a Redis TTL lock, so each is uncontested in its own scheme and every command gets
+  // answered twice. Previously only the supervisor's log could reveal this.
+  const config = await load({ redis: { enabled: true, url: "redis://localhost:6379" } });
+
+  assert.equal(botModeMismatched(config), true);
+});
+
+test("the mismatch is about the mode alone, not about Redis", async () => {
+  // Redis is checked separately by `bot.ts`, which REFUSES to start without it. Folding the
+  // two together here would make the mismatch unreportable in the case that needs it most:
+  // the default config, where Redis is off and the mode is unset.
+  const config = await load({});
+
+  assert.equal(config.redis.enabled, false);
+  assert.equal(botModeMismatched(config), true);
 });
 
 /* ─────────────────── what the gate actually does to the connection ─────────────────── */

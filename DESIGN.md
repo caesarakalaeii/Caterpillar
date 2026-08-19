@@ -1112,13 +1112,18 @@ What moves with it, and what does not:
   `undefined`, which leaves the last good mapping alone, while a published `[]` really does
   mean the last live task went terminal and clears it. A thread the **bot itself** bound is
   *pinned* and survives a mapping that has not heard of it: a brainstorm's thread exists
-  several refreshes before the task the mapping is derived from does, and unbinding it in
+  well before the task the mapping is derived from does, and unbinding it in
   that window would drop the thread a human was just invited to type in. The pin ends the
   moment the mapping mentions the thread, so a terminal task still unbinds — and it also
-  **expires after a few passes**, because a mapping might never mention the thread at all:
+  **expires on a timer**, because a mapping might never mention the thread at all:
   a brainstorm cancelled before the first survey that would have published it is named by
   nothing, and a permanent pin would leave that dead thread bound for the life of the
-  process, swallowing everything typed into it. A pin covers one window; it is not a lease. A message in a
+  process, swallowing everything typed into it. The expiry is a **duration, not a count of
+  refreshes**, and the difference was a real bug: the window the pin must cover is set by
+  the *supervisor's* `housekeepingSeconds` (default 30s, plus a pull, a drain and a survey),
+  while the bot refreshes on its own unrelated 5s timer. Counting refreshes measured the
+  wrong clock and spent the pin in ~15s, so a human typing in a fresh brainstorm thread was
+  told the thread could not be placed — and that text is dropped, not queued. A pin covers one window; it is not a lease. A message in a
   thread the bot cannot place produces an **honest reply**, never silence: in a bound thread
   every message *is* the answer, so saying nothing is indistinguishable from the agent being
   busy.
@@ -1136,6 +1141,15 @@ What moves with it, and what does not:
 - Redis is **required** for this process, unlike everywhere else in §21. It is the only
   route to the supervisor, so a bot without it would acknowledge every command and answer
   none. It refuses to start rather than come up and fail each command individually.
+- The `bot.mode` interlock is checked from **both** sides, because the two failures are
+  different and only one of them was diagnosable. `external` without Redis makes the
+  *supervisor* keep the gateway and warn (`bot.mode-ignored`); running the *bot* binary
+  under any mode but `external` makes it warn in turn (`bot.mode-mismatch`), because the
+  supervisor has then kept the gateway too and both processes act. Nothing downstream
+  catches that pair: they arbitrate by different mechanisms — the supervisor by the git CAS,
+  the bot by the Redis TTL lock — so each is uncontested in its own scheme and every command
+  is answered twice. Both are warnings rather than refusals, so a config slip degrades
+  loudly instead of taking the fleet off Discord.
 
 **Leadership: one replica, plus a Redis lock for the rollout.** The bot Deployment runs
 **one** replica and needs no leadership object at all — `acts()` already treats absent

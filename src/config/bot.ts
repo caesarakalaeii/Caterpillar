@@ -39,3 +39,19 @@ export const externalBot = (config: RunnerConfig, logger: Logger): boolean => {
   });
   return false;
 };
+
+/**
+ * The same interlock seen from the BOT process: warn when this binary is running but the
+ * config has not told the supervisor to stand down.
+ *
+ * `externalBot` keeps the gateway on the supervisor unless the config hands it over, so
+ * starting this binary under any other mode leaves BOTH processes holding it. Nothing
+ * downstream notices, because the two arbitrate by different mechanisms — the supervisor by
+ * the git CAS in `notify/leadership.ts`, the bot by a Redis TTL lock — so each is
+ * uncontested within its own scheme and both act, double-answering every command.
+ *
+ * Here for the reason the whole module is here: it is half of a decision whose other half
+ * is already tested, and a check that can only be reached by booting a process does not get
+ * tested. Returns whether to warn rather than warning itself, so the caller owns the log.
+ */
+export const botModeMismatched = (config: RunnerConfig): boolean => config.bot.mode !== "external";
