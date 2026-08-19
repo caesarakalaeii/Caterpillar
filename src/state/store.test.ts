@@ -765,8 +765,8 @@ test("commitAndPush stages alert records, and pull sweeps unpushed ones", async 
   const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
   assert.match(listed, /^alerts\/refusals\/a1b2c3\.json$/m);
 
-  // Now force the reset path, with an unpushed refusal on disk. The other clone has to
-  // catch up first, or its push is the one that gets rejected.
+  // Now force the reset path, with a refusal on disk that reached no commit. The other
+  // clone has to catch up first, or its push is the one that gets rejected.
   await other.run("pull", "--quiet", "--ff-only", "origin", "main");
   await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
   await other.run("push", "--quiet", "origin", "HEAD:main");
@@ -775,8 +775,32 @@ test("commitAndPush stages alert records, and pull sweeps unpushed ones", async 
     alertname: "CaterpillarPodCrashLooping",
     reason: "no policy entry",
   });
-  await subject.pull("origin", "main");
 
+  // The pull DECLINES, because that write has not been committed yet and the sweep cannot
+  // tell it apart from a session's half-written state (see `pull`). It is not a weakening
+  // of the rule below — it is the rule arriving one commit later.
+  assert.equal(
+    await subject.pull("origin", "main"),
+    "skipped",
+    "a pull must not sweep a write that has not reached a commit yet",
+  );
+  assert.ok(existsSync(join(root, "alerts", "refusals", "ff9900.json")));
+
+  // Now the case the sweep is actually FOR: an untracked leftover that no write of this
+  // store's produced, so nothing marked the tree dirty — an `applyPlan` whose push was
+  // rejected and whose commit was then salvaged away, or a pod that died between the two.
+  // Written past the store on purpose: going through `writeAlertRefusal` again would set
+  // the flag and, correctly, defer the pull once more.
+  await subject.commitAndPush("chore(alerts): record the second refusal", "origin", "main");
+  await rm(join(root, "alerts", "refusals", "ff9900.json"));
+  await subject.commitAndPush("chore(alerts): withdraw it again", "origin", "main");
+  await writeFile(
+    join(root, "alerts", "refusals", "ff9900.json"),
+    '{"fingerprint":"ff9900","alertname":"CaterpillarPodCrashLooping","reason":"orphaned"}\n',
+    "utf8",
+  );
+
+  assert.equal(await subject.pull("origin", "main"), "pulled");
   assert.equal(
     existsSync(join(root, "alerts", "refusals", "ff9900.json")),
     false,
@@ -994,4 +1018,302 @@ test("two runners recording the same task produce commits that rebase cleanly", 
   assert.equal(theirs, journal, "both runners must agree on the journal");
   assert.ok(existsSync(join(root, "tasks", task, "journal")));
   await other.run("rev-parse", "HEAD");
+});
+
+test("a commit from either loop leaves nothing of the other's uncommitted", async () => {
+  // Why clearing `dirty` on ANY commit is safe, now that two loops write this checkout
+  // (DESIGN.md §6.4). The worry is the obvious one: housekeeping commits a `/resume` while
+  // a session is halfway through writing its own task, `dirty` goes false on the strength
+  // of housekeeping's commit, and a pull one tick later resets over the rest.
+  //
+  // It cannot happen, and the reason is a property of `stageCommitPush` rather than of the
+  // flag: it stages `tasks`, `intake`, `digests` and `alerts` with `add -A`, which is the
+  // WHOLE tree the supervisor ever writes. So a commit by either writer necessarily carries
+  // the other's pending files too — the tree really is clean afterwards, and `dirty` is
+  // telling the truth. The cost is attribution, not durability: one commit message
+  // undersells its contents. Losing a task would be worse than an inaccurate subject line,
+  // and this is the assertion that says which one we got.
+  //
+  // If `add -A` is ever narrowed to per-task pathspecs, this test fails and `dirty` must
+  // become a counter rather than a boolean. That is the point of pinning it here.
+  const { store: subject, git } = await sharedStateRepo();
+  const session = asTaskId("MIXED-SESSION");
+  const housekeeping = asTaskId("MIXED-HOUSEKEEPING");
+
+  // The session's half: written, not yet committed. Exactly mid-`recordSession`.
+  await subject.appendJournal(session, 1, "the session's uncommitted work");
+  assert.equal(subject.hasUncommittedState, true);
+
+  // Housekeeping writes something unrelated and commits it, as `applyChatRequests` does.
+  await subject.writeHandoff(housekeeping, "a /resume served while the session ran");
+  await subject.commitAndPush(`chore(${housekeeping}): resumed`, "origin", "main");
+
+  // The flag is clear — and it is entitled to be, because the tree is.
+  assert.equal(subject.hasUncommittedState, false);
+  assert.equal(
+    (await git.run("status", "--porcelain")).trim(),
+    "",
+    "`dirty` may only go false when the tree genuinely has nothing left in it",
+  );
+
+  // Which is to say the session's journal went along with housekeeping's commit, rather
+  // than being left behind for a pull to sweep away.
+  assert.match(
+    await git.run("show", "--name-only", "--format=", "HEAD"),
+    new RegExp(`tasks/${session}/journal/`),
+    "the session's file must be IN the commit, not merely survive it",
+  );
+
+  // So the pull that follows is safe, and the session's work is on the remote.
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(session)) ?? "", /uncommitted work/);
+});
+
+test("a pull will not reset over state a session has written but not committed", async () => {
+  // The incident `pull` records — five destroyed tasks — with a new way to reach it. Since
+  // the supervisor split housekeeping onto its own timer (DESIGN.md §6.4), `pull` runs on a
+  // clock that knows nothing about the session: it can land in the window between a
+  // session's `writeState` and the `commitAndPush` that was going to persist it, and
+  // `reset --hard` plus `clean -ffdq` over `tasks/` inside that window destroys the lot.
+  //
+  // Mutual exclusion does not cover this. The mutex only guarantees the pull is not inside
+  // a `git add`; the window here is minutes wide and contains no git at all.
+  const { store: subject, other, root } = await sharedStateRepo();
+  const task = asTaskId("PULL-GUARD-1");
+
+  // Something for the remote to be ahead by, so a pull that DID run would visibly reset.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  await subject.writeState({
+    id: task,
+    status: "running",
+    phase: "implementing",
+    requires: [],
+    sessions: 3,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 3, noProgressStreak: 0 },
+    createdAt: "2026-08-13T00:00:00Z",
+    updatedAt: "2026-08-13T00:00:00Z",
+  });
+  await subject.appendJournal(task, 3, "work the housekeeping loop must not destroy");
+
+  assert.equal(await subject.pull("origin", "main"), "skipped");
+  assert.equal((await subject.readState(task)).sessions, 3, "the state must survive");
+  assert.match(
+    (await subject.readJournal(task)) ?? "",
+    /must not destroy/,
+    "the journal must survive too — `clean -ffdq` would have taken the whole directory",
+  );
+  assert.ok(
+    existsSync(join(root, "tasks", task, "state.json")),
+    "and the directory itself, which the sweep removes wholesale",
+  );
+
+  // And the deferral is exactly that: once the session commits, the very next pull runs.
+  await subject.commitAndPush(`chore(${task}): session 3`, "origin", "main");
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.equal((await subject.readState(task)).sessions, 3);
+});
+
+test("a write that races a commit is not marked clean by it", async () => {
+  // The narrow window the write GENERATION closes, as opposed to the minutes-wide one the
+  // `dirty` flag closes on its own.
+  //
+  // Store writes are plain `writeFile` + `touched()` and deliberately do NOT take the
+  // mutex — holding it from a session's `writeState` to its `commitAndPush` is the deadlock
+  // `exclusively` exists to avoid. So a write can land INSIDE `stageCommitPush`: after the
+  // `add -A tasks` that would have staged it, before the flag is cleared. It is then in
+  // neither the commit nor the flag, `pull` believes the tree is clean, and `clean -ffdq`
+  // over `tasks/` destroys it — the same five-task incident, reached through a hole two
+  // hundred milliseconds wide instead of two minutes.
+  //
+  // In production the racing writer is a session's `publishArtifact` or `appendJournal`,
+  // which may then run for hours before its own commit. That is what makes a window this
+  // small worth closing: the loss is taken instantly and noticed much later.
+  const { store: subject, other } = await sharedStateRepo();
+  const session = asTaskId("RACE-SESSION");
+  const housekeeping = asTaskId("RACE-HOUSEKEEPING");
+
+  // Something for a pull to reset onto, so a pull that runs is visibly destructive.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  // Housekeeping commits its own work — and the session writes while that is in flight.
+  await subject.writeHandoff(housekeeping, "a /resume served while the session ran");
+  const committing = subject.commitAndPush(`chore(${housekeeping}): resumed`, "origin", "main");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await subject.appendJournal(session, 1, "written while housekeeping was committing");
+  await committing;
+
+  // The commit may or may not have caught that journal shard — it depends on where in the
+  // subprocess sequence the write landed, which is exactly why this cannot be reasoned
+  // about per-call. What must hold either way is that the flag does not claim otherwise.
+  assert.equal(
+    subject.hasUncommittedState,
+    true,
+    "a write racing the commit must leave the tree marked dirty, not silently unstaged",
+  );
+  assert.equal(
+    await subject.pull("origin", "main"),
+    "skipped",
+    "and the pull that would have destroyed it must therefore decline",
+  );
+  assert.match(
+    (await subject.readJournal(session)) ?? "",
+    /while housekeeping was committing/,
+    "the racing write must survive",
+  );
+
+  // Deferred, not dropped: the next commit carries it and the pull runs again.
+  await subject.commitAndPush(`chore(${session}): session 1`, "origin", "main");
+  assert.equal(subject.hasUncommittedState, false);
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(session)) ?? "", /while housekeeping was committing/);
+});
+
+test("a write that races a pull is not destroyed by it", async () => {
+  // The mirror image of the test above, and the one that cost real work to find.
+  //
+  // `pull` checks `dirty` inside the mutex and then does a network `fetch` before anything
+  // destructive. `dirty` is only a SAMPLE — store writes do not take the mutex — so a write
+  // landing during that fetch is invisible to the check at the top and deleted by the
+  // `clean -ffdq tasks` at the bottom. The gate looked sufficient and was not: this is the
+  // five-destroyed-tasks incident, still reachable after the flag was added.
+  //
+  // It stopped being theoretical when the work loop began pulling before each claim, which
+  // put a pull in the same instant as a `/brainstorm` creating a task. The spec was written
+  // between the fetch and the clean, vanished, and the `commitAndPush` immediately after
+  // found nothing to commit and reported success — a task acknowledged to the human that
+  // existed nowhere.
+  const { store: subject, other } = await sharedStateRepo();
+  const created = asTaskId("PULL-RACE-1");
+
+  // The remote must have moved, or the pull has nothing to reset onto and the test proves
+  // nothing about a destructive refresh.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  // Clean at the instant the pull starts — which is what makes the `dirty` check pass and
+  // the window open.
+  assert.equal(subject.hasUncommittedState, false);
+
+  // Issued while the pull is inside its fetch, and not awaited first: the whole point is
+  // that it is submitted after the gate was checked and before the tree is touched.
+  const pulling = subject.pull("origin", "main");
+  const writing = subject.appendJournal(created, 1, "written while the pull was fetching");
+  const outcome = await pulling;
+  await writing;
+
+  assert.match(
+    (await subject.readJournal(created)) ?? "",
+    /while the pull was fetching/,
+    "a pull must not delete a write that landed after it sampled the dirty flag",
+  );
+
+  // It used to have to DECLINE to keep that promise, and the assertion here was `skipped`.
+  // Writes take the mutex now, so this write waits out the fetch instead of racing it: the
+  // pull has the tree to itself and completes, and the write lands after it. Same survival,
+  // one fewer deferred refresh — and the survival no longer depends on the pull noticing.
+  assert.equal(outcome, "pulled", "a write that waits its turn is not a reason to decline");
+
+  // And it is still pending a commit, so the next pull defers to it rather than sweeping it.
+  assert.equal(subject.hasUncommittedState, true);
+  await subject.commitAndPush(`chore(${created}): created`, "origin", "main");
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.match((await subject.readJournal(created)) ?? "", /while the pull was fetching/);
+});
+
+test("a write waits for whoever holds the tree — unless it IS the holder", async () => {
+  // Both halves of what `write` taking the mutex means, because getting either backwards
+  // reintroduces a bug this change exists to remove.
+  //
+  // A write from ANOTHER async context must wait: that is the whole fix. `dirty` cannot do
+  // this job alone — it is a sample, and every destructive step after it is sampled is a
+  // window (see the DESTRUCTIVE pull test below).
+  //
+  // A write from the HOLDER's own context must not: `exclusively` exists so a write and its
+  // commit are one unit, so a holder that deadlocked on its own hold the moment it wrote
+  // would make the API unusable. It is scoped to the holding context and not a "someone
+  // holds it" flag, because a flag would wave through the concurrent write the lock is for.
+  const { subject } = await storeAt();
+  const outside = asTaskId("HELD-1");
+  const inside = asTaskId("HELD-2");
+
+  let release: () => void = () => {};
+  const holding = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  let heldTheirs: string | undefined;
+  let heldOwn: string | undefined;
+  const held = subject.exclusively(async () => {
+    // The holder's own write, through the ordinary public method: it must land here and now.
+    await subject.appendJournal(inside, 1, "the holder writes");
+    heldOwn = await subject.readJournal(inside);
+    await holding;
+  });
+
+  // Issued from outside the hold, and long enough that an unlocked write would have
+  // finished several times over.
+  const writing = subject.appendJournal(outside, 1, "written while the tree was held");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  heldTheirs = await subject.readJournal(outside);
+
+  release();
+  await held;
+  await writing;
+
+  assert.match(heldOwn ?? "", /the holder writes/, "the holder must not deadlock on itself");
+  assert.equal(heldTheirs, undefined, "another context's write must wait, not race");
+  assert.match(
+    (await subject.readJournal(outside)) ?? "",
+    /while the tree was held/,
+    "and it must then land, rather than be dropped",
+  );
+});
+
+test("a write that races a DESTRUCTIVE pull is not destroyed by it", async () => {
+  // The sibling of "a write that races a pull", and the one that actually broke CI. That
+  // test lands its write during the `fetch`, which the post-fetch generation re-check
+  // catches — the pull declines and the write survives. This one lands it AFTER that check,
+  // inside the `reset --hard` + `clean -ffdq` that follows, which no re-check can undo:
+  // several subprocess spawns wide, and on a loaded runner that is hundreds of milliseconds.
+  //
+  // It cost a whole afternoon as a flake in `loop.test.ts` — an answer from Discord that
+  // reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work loop's
+  // pre-claim pull, and then pushed a `state.json` saying the question was answered. The
+  // task resumes with the answer missing from the one place the next session reads it.
+  const { store: subject, git, other } = await sharedStateRepo();
+  const task = asTaskId("PULL-RACE-2");
+
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+  const remoteHead = (await other.run("rev-parse", "HEAD")).trim();
+
+  const pulling = subject.pull("origin", "main");
+
+  // The tracking ref moving is how the fetch announces that the destructive phase is next —
+  // which is precisely the point the `dirty` gate has stopped being able to help.
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const tracking = await git.tryRun("rev-parse", "refs/remotes/origin/main");
+    if (tracking.code === 0 && tracking.stdout.trim() === remoteHead) break;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  await subject.writeAnswer(task, 4, "Use the existing migration path.");
+  await pulling;
+
+  assert.match(
+    (await subject.readAnswer(task, 4)) ?? "",
+    /Use the existing migration path\./,
+    "a pull already past its own gate must still not delete a write",
+  );
+  assert.equal(subject.hasUncommittedState, true, "and the write must still be pending a commit");
 });

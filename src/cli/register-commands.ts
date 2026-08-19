@@ -5,10 +5,14 @@
  *   DISCORD_BOT_TOKEN=... DISCORD_APPLICATION_ID=... DISCORD_GUILD_ID=... \
  *     npm run discord:register
  *
- * Commands do NOT register themselves at boot. Registration is a write against Discord's
- * API and the supervisor restarts on every deploy; doing it in `main()` would mean a
- * write per pod per rollout, all of them identical. It is a deploy-time step, run once,
- * and re-run only when `COMMANDS` changes.
+ * A runner NOW registers the set itself at boot, once per change across the whole fleet
+ * (`notify/register.ts`) — the objection this file used to record was about redundant
+ * writes, and a digest-keyed claim answers it without making a human remember the step.
+ *
+ * This remains, and remains UNCONDITIONAL: it is the escape hatch for what a digest cannot
+ * see. Commands edited or deleted in Discord itself leave the ref saying "published" and the
+ * guild disagreeing, and this is what fixes that. It is also how a command set is iterated
+ * on against a test guild from a workstation, without a pod or a state repo.
  *
  * Registration is a full REPLACE: the array in `slash.ts` becomes the entire command set,
  * so a command deleted from it disappears from the client. That is what makes this
@@ -25,8 +29,8 @@
  *     by the gateway.
  */
 import { SecretBundle } from "../secrets/load.ts";
-import { DiscordHttpError, postJson } from "../notify/http.ts";
-import { API_BASE } from "../notify/bot.ts";
+import { DiscordHttpError } from "../notify/http.ts";
+import { putCommands } from "../notify/register.ts";
 import { COMMANDS } from "../notify/slash.ts";
 
 const SECRETS_DIR = process.env["SECRETS_DIR"] ?? "/etc/caterpillar/secrets";
@@ -60,18 +64,10 @@ const main = async (): Promise<void> => {
     console.log(`  /${String(command["name"])} — ${String(command["description"])}`);
   }
 
-  const response = await postJson({
-    url: `${API_BASE}/applications/${applicationId}/guilds/${guildId}/commands`,
-    method: "PUT",
-    body: JSON.stringify(COMMANDS),
-    what: "command registration",
-    headers: { authorization: `Bot ${token}` },
-  });
-
-  const registered = (await response.json().catch(() => [])) as readonly { readonly name?: string }[];
+  const registered = await putCommands({ applicationId, guildId, token, commands: COMMANDS });
   console.log(
     `✓ Discord accepted ${registered.length} command(s): ${registered
-      .map((c) => `/${c.name ?? "?"}`)
+      .map((name) => `/${name}`)
       .join(" ")}`,
   );
   console.log("\nGuild commands take effect immediately — try one in the channel now.");

@@ -24,6 +24,7 @@ import type {
   DigestConfig,
   LlmConfig,
   RedisConfig,
+  BotConfig,
   RemediationConfig,
   RunnerConfig,
   WebConfig,
@@ -81,6 +82,7 @@ interface RawConfig {
   readonly llm?: Record<string, unknown>;
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
+  readonly housekeepingSeconds?: unknown;
   readonly secretsDir?: unknown;
   readonly log?: { readonly level?: unknown };
   readonly intake?: { readonly intervalSeconds?: unknown };
@@ -89,6 +91,7 @@ interface RawConfig {
   readonly cluster?: Record<string, unknown>;
   readonly remediation?: Record<string, unknown>;
   readonly redis?: Record<string, unknown>;
+  readonly bot?: Record<string, unknown>;
 }
 
 const str = (value: unknown, field: string, fallback?: string): string => {
@@ -478,6 +481,26 @@ const redisConfig = (redis: Record<string, unknown>): RedisConfig => {
   };
 };
 
+/**
+ * Validate the `bot` block (DESIGN.md §7).
+ *
+ * The mode is validated as an enum rather than coerced, because the failure of a typo is
+ * invisible: `mode: "extrenal"` silently falling back to in-process gives a fleet where
+ * the supervisor AND the standalone bot are both connected to Discord and both acting,
+ * which is the duplicate-acting failure the whole arrangement exists to prevent. A boot
+ * failure naming the field is the only honest answer.
+ */
+const botConfig = (bot: Record<string, unknown>): BotConfig => {
+  const mode = str(bot["mode"], "bot.mode", "in-process");
+  if (mode !== "in-process" && mode !== "external") {
+    throw new ConfigError(
+      `bot.mode must be "in-process" or "external" (got '${mode}')`,
+    );
+  }
+
+  return { mode, port: port(bot["port"], "bot.port", 9091) };
+};
+
 export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   const raw = JSON.parse(await readFile(path, "utf8")) as RawConfig;
 
@@ -496,6 +519,10 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
 
   const mirrors = str(raw.paths?.mirrors, "paths.mirrors");
   const tasks = str(raw.paths?.tasks, "paths.tasks");
+
+  // Hoisted because `housekeepingSeconds` both defaults to it and is clamped by it, and
+  // three copies of the same `num(..., 30)` are three places for the default to drift.
+  const poll = num(raw.pollSeconds, "pollSeconds", 30);
 
   return {
     runnerId,
@@ -592,7 +619,13 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     },
     llm: llmConfig(llm),
     workspaces,
-    pollSeconds: num(raw.pollSeconds, "pollSeconds", 30),
+    pollSeconds: poll,
+    // Defaulted to `pollSeconds` rather than to a constant, and then clamped to it: the
+    // guarantee the split is worth having for is "chat, intake and leadership are never
+    // slower than they were before", and a config that set `pollSeconds: 5` and left this
+    // alone would silently break it. Faster is allowed — housekeeping costs a fetch and a
+    // few array filters, and a human waiting on `/resume` is the thing being optimised.
+    housekeepingSeconds: Math.min(num(raw.housekeepingSeconds, "housekeepingSeconds", poll), poll),
     secretsDir: str(raw.secretsDir, "secretsDir"),
     log: { level: logLevel(raw.log?.level) },
     intake: {
@@ -603,5 +636,6 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     cluster: clusterConfig(raw.cluster ?? {}),
     remediation: remediationConfig(raw.remediation ?? {}),
     redis: redisConfig(raw.redis ?? {}),
+    bot: botConfig(raw.bot ?? {}),
   };
 };

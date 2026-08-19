@@ -384,3 +384,62 @@ test("the timeout and the enabled flag are validated rather than coerced", async
   // only reading that cannot silently mean the opposite of what was written.
   await assert.rejects(() => load({ redis: { enabled: "false" } }), ConfigError);
 });
+
+test("housekeeping defaults to the poll interval and is never slower than it", async () => {
+  // The guarantee the two-loop split (DESIGN.md §6.4) is worth having is "chat, intake and
+  // leadership are never noticed later than they were before". Housekeeping running slower
+  // than claiming would break exactly that, and it would break it silently: nothing fails,
+  // a human just waits longer for `/resume` than they did on the single loop.
+  const plain = await load({});
+  assert.equal(plain.pollSeconds, 30);
+  assert.equal(plain.housekeepingSeconds, 30, "unset, it tracks pollSeconds");
+
+  // Tracks a NON-default pollSeconds too. Defaulting to a constant would have left a
+  // runner configured for a five-second poll doing housekeeping every thirty.
+  const eager = await load({ pollSeconds: 5 });
+  assert.equal(eager.housekeepingSeconds, 5);
+
+  // Faster than the poll is allowed: housekeeping costs a fetch and a few array filters,
+  // and the human waiting on `/resume` is the thing being optimised.
+  const faster = await load({ pollSeconds: 60, housekeepingSeconds: 10 });
+  assert.equal(faster.housekeepingSeconds, 10);
+
+  // Slower is clamped rather than refused. It is a coherent thing to have written and the
+  // right answer is knowable, so failing to boot over it would be worse than correcting it.
+  const slower = await load({ pollSeconds: 15, housekeepingSeconds: 600 });
+  assert.equal(slower.housekeepingSeconds, 15);
+
+  await assert.rejects(() => load({ housekeepingSeconds: "often" }), ConfigError);
+});
+
+/**
+ * The `bot` block (DESIGN.md §7).
+ *
+ * The default is the whole point: a config that says nothing about the bot must produce
+ * exactly the runner that has always existed, connecting to Discord itself. Every other
+ * assertion here is about the one mistake that is silent — a mode nobody validated.
+ */
+test("a config that says nothing about the bot runs it in-process, as it always has", async () => {
+  const config = await load({});
+
+  assert.equal(config.bot.mode, "in-process");
+  assert.equal(config.bot.port, 9091);
+});
+
+test("an external bot is carried through with its own port", async () => {
+  const config = await load({ bot: { mode: "external", port: 9092 } });
+
+  assert.equal(config.bot.mode, "external");
+  // Its own port, not the supervisor's: the two run in one namespace and one number
+  // meaning both is an EADDRINUSE in whichever pod loses.
+  assert.equal(config.bot.port, 9092);
+});
+
+test("a misspelled mode fails the boot rather than quietly connecting twice", async () => {
+  // The failure this prevents is invisible otherwise: `extrenal` falling back to
+  // in-process gives a supervisor AND a standalone bot both connected to Discord and both
+  // acting, which is the duplicate-acting failure the split exists to prevent.
+  await assert.rejects(() => load({ bot: { mode: "extrenal" } }), ConfigError);
+  await assert.rejects(() => load({ bot: { mode: "" } }), ConfigError);
+  await assert.rejects(() => load({ bot: { port: "9091" } }), ConfigError);
+});

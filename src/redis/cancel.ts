@@ -1,13 +1,13 @@
 /**
  * `/cancel`, delivered to a session that is already running.
  *
- * The problem, from `supervisor/loop.ts`: the poll loop is BLOCKED for the whole duration
- * of a session — hours, in the limit — and the inbox drain runs in that loop. A `/cancel`
- * typed while the agent is working therefore sat in the queue until the session it was
- * meant to stop had already finished, and the operator's Discord reply hung until then.
- * The existing fix is `CANCEL_POLL_MS`: a 2-second `setInterval` inside the session that
- * filters the in-process queue for a matching park. That works, and it works only because
- * the submitter and the session are the same process.
+ * The problem, from `supervisor/loop.ts`: a `/cancel` for the task a runner is CURRENTLY
+ * running cannot be served by that runner's housekeeping loop, however promptly it drains.
+ * Parking takes the task's lease, and the in-flight session is holding it. So the drain
+ * deliberately excludes exactly that request and `CANCEL_POLL_MS` serves it instead: a
+ * 2-second `setInterval` inside the session that filters the in-process queue for a
+ * matching park. That works, and it works only because the submitter and the session are
+ * the same process.
  *
  * With a standalone bot they are not, so the signal needs somewhere to cross. Two halves,
  * for the same reason the inbox has two:

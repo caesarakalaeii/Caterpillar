@@ -678,10 +678,14 @@ into `agent.prompt()` via pi's `abort()`:
    tool documents `timeout` as optional with **no default**, so the model decides whether
    a command may block forever — and a provider request can hang just as well as a
    command can. `npm run dev`, a test runner waiting on stdin, a
-   `nix build` against a dead cache — the promise never settles, and everything in the
-   supervisor is single-threaded, so the poll loop, the chat drain and intake stop with
-   it. The heartbeat keeps renewing, `/healthz` keeps answering 200, and the typing
-   indicator stays on: a runner that looks healthier the longer it is wedged.
+   `nix build` against a dead cache — the promise never settles. The heartbeat keeps
+   renewing, `/healthz` keeps answering 200, and the typing indicator stays on: a runner
+   that looks healthier the longer it is wedged.
+
+   This used to take everything else down with it. The supervisor ran one loop, so the
+   chat drain, intake, alerts and the digest stopped with the session too — see *Two
+   loops* below, which is the fix and which changes what the paragraph above costs: a
+   wedged session is now a wedged session rather than a wedged runner.
 
 #### It happened, and the session ceiling was the wrong place to catch it
 
@@ -748,14 +752,172 @@ deliberately distinct from it: no provider misbehaved, so no cooldown starts. Ch
 task a session for a deploy would also count it against the no-progress streak, which is
 how a pod restart could park a task that was doing fine.
 
-**`/cancel` needs the queue read while the session runs.** `ChatInbox` is drained in the
-poll loop, which is blocked for the entire duration of a session — so a cancel sat in the
-queue until the session it was meant to stop had already finished, and the operator's
-Discord reply hung until then. `workTask` therefore watches for park requests naming its
-own task and takes only those (`takeWhere`), leaving everything else queued: the rest
-write the state repo, and this session holds the lease those writes would have to fence
-against. The reply says `cancelling`, not `parked`, because the session may take a turn
-boundary to unwind and the human is waiting on a Discord interaction.
+#### Two loops: housekeeping does not wait for a session
+
+The supervisor's `run()` was one `while`, and one iteration of it did `store.pull` →
+`chat.refresh` → `applyChatRequests` → `maybeIngest` → `drainAlerts` → `maybeDigest` →
+`claimNext` → `workTask`. `workTask` runs a whole session, which is hours, so every step
+before it lived in that session's shadow. The consequences were not hypothetical: a
+labelled GitHub issue was not ingested until the session ended (`maybeIngest` had its own
+interval, but an interval is only an interval if something consults it); a `/resume` or
+`/answer` sat unread in the `ChatInbox`; and the Discord holder claim — refreshed from
+that same loop — could neither be renewed nor stood down from, so a mid-session replica
+went on advertising itself as the holder while answering nothing (§7).
+
+The workarounds that existed confirmed the diagnosis rather than fixing it: a
+`CANCEL_POLL_MS` interval that watched for one request kind, and `yieldToBrainstorm`,
+which hands the whole runner back at a session boundary.
+
+So the timing is split in two, in `src/supervisor/loop.ts`:
+
+- **The housekeeping loop**, on `housekeepingSeconds`: `store.pull`, `chat.refresh`,
+  `applyChatRequests`, `maybeIngest`, `drainAlerts`, `maybeDigest`, and
+  `toolchain.maybeCollectGarbage()` when idle. It runs whether or not a session is in
+  flight.
+- **The work loop**, on `pollSeconds`: `store.pull` → `coolingDown` → `claimNext` →
+  `workTask`. It blocks for the session, as it always did. `pollSeconds` is now a claim
+  *backoff* — how long an idle runner waits before looking for work again — and nothing a
+  human waits on depends on it. `housekeepingSeconds` defaults to `pollSeconds` and is
+  clamped to it.
+
+  The work loop pulls too, and that is not redundant with housekeeping's pull. The single
+  loop did pull-then-claim in one pass, so a claim was always decided from a checkout
+  refreshed moments earlier; splitting the loops broke that silently, because `pull`
+  declines while the tree is dirty and the tree is dirty for the *whole* of a session. The
+  first claim after every session would then be decided from a view of `tasks/` predating
+  it. The lease CAS does not cover that gap — `isClaimable` is a filter over local state,
+  and the CAS succeeds freely once another runner has released — so a task finished
+  elsewhere hours ago looks ready and claimable, and this runner opens a session on
+  already-merged work, which §6.2 names as the worst outcome the system has. Mid-session
+  the call is a no-op `"skipped"`; it is only ever a real pull when the tree is clean,
+  which is exactly when a claim is about to be made.
+
+This is **not** task concurrency, and §6's one-session-at-a-time rule is unchanged: there
+is one work loop, so there is one `workTask`. What is concurrent is housekeeping against a
+session. Both loops contain their own failures for the reason the single loop did — a
+throw out of `run()` reaches main's `finally`, which closes `/healthz` and the credential
+socket and then blocks forever on `await bridge`, leaving a live process that polls nothing
+and that systemd never restarts because it never exited. Splitting the loop doubled the
+number of places that can happen. Both honour the same `AbortSignal`, and `run` awaits both
+so a throw that did escape ends the process rather than leaving one loop turning.
+
+**The two loops share one git checkout, and that is the hard part.** `StateStore` is a
+single working copy; `commitAndPush` stages the tree and `push` rebases on conflict. Two
+concurrent writers get `index.lock` at best and a commit carrying the other's half-written
+state at worst — exactly the reasoning §7 already gives for why the Discord bridge does not
+touch git. Two mechanisms, and both are needed:
+
+1. **A serialising mutex** (`src/state/serial.ts`) in front of every `StateStore` method
+   that runs git. A promise chain, no dependency, fair, and a throw releases it — a
+   rejected tail would make one failed push wedge every later write. It is deliberately not
+   re-entrant: a public method calling another public one is the bug, and an ownership
+   token would hide it.
+2. **`pull` declines while the tree is dirty.** Mutual exclusion says a pull does not land
+   inside a `git add`; it says nothing about one landing between a session's `writeState`
+   and the `commitAndPush` that would have persisted it, which is a window of *minutes*.
+   `pull` does `reset --hard` and `clean -ffdq` over `tasks/`, `intake/` and `alerts/`, and
+   that combination once destroyed five tasks' work outright (§4.3). So every write sets a
+   dirty flag, the commit clears it, and a pull that finds it set returns `"skipped"` and
+   tries again next tick. Skipping is cheap and safe in a way resetting is not: the state
+   repo is authoritative but never urgent, a session commits at defined points
+   (`recordSession`, `push`), and the very next housekeeping tick after one of those finds
+   a clean tree. The failure modes are not symmetrical — a deferred refresh costs one
+   interval and a taken one costs a task.
+
+   One flag covers both writers, which looks too simple and is not. `commitAndPush` stages
+   `tasks`, `intake`, `digests` and `alerts` with `add -A` — the whole of what the
+   supervisor writes — so whichever loop commits carries the other's pending files with it
+   and the tree afterwards really is clean. What the two lose is attribution, not
+   durability: a commit message occasionally undersells its contents. That is the right way
+   round.
+
+   The flag is backed by a monotonic write counter. `commitAndPush` samples it before its
+   first `add` and clears the flag only if it has not moved, so a write that lands *during*
+   a commit — after the `add` that would have staged it — leaves the tree marked dirty
+   rather than being lost to the next `pull`; and `pullNow` re-reads it after its `fetch`
+   and abandons the refresh if it moved, reporting `"skipped"`. That second one is the
+   original five-task incident, still reachable after the flag alone was added: it stopped
+   being theoretical the moment the work loop began pulling before each claim, which put a
+   pull in the same instant as a `/brainstorm` creating a task — the spec was written
+   between the fetch and the clean, and the `commitAndPush` immediately after found nothing
+   to commit and reported success. A task acknowledged to a human that existed nowhere.
+
+3. **Writes take the mutex too — one write at a time.** This is the third mechanism, and it
+   exists because the first two are not enough however carefully the counter is placed.
+   `dirty` is a *sample*, and both destructive paths spend several subprocess spawns in the
+   working tree **after the last moment they could check it**: `pullNow` between its
+   post-fetch re-check and its `clean -ffdq`, and `rebaseOnto` between its `reset --hard
+   HEAD` and the end of its salvage. An unlocked write landing in there is deleted having
+   been visible to nothing, and no additional flag can see it — the check would have to
+   happen after the damage.
+
+   It was not found by reasoning about the window. It was found as a **flaky test**: one CI
+   run in three, `an answer from the bridge unparks the task on the REMOTE`. An answer typed
+   in Discord reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work
+   loop's pre-claim pull, and then pushed a `state.json` saying the question had been
+   answered — the answer gone from the one file the next session reads it out of (§4.1),
+   while every status said it had been recorded. The same red job also skipped the image
+   build, so that deploy silently did not happen.
+
+   The objection this design started with — that holding the mutex across a session's
+   minutes-long write-then-commit window is a deadlock waiting to happen — is answered by
+   **scope**: the lock is held for one `writeFile`, never for a write-then-commit unit. What
+   a write can now do is wait out a fetch. Losing it was the alternative.
+
+   The one real deadlock this did introduce is worth writing down, because it hung a test
+   file rather than failing it. `exclusively` exists so that a write and its commit are one
+   unit — so the holder of the tree writing through it deadlocks on its own hold the instant
+   writes acquire. So acquisition is **scoped to the async context that holds the lock**
+   (`AsyncLocalStorage`, in `StateStore.exclusive`): the holder's own write runs immediately,
+   anyone else's queues. `Serial` stays re-entrant-hostile and is not weakened, because the
+   re-entrancy turns on *identity* — a boolean saying "someone holds it" would wave through
+   the very concurrent write the lock exists to order.
+
+   The counter checks stay as the second line rather than the only one: `serial` is
+   injectable, so something else can share the checkout, and a guard whose incident is
+   written down is not one to delete because it has become hard to reach. What the mutex
+   still does not make atomic is a read-then-write — a caller that reads state, decides, and
+   writes it back can have a pull land in the middle. That is what `exclusively` is for.
+
+   `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
+   needs the two to be one unit. **No production path uses it today** — the supervisor's
+   writes go through `writeState`/`appendJournal`, which now take the mutex individually and
+   are covered by the dirty flag and its counter between them. It exists because the gap it closes is
+   real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
+   then commits can have its files swept into another writer's commit under the wrong
+   message. That costs attribution, not durability, which is precisely why the supervisor
+   accepts it rather than restructuring every session write into a held-lock unit.
+
+**`/cancel` keeps its own interval, and it is not redundant.** Housekeeping drains the
+inbox during a session now, which is what `CANCEL_POLL_MS` was built to work around — but
+not for the one request kind it exists for. A `/cancel` naming the task *this runner is
+currently running* cannot be served from housekeeping: acting on it means writing state
+under a lease the session holds, and only the session can stand down from it. So
+`applyChatRequests` leaves exactly those requests queued and takes everything else, and
+`workTask` watches for park requests naming its own task and takes only those
+(`takeWhere`). The reply says `cancelling`, not `parked`, because the session may take a
+turn boundary to unwind and the human is waiting on a Discord interaction.
+
+The watcher also wants a tighter interval than housekeeping does: it is an in-memory queue
+check, where housekeeping's interval is tuned against a git fetch and a Discord round trip.
+
+**That split depends on the queue being able to take selectively, and one cannot.**
+`RedisChatQueue.takeWhere` is a stub returning empty — a selective pop from a shared list
+is a Lua script, and it was never needed while the only caller was the in-session watcher
+(§21). Routing the whole housekeeping drain through `takeWhere` therefore drained *nothing*
+on a Redis-backed fleet for the duration of every session: `/resume`, `/answer`, `/merge`
+and `/brainstorm` all unserved, silently, on exactly the multi-replica path the split was
+aimed at. Worse, the in-session watcher polls that same stub, so an in-flight `/cancel` had
+no path at all and deleting the pod was the only way to stop a session — which strands the
+task (§6.2).
+
+So `ChatDrainer` carries an explicit `selective` flag and the loop branches on it. Where it
+is true, the behaviour above stands. Where it is false, housekeeping drains *everything*
+and routes a park naming the in-flight task to the session directly, through a handler
+`workTask` installs for its own duration and clears in its `finally`. The handler settles
+`cancelling` and aborts the session — the same two things the watcher does, because it is
+the same function. A queue that cannot take selectively must say so rather than answering
+"nothing matched" to every question.
 
 Stopping the session is **not** cancelling the task, and the difference is easy to miss:
 an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
@@ -790,12 +952,16 @@ every runner that is not this pod. A gateway connection is dialled OUT, so there
 ingress, no TLS, and no URL to leak. Node ships a global WebSocket, so it costs no
 dependency either.
 
-The bridge does **not** touch the state repo. The poll loop owns that working copy, and
-two git invocations interleaving in it is `index.lock` at best; a websocket handler
+The bridge does **not** touch the state repo. The supervisor's loops own that working copy,
+and two git invocations interleaving in it is `index.lock` at best; a websocket handler
 writing it concurrently would be a race with no owner. So a command is submitted to an
-in-process inbox, the loop drains it *before claiming* — so a task unparked by an answer
-is claimable on the same pass — and the submitter is told what actually happened. Silence
+in-process inbox, the housekeeping loop drains it — on that loop's interval, whether or not
+a session is in flight (§6.4) — and the submitter is told what actually happened. Silence
 would leave a human unable to tell a typo from an offline bridge.
+
+That argument is also why the two supervisor loops take a mutex rather than each opening
+their own checkout: they are both loops, so neither can queue for the other the way the
+bridge queues for them. See §6.4.
 
 Answering also **resets `noProgressStreak`**. `awaiting-human` is only ever reached from a
 session that produced no commit, so a task answered at the no-progress limit would park
@@ -842,16 +1008,53 @@ is the same failure again.
 
 **Acknowledge in 3 seconds, deliver the outcome separately.** Discord gives an interaction
 three seconds to be answered and then keeps its token alive for fifteen minutes. The
-supervisor settles a request when its poll loop next comes round, which may be several
-hours into a session. The natural design — defer, then follow up on the interaction token —
-therefore works in testing and fails the first time a session runs long. So a click is
+supervisor settles a request when its loop next comes round. That was once several hours
+into a session; since the housekeeping split (§6.4) it is one housekeeping interval, which
+removes the pathological case but not the design. The natural design — defer, then follow
+up on the interaction token — works in testing and fails whenever settlement outruns
+fifteen minutes, and a housekeeping pass that waits on a git fetch still can. So a click is
 acknowledged immediately with what is knowable at click time, and the real outcome arrives
 afterwards as an ordinary channel message from the bot.
 
-Reads never take that path at all. `/tasks`, `/task` and autocomplete are served from an
-in-memory snapshot the loop refreshes once per poll, from the same sweep that decides what
-to claim. Going through the inbox for a listing would mean waiting on a session to finish
-before being told what it is doing.
+Reads never take that path at all. `/tasks`, `/task` and task-id autocomplete are served
+from an in-memory snapshot, refreshed by the same sweep that decides what to claim. Going
+through the inbox for a listing would mean waiting on a session to finish before being told
+what it is doing. `/brainstorm`'s `repo:` box is the one autocomplete answered from
+somewhere else — the workspaces' forges (§9.1.1) — and it is bounded and failure-isolated
+for the same 3-second reason.
+
+The **housekeeping** loop refreshes it, not only the work loop (§6.4), and that is not
+belt-and-braces. The sweep publishes the snapshot on its way to picking a task, so on the
+work loop alone it stops the moment a session claims and does not run again until the
+session ends — `/tasks` would keep answering in milliseconds from a view taken hours ago,
+showing the running task as `ready` and missing every task created since. The same sweep
+publishes the thread bindings, so an `!answer` typed into a thread opened during the
+session would find no binding and be swallowed. That is this section's own defect arriving
+through the reader rather than the writer, and it is the reason a read being fast is not
+the same as a read being right.
+
+**The snapshot is sorted, and the order is a correctness property rather than a
+presentation one.** A Discord message is capped at 2000 characters, so a listing is capped
+at 25 lines, so the *order* decides what a human is shown. `survey` builds its records by
+walking `tasks/`, which yields them effectively alphabetically by id — and for ids like
+`BS-<snowflake>` and `BS-<snowflake>-07` that means oldest brainstorm first. At 39 tasks
+`/tasks` showed **23 finished tasks and elided the one that was running**: the command whose
+entire job is to say what the fleet is doing showed everything except that.
+
+`TaskSnapshot.replace` therefore sorts by `updatedAt`, newest first, tie-broken by id.
+Recency and not a status ranking: a status order needs a policy about which status outranks
+which, that policy is wrong for somebody, and recency reaches the same answer without one —
+the task a runner is working is the task whose state is being rewritten, and finished work
+sinks on its own. The tie-break matters because tasks cut from one plan are created in the
+same millisecond, and a listing that shuffled them between two runs of the same command
+reads as a bug.
+
+Sorted **once, in the snapshot**, rather than in each reader, because pagination slices it:
+`/tasks page:2` over a list a reader had re-ordered would repeat some tasks and skip others.
+The listing also states the per-status counts over the whole set, which is the half of the
+answer a capped list cannot give, and names the exact command that shows the next page —
+the previous wording was `…and 14 more.`, which announces that something is missing and
+offers no way to reach it.
 
 **Buttons can only come from the bot.** Discord refuses interactive components from a
 webhook the application does not own, and `webhook-url` is a webhook created in the
@@ -906,12 +1109,137 @@ are blocked by whatever failed, so the fleet had eight tasks it could not touch 
 command that could help. `done` stays refused: it is the one terminal status where coming
 back is not a recovery but a re-run of work that passed every gate and merged.
 
+### The bot runs as its own process
+
+**`src/bot.ts` is a second entrypoint, and the supervisor becomes a pure worker.** The
+image ships both (§10); `bot.mode: "external"` plus `redis.enabled` is what selects the
+split, and anything else is today's in-process behaviour unchanged.
+
+The reason is **liveness, not duplicate claims.** The duplicate-claim problem was already
+solved by the ref below: four replicas produced one acting bot, and that worked. What did
+not work is that leadership was refreshed from a supervisor loop and the inbox was drained
+between tasks, so a replica in the middle of a four-hour session could neither renew nor
+step down, and nothing was drained for the length of the session. The bot was online and
+answered nothing. A dedicated process cannot have that failure: it has no sessions to block
+on, so its liveness stops depending on any runner's.
+
+What moves with it, and what does not:
+
+- The bot owns the gateway, the bridge, the thread index and the REST half. It **touches no
+  state repo and holds no forge or LLM credential** — that separation is most of the value.
+  Reads are answered from the Redis snapshot inside Discord's 3-second budget; anything
+  that writes goes to the supervisor as an intent on the Redis inbox and comes back as a
+  `ChatOutcome` on a reply channel.
+- The supervisor keeps everything **outbound**: the notification with an Answer button, the
+  typing indicator, closing a cancelled task's thread. Only *reading* the channel has to be
+  exclusive, so `external` turns off the gateway and nothing else.
+- **Registering the command set (§7.1) also stays with the supervisor**, which looks
+  backwards until you follow the credential. Publishing is a PUT authorised by the bot
+  token, but it is claimed on a git ref keyed by the commands' digest so that it happens
+  once per change across the fleet — and that claim is a push to the state repo with the
+  forge credential, the one thing this split defines the bot process as not holding. So the
+  bot registers nothing, and the supervisor keeps registering even when it has handed the
+  gateway away. Folding registration in behind the same gate as the bridge would leave the
+  fleet with no command set and nothing to report it.
+- The `/brainstorm repo:` **autocomplete is not completed in the split**, for the same
+  reason: the catalogue is built from the configured forges (§9.1.1). An absent catalogue
+  produces an empty suggestion list — the same answer a refusing forge gets, so the
+  interaction never hangs — and the repo is typed by hand. Nothing is lost but the
+  convenience: the supervisor parses and validates it when it drains the intent, and an
+  unparseable or cross-workspace repo comes back as a `refused` outcome with a reason.
+- The **thread↔task index** cannot be rebuilt from the state repo in a process that has
+  none, so the supervisor publishes the bindings its survey already derives (`chat:threads`)
+  and the bot consumes them on a timer. Design consequences, both load-bearing: the bot may
+  start **before** any supervisor has published, and a binding is always **briefly stale**.
+  Absent is therefore not empty — a failed read and a cold start both resolve to
+  `undefined`, which leaves the last good mapping alone, while a published `[]` really does
+  mean the last live task went terminal and clears it. A thread the **bot itself** bound is
+  *pinned* and survives a mapping that has not heard of it: a brainstorm's thread exists
+  well before the task the mapping is derived from does, and unbinding it in
+  that window would drop the thread a human was just invited to type in. The pin ends the
+  moment the mapping mentions the thread, so a terminal task still unbinds — and it also
+  **expires on a timer**, because a mapping might never mention the thread at all:
+  a brainstorm cancelled before the first survey that would have published it is named by
+  nothing, and a permanent pin would leave that dead thread bound for the life of the
+  process, swallowing everything typed into it. The expiry is a **duration, not a count of
+  refreshes**, and the difference was a real bug: the window the pin must cover is set by
+  the *supervisor's* `housekeepingSeconds` (default 30s, plus a pull, a drain and a survey),
+  while the bot refreshes on its own unrelated 5s timer. Counting refreshes measured the
+  wrong clock and spent the pin in ~15s, so a human typing in a fresh brainstorm thread was
+  told the thread could not be placed — and that text is dropped, not queued. A pin covers one window; it is not a lease. A message in a
+  thread the bot cannot place produces an **honest reply**, never silence: in a bound thread
+  every message *is* the answer, so saying nothing is indistinguishable from the agent being
+  busy.
+- That honest reply needs the gateway to **deliver** the message the bridge has an answer
+  for, and for one revision it did not. The filter consulted the same `ThreadIndex` the
+  bridge would, so a thread the bridge would call unbound was one the gateway had already
+  dropped, and the branch was reachable only from a direct call in a test. **Routing and
+  delivery are therefore separate questions**: the index says which task owns a thread,
+  while `ThreadRouter` says whether the bridge sees the message at all. `MESSAGE_CREATE`
+  names no parent channel, so deciding "is this a thread of ours?" costs a REST lookup; the
+  router memoises it per channel — **both** answers, since a negative cache is what stops an
+  unrelated busy channel spending a lookup per message — and the main channel and every
+  bound thread stay on the synchronous path. The supervisor's in-process index supplies no
+  `deliverable`, so that path keeps today's behaviour and makes no REST call per message.
+- Redis is **required** for this process, unlike everywhere else in §21. It is the only
+  route to the supervisor, so a bot without it would acknowledge every command and answer
+  none. It refuses to start rather than come up and fail each command individually.
+- The `bot.mode` interlock is checked from **both** sides, because the two failures are
+  different and only one of them was diagnosable. `external` without Redis makes the
+  *supervisor* keep the gateway and warn (`bot.mode-ignored`); running the *bot* binary
+  under any mode but `external` makes it warn in turn (`bot.mode-mismatch`), because the
+  supervisor has then kept the gateway too and both processes act. Nothing downstream
+  catches that pair: they arbitrate by different mechanisms — the supervisor by the git CAS,
+  the bot by the Redis TTL lock — so each is uncontested in its own scheme and every command
+  is answered twice. Both are warnings rather than refusals, so a config slip degrades
+  loudly instead of taking the fleet off Discord.
+
+**Leadership: one replica, plus a Redis lock for the rollout.** The bot Deployment runs
+**one** replica and needs no leadership object at all — `acts()` already treats absent
+leadership as yes. One replica is not one *process*, though: a rolling update overlaps two
+pods, and both would act, which for `/brainstorm` means two threads and two tasks. So the
+bot takes a **Redis key with a TTL** (`chat:holder`, `SET NX EX`, renewed on its own timer,
+released on shutdown so the incoming pod need not wait out the TTL).
+
+Keeping `ChatLeadership` and refreshing it on a timer was considered and is **unbuildable
+here**: `refresh()` goes through `claimStealable`, which is `ls-remote` plus a ref push, and
+that needs exactly the forge credential the split exists to take away. The docstring's old
+objection to a timer — that it would renew while a session blocked the loop — *is* void for
+this process, but the credential constraint decides it instead.
+
+Redis is acceptable for this decision where it is explicitly **not** acceptable for leases
+(§21): losing a task lease means two runners writing one task and a commit that can never
+rebase, while losing the chat lock costs one duplicated Discord message. When Redis is
+unreachable the bot **does not act**, which is the same honest reading `refresh()` takes of
+an unreachable remote, and it composes with the readiness probe below.
+
+**Health is gateway-connectedness and Redis reachability, not a bound port.** `/readyz`
+reports both and fails if either is down; `/healthz` stays cheap and almost always true.
+The split matters: restarting the process does not fix a Redis outage, so a liveness probe
+that reacted to one would turn a dependency's bad minute into a crash loop, while a
+readiness probe that ignored it would keep a pod in the Service that can answer nothing.
+That is `supervisor/loop.ts`'s containment lesson — a process answering probes while doing
+nothing useful is worse than one that exits — applied to the process whose entire job is to
+be reachable.
+
 **One replica of a fleet acts on Discord.** Every replica connects to the gateway — that
 is what keeps the bot online across a rollout, and a connection costs nothing — but
 exactly one may act on what arrives over it, decided by a compare-and-swap on
-`refs/chat/holder` (`claimStealable`) refreshed from the poll loop. The same mechanism as
-a task lease and as the digest's day ref, because the state repo is the only thing the
-fleet shares and so the only place a fleet-wide decision can be made.
+`refs/chat/holder` (`claimStealable`) refreshed from the **housekeeping** loop (§6.4). The
+same mechanism as a task lease and as the digest's day ref, because the state repo is the
+only thing the fleet shares and so the only place a fleet-wide decision can be made. This
+is the arrangement for a fleet running the bot **in-process**, which remains the default
+and the development path; a split-out bot uses the Redis lock described above instead.
+
+It was refreshed from the single poll loop, and deliberately not from a timer of its own:
+a timer would keep renewing the claim while a session blocked the loop, advertising a
+holder that could not currently answer anything. That objection is void now, because the
+thing on the other side of the claim moved with it — the housekeeping loop IS what drains
+the inbox and applies `/resume` and `/answer`. A replica that renews here is by
+construction a replica that can answer. The arrangement it replaces had the worse failure
+anyway: renewing and *stepping down* are both the same call, so a replica that took the
+claim and then started a four-hour session did neither for four hours — it went on
+believing it was the holder while the claim went stale, online and answering nothing.
 
 Nothing said this at first, and four replicas each handled every event. Reads mostly hid
 it: Discord accepts one response per interaction token, so three replicas simply failed
@@ -954,11 +1282,86 @@ id addressing a different task. A button from an older deploy is refused rather 
 guessed at — Discord keeps message history forever, and every button in it outlives the
 code that rendered it.
 
-Commands are registered **per guild**, at deploy time, by `npm run discord:register`.
-Guild registration takes effect instantly where global registration is
-eventually-consistent, registration is a full replace so re-running it is a no-op, and it
-is not done at boot because the supervisor restarts on every deploy and would otherwise
-write the identical command set once per pod per rollout.
+Commands are registered **per guild**, and the runner does it **itself, at boot, once per
+change across the whole fleet, ever**. Guild registration takes effect instantly where
+global registration is eventually-consistent, and it is a full REPLACE — the `COMMANDS`
+array is the entire surface, so a command deleted from it disappears from the client.
+
+It used to be a deploy-time step run by hand, for one real reason: the supervisor restarts
+on every deploy and there are four of it, so a naive call in `main()` writes the identical
+command set once per pod per rollout. That objection is about redundant *writes*, not about
+who does it — and the cost of answering it with a human was paid in full when `/brainstorm`'s
+autocompleted `repo:` box (§9.1.1) shipped as code and stayed a plain text field in Discord,
+because the step was forgotten.
+
+So the write is claimed, on `refs/commands/<digest>`, where the digest covers the commands
+AND the guild. The same compare-and-swap as a task claim (§5), in the same shape the daily
+digest uses (§19), with the same four properties:
+
+- **the ref's existence IS the record** that this exact set has been published, so a restart
+  registers nothing and there is no in-memory flag to lose
+- **a changed set is a changed digest**, so the first boot after a deploy publishes it and
+  every boot after that does not
+- **a claim that errors is not a claim someone else won** — a rejected push is also what a
+  dead network looks like, and reading it as a win would mark a set published that nobody
+  published
+- **a failed write hands the claim back**, because a claimed-but-unregistered set is
+  invisible and nothing would ever revisit it
+
+It is fire-and-forget and cannot fail a boot. A registration Discord refuses is a 403 for a
+missing `applications.commands` scope, which no retry fixes and which stops nothing else: the
+bridge still runs, and `!answer` and the buttons never depended on it.
+
+`npm run discord:register` remains, and remains unconditional — it is the escape hatch for
+what a digest cannot see. Commands edited or deleted **in Discord** leave the ref saying
+"published" and the guild disagreeing, and it is also how a command set is iterated on
+against a test guild from a workstation, with no pod and no state repo.
+
+### 7.2 The presence says what the fleet is working on
+
+`/tasks` and the web view both answer "what is Caterpillar doing" and both have to be
+asked. The bot's Discord presence answers it without being asked, in the member list, which
+is where somebody who is already in the channel is already looking. That is the whole
+feature: **"Watching ALERT-6155db · implementing"**, or **"Watching for work · 4 ready"**,
+or — the one that should change what you do next — **"Watching 1 waiting for you"**.
+
+**It is rendered from the survey, not from the live session.** `obs/live.ts` knows what THIS
+runner is doing and nothing about the other three, so a presence built from it would say
+`idle` on three replicas out of four and race to overwrite whichever one was right. The
+survey is every task's committed state, read out of the state repo, so all four replicas
+render the *same* string — which is what makes it safe for all four to send it.
+
+**Every replica publishes, unlike everything else on Discord.** §7's rule is that every
+replica connects and exactly one *acts*, because four replicas acting on one `!answer` did
+real damage. A presence is not an action: it is idempotent, carries no state, and four
+identical payloads converge on the identical result. Restricting it to the chat holder would
+be strictly worse — the status would go stale for as long as a claim handover takes, and a
+bot advertising `idle` while a session runs is the exact thing this exists to prevent.
+
+**It rides on IDENTIFY, and is re-sent on RESUMED.** Carried in the IDENTIFY rather than as
+a separate opcode 3 so a reconnecting replica is never briefly online with no activity — on
+a fleet that reconnects during every rollout that would be a visible flicker to no purpose.
+A RESUME carries no IDENTIFY, so it gets an explicit re-send; without that, a runner comes
+back from a blip still advertising what it was doing before the blip, and the runners with
+the longest outage are the ones lying hardest. A READY does *not* re-send, because the
+IDENTIFY beside it already did.
+
+**Only changes are sent.** Presence updates are rate-limited per connection and the survey
+runs every housekeeping tick, so an unchanged line is dropped rather than re-sent — a runner
+that sent unconditionally would spend its whole idle life burning the allowance it needs at
+the moment the state actually changes. The `since` timestamp is restamped only on a real
+change, so Discord's elapsed timer measures how long the fleet has been in *this* state
+rather than how long the pod has been up.
+
+**Activity type 3, `Watching`.** Discord renders it as "Watching <name>", so the strings are
+written to read as English after that word. Type 4 (`Custom`) would drop the verb and read
+better, and is deliberately not used: its support for *bots* has changed more than once and
+the failure mode is a status that silently renders as nothing at all.
+
+Published from `survey` (`supervisor/loop.ts`) — the one place in the process that has just
+read every task's state — which since §6.4's split runs on the **housekeeping** loop. That
+matters more than it looks: on the old single loop the presence would have frozen for the
+whole of a session, which is precisely the interval it exists to describe.
 
 ---
 
@@ -1243,7 +1646,117 @@ With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec sa
   OAuth code).
 
 Run `npm run verify:github-app` after installing — it confirms the JWT signs, prints
-the installation id, and proves per-task repo scoping works, without printing a token.
+the installation id, proves the installation can reach the repo you name, and proves
+per-task repo scoping works, without printing a token.
+
+### 9.1.1 A repo the credential cannot reach is refused at the door
+
+Everything above bounds which repos a task is *allowed* to name. Nothing asked whether
+the credential can *reach* the ones it named — and the answer arrived at the worst
+possible moment.
+
+```
+BS-1539331435477860432 parked — session failed: git clone --mirror
+  https://github.com/caesarakalaeii/allchat.git failed (128):
+  caterpillar-cred: GitHub /app/installations/153385932/access_tokens failed with 422:
+    the App is not installed on one of the requested repositories
+  fatal: could not read Username for '…': terminal prompts disabled
+```
+
+The repo is called **`all-chat`**. Somebody typed `allchat` into `/brainstorm`, and every
+check on the way in passed: it parses as `owner/name` (§domain), it is on the workspace's
+host, it is not the state repo, so it resolved to a workspace and became a task. A runner
+claimed it, spent a session, and died on the first thing a session does. The park reason
+named an installation id and a git exit code; the one word that mattered — `all-chat` —
+appeared nowhere.
+
+**Why the mint cannot say it.** `POST /access_tokens` answers **422 for a repo that does
+not exist and 422 for a repo the App is not installed on**, with a body of
+`{"message": "Unprocessable Entity"}`, and it takes `repositories` as *names* — so it does
+not even echo which one it refused. A 422 is not evidence about an installation. Reading
+it as one sent the operator to the App's settings page for what was a dash.
+
+The question is therefore asked from the other side: **`GET /installation/repositories`**
+returns the list, so the difference can be computed here, and a list makes the useful
+sentence possible — *"`caesarakalaeii/allchat` is not one of the 65 repositories this
+workspace's GitHub App can see. Did you mean `caesarakalaeii/all-chat`?"* Near misses are
+ranked by a squashed comparison first (`-`, `_`, `.` and case are what people retype
+wrong: `AllChat`, `all_chat`, `allchat` are all one edit from nothing) and then by bounded
+edit distance. `ForgeFactory` answers it — one per workspace, which is the unit a
+credential belongs to — and Forgejo answers the same question from what it has: a token
+configured for the owner, and a `GET /repos/{owner}/{name}` that is not a 404.
+
+Asked in three places, each the first moment the answer is cheap:
+
+- **the `/brainstorm` door** (`applyBrainstorm`) — a refusal typed back into the channel
+  before a task exists. This is where the incident above was avoidable.
+- **intake** (`Ingester`) — an `agent` block's `repos` list is free text too, and on that
+  path nobody is watching: the refusal becomes a comment on the item, recorded and
+  suppressed exactly like every other intake refusal (§14.2).
+- **before every session** (`workTask`) — the net under both, and the only one that
+  catches a repo that became unreachable *after* the task was created, or one that arrived
+  through a plan (`materialise` resolves repos from agent free text and is synchronous, so
+  it does not ask; its children are caught here). The task parks with the sentence instead
+  of with a git exit code, and no session is spent.
+
+Re-asked per session rather than cached per task, because the answer changes without the
+task changing: an App uninstalled mid-task, or one installed a minute ago by the human who
+read the last park reason. The listing behind it is cached for five minutes, so the steady
+state costs one request per workspace per five minutes — the same budget §14.2 rations.
+
+A **hit is served from that cache and a miss is not**: an absence is re-read from GitHub
+before it becomes a refusal. A repo installed a minute ago is absent from a five-minute-old
+list, and "your brand-new repo does not exist" is the one wrong answer this check exists to
+stop being given. It is affordable exactly because misses are rare, and it is bounded to one
+re-read per call however many repos miss.
+
+**Every one of the three fails OPEN.** A forge that throws has told us nothing: a 500, a
+DNS blip, an expired key. Refusing a `/brainstorm`, or parking a task, over that would be
+strictly worse than the clone failure this exists to pre-empt — so a refusal only ever
+comes from a forge that *answered*, and a listing that could not be read to completion is
+an error rather than a short list (the same reasoning as the check-run cap in §12).
+
+**And the mint still explains itself**, because the check is a usability layer and not a
+boundary: a 422 now asks the installation what it *can* see and names the repos that are
+missing, with the same near miss. That is the message the credential helper prints into a
+failing `git clone`, so it is the last place a human is told anything at all.
+
+**The refusal is the floor, not the fix.** The better outcome is never typing the name: the
+same list answers forwards as well as backwards, so `/brainstorm`'s `repo:` option is
+**autocompleted** from the repos the runner can actually reach (`RepoCatalog`, the mirror of
+`RepoReach`). A name that cannot be reached is a name that is never offered.
+
+Four things make that box behave:
+
+- **The ranking is forgiving in exactly the way the incident was.** Prefix, then substring,
+  then the *squashed* comparison — so `allchat` finds `all-chat` while it is still being
+  typed — then bounded edit distance for `all-chta`. An empty query lists the catalogue
+  rather than nothing: an empty suggestion box is indistinguishable from a bot that has
+  stopped working.
+- **`repo:` takes several repos** (§14.3), and Discord replaces the *entire* option value
+  with the chosen suggestion — so each choice carries the repos already typed plus the new
+  one. A choice carrying only its own repo would silently delete the others, which is the
+  same "plan about half a system" the cross-workspace refusal exists to prevent. A
+  completion that would exceed Discord's 100-character ceiling is dropped rather than sent,
+  because that ceiling rejects the *whole* response and shows the human no suggestions at
+  all.
+- **One catalogue over every workspace**, because `/brainstorm` does not name one — the loop
+  derives the workspace from the repo. Each workspace's contribution is bounded (1.5s) and
+  failure-isolated: one forge being slow or refusing costs it its place in the list, not the
+  list.
+- **It never throws.** An autocomplete accepts exactly one response and no other kind, so an
+  unanswered interaction is a spinner that never resolves — worse than no suggestions. A
+  bridge with no catalogue at all (a standalone bot process holds no forge credential) is a
+  supported shape and behaves as it did before the box was completed.
+
+GitHub's catalogue is the installation listing already described. Forgejo's is `GET
+/user/repos` narrowed to the owners a token covers, falling back to the configured per-repo
+slugs when the token is repository-scoped and not permitted to list — so the box is as good
+as what the credential can enumerate, and empty rather than wrong when it can enumerate
+nothing.
+
+`COMMANDS` changed, and nothing has to be remembered for the box to appear: the first runner
+to boot on the new image registers the new set and the rest of the fleet does not (§7.1).
 
 ### 9.2 Why the agent never holds the token
 
@@ -1657,6 +2170,7 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 | `StatefulSet` | the supervisor fleet, N replicas, `RollingUpdate` |
 | `volumeClaimTemplates` | git mirrors + worktrees, and the nix store — **one pair per replica** |
 | `Deployment` | credential holder, **exactly 1** (§9.6) + its own claim + `Service` |
+| `Deployment` | **the Discord bot, exactly 1** (§7) — Discord secret + Redis, no PVC, no forge/LLM credential |
 | `Deployment` | nix pull-through cache, **exactly 1** (§8.1) + its own claim + `Service` |
 | `Secret` (SOPS) | GitHub App PEM, Discord webhook, credential-holder token |
 | `ConfigMap` | capabilities, thresholds, workspace forge host (the repo scope, §9.1) |
@@ -1678,6 +2192,41 @@ replica there is nothing to contend for, and overlapping supervisors were always
 their own — leases handle it. `podManagementPolicy: Parallel`, because these pods do not
 form a quorum: `OrderedReady` would let a wedged `caterpillar-0` stop `caterpillar-1` from
 ever booting, which is the opposite of what a fleet is for.
+
+### The bot is a second Deployment, and deliberately a small one
+
+Splitting the bot out (§7) costs one manifest in `caesar-deployment` and no second image:
+`dist/` is copied whole, so the entrypoint is already there.
+
+```yaml
+command: ["node", "/app/dist/bot.js"]
+```
+
+What it **has**: the `caterpillar-discord` secret, the Redis connection, and its own port
+(`bot.port`, 9091) for `/healthz`, `/readyz` and `/metrics` — its own because the two
+processes share a namespace and one number meaning both is an EADDRINUSE in whichever pod
+loses. Probe **`/readyz`**, not `/healthz`: readiness carries gateway connectedness and
+Redis reachability, liveness deliberately does not.
+
+What it **does not have**, and this is the point rather than an economy:
+
+- **no work PVC.** It runs no sessions and clones nothing, so it needs neither `/work` nor
+  `/nix`. That is also why it can be a Deployment where the supervisors must be a
+  StatefulSet — with no `volumeClaimTemplates` there is nothing to template.
+- **no forge credential, no LLM credential, no ServiceAccount token.** It cannot touch a
+  repo, cannot spend money, and cannot read the cluster. Everything that writes the state
+  repo goes to a supervisor over the Redis inbox, so the blast radius of the process
+  holding a public-facing socket is "it can post a Discord message".
+
+**`replicas: 1`.** Not a constraint of the code — the Redis lock (§7) makes an overlap
+correct — but the intended shape: one bot is all a fleet wants, and the lock is there for
+the seconds of a rolling update rather than as a scaling mechanism. Supervisors scale
+freely underneath it and connect to Discord not at all, which is what the split bought.
+
+The supervisor StatefulSet's ConfigMap gains `bot.mode: "external"` alongside
+`redis.enabled: true`. Both are required: `external` without Redis would leave supervisors
+deaf to Discord and the bot unable to reach them, so the supervisor logs that
+misconfiguration and stays in-process rather than obeying it.
 
 **What actually bounds the replica count** — none of it is this repo:
 
@@ -1766,11 +2315,14 @@ all, and divided by the first it says what one task actually costs on disk.
 
 The `work_*` family answers the one question the supervisor could not previously answer
 about itself: where the disk went. It is produced by a directory walk
-(`workspace/usage.ts`) that is READ-ONLY, runs only from the poll loop's idle branch beside
-the nix store collection, and is rate-limited to `usage.intervalHours` — one `stat` per
-file over a tree carrying a `node_modules` per task is not something to do on the thread
-that claims work. It is bounded by `usage.deadlineSeconds` and reports what it has with
-`caterpillar_work_partial` set rather than blocking the loop or throwing the pass away.
+(`workspace/usage.ts`) that is READ-ONLY, runs only from the **work** loop's idle branch,
+and is rate-limited to `usage.intervalHours` — one `stat` per file over a tree carrying a
+`node_modules` per task is not something to do on the thread that claims work. It stayed on
+the work loop when the nix store collection moved to housekeeping (§6.4), and the asymmetry
+is deliberate: this walk spends its time inside *this* process, and housekeeping is what a
+human waiting on `/resume` is waiting for. An idle work loop has nothing better to do. It is
+bounded by `usage.deadlineSeconds` and reports what it has with `caterpillar_work_partial`
+set rather than blocking the loop or throwing the pass away.
 
 `category` is disjoint and sums to what THIS runner can account for, which is not the same
 as what the volume holds — another process on the same disk makes `work_fs_bytes` the only
@@ -2100,9 +2652,16 @@ running. Priority is a tie-break ahead of the existing order, never a replacemen
 sorting the same queue reach the same answer.
 
 *A session in flight yields at its boundary.* `workTask` drives one task through as many
-sessions as it needs, and the poll loop — with it the chat drain and the next claim — is
-blocked for all of them. So the runner checks the inbox at each session boundary and, if
-a brainstorm is waiting, puts the task back to `ready` and hands the runner over.
+sessions as it needs, and the **work** loop is blocked for all of them. Since the
+housekeeping split (§6.4) the chat drain is no longer blocked with it, so the brainstorm
+request is drained, answered and turned into a task on schedule — but the runner it needs
+is still occupied, and a claim is what only the work loop can make. So the runner checks
+the inbox at each session boundary and, if a brainstorm is waiting, puts the task back to
+`ready` and hands the runner over. Housekeeping fixed the latency of *acknowledging*; this
+fixes the latency of *starting*, and neither substitutes for the other.
+
+The check reads the queue without taking from it — the request is left for
+`applyChatRequests` on the housekeeping loop, which is what actually creates the task now.
 Deliberately not an interrupt: `/cancel` aborts a session because stopping it *is* the
 intent, whereas here the session is doing legitimate work and an interrupted session
 records nothing at all (§6.4). Waiting for the boundary costs the human the tail of one
@@ -3120,8 +3679,8 @@ requirements that happen to have one answer:
 - **A Redis outage must degrade the fleet to the single-replica arrangement, not take it
   down.** This is the one that decides the code. Every operation is bounded by a timeout and
   passes through `RedisGuard`, which turns a failure into the in-memory answer and a
-  throttled warn line. Nothing in `src/redis/` may throw into the poll loop, for the reason
-  the loop's own try/catch exists (§6, `supervisor/loop.ts`): a live process that answers
+  throttled warn line. Nothing in `src/redis/` may throw into either supervisor loop (§6.4),
+  for the reason their try/catch exists (§6, `supervisor/loop.ts`): a live process that answers
   `/healthz` and does no work is worse than a crash, because nothing restarts it.
 
 The reading of a failure is `ChatLeadership.refresh`'s (§7), one layer down. "I could not
@@ -3162,5 +3721,16 @@ the intake pass stay in-process for the reason they were put there: they write t
 repo, and the loop owns the state repo working copy.
 
 **No `takeWhere` over Redis.** Selectively removing one entry from a shared list is a Lua
-script racing every other drainer, and the one caller that needed it — a session watching
-for a cancel — has a channel now.
+script racing every other drainer, so `RedisChatQueue.takeWhere` and `some` return empty.
+
+That absence is only safe because it is **declared**, and it was not declared once. A queue
+that answers "nothing matched" to every question is indistinguishable from an empty one,
+and the housekeeping split briefly routed its entire drain through `takeWhere` while a
+session was in flight — so a Redis-backed runner served no chat request at all for the
+duration of every session, and an in-flight `/cancel` had no path whatsoever, because the
+in-session watcher polls the same stub and nothing in the process calls
+`CancelSignals.request`. `ChatDrainer.selective` exists so that a caller must decide what
+to do about it rather than silently receiving nothing; `applyChatRequests` reads it and
+drains everything, routing an in-flight cancel to the session in process (§6.4). If a real
+selective pop is ever written, that flag flips and the branch disappears — but the flag
+must never be flipped without it.

@@ -97,6 +97,7 @@ const CONFIG: RunnerConfig = {
     ],
   ]),
   pollSeconds: 30,
+  housekeepingSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
   cluster: {
@@ -113,6 +114,7 @@ const CONFIG: RunnerConfig = {
     commandTimeoutMs: 1000,
     keyPrefix: "caterpillar:",
   },
+  bot: { mode: "in-process" as const, port: 9091 },
   web: {
     enabled: true,
     port: 8080,

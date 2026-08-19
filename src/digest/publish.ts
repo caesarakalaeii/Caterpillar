@@ -14,8 +14,10 @@
  * publishing failed, and the ordering inside is git before Discord — the durable copy is
  * written before anything announces it, and a Discord outage never rewrites the record.
  *
- * It runs on the poll loop, so it is deliberately cheap and deliberately bounded: one
- * digest per poll, and nothing at all before the hour.
+ * It runs on the housekeeping loop, so it is deliberately cheap and deliberately bounded:
+ * one digest per pass, and nothing at all before the hour. Being on housekeeping rather
+ * than the work loop is what stops a long session from swallowing the day's digest
+ * entirely (§6.4).
  */
 import type { Notification, Notifier } from "../notify/discord.ts";
 import { errorFields, type Logger } from "../obs/log.ts";

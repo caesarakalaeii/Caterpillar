@@ -127,6 +127,75 @@ test("the mirror clone carries the credential helper, not just the repo config",
   assert.ok(!/ghs_|ghp_|x-access-token/.test(joined));
 });
 
+test("refreshing an EXISTING mirror carries the credential helper too", async () => {
+  // The regression that arrived with per-task credential keying. The helper moved out of
+  // the mirror's shared config into each worktree's `config.worktree`, and a mirror is not
+  // a worktree — so the refresh had nothing to read and went out anonymous, while the CLONE
+  // still authenticated because it is passed `-c` explicitly.
+  //
+  // That asymmetry is what made it invisible: a repo's FIRST task built the mirror and
+  // succeeded, and every task afterwards failed on the fetch with `could not read
+  // Username`. It reads as "the second task on a repo is broken", and no existing test
+  // caught it because a `file://` origin needs no credential to fetch from.
+  //
+  // Asserted on the invocation, like the clone test above, because "it threw" is true with
+  // or without the fix.
+  const root = await scratch();
+  const invocations: (readonly string[])[] = [];
+
+  class RecordingGit extends Git {
+    override async run(...args: readonly string[]): Promise<string> {
+      invocations.push(args);
+      // `refspecs` reads `worktree list --porcelain` to avoid fetching a checked-out
+      // branch; empty output is a mirror with no worktrees, which is the case here.
+      return "";
+    }
+    override async tryRun(...args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+      invocations.push(args);
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    override at(): Git {
+      return this;
+    }
+    override withoutCredentials(): Git {
+      return this;
+    }
+  }
+
+  const mirror = mirrorDir(root);
+  // A mirror that already exists, which is the whole point: this is the path taken by every
+  // task after the first one on a repo.
+  await mkdir(mirror, { recursive: true });
+  await writeFile(join(mirror, "HEAD"), "ref: refs/heads/main\n");
+
+  const subject = new WorktreeManager({
+    git: new RecordingGit(root),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketDir: "/run/caterpillar/cred",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+  await subject.syncMirror(REPO, asTaskId("T-2")).catch(() => undefined);
+
+  const fetched = invocations.find((args) => args.includes("fetch"));
+  assert.ok(fetched !== undefined, "an existing mirror must be refreshed");
+  assert.ok(!invocations.some((args) => args.includes("clone")), "and must not be re-cloned");
+
+  const joined = fetched.join(" ");
+  assert.match(joined, /credential\.helper=!\/usr\/local\/bin\/caterpillar-cred/);
+  // This task's socket, not another task's and not a shared one.
+  assert.match(joined, /--socket \/run\/caterpillar\/cred\/T-2\.sock/);
+  assert.match(joined, /credential\.useHttpPath=true/);
+  // `git fetch -c ...` is not valid — the overrides belong before the subcommand.
+  assert.ok(
+    fetched.indexOf("-c") < fetched.indexOf("fetch"),
+    "-c overrides must come before the subcommand",
+  );
+  assert.ok(!/ghs_|ghp_|x-access-token/.test(joined), "the token never reaches argv (\u00a79.2)");
+});
+
 test("the mirror clone does not inherit the supervisor's own credential", async () => {
   // The bug that produced `remote: Repository not found` on the first real task.
   // `index.ts` builds ONE Git for the state repo, carrying an http.extraHeader with an

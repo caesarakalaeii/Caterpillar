@@ -12,7 +12,7 @@ import { asTaskId } from "../domain/task.ts";
 import { parseCommand } from "./commands.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, type Interaction } from "./interactions.ts";
-import { ANSWER_FIELD, COMMANDS, parseInteraction } from "./slash.ts";
+import { ANSWER_FIELD, COMMANDS, parseInteraction, repoChoices } from "./slash.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
 
@@ -104,6 +104,37 @@ test("/tasks filters only on a status that exists", () => {
     parseInteraction(interaction({ data: { name: "tasks", options: [{ name: "status", value: "nonsense" }] } })),
     { kind: "run", command: { kind: "list" } },
   );
+});
+
+test("/tasks carries a page, and drops one that is not a number", () => {
+  // The client sends an integer, but `optionValue` stringifies whatever arrived and the
+  // command surface is reachable by anything that can POST an interaction. A malformed page
+  // is not worth refusing a listing over — the default page is the one almost everybody
+  // wants — so it is dropped and `describeList` clamps whatever does get through.
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ data: { name: "tasks", options: [{ name: "page", value: 3 }] } }),
+    ),
+    { kind: "run", command: { kind: "list", page: 3 } },
+  );
+  assert.deepEqual(
+    parseInteraction(
+      interaction({
+        data: { name: "tasks", options: [{ name: "status", value: "done" }, { name: "page", value: 2 }] },
+      }),
+    ),
+    { kind: "run", command: { kind: "list", status: "done", page: 2 } },
+  );
+
+  for (const bad of ["two", "", 0, -1]) {
+    assert.deepEqual(
+      parseInteraction(
+        interaction({ data: { name: "tasks", options: [{ name: "page", value: bad }] } }),
+      ),
+      { kind: "run", command: { kind: "list" } },
+      `page:${JSON.stringify(bad)} must fall back to the first page`,
+    );
+  }
 });
 
 test("/cancel parks", () => {
@@ -238,7 +269,7 @@ test("autocomplete reports what is being typed", () => {
         data: { name: "answer", options: [{ name: "task", value: "GH-ac", focused: true }] },
       }),
     ),
-    { kind: "autocomplete", query: "GH-ac" },
+    { kind: "autocomplete", field: "task", query: "GH-ac" },
   );
 });
 
@@ -284,4 +315,78 @@ test("registered commands stay inside Discord's naming rules", () => {
       );
     }
   }
+});
+
+/**
+ * `/brainstorm repo:` is autocompleted (DESIGN.md §9.1.1).
+ *
+ * A repo that cannot be reached is now refused, which turns a typo into a refusal instead
+ * of a parked task — but the better outcome is not having to type the name at all. These
+ * cover the half that has to be right for that: which field is being completed, and what
+ * a chosen suggestion puts back in the box.
+ */
+const CATALOG = ["acme/all-chat", "acme/all-chat-extension", "acme/widget"];
+
+test("the repo box is completed from the catalogue, not from task ids", () => {
+  const intent = parseInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "allch", focused: true }] },
+    }),
+  );
+
+  assert.deepEqual(intent, { kind: "autocomplete", field: "repo", query: "allch" });
+});
+
+test("every other autocompleted option is still a task id", () => {
+  const boxes: readonly [string, string][] = [
+    ["answer", "task"],
+    ["task", "id"],
+    ["cancel", "task"],
+    ["resume", "task"],
+  ];
+  for (const [command, option] of boxes) {
+    const intent = parseInteraction(
+      interaction({
+        type: INTERACTION.autocomplete,
+        data: { name: command, options: [{ name: option, value: "widget", focused: true }] },
+      }),
+    );
+    assert.deepEqual(intent, { kind: "autocomplete", field: "task", query: "widget" });
+  }
+});
+
+test("a suggestion taken mid-list keeps the repos already typed", () => {
+  // Discord replaces the WHOLE option value with the chosen one, so a choice that carried
+  // only the repo it suggests would silently delete the others. This is a multi-repo
+  // option (§14.3) and losing one produces a plan about half a system.
+  const choices = repoChoices("acme/widget, allch", CATALOG);
+
+  assert.deepEqual(
+    choices.map((choice) => choice.value),
+    ["acme/widget, acme/all-chat", "acme/widget, acme/all-chat-extension"],
+  );
+});
+
+test("a repo already in the box is not offered twice", () => {
+  const choices = repoChoices("acme/widget, ", CATALOG);
+  assert.deepEqual(
+    choices.map((choice) => choice.value),
+    ["acme/widget, acme/all-chat", "acme/widget, acme/all-chat-extension"],
+  );
+});
+
+test("a completion Discord would reject is dropped rather than sent", () => {
+  // Discord's ceiling on a choice value is 100 characters and it rejects the whole
+  // response — so one over-long completion would empty the box instead of trimming itself.
+  const long = `acme/${"x".repeat(90)}`;
+  const choices = repoChoices(`${long}, wid`, ["acme/widget"]);
+  assert.deepEqual(choices, []);
+});
+
+test("the repo option is registered as autocompleted", () => {
+  const brainstorm = COMMANDS.find((command) => command["name"] === "brainstorm");
+  const options = (brainstorm?.["options"] as readonly Record<string, unknown>[]) ?? [];
+  const repo = options.find((option) => option["name"] === "repo");
+  assert.equal(repo?.["autocomplete"], true, "an unautocompleted box is where the typo came from");
 });

@@ -21,6 +21,7 @@
  *     literal "!answer …" hint, so ignoring bots and webhooks is not optional.
  */
 import type { Logger } from "../obs/log.ts";
+import type { PresencePayload } from "./activity.ts";
 import type { Interaction } from "./interactions.ts";
 
 /** Injection seam for tests. Production uses the global WebSocket. */
@@ -43,8 +44,18 @@ export interface GatewayOptions {
    * A message in a thread arrives with `channel_id` set to the THREAD and no reference to
    * its parent, so there is no way to recognise one without knowing which threads are
    * ours. Optional: without it only the channel itself is read.
+   *
+   * `deliverable` is the standalone bot's addition (`ThreadRouter`). Without it this filter
+   * asked the same index the bridge asks, so a thread the bridge would answer honestly as
+   * unbound was one this had already dropped — and the honest reply was unreachable in
+   * production. When supplied it gets the final say, and may resolve true for a thread the
+   * index does not know, so the bridge can say so. `knows` alone remains the in-process
+   * behaviour exactly.
    */
-  readonly threads?: { knows(channelId: string): boolean };
+  readonly threads?: {
+    knows(channelId: string): boolean;
+    deliverable?(channelId: string): Promise<boolean>;
+  };
   readonly onMessage: (content: string, author: string, channelId: string) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
@@ -58,6 +69,20 @@ export interface GatewayOptions {
    * whether it is ours belongs where a reply can still be sent.
    */
   readonly onInteraction?: (interaction: Interaction) => Promise<void>;
+  /**
+   * What the bot advertises it is doing (`activity.ts`), if anything.
+   *
+   * Optional, and absent in every existing test: a gateway with no presence source behaves
+   * exactly as it did before this existed. `payload()` is read at IDENTIFY so a fresh
+   * connection is never briefly blank, and `attach` is called at READY so a later change
+   * reaches this socket — the two together are why a reconnect does not lose the presence.
+   */
+  readonly presence?: {
+    payload(): PresencePayload | undefined;
+    attach(send: (payload: PresencePayload) => void): void;
+    resend(): void;
+    detach(): void;
+  };
   readonly logger: Logger;
   readonly socket?: SocketFactory;
   /** Seam for tests; production waits for real. */
@@ -80,6 +105,7 @@ const OP = {
   dispatch: 0,
   heartbeat: 1,
   identify: 2,
+  presenceUpdate: 3,
   resume: 6,
   reconnect: 7,
   invalidSession: 9,
@@ -114,12 +140,36 @@ export class DiscordGateway {
   private sequence: number | null = null;
   private sessionId: string | undefined;
   private resumeUrl: string | undefined;
+  /**
+   * Whether a socket is currently identified and acking heartbeats.
+   *
+   * Exists for the standalone bot's health check (`src/bot.ts`). A bot process whose
+   * gateway is down is a bot that answers nothing, and `supervisor/loop.ts:~287`'s lesson
+   * is that a process which answers probes while doing nothing useful is worse than one
+   * that exits — so this has to be observable from outside, not merely logged.
+   *
+   * Set at READY/RESUMED rather than at dial: an open TCP connection that has not
+   * identified delivers nothing, and reporting it as healthy would be the exact lie this
+   * is here to prevent. Cleared on every teardown, including the zombie case.
+   */
+  private live = false;
 
   constructor(options: GatewayOptions) {
     this.options = options;
     this.open = options.socket ?? ((url) => new WebSocket(url) as unknown as SocketLike);
     this.pause = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.random = options.random ?? Math.random;
+  }
+
+  /**
+   * Is there a live, identified connection right now?
+   *
+   * Read by the bot's readiness probe. Deliberately not "has ever connected": a bot that
+   * connected at boot and has been reconnect-looping for ten minutes is not serving
+   * anyone, and reporting it ready keeps a broken pod in the Service.
+   */
+  connected(): boolean {
+    return this.live;
   }
 
   /** Connect, and keep reconnecting until `signal` aborts. Never throws. */
@@ -160,7 +210,13 @@ export class DiscordGateway {
       const shutdown = (why: string): void => {
         if (settled) return;
         settled = true;
+        // Before anything else: from here on this process is not connected, and a probe
+        // arriving during teardown must be told so rather than reading a stale `true`.
+        this.live = false;
         if (heartbeat !== undefined) clearInterval(heartbeat);
+        // Before the close, so a presence change landing during teardown cannot be written
+        // to a socket this function is about to dispose of.
+        this.options.presence?.detach();
         signal.removeEventListener("abort", abort);
         try {
           socket.close(1000);
@@ -203,6 +259,7 @@ export class DiscordGateway {
 
         switch (payload.op) {
           case OP.hello: {
+            const presence = this.options.presence?.payload();
             const interval = (payload.d as { heartbeat_interval?: number })?.heartbeat_interval;
             const period = typeof interval === "number" && interval > 0 ? interval : 41_250;
             // Jittered, because every client reconnecting after an outage would
@@ -222,6 +279,13 @@ export class DiscordGateway {
                       token: this.options.token,
                       intents: INTENTS,
                       properties: { os: "linux", browser: "caterpillar", device: "caterpillar" },
+                      // Carried on IDENTIFY rather than sent as an opcode 3 straight after
+                      // it: a separate send would leave the bot briefly present with no
+                      // activity, which on a fleet that reconnects during every rollout is
+                      // a visible flicker to no purpose. Omitted entirely before the first
+                      // survey, because Discord reads a `presence` with no activities as an
+                      // instruction to CLEAR one.
+                      ...(presence === undefined ? {} : { presence }),
                     },
                   })
                 : JSON.stringify({
@@ -255,7 +319,7 @@ export class DiscordGateway {
             return;
 
           case OP.dispatch:
-            this.dispatch(payload);
+            this.dispatch(payload, socket, () => settled);
             return;
 
           default:
@@ -265,8 +329,15 @@ export class DiscordGateway {
     });
   }
 
-  private dispatch(payload: Payload): void {
-    const { logger, channelId, onMessage, onInteraction } = this.options;
+  /**
+   * `socket` and `closed` are threaded in rather than held on the instance because a
+   * presence send must go to THIS connection: `run` reconnects, so an instance field would
+   * outlive the socket it named and a presence change arriving mid-reconnect would be
+   * written to a dead one. `closed` is read at send time for the same reason — the socket
+   * can be torn down between the READY that attached and a change minutes later.
+   */
+  private dispatch(payload: Payload, socket: SocketLike, closed: () => boolean): void {
+    const { logger, channelId, onMessage, onInteraction, presence } = this.options;
 
     if (payload.t === "INTERACTION_CREATE") {
       if (onInteraction === undefined) return;
@@ -280,14 +351,43 @@ export class DiscordGateway {
       return;
     }
 
-    if (payload.t === "READY") {
-      const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
-      this.sessionId = ready.session_id;
-      this.resumeUrl =
-        ready.resume_gateway_url === undefined
-          ? undefined
-          : `${ready.resume_gateway_url}/?v=10&encoding=json`;
-      logger.info("gateway.ready", { channel: channelId });
+    if (payload.t === "READY" || payload.t === "RESUMED") {
+      // Identified and receiving. This is the earliest point at which the bot can
+      // actually answer a human, which is what the readiness probe means by "up".
+      this.live = true;
+
+      if (payload.t === "READY") {
+        const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
+        this.sessionId = ready.session_id;
+        this.resumeUrl =
+          ready.resume_gateway_url === undefined
+            ? undefined
+            : `${ready.resume_gateway_url}/?v=10&encoding=json`;
+        logger.info("gateway.ready", { channel: channelId });
+      }
+
+      // Both events attach, because both mean "this socket is now the live one" and a later
+      // change has to reach whichever it is.
+      presence?.attach((next) => {
+        if (closed()) return;
+        try {
+          socket.send(JSON.stringify({ op: OP.presenceUpdate, d: next }));
+        } catch (error) {
+          // Never fatal, and never retried here. A presence is a comfort signal (`bot.ts`
+          // makes the same call for the typing indicator); the next survey re-sends it, and
+          // a throw on this path would unwind into the socket's message handler.
+          logger.debug("gateway.presence-failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+
+      // Only a RESUME pushes. A READY followed an IDENTIFY that already carried the
+      // presence, so sending it again here would spend a second update out of a
+      // per-connection allowance to repeat what Discord was just told. A resume carries no
+      // IDENTIFY, so without this the runner comes back advertising whatever it was doing
+      // before the disconnect — indefinitely, and worst for the longest outage.
+      if (payload.t === "RESUMED") presence?.resend();
       return;
     }
 
@@ -296,18 +396,45 @@ export class DiscordGateway {
     const message = payload.d as MessageCreate;
     const from = message.channel_id;
     if (from === undefined) return;
-    if (from !== channelId && this.options.threads?.knows(from) !== true) return;
     // The bridge reads the channel it posts into. Without this it answers its own
-    // question notifications, which end with a literal `!answer` hint.
+    // question notifications, which end with a literal `!answer` hint. Checked BEFORE any
+    // routing lookup, so the bot's own chatter never costs a REST call.
     if (message.author?.bot === true || message.webhook_id !== undefined) return;
 
     const content = message.content ?? "";
     if (content.length === 0) return;
 
-    void onMessage(content, message.author?.username ?? "someone", from).catch((error: unknown) => {
-      logger.error("gateway.handler-failed", {
-        error: error instanceof Error ? error.message : String(error),
+    const deliver = (): void => {
+      void onMessage(content, message.author?.username ?? "someone", from).catch(
+        (error: unknown) => {
+          logger.error("gateway.handler-failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
+    };
+
+    // The synchronous answer first: the main channel and every bound thread take no await,
+    // which is the shape this filter was written for.
+    if (from === channelId || this.options.threads?.knows(from) === true) {
+      deliver();
+      return;
+    }
+
+    const router = this.options.threads?.deliverable?.bind(this.options.threads);
+    if (router === undefined) return;
+
+    // An unknown channel: ask whether it is a thread of ours, and deliver if so, so the
+    // bridge can answer "I do not know which task this thread belongs to yet" rather than
+    // the message vanishing. A failed lookup is a no — `ThreadRouter` swallows it.
+    void router(from)
+      .then((ok) => {
+        if (ok) deliver();
+      })
+      .catch((error: unknown) => {
+        logger.error("gateway.route-failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
-    });
   }
 }

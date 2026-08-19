@@ -18,7 +18,8 @@
  * the permission, GitHub would refuse the approval, and the gate stays real.
  */
 import { createSign } from "node:crypto";
-import type { RepoRef, TaskSpec } from "../domain/task.ts";
+import { repoSlug, type RepoRef, type TaskSpec } from "../domain/task.ts";
+import { nearestName, nearestSlug, type UnreachableRepo } from "./reach.ts";
 import {
   assertInScope,
   assertWorkspaceScope,
@@ -83,11 +84,38 @@ const TRACKER_PERMISSIONS = {
   metadata: "read",
 } as const;
 
+/**
+ * All it takes to ask an installation what it can see. `metadata: read` is granted to
+ * every GitHub App and reaches no content — this token exists to list repositories and
+ * nothing else, so it asks for nothing else.
+ */
+const METADATA_PERMISSIONS = { metadata: "read" } as const;
+
+/**
+ * How long an installation's repository list is trusted.
+ *
+ * The list changes when a human edits an App installation, which is minutes-scale work,
+ * and the reason not to re-read it per question is the same budget §14.2 rations: one
+ * installation has 5000 requests an hour across every endpoint, shared by the whole fleet.
+ * Five minutes makes the door checks free in the steady state while still noticing an
+ * installation that was fixed a moment ago.
+ */
+const INSTALLATION_REPOS_TTL_MS = 5 * 60 * 1000;
+/** 100 is GitHub's maximum page size; 50 pages is 5000 repos, far past any account. */
+const REPO_PAGE_SIZE = 100;
+const REPO_PAGES = 50;
+
 export interface InstallationTokenRequest {
   /** Omit for an installation-wide token; supply names to scope it narrower. */
   readonly repositories?: readonly string[];
   readonly permissions: Readonly<Record<string, string>>;
 }
+
+/**
+ * The one seam the tests need. Declared here rather than imported from `notify/http.ts`
+ * so a forge does not depend on the Discord transport for a type alias.
+ */
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface GitHubAppOptions {
   readonly appId: string;
@@ -100,11 +128,23 @@ export interface GitHubAppOptions {
    * asks for a different, smaller set (§12.1). Always narrower than the App itself.
    */
   readonly permissions?: Readonly<Record<string, string>>;
+  /** Injected transport. Absent means the global `fetch`; only tests pass one. */
+  readonly fetch?: FetchLike;
 }
 
 interface InstallationTokenResponse {
   readonly token: string;
   readonly expires_at: string;
+}
+
+interface InstallationReposResponse {
+  /**
+   * How many repositories the installation has, as opposed to how many this page carries.
+   * Declared for the same reason `CheckRunsResponse.total_count` is: a page loop that
+   * cannot tell truncation from completion produces a confident wrong answer.
+   */
+  readonly total_count?: number;
+  readonly repositories?: readonly { readonly full_name: string }[];
 }
 
 interface PullRequestResponse {
@@ -135,6 +175,10 @@ interface CombinedStatusResponse {
 
 const base64Url = (input: Buffer | string): string =>
   Buffer.from(input).toString("base64url");
+
+/** The transport for one set of options: injected in tests, the global otherwise. */
+const http = (options: GitHubAppOptions): FetchLike =>
+  options.fetch ?? ((input, init) => fetch(input, init));
 
 /**
  * Sign a GitHub App JWT.
@@ -292,7 +336,7 @@ class GitHubAppForge implements Forge {
     if (cached === undefined) return;
 
     // Best-effort: an un-revoked token simply expires within the hour.
-    await fetch(`${this.options.apiBase}/installation/token`, {
+    await http(this.options)(`${this.options.apiBase}/installation/token`, {
       method: "DELETE",
       headers: this.headers(cached.password),
     }).catch(() => undefined);
@@ -318,7 +362,7 @@ class GitHubAppForge implements Forge {
 
   private async api<T>(repo: RepoRef, route: string, init: RequestInit = {}): Promise<T> {
     const credential = await this.credential(repo);
-    const response = await fetch(`${this.options.apiBase}${route}`, {
+    const response = await http(this.options)(`${this.options.apiBase}${route}`, {
       ...init,
       headers: this.headers(credential.password),
     });
@@ -331,6 +375,70 @@ class GitHubAppForge implements Forge {
 }
 
 /**
+ * What a 422 from the mint means, before anything is known about which repo caused it.
+ *
+ * GitHub's own body for this is `{"message": "Unprocessable Entity"}` with no detail at
+ * all, so this sentence is the floor: it is what the operator gets when the installation
+ * cannot be enumerated to say anything sharper.
+ */
+const NOT_INSTALLED =
+  "the App is not installed on one of the requested repositories, or was granted none of " +
+  "the requested permissions — check the installation, not the key";
+
+/**
+ * Turn a 422 into a sentence that names the repo.
+ *
+ * The mint request carries repository NAMES, and GitHub refuses the whole request without
+ * saying which of them it could not serve — identically for a repo the App is not
+ * installed on and for a repo that does not exist. So the installation is asked what it
+ * CAN see and the difference is computed here, which is also the only way to offer the
+ * near miss that resolves this most of the time — `allchat` for `all-chat` (`reach.ts`).
+ *
+ * Best-effort by construction. It costs two requests on a path that has already failed,
+ * and it must never replace a diagnosis with a second failure: anything going wrong here
+ * falls back to `NOT_INSTALLED`, which is what this said before it could say more. This is
+ * the message the credential helper prints into a failing `git clone`, so it is the last
+ * place a human is told anything at all.
+ */
+const explainUnprocessable = async (
+  options: GitHubAppOptions,
+  request: InstallationTokenRequest,
+): Promise<string> => {
+  const asked = request.repositories;
+  if (asked === undefined || asked.length === 0) return NOT_INSTALLED;
+
+  let installed: readonly string[];
+  try {
+    installed = await new InstallationRepositories(options).list();
+  } catch {
+    return NOT_INSTALLED;
+  }
+
+  const known = new Set(installed.map((slug) => slug.slice(slug.indexOf("/") + 1).toLowerCase()));
+  const missing = asked.filter((name) => !known.has(name.toLowerCase()));
+  // Every repo asked for IS installed, so the 422 was about the permissions instead — the
+  // other half of what GitHub folds into this status code.
+  if (missing.length === 0) {
+    return (
+      `the App is installed on ${asked.join(", ")} but was granted none of the requested ` +
+      `permissions (${Object.keys(request.permissions).join(", ")}) — re-grant them on the ` +
+      `installation and accept the request`
+    );
+  }
+
+  return missing
+    .map((name) => {
+      const suggestion = nearestName(name, installed);
+      return (
+        `the App cannot see '${name}' — either it does not exist or the App is not ` +
+        `installed on it` +
+        (suggestion === undefined ? "" : `; did you mean '${suggestion}'?`)
+      );
+    })
+    .join(" ");
+};
+
+/**
  * Exchange an App JWT for an installation access token.
  *
  * Shared by the forge and the Issues tracker so there is exactly one place that knows
@@ -338,7 +446,9 @@ class GitHubAppForge implements Forge {
  * helper or an Authorization header, never log it, never put it on argv (DESIGN.md §9.2).
  *
  * A 422 here almost always means the App is not installed on the repositories asked
- * for — the message says so, because the raw GitHub body does not.
+ * for — or that no such repository exists, which GitHub reports identically.
+ * `explainUnprocessable` asks the installation which of the two it was, because the raw
+ * GitHub body ("Unprocessable Entity") says neither.
  */
 export const mintInstallationToken = async (
   options: GitHubAppOptions,
@@ -347,7 +457,7 @@ export const mintInstallationToken = async (
   const jwt = signAppJwt(options.appId, options.privateKeyPem);
   const route = `/app/installations/${options.installationId}/access_tokens`;
 
-  const response = await fetch(`${options.apiBase}${route}`, {
+  const response = await http(options)(`${options.apiBase}${route}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${jwt}`,
@@ -364,12 +474,7 @@ export const mintInstallationToken = async (
   });
 
   if (response.status === 422) {
-    throw new GitHubApiError(
-      422,
-      route,
-      "the App is not installed on one of the requested repositories, or was granted " +
-        "none of the requested permissions — check the installation, not the key",
-    );
+    throw new GitHubApiError(422, route, await explainUnprocessable(options, request));
   }
   if (!response.ok) {
     throw new GitHubApiError(response.status, route, await response.text());
@@ -411,6 +516,85 @@ export class InstallationTokenSource {
     });
     this.cached = minted;
     return minted.password;
+  }
+}
+
+/**
+ * The repositories an installation can see, cached for `INSTALLATION_REPOS_TTL_MS`.
+ *
+ * `GET /installation/repositories` is the only route that answers "can this App reach that
+ * repo", and it answers it as a LIST — which is what makes a near miss offerable. One
+ * instance per workspace, held by the forge factory, so the fleet's repeated door checks
+ * cost one request every five minutes rather than one per question (§14.2's budget).
+ *
+ * Paginated, and a list it could not finish reading is an ERROR rather than a short list.
+ * The same reasoning as the check-run cap in `summarise`: an incomplete list cannot answer
+ * "is this repo absent" in either direction, and every caller here fails open on a throw —
+ * so "cannot say" costs a clone that fails the way it used to, while a wrong "absent"
+ * would refuse a `/brainstorm` or park a task over a page boundary.
+ */
+export class InstallationRepositories {
+  private readonly options: GitHubAppOptions;
+  private readonly tokens: InstallationTokenSource;
+  private cached: { readonly slugs: readonly string[]; readonly atMs: number } | undefined;
+
+  constructor(options: GitHubAppOptions) {
+    this.options = options;
+    this.tokens = new InstallationTokenSource(options, METADATA_PERMISSIONS);
+  }
+
+  /** `owner/name` exactly as GitHub spells it, so a suggestion is copy-pasteable. */
+  async list(nowMs = Date.now()): Promise<readonly string[]> {
+    const cached = this.cached;
+    if (cached !== undefined && nowMs - cached.atMs < INSTALLATION_REPOS_TTL_MS) {
+      return cached.slugs;
+    }
+    return this.refresh(nowMs);
+  }
+
+  /**
+   * Read the list again, whatever the cache says.
+   *
+   * Exists because a MISS is not the same kind of answer as a hit. A repo installed a
+   * minute ago is absent from a five-minute-old list, and refusing on that would tell a
+   * human their brand-new repo does not exist — the one wrong answer this whole check is
+   * meant to stop being given. So a hit is served from cache and a miss is confirmed
+   * against GitHub, which is affordable precisely because misses are rare.
+   */
+  async refresh(nowMs = Date.now()): Promise<readonly string[]> {
+    const token = await this.tokens.token();
+    const slugs: string[] = [];
+    let total = 0;
+
+    for (let page = 1; page <= REPO_PAGES; page += 1) {
+      const route = `/installation/repositories?per_page=${REPO_PAGE_SIZE}&page=${page}`;
+      const response = await http(this.options)(`${this.options.apiBase}${route}`, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+        },
+      });
+      if (!response.ok) {
+        throw new GitHubApiError(response.status, route, await response.text());
+      }
+
+      const body = (await response.json()) as InstallationReposResponse;
+      const repositories = body.repositories ?? [];
+      slugs.push(...repositories.map((repo) => repo.full_name));
+      total = body.total_count ?? slugs.length;
+      if (slugs.length >= total || repositories.length === 0) break;
+    }
+
+    if (slugs.length < total) {
+      throw new Error(
+        `read only ${slugs.length} of the installation's ${total} repositories — refusing ` +
+          `to judge what it can reach on a partial list`,
+      );
+    }
+
+    this.cached = { slugs, atMs: nowMs };
+    return slugs;
   }
 }
 
@@ -493,10 +677,12 @@ export const summarise = (
 export class GitHubAppForgeFactory implements ForgeFactory {
   private readonly options: GitHubAppOptions;
   private readonly scope: WorkspaceScope;
+  private readonly installed: InstallationRepositories;
 
   constructor(options: GitHubAppOptions, scope: WorkspaceScope) {
     this.options = options;
     this.scope = scope;
+    this.installed = new InstallationRepositories(options);
   }
 
   async forTask(spec: TaskSpec): Promise<Forge> {
@@ -505,6 +691,79 @@ export class GitHubAppForgeFactory implements ForgeFactory {
     // failing here names the offending repo while nothing has been cloned yet.
     for (const repo of spec.repos) assertWorkspaceScope(repo, this.scope);
     return new GitHubAppForge(this.options, spec.repos, this.scope);
+  }
+
+  /**
+   * Every repo this installation can see, for the `/brainstorm repo:` autocomplete.
+   *
+   * The same cached listing `unreachable` judges against, deliberately: a box that offers a
+   * repo the door would then refuse would be worse than no box at all.
+   */
+  async reachable(): Promise<readonly string[]> {
+    return this.installed.list();
+  }
+
+  /**
+   * Which of these repos this App cannot reach, and why (DESIGN.md §9.1.1).
+   *
+   * Both bounds in one answer, because both are things a human typing a repo name gets
+   * wrong and neither used to be discovered before a session was underway:
+   *
+   *   - the CONFIGURED bound (`assertWorkspaceScope`) — another forge's host, or the
+   *     supervisor's own state repo. Answered without a request, and answered first: "the
+   *     App is not installed on it" would be true of a Codeberg repo and would send the
+   *     operator to a settings page that was never the problem.
+   *   - the INSTALLATION — whether the App can see the repo at all.
+   *
+   * Throws if the installation cannot be listed. That is the contract every caller relies
+   * on (`RepoReach`): a 500 is not evidence that an App was uninstalled.
+   */
+  async unreachable(repos: readonly RepoRef[]): Promise<readonly UnreachableRepo[]> {
+    const failures: UnreachableRepo[] = [];
+    // Read on first need and then reused, so a list of repos costs at most one listing —
+    // and a list of entirely off-host repos costs none.
+    let installed: readonly string[] | undefined;
+    // At most one re-read per call, however many repos miss: the second miss is judged
+    // against the list the first one just refreshed.
+    let confirmed = false;
+
+    for (const repo of repos) {
+      try {
+        assertWorkspaceScope(repo, this.scope);
+      } catch (error) {
+        failures.push({ repo, reason: error instanceof Error ? error.message : String(error) });
+        continue;
+      }
+
+      installed ??= await this.installed.list();
+      const slug = repoSlug(repo);
+      const reachable = (candidates: readonly string[]): boolean =>
+        candidates.some((candidate) => candidate.toLowerCase() === slug.toLowerCase());
+
+      if (reachable(installed)) continue;
+      // A miss against a cached list may be a stale list rather than a missing repo — see
+      // `InstallationRepositories.refresh`. Confirmed before it becomes a refusal.
+      if (!confirmed) {
+        installed = await this.installed.refresh();
+        confirmed = true;
+        if (reachable(installed)) continue;
+      }
+
+      const suggestion = nearestSlug(repo, installed);
+      failures.push({
+        repo,
+        reason:
+          installed.length === 0
+            ? `\`${slug}\` is unreachable: this workspace's GitHub App is installed on no ` +
+              `repositories at all. Install it on the repos the fleet should work on.`
+            : `\`${slug}\` is not one of the ${installed.length} repositories this ` +
+              `workspace's GitHub App can see — either it does not exist or the App is not ` +
+              `installed on it.` +
+              (suggestion === undefined ? "" : ` Did you mean \`${suggestion}\`?`),
+      });
+    }
+
+    return failures;
   }
 }
 

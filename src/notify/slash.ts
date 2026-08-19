@@ -14,6 +14,7 @@
  * one guild.
  */
 import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task.ts";
+import { rankRepos } from "../forge/reach.ts";
 import { parseRepo } from "../plan/brainstorm.ts";
 import type { Command } from "./commands.ts";
 import { decodeCustomId } from "./components.ts";
@@ -22,11 +23,19 @@ import {
   focusedOption,
   modalValue,
   optionValue,
+  type AutocompleteChoice,
   type Interaction,
 } from "./interactions.ts";
 
-/** Discord's application-command option types. Only strings are used here. */
+/** Discord's application-command option types. */
 const OPTION_STRING = 3;
+/**
+ * An integer, for `/tasks page:`. Typed rather than a string so the client refuses "two"
+ * before an interaction is ever sent, and `min_value` stops a 0 or a negative reaching the
+ * pagination at all — `describeList` clamps as well, because a client-side bound is a
+ * convenience and never a guarantee.
+ */
+const OPTION_INTEGER = 4;
 
 /** The modal's single field. Its id is ours to choose and must round-trip on submit. */
 export const ANSWER_FIELD = "text";
@@ -61,7 +70,7 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
   },
   {
     name: "tasks",
-    description: "List tasks and their status",
+    description: "List tasks, most recently updated first",
     options: [
       {
         name: "status",
@@ -69,6 +78,13 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
         type: OPTION_STRING,
         required: false,
         choices: STATUSES.map((status) => ({ name: status, value: status })),
+      },
+      {
+        name: "page",
+        description: "Page of the listing, 25 per page. 1 by default.",
+        type: OPTION_INTEGER,
+        required: false,
+        min_value: 1,
       },
     ],
   },
@@ -100,6 +116,10 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
         description: "owner/name — one repo, or several separated by commas or spaces",
         type: OPTION_STRING,
         required: true,
+        // Completed from the repos the workspace's credential can actually reach
+        // (DESIGN.md §9.1.1). A free-text box is where `allchat` came from, and a name that
+        // is never offered is a name nobody has to have refused.
+        autocomplete: true,
       },
     ],
   },
@@ -140,7 +160,13 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
 export type Intent =
   | { readonly kind: "run"; readonly command: Command }
   | { readonly kind: "open-answer-modal"; readonly task: TaskId }
-  | { readonly kind: "autocomplete"; readonly query: string }
+  /**
+   * A box being typed into. `field` says WHICH box, because the two are answered from
+   * different places: a task id from the in-memory snapshot, a repo from the workspace's
+   * forge (§9.1.1). Getting it wrong suggests task ids for a repo, which is how a
+   * suggestion list becomes noise.
+   */
+  | { readonly kind: "autocomplete"; readonly field: "task" | "repo"; readonly query: string }
   /** Not ours, or no longer ours. Acknowledged and dropped. */
   | { readonly kind: "ignored"; readonly reason: string };
 
@@ -154,9 +180,12 @@ export const parseInteraction = (interaction: Interaction): Intent => {
       return fromModal(interaction);
     case INTERACTION.autocomplete: {
       const focused = focusedOption(interaction);
-      return focused === undefined
-        ? { kind: "ignored", reason: "no focused option" }
-        : { kind: "autocomplete", query: focused.value };
+      if (focused === undefined) return { kind: "ignored", reason: "no focused option" };
+      // Keyed on the command AND the option, not the option alone: `repo` means a repo on
+      // `/brainstorm` and nothing else registers one, but a future command with a `repo`
+      // option that means something else must not silently inherit this.
+      const repo = interaction.data?.name === "brainstorm" && focused.name === "repo";
+      return { kind: "autocomplete", field: repo ? "repo" : "task", query: focused.value };
     }
     default:
       return { kind: "ignored", reason: `interaction type ${interaction.type}` };
@@ -209,6 +238,40 @@ const taskOption = (interaction: Interaction, name: string): TaskId | string => 
  * neither is wrong. Splitting on either means `owner/a, owner/b` and `owner/a owner/b`
  * are the same command, which is the only behaviour a human would predict.
  */
+/**
+ * Discord's ceiling on a choice's `value` and `name`. Exceeding either is a 400 for the
+ * WHOLE response, which the client shows as no suggestions at all — so an over-long
+ * completion is dropped here rather than sent and lost with its neighbours.
+ */
+const MAX_CHOICE_LENGTH = 100;
+
+/**
+ * Completions for the `repo:` box, which may already hold several repos (§14.3).
+ *
+ * Discord replaces the ENTIRE option value with the chosen one, so each choice carries the
+ * repos already typed plus the suggestion. A choice that carried only the suggested repo
+ * would silently delete the others, and a brainstorm that quietly lost a repo produces a
+ * plan about half a system — the same failure the multi-workspace refusal exists to avoid.
+ *
+ * The partial being completed is the LAST entry, unless the box ends on a separator, in
+ * which case there is nothing partial and everything typed so far is kept.
+ */
+export const repoChoices = (
+  typed: string,
+  catalog: readonly string[],
+): readonly AutocompleteChoice[] => {
+  const entries = splitRepos(typed);
+  const partial = /[\s,]$/.test(typed) ? "" : (entries.at(-1) ?? "");
+  const complete = partial === "" ? entries : entries.slice(0, -1);
+  const already = new Set(complete.map((entry) => entry.toLowerCase()));
+
+  return rankRepos(partial, catalog)
+    .filter((slug) => !already.has(slug.toLowerCase()))
+    .map((slug) => [...complete, slug].join(", "))
+    .filter((value) => value.length <= MAX_CHOICE_LENGTH)
+    .map((value) => ({ name: value, value }));
+};
+
 const splitRepos = (raw: string): readonly string[] =>
   raw
     .split(/[\s,]+/)
@@ -228,11 +291,17 @@ const fromCommand = (interaction: Interaction): Intent => {
     }
     case "tasks": {
       const status = optionValue(interaction, "status");
+      // Parsed defensively and dropped when it is not a number. A malformed page is not
+      // worth refusing a listing over — the default page is the one almost everybody wants,
+      // and `describeList` clamps whatever does arrive.
+      const raw = Number(optionValue(interaction, "page"));
+      const page = Number.isFinite(raw) && raw >= 1 ? Math.trunc(raw) : undefined;
       return {
         kind: "run",
         command: {
           kind: "list",
           ...(status !== undefined && isStatus(status) ? { status } : {}),
+          ...(page === undefined ? {} : { page }),
         },
       };
     }

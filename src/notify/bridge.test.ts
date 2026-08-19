@@ -54,6 +54,7 @@ const harness = (
   over: {
     readonly threads?: ThreadIndex;
     readonly leadership?: { readonly held: () => boolean };
+    readonly repos?: { reachable: () => Promise<readonly string[]> };
   } = {},
 ): {
   readonly bridge: DiscordBridge;
@@ -82,6 +83,7 @@ const harness = (
     ...(over.threads === undefined ? {} : { threads: over.threads }),
     // Absent means "act", so every test written before the fleet existed still applies.
     ...(over.leadership === undefined ? {} : { leadership: over.leadership }),
+    ...(over.repos === undefined ? {} : { repos: over.repos }),
     fetch,
   });
 
@@ -452,4 +454,113 @@ test("the replica that holds the claim behaves exactly as before", async () => {
 
   assert.equal(inbox.size, 0, "a listing still never queues work");
   assert.match(String((callback(calls).body["data"] as { content: string }).content), /GH-acme-widget-42/);
+});
+
+test("a message in a thread with no known binding gets an honest answer, not silence", async () => {
+  // Routine for the STANDALONE bot (§7): its index arrives over Redis from the supervisor,
+  // so a thread bound seconds ago, or a bot that started before any supervisor, is a
+  // thread it does not know yet.
+  //
+  // Silence is the one unacceptable reply. In a bound thread everything typed IS the
+  // answer, so a human typing into one that looks unbound would get nothing back and
+  // could not tell that from the agent being busy.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  await bridge.handleMessage("we want B", "operator", THREAD);
+
+  assert.equal(inbox.size, 0, "an unroutable message must not be queued as somebody's answer");
+  const said = posted(calls);
+  assert.equal(said.length, 1, "the human was told nothing");
+  assert.match(String(said[0]?.body["content"]), /do not know which task this thread/i);
+  // Answered IN the thread, where the person is looking.
+  assert.match(String(said[0]?.url), new RegExp(`/channels/${THREAD}/messages$`));
+});
+
+test("a binding that arrives later makes the same thread answerable", async () => {
+  // The staleness window closing. Once the supervisor's binding reaches the bot, the
+  // thread behaves exactly as it does in the unsplit process.
+  const threads = new ThreadIndex();
+  const { bridge, inbox, calls } = harness({ threads });
+
+  await bridge.handleMessage("we want B", "operator", THREAD);
+  assert.equal(inbox.size, 0);
+
+  threads.replace([[THREAD, TASK]]);
+  const handled = bridge.handleMessage("we want B", "operator", THREAD);
+  await settleQueued(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  const said = posted(calls);
+  assert.match(String(said[said.length - 1]?.body["content"]), /Answered/);
+});
+
+test("an ordinary message in the main channel is still ignored", async () => {
+  // The unbound-thread reply must not become a reply to everything. The channel carries
+  // ordinary conversation, and answering all of it would make the bot unusable.
+  const { bridge, inbox, calls } = harness({ threads: new ThreadIndex() });
+
+  await bridge.handleMessage("morning all", "operator", CHANNEL);
+
+  assert.equal(inbox.size, 0);
+  assert.deepEqual(calls, [], "the channel is not a thread and silence is correct there");
+});
+
+test("the repo box is completed from the workspaces' repos, not from task ids", async () => {
+  // The whole point of §9.1.1's second half: `allchat` must find `all-chat` while it is
+  // still being typed, so the name that parked a task cannot be committed to at all.
+  const { bridge, calls } = harness({
+    repos: {
+      reachable: () => Promise.resolve(["caesarakalaeii/Caterpillar", "caesarakalaeii/all-chat"]),
+    },
+  });
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "allchat", focused: true }] },
+    }),
+  );
+
+  const ack = callback(calls);
+  assert.equal(ack.body["type"], RESPONSE.autocomplete);
+  const data = ack.body["data"] as { readonly choices: readonly { readonly value: string }[] };
+  assert.deepEqual(
+    data.choices.map((choice) => choice.value),
+    ["caesarakalaeii/all-chat"],
+  );
+});
+
+test("a forge that cannot be asked answers with an empty box, not a dead interaction", async () => {
+  // An autocomplete accepts one response and no other kind. A throw out of here is a
+  // spinner that never resolves, which is worse than no suggestions.
+  const { bridge, calls } = harness({
+    repos: { reachable: () => Promise.reject(new Error("GitHub 500")) },
+  });
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "all", focused: true }] },
+    }),
+  );
+
+  const ack = callback(calls);
+  assert.equal(ack.body["type"], RESPONSE.autocomplete);
+  const data = ack.body["data"] as { readonly choices: readonly unknown[] };
+  assert.deepEqual(data.choices, []);
+});
+
+test("a runner with no catalogue still answers the box", async () => {
+  // No forge configured for the bridge is a supported shape (a standalone bot process has
+  // no credentials at all), and it must behave as it did before the box was completed.
+  const { bridge, calls } = harness();
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "all", focused: true }] },
+    }),
+  );
+
+  assert.equal(callback(calls).body["type"], RESPONSE.autocomplete);
 });

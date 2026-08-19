@@ -24,7 +24,7 @@ import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task
 export type Command =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
   /** List tasks, optionally filtered. Served from the snapshot, never from git. */
-  | { readonly kind: "list"; readonly status?: TaskStatus }
+  | { readonly kind: "list"; readonly status?: TaskStatus; readonly page?: number }
   | { readonly kind: "show"; readonly task: TaskId }
   /** Stop working a task and leave it parked for a human. */
   | { readonly kind: "park"; readonly task: TaskId }

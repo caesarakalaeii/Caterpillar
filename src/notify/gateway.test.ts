@@ -6,8 +6,10 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { asTaskId } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
-import { DiscordGateway, type SocketLike } from "./gateway.ts";
+import { FleetActivity } from "./activity.ts";
+import { DiscordGateway, type GatewayOptions, type SocketLike } from "./gateway.ts";
 
 const CHANNEL = "999";
 
@@ -50,7 +52,10 @@ const fakeSocket = (): Fake => {
 };
 
 const build = (
-  onMessage: (content: string, author: string) => Promise<void> = () => Promise.resolve(),
+  onMessage: (content: string, author: string, channelId: string) => Promise<void> = () =>
+    Promise.resolve(),
+  presence?: GatewayOptions["presence"],
+  threads?: GatewayOptions["threads"],
 ): { gateway: DiscordGateway; sockets: Fake[]; slept: number[] } => {
   const sockets: Fake[] = [];
   const slept: number[] = [];
@@ -59,6 +64,8 @@ const build = (
     token: "bot-token",
     channelId: CHANNEL,
     onMessage,
+    ...(presence === undefined ? {} : { presence }),
+    ...(threads === undefined ? {} : { threads }),
     logger: SILENT_LOGGER,
     random: () => 0.5,
     sleep: async (ms) => {
@@ -231,4 +238,260 @@ test("an invalid session forces a fresh IDENTIFY instead of resuming forever", a
   assert.ok(next.sent.some((p) => (p as { op: number }).op === 2), "must IDENTIFY afresh");
 
   await stop();
+});
+
+/* ----------------------------------------------------------------- presence (§7.2) */
+
+const ready = (over: Record<string, unknown> = {}): unknown => ({
+  op: 0,
+  s: 1,
+  t: "READY",
+  d: { session_id: "sess-1", resume_gateway_url: "wss://resume.example", ...over },
+});
+
+/** A fleet with one running task, already surveyed once. */
+const surveyed = (): FleetActivity => {
+  const activity = new FleetActivity({ now: () => 1_000 });
+  activity.publish([
+    { id: asTaskId("ALERT-6155db"), status: "running", phase: "implementing" },
+  ]);
+  return activity;
+};
+
+test("IDENTIFY carries the presence, rather than sending it as a second frame", async () => {
+  // A separate opcode 3 after IDENTIFY would leave the bot briefly online with no activity.
+  // On a fleet that reconnects during every rollout that is a visible flicker to no purpose.
+  const built = build(undefined, surveyed());
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  const identify = socket.sent.find((p) => (p as { op: number }).op === 2) as {
+    d: { presence?: { activities: { name: string; type: number }[]; status: string } };
+  };
+
+  assert.ok(identify.d.presence !== undefined, "a fresh connection must not be briefly blank");
+  assert.equal(identify.d.presence.activities[0]?.name, "ALERT-6155db · implementing");
+  assert.equal(identify.d.presence.activities[0]?.type, 3, "Watching");
+  assert.equal(identify.d.presence.status, "online");
+
+  await stop();
+});
+
+test("a gateway with no presence source identifies exactly as it did before", async () => {
+  // The field must be ABSENT and not empty: Discord reads a `presence` carrying no
+  // activities as an instruction to clear one.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  const identify = socket.sent.find((p) => (p as { op: number }).op === 2) as {
+    d: Record<string, unknown>;
+  };
+
+  assert.equal("presence" in identify.d, false);
+  await stop();
+});
+
+test("a change after READY is sent as an opcode 3 on that connection", async () => {
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+
+  activity.publish([{ id: asTaskId("TASK-9"), status: "awaiting-human", phase: "review" }]);
+
+  const updates = socket.sent.filter((p) => (p as { op: number }).op === 3) as {
+    d: { activities: { name: string }[] };
+  }[];
+
+  assert.equal(updates.length, 1, "the change must reach the live socket");
+  assert.equal(updates[0]?.d.activities[0]?.name, "1 waiting for you");
+
+  await stop();
+});
+
+test("RESUMED re-sends the presence, because a resume carries no IDENTIFY", async () => {
+  // The failure this pins: a runner comes back from a blip and keeps advertising whatever it
+  // was doing before it, indefinitely — worst for the runners that were out longest.
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit({ op: 0, s: 2, t: "RESUMED", d: {} });
+
+  const resumed = socket.sent.filter((p) => (p as { op: number }).op === 3) as {
+    d: { activities: { name: string }[] };
+  }[];
+  assert.equal(resumed.length, 1, "a resumed session must be told the presence again");
+  assert.equal(resumed[0]?.d.activities[0]?.name, "ALERT-6155db · implementing");
+
+  await stop();
+});
+
+test("READY does NOT re-send, because the IDENTIFY beside it already carried the presence", async () => {
+  // A per-connection allowance spent repeating what Discord was just told is the one that is
+  // not available when the state actually changes.
+  const built = build(undefined, surveyed());
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+
+  assert.equal(socket.sent.filter((p) => (p as { op: number }).op === 3).length, 0);
+  await stop();
+});
+
+test("a presence change after the socket is gone is not written to it", async () => {
+  // Surveys keep running across a disconnect. Writing into a disposed socket is the bug.
+  const activity = surveyed();
+  const built = build(undefined, activity);
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(ready());
+  const before = socket.sent.length;
+
+  socket.fire("close");
+  await new Promise((r) => setImmediate(r));
+  activity.publish([{ id: asTaskId("TASK-4"), status: "running", phase: "planning" }]);
+
+  assert.equal(socket.sent.length, before, "nothing may be sent on a closed connection");
+  await stop();
+});
+
+test("connected() is false until IDENTIFY has been answered, and false again after close", async () => {
+  // The standalone bot's readiness probe reads this. An open socket that has not
+  // identified delivers nothing, so reporting it ready would keep a pod in the Service
+  // that answers no human — `supervisor/loop.ts:~287`'s lesson, one process along.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  assert.equal(built.gateway.connected(), false, "a dialled socket is not yet a working bot");
+
+  socket.emit(hello());
+  assert.equal(built.gateway.connected(), false, "IDENTIFY sent is still not IDENTIFY answered");
+
+  socket.emit({ op: 0, s: 1, t: "READY", d: { session_id: "sess-1" } });
+  assert.equal(built.gateway.connected(), true);
+
+  socket.fire("close");
+  assert.equal(built.gateway.connected(), false, "a closed socket must not report ready");
+
+  await stop();
+});
+
+test("a zombie socket reports disconnected, not merely logs", async () => {
+  // Open, and delivering nothing. This is the failure that looks identical to an idle
+  // channel, and the whole reason the probe cannot just be "the HTTP server is up".
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello(1_000));
+  socket.emit({ op: 0, s: 1, t: "READY", d: { session_id: "sess-1" } });
+  assert.equal(built.gateway.connected(), true);
+
+  // Two beats with no ACK between them is the zombie test the gateway already makes.
+  await new Promise((r) => setTimeout(r, 5));
+  socket.fire("close");
+
+  assert.equal(built.gateway.connected(), false);
+  await stop();
+});
+
+test("a RESUMED connection is connected again", async () => {
+  // A reconnect is the ordinary case during a rollout, and a bot that never reported
+  // ready again after resuming would be restarted forever by its own probe.
+  const built = build();
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit({ op: 0, s: 1, t: "RESUMED", d: {} });
+
+  assert.equal(built.gateway.connected(), true);
+  await stop();
+});
+
+/* ─────────────────── which channels reach the bridge (§7, §14.3) ─────────────────── */
+
+const THREAD = "thread-77";
+
+/**
+ * Drive a message from `THREAD` through the real socket path and report whether it landed.
+ *
+ * Deliberately NOT a direct `bridge.handleMessage` call. Every existing test of the
+ * unbound-thread reply called the bridge directly, which is exactly why the gap this
+ * covers survived: the branch was reachable in a test and unreachable in production,
+ * because the gateway dropped the message before the bridge could answer.
+ */
+const deliverFromThread = async (
+  threads: GatewayOptions["threads"],
+): Promise<{ delivered: string[] }> => {
+  const delivered: string[] = [];
+  const built = build(
+    (_content, _author, channelId) => {
+      delivered.push(channelId);
+      return Promise.resolve();
+    },
+    undefined,
+    threads,
+  );
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(messageCreate({ channel_id: THREAD }));
+  // The routing decision may be asynchronous (a parent lookup), so let it settle.
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  await stop();
+
+  return { delivered };
+};
+
+test("a message in a bound thread reaches the bridge without any lookup", async () => {
+  let lookups = 0;
+  const { delivered } = await deliverFromThread({
+    knows: (channelId) => channelId === THREAD,
+    deliverable: () => {
+      lookups += 1;
+      return Promise.resolve(true);
+    },
+  });
+
+  assert.deepEqual(delivered, [THREAD]);
+  assert.equal(lookups, 0, "a known thread must stay on the synchronous path");
+});
+
+test("a message in an UNBOUND thread of our channel still reaches the bridge", async () => {
+  // The whole point. The standalone bot's index arrives over Redis and is legitimately
+  // behind, so a thread bound seconds ago — or one no supervisor has published yet — must
+  // still be delivered, or the bridge's honest "I do not know which task this thread
+  // belongs to yet" is dead code and the human gets silence.
+  const { delivered } = await deliverFromThread({
+    knows: () => false,
+    deliverable: () => Promise.resolve(true),
+  });
+
+  assert.deepEqual(delivered, [THREAD], "an unbound thread of ours must be answerable");
+});
+
+test("a message in an unrelated channel is still dropped", async () => {
+  // The filter still has to filter: this bot shares a guild with channels that are none
+  // of its business, and answering in one would be worse than missing a reply.
+  const { delivered } = await deliverFromThread({
+    knows: () => false,
+    deliverable: () => Promise.resolve(false),
+  });
+
+  assert.deepEqual(delivered, [], "a channel that is not ours must never reach the bridge");
+});
+
+test("without a router the filter behaves exactly as it did in-process", async () => {
+  // The supervisor's in-process path supplies a bare `ThreadIndex` with no `deliverable`,
+  // and must keep dropping unknown channels rather than gaining a REST call per message.
+  const { delivered } = await deliverFromThread({ knows: () => false });
+
+  assert.deepEqual(delivered, []);
 });

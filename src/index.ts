@@ -7,17 +7,21 @@
  */
 import { createServer } from "node:http";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
 import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
+import { externalBot } from "./config/bot.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { MirrorChangeReader } from "./digest/changes.ts";
 import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
+import { mergedCatalog } from "./forge/catalog.ts";
+import type { RepoCatalog } from "./forge/reach.ts";
 import type { ForgeFactory, WorkspaceScope } from "./forge/types.ts";
 import { Ingester, type IntakeObserver } from "./intake/ingest.ts";
 import { IntakeStatus } from "./intake/status.ts";
@@ -27,9 +31,11 @@ import { createLlmRuntime, type LlmRuntime } from "./llm/models.ts";
 import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
+import { registerCommandsOnce } from "./notify/register.ts";
 import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
 import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
+import { FleetActivity } from "./notify/activity.ts";
 import { DiscordGateway } from "./notify/gateway.ts";
 import { AlertProcessor, AlertQueue } from "./remediation/queue.ts";
 import { startRemediationReceiver, type AlertObserver } from "./remediation/receiver.ts";
@@ -310,7 +316,7 @@ const main = async (): Promise<void> => {
   // here keeps the receiver's own startup a single decision about the port and the secret.
   const alertQueue = new AlertQueue();
   const threads = new ThreadIndex();
-  const discord = await loadDiscord(config.secretsDir, logger);
+  const discord = await loadDiscord(config.secretsDir, logger, externalBot(config, logger));
 
   // Shared by the implementation sessions and the review council — one provider, one
   // credential store, one place the model id is decided.
@@ -343,6 +349,20 @@ const main = async (): Promise<void> => {
     logger,
   });
 
+  // Also built before both users, and for a sharper version of the same reason (§7.2). The
+  // supervisor's survey writes into it on the housekeeping timer; the gateway reads it at
+  // IDENTIFY and subscribes at READY. Those two have deliberately different lifetimes — the
+  // survey outlives every socket, and a socket is replaced on every reconnect — so neither
+  // can own the other and both hold this.
+  //
+  // Only when there IS a bot AND this process holds the gateway: the presence is sent as an
+  // opcode 3 on that socket, so a supervisor whose bot is split out has nothing to send it
+  // over. Leaving it undefined is what makes the supervisor's `activity` call a no-op on a
+  // webhook-only runner rather than a wasted render per poll — and the same is now true of
+  // an external-bot runner, where the standalone process advertises the presence instead.
+  const activity =
+    discord.bot === undefined || discord.gateway === false ? undefined : new FleetActivity();
+
   const supervisor = new Supervisor({
     config,
     store,
@@ -373,6 +393,11 @@ const main = async (): Promise<void> => {
     council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
+    // The workspaces' forge factories, for the one question the loop asks of them: can this
+    // credential reach the repo somebody just named (§9.1.1)? The same map the session runner
+    // holds — a repo checked at the `/brainstorm` door and again before a session, so the
+    // answer never has to come from a failing `git clone`.
+    forges,
     threads,
     ...(discord.bot === undefined
       ? {}
@@ -384,8 +409,16 @@ const main = async (): Promise<void> => {
     credentials,
     inbox,
     snapshot,
+    ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     runners: plane.runners,
+    // The supervisor→bot half of the thread index (§7.2). Always passed, never gated on
+    // the mode: with Redis off this is the in-memory store nobody else reads and the
+    // publish is an assignment, and with it on a supervisor that has NOT been told the bot
+    // is external still publishes — which is what makes a fleet mid-rollout, where the bot
+    // pod is already up and the supervisors have not restarted yet, route replies instead
+    // of dropping them.
+    threadBindings: plane.threads,
     metrics,
     logger,
     trackers,
@@ -395,6 +428,7 @@ const main = async (): Promise<void> => {
       store,
       trackers,
       scopes,
+      forges,
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
@@ -439,16 +473,42 @@ const main = async (): Promise<void> => {
   // `we`. Keel rolls this pod on every push to main, which makes that window routine.
   await hydrateThreads(store, threads, logger);
 
+  // Once per change, across the fleet, ever (§7.1). NOT awaited: commands appearing a
+  // moment after boot is invisible to a human, whereas a Discord write between the pod
+  // starting and the first poll is a rollout that idles on someone else's API. It never
+  // throws — a runner whose registration is refused still runs the bridge, and `!answer`
+  // and the buttons do not depend on it.
+  if (discord.bot !== undefined) {
+    void registerCommandsOnce({
+      ...(discord.applicationId === undefined ? {} : { applicationId: discord.applicationId }),
+      ...(discord.guildId === undefined ? {} : { guildId: discord.guildId }),
+      token: discord.bot.token,
+      claims: leases,
+      runner: config.runnerId,
+      logger,
+    });
+  }
+
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
   const bridge =
-    discord.bot === undefined
+    discord.bot === undefined || discord.gateway === false
       ? Promise.resolve()
-      : runBridge(discord.bot, inbox, snapshot, threads, logger, controller.signal, chat).catch(
-          (error: unknown) => {
-            logger.error("bridge.failed", errorFields(error));
-          },
-        );
+      : runBridge({
+          bot: discord.bot,
+          inbox,
+          snapshot,
+          threads,
+          logger,
+          signal: controller.signal,
+          leadership: chat,
+          // One catalogue over every workspace, because `/brainstorm` does not name one —
+          // the loop derives the workspace from the repo (§14.3, §9.1.1).
+          repos: mergedCatalog({ catalogs: [...forges.values()], logger }),
+          ...(activity === undefined ? {} : { activity }),
+        }).catch((error: unknown) => {
+          logger.error("bridge.failed", errorFields(error));
+        });
 
   try {
     await supervisor.run(controller.signal);
@@ -755,24 +815,56 @@ const hydrateThreads = async (
  * always was: the gateway drops `author.bot` messages (`gateway.ts`), a guard that was
  * written for the webhook's `!answer` hint and now carries the bot's own output too.
  */
-const loadDiscord = async (
+export const loadDiscord = async (
   secretsDir: string,
   logger: Logger,
-): Promise<{ readonly bot?: DiscordBot; readonly notifier: Notifier }> => {
+  external = false,
+): Promise<{
+  readonly bot?: DiscordBot;
+  readonly notifier: Notifier;
+  /** Whether THIS process should connect to the gateway. False when the bot is split out. */
+  readonly gateway?: boolean;
+  /** Where the slash commands are published, when both are sealed (§7.1). */
+  readonly applicationId?: string;
+  readonly guildId?: string;
+}> => {
   const bundle = new SecretBundle(secretsDir, "caterpillar-discord");
   const token = await bundle.readOptional("bot-token").catch(() => undefined);
   const channelId = await bundle.readOptional("channel-id").catch(() => undefined);
   const webhookUrl = await bundle.readOptional("webhook-url").catch(() => undefined);
+  const applicationId = await bundle.readOptional("application-id").catch(() => undefined);
+  const guildId = await bundle.readOptional("guild-id").catch(() => undefined);
+
+  // A separate process owns the gateway (§7), so this one must not connect: two processes
+  // reading one channel is the duplicate-acting failure the arrangement exists to prevent.
+  //
+  // `gateway` is the WHOLE difference, which is why it rides on the ordinary returns below
+  // rather than a branch that restates them. Only the bridge is skipped: everything the
+  // bot does OUTBOUND still belongs to this process — the notification with the Answer
+  // button, the typing indicator while a session runs, closing a cancelled task's thread —
+  // because only READING the channel has to be exclusive.
+  if (external) {
+    logger.info("bridge.external", {
+      reason: "bot.mode is external — a separate process owns the gateway",
+    });
+  }
 
   if (token === undefined || channelId === undefined) {
-    logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
+    if (!external) logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
     return {
       notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
+      gateway: !external,
     };
   }
 
   const bot = new DiscordBot({ token, channelId });
-  return { bot, notifier: new BotNotifier(bot) };
+  return {
+    bot,
+    notifier: new BotNotifier(bot),
+    gateway: !external,
+    ...(applicationId === undefined ? {} : { applicationId }),
+    ...(guildId === undefined ? {} : { guildId }),
+  };
 };
 
 /**
@@ -783,18 +875,22 @@ const loadDiscord = async (
  * the only thing that touches the state repo, and answers reads from the snapshot, which
  * touches nothing at all.
  */
-const runBridge = (
-  bot: DiscordBot,
-  inbox: ChatSubmitter,
-  snapshot: SnapshotReader,
-  threads: ThreadIndex,
-  logger: Logger,
-  signal: AbortSignal,
-  leadership: ChatLeadership,
-): Promise<void> => {
+const runBridge = (deps: {
+  readonly bot: DiscordBot;
+  readonly inbox: ChatSubmitter;
+  readonly snapshot: SnapshotReader;
+  readonly threads: ThreadIndex;
+  readonly logger: Logger;
+  readonly signal: AbortSignal;
+  readonly leadership: ChatLeadership;
+  /** The repos `/brainstorm repo:` completes from (§9.1.1). */
+  readonly repos: RepoCatalog;
+  readonly activity?: FleetActivity;
+}): Promise<void> => {
+  const { bot, inbox, snapshot, threads, logger, leadership, repos, activity } = deps;
   // Every replica connects; one acts (§7). The connection is what keeps the bot online
   // through a rollout, and it costs nothing — it is acting four times that broke things.
-  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership });
+  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership, repos });
 
   return new DiscordGateway({
     token: bot.token,
@@ -803,7 +899,12 @@ const runBridge = (
     logger,
     onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
-  }).run(signal);
+    // Passed WITHOUT a leadership check, unlike everything else the bridge does. Presence
+    // is idempotent and identical on every replica — all four render from the same surveyed
+    // state — so four senders converge where four ACTORS conflicted (§7.2). Holder-only
+    // would make the status go stale for the length of a claim handover instead.
+    ...(activity === undefined ? {} : { presence: activity }),
+  }).run(deps.signal);
 };
 
 /**
@@ -823,18 +924,30 @@ const die = (event: string, error: unknown): never => {
   process.exit(1);
 };
 
-process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
-process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
+/**
+ * Only when this file is the program, never when it is imported.
+ *
+ * `bot.ts` carries the same guard and explains why: without it, a test importing anything
+ * from this module boots a whole supervisor — it reads `/etc/caterpillar/config.json`,
+ * fails, and calls `process.exit`, which kills the test RUNNER mid-suite and reports every
+ * file that never ran as passing. This module had no such guard because nothing imported
+ * it; `loadDiscord` is now exported so the split's gate can be tested at its own seam,
+ * which is precisely the moment the guard stops being optional.
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
+  process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
 
-main().then(
-  () => {
-    // A clean return means the signal aborted and shutdown completed.
-    process.exit(0);
-  },
-  (error: unknown) => {
-    // A failure here can predate `loadConfig`, so this logger takes the default level
-    // rather than the configured one — a boot failure must never be the thing that gets
-    // filtered out.
-    die("supervisor.boot-failed", error);
-  },
-);
+  main().then(
+    () => {
+      // A clean return means the signal aborted and shutdown completed.
+      process.exit(0);
+    },
+    (error: unknown) => {
+      // A failure here can predate `loadConfig`, so this logger takes the default level
+      // rather than the configured one — a boot failure must never be the thing that gets
+      // filtered out.
+      die("supervisor.boot-failed", error);
+    },
+  );
+}

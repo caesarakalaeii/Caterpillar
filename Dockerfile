@@ -99,10 +99,29 @@ EXPOSE 9090
 # tini reaps the processes the agent's bash tool spawns; without it a long-running
 # supervisor accumulates zombies from every session.
 #
-# The aggregating viewer (DESIGN.md §18) is the SAME image with a different command:
-#   command: ["node", "/app/dist/cli/view.js"]
-# `dist/` is copied whole, so it costs a Deployment manifest and no second build. That
-# process holds no credential, no volume and no ServiceAccount token — it reads the
-# runners' `/api/*` routes and nothing else.
+# ONE IMAGE, THREE ENTRYPOINTS. `dist/` is copied whole and `tsc` emits every file under
+# `src/`, so each of these costs a Deployment manifest and no second build:
+#
+#   the supervisor (the default below)
+#     command: ["node", "/app/dist/index.js"]
+#
+#   the standalone Discord bot (DESIGN.md §7, §10)
+#     command: ["node", "/app/dist/bot.js"]
+#   Runs ONE replica. It needs the caterpillar-discord secret and Redis, and it needs
+#   NOTHING else: no work PVC, no forge or LLM credential, no ServiceAccount token. That
+#   is the point of splitting it out — it holds the Discord connection and reaches the
+#   supervisor only through the Redis inbox. It serves /healthz, /readyz and /metrics on
+#   `bot.port` (9091 by default) rather than 9090, so the two can share a namespace.
+#   Probe /readyz, not /healthz: readiness reflects gateway connectedness and Redis
+#   reachability, and liveness deliberately does not — restarting the process does not fix
+#   a Redis outage, and a liveness probe that reacted to one would be a crash loop.
+#
+#   the aggregating viewer (DESIGN.md §18)
+#     command: ["node", "/app/dist/cli/view.js"]
+#   Holds no credential, no volume and no ServiceAccount token — it reads the runners'
+#   `/api/*` routes and nothing else.
+#
+# The supervisor stays the default because it is the one that must exist; the other two
+# are additions to a fleet that already has one.
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "/app/dist/index.js"]
