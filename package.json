@@ -9,6 +9,7 @@
   },
   "bin": {
     "caterpillar": "./dist/index.js",
+    "caterpillar-bot": "./dist/bot.js",
     "caterpillar-cred": "./dist/cli/credential-helper.js",
     "caterpillar-view": "./dist/cli/view.js"
   },

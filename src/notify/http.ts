@@ -60,6 +60,23 @@ export interface PostOptions {
 }
 
 /**
+ * Methods for which `fetch` refuses a body — and refuses it as a synchronous `TypeError`
+ * ("Request with GET/HEAD method cannot have body"), thrown while constructing the
+ * request, before any network I/O.
+ *
+ * This is not a tidiness rule. `parentChannel` shipped passing `body: ""` with a GET, and
+ * because every caller of it wraps the failure in a fallback, the throw was invisible: the
+ * lookup resolved undefined for EVERY channel, `ThreadRouter` read that as "not our
+ * thread" and cached it, and the bot went back to silently dropping messages in threads it
+ * had no binding for — the exact failure the honest-reply path exists to remove. Tests
+ * missed it because a fetch stub happily ignores a body the real one rejects.
+ *
+ * So the invariant lives here, in the one client every Discord path shares, rather than in
+ * each call site where it can be forgotten again.
+ */
+const BODILESS_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD"]);
+
+/**
  * POST JSON, retrying only what retrying can fix. Resolves with the successful response.
  *
  * Everything outside 429 and 5xx is permanent: a 404 is a webhook deleted in the UI, a
@@ -71,11 +88,15 @@ export const postJson = async (options: PostOptions): Promise<Response> => {
   const pause = options.sleep ?? ((ms: number) => sleep(ms));
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
 
+  const method = options.method ?? "POST";
+  // Omitted, not emptied: `fetch` rejects a GET carrying even "" (see BODILESS_METHODS).
+  const body = BODILESS_METHODS.has(method.toUpperCase()) ? {} : { body: options.body };
+
   for (let attempt = 0; ; attempt++) {
     const response = await http(options.url, {
-      method: options.method ?? "POST",
+      method,
       headers: { "content-type": "application/json", ...options.headers },
-      body: options.body,
+      ...body,
     });
 
     if (response.ok) return response;

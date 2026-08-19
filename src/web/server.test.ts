@@ -96,6 +96,7 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     commandTimeoutMs: 1000,
     keyPrefix: "caterpillar:",
   },
+  bot: { mode: "in-process" as const, port: 9091 },
   web: {
     enabled: true,
     port: 0,

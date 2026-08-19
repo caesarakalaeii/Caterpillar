@@ -7,11 +7,13 @@
  */
 import { createServer } from "node:http";
 import { dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
 import { ClusterClient, type ClusterReader } from "./cluster/client.ts";
 import { loadConfig } from "./config/load.ts";
 import { stateRepoRef, workspaceScopeOf } from "./config/scope.ts";
+import { externalBot } from "./config/bot.ts";
 import type { RunnerConfig } from "./config/types.ts";
 import { CredentialService } from "./credential/service.ts";
 import { MirrorChangeReader } from "./digest/changes.ts";
@@ -314,7 +316,7 @@ const main = async (): Promise<void> => {
   // here keeps the receiver's own startup a single decision about the port and the secret.
   const alertQueue = new AlertQueue();
   const threads = new ThreadIndex();
-  const discord = await loadDiscord(config.secretsDir, logger);
+  const discord = await loadDiscord(config.secretsDir, logger, externalBot(config, logger));
 
   // Shared by the implementation sessions and the review council — one provider, one
   // credential store, one place the model id is decided.
@@ -353,10 +355,13 @@ const main = async (): Promise<void> => {
   // survey outlives every socket, and a socket is replaced on every reconnect — so neither
   // can own the other and both hold this.
   //
-  // Only when there IS a bot: the presence travels over the gateway connection, and without
-  // a token there is no gateway. Leaving it undefined is what makes the supervisor's
-  // `activity` call a no-op on a webhook-only runner rather than a wasted render per poll.
-  const activity = discord.bot === undefined ? undefined : new FleetActivity();
+  // Only when there IS a bot AND this process holds the gateway: the presence is sent as an
+  // opcode 3 on that socket, so a supervisor whose bot is split out has nothing to send it
+  // over. Leaving it undefined is what makes the supervisor's `activity` call a no-op on a
+  // webhook-only runner rather than a wasted render per poll — and the same is now true of
+  // an external-bot runner, where the standalone process advertises the presence instead.
+  const activity =
+    discord.bot === undefined || discord.gateway === false ? undefined : new FleetActivity();
 
   const supervisor = new Supervisor({
     config,
@@ -407,6 +412,13 @@ const main = async (): Promise<void> => {
     ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     runners: plane.runners,
+    // The supervisor→bot half of the thread index (§7.2). Always passed, never gated on
+    // the mode: with Redis off this is the in-memory store nobody else reads and the
+    // publish is an assignment, and with it on a supervisor that has NOT been told the bot
+    // is external still publishes — which is what makes a fleet mid-rollout, where the bot
+    // pod is already up and the supervisors have not restarted yet, route replies instead
+    // of dropping them.
+    threadBindings: plane.threads,
     metrics,
     logger,
     trackers,
@@ -480,7 +492,7 @@ const main = async (): Promise<void> => {
   // Deliberately NOT awaited here — it resolves only at shutdown, so awaiting it would
   // mean the supervisor never starts polling and the pod idles while looking healthy.
   const bridge =
-    discord.bot === undefined
+    discord.bot === undefined || discord.gateway === false
       ? Promise.resolve()
       : runBridge({
           bot: discord.bot,
@@ -803,12 +815,15 @@ const hydrateThreads = async (
  * always was: the gateway drops `author.bot` messages (`gateway.ts`), a guard that was
  * written for the webhook's `!answer` hint and now carries the bot's own output too.
  */
-const loadDiscord = async (
+export const loadDiscord = async (
   secretsDir: string,
   logger: Logger,
+  external = false,
 ): Promise<{
   readonly bot?: DiscordBot;
   readonly notifier: Notifier;
+  /** Whether THIS process should connect to the gateway. False when the bot is split out. */
+  readonly gateway?: boolean;
   /** Where the slash commands are published, when both are sealed (§7.1). */
   readonly applicationId?: string;
   readonly guildId?: string;
@@ -820,10 +835,25 @@ const loadDiscord = async (
   const applicationId = await bundle.readOptional("application-id").catch(() => undefined);
   const guildId = await bundle.readOptional("guild-id").catch(() => undefined);
 
+  // A separate process owns the gateway (§7), so this one must not connect: two processes
+  // reading one channel is the duplicate-acting failure the arrangement exists to prevent.
+  //
+  // `gateway` is the WHOLE difference, which is why it rides on the ordinary returns below
+  // rather than a branch that restates them. Only the bridge is skipped: everything the
+  // bot does OUTBOUND still belongs to this process — the notification with the Answer
+  // button, the typing indicator while a session runs, closing a cancelled task's thread —
+  // because only READING the channel has to be exclusive.
+  if (external) {
+    logger.info("bridge.external", {
+      reason: "bot.mode is external — a separate process owns the gateway",
+    });
+  }
+
   if (token === undefined || channelId === undefined) {
-    logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
+    if (!external) logger.info("bridge.disabled", { reason: "no bot-token and channel-id" });
     return {
       notifier: webhookUrl === undefined ? new NullNotifier() : new DiscordNotifier({ webhookUrl }),
+      gateway: !external,
     };
   }
 
@@ -831,6 +861,7 @@ const loadDiscord = async (
   return {
     bot,
     notifier: new BotNotifier(bot),
+    gateway: !external,
     ...(applicationId === undefined ? {} : { applicationId }),
     ...(guildId === undefined ? {} : { guildId }),
   };
@@ -893,18 +924,30 @@ const die = (event: string, error: unknown): never => {
   process.exit(1);
 };
 
-process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
-process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
+/**
+ * Only when this file is the program, never when it is imported.
+ *
+ * `bot.ts` carries the same guard and explains why: without it, a test importing anything
+ * from this module boots a whole supervisor — it reads `/etc/caterpillar/config.json`,
+ * fails, and calls `process.exit`, which kills the test RUNNER mid-suite and reports every
+ * file that never ran as passing. This module had no such guard because nothing imported
+ * it; `loadDiscord` is now exported so the split's gate can be tested at its own seam,
+ * which is precisely the moment the guard stops being optional.
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.on("uncaughtException", (error) => die("supervisor.uncaught", error));
+  process.on("unhandledRejection", (reason) => die("supervisor.unhandled-rejection", reason));
 
-main().then(
-  () => {
-    // A clean return means the signal aborted and shutdown completed.
-    process.exit(0);
-  },
-  (error: unknown) => {
-    // A failure here can predate `loadConfig`, so this logger takes the default level
-    // rather than the configured one — a boot failure must never be the thing that gets
-    // filtered out.
-    die("supervisor.boot-failed", error);
-  },
-);
+  main().then(
+    () => {
+      // A clean return means the signal aborted and shutdown completed.
+      process.exit(0);
+    },
+    (error: unknown) => {
+      // A failure here can predate `loadConfig`, so this logger takes the default level
+      // rather than the configured one — a boot failure must never be the thing that gets
+      // filtered out.
+      die("supervisor.boot-failed", error);
+    },
+  );
+}

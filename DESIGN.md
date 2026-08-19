@@ -1109,12 +1109,127 @@ are blocked by whatever failed, so the fleet had eight tasks it could not touch 
 command that could help. `done` stays refused: it is the one terminal status where coming
 back is not a recovery but a re-run of work that passed every gate and merged.
 
+### The bot runs as its own process
+
+**`src/bot.ts` is a second entrypoint, and the supervisor becomes a pure worker.** The
+image ships both (§10); `bot.mode: "external"` plus `redis.enabled` is what selects the
+split, and anything else is today's in-process behaviour unchanged.
+
+The reason is **liveness, not duplicate claims.** The duplicate-claim problem was already
+solved by the ref below: four replicas produced one acting bot, and that worked. What did
+not work is that leadership was refreshed from a supervisor loop and the inbox was drained
+between tasks, so a replica in the middle of a four-hour session could neither renew nor
+step down, and nothing was drained for the length of the session. The bot was online and
+answered nothing. A dedicated process cannot have that failure: it has no sessions to block
+on, so its liveness stops depending on any runner's.
+
+What moves with it, and what does not:
+
+- The bot owns the gateway, the bridge, the thread index and the REST half. It **touches no
+  state repo and holds no forge or LLM credential** — that separation is most of the value.
+  Reads are answered from the Redis snapshot inside Discord's 3-second budget; anything
+  that writes goes to the supervisor as an intent on the Redis inbox and comes back as a
+  `ChatOutcome` on a reply channel.
+- The supervisor keeps everything **outbound**: the notification with an Answer button, the
+  typing indicator, closing a cancelled task's thread. Only *reading* the channel has to be
+  exclusive, so `external` turns off the gateway and nothing else.
+- **Registering the command set (§7.1) also stays with the supervisor**, which looks
+  backwards until you follow the credential. Publishing is a PUT authorised by the bot
+  token, but it is claimed on a git ref keyed by the commands' digest so that it happens
+  once per change across the fleet — and that claim is a push to the state repo with the
+  forge credential, the one thing this split defines the bot process as not holding. So the
+  bot registers nothing, and the supervisor keeps registering even when it has handed the
+  gateway away. Folding registration in behind the same gate as the bridge would leave the
+  fleet with no command set and nothing to report it.
+- The `/brainstorm repo:` **autocomplete is not completed in the split**, for the same
+  reason: the catalogue is built from the configured forges (§9.1.1). An absent catalogue
+  produces an empty suggestion list — the same answer a refusing forge gets, so the
+  interaction never hangs — and the repo is typed by hand. Nothing is lost but the
+  convenience: the supervisor parses and validates it when it drains the intent, and an
+  unparseable or cross-workspace repo comes back as a `refused` outcome with a reason.
+- The **thread↔task index** cannot be rebuilt from the state repo in a process that has
+  none, so the supervisor publishes the bindings its survey already derives (`chat:threads`)
+  and the bot consumes them on a timer. Design consequences, both load-bearing: the bot may
+  start **before** any supervisor has published, and a binding is always **briefly stale**.
+  Absent is therefore not empty — a failed read and a cold start both resolve to
+  `undefined`, which leaves the last good mapping alone, while a published `[]` really does
+  mean the last live task went terminal and clears it. A thread the **bot itself** bound is
+  *pinned* and survives a mapping that has not heard of it: a brainstorm's thread exists
+  well before the task the mapping is derived from does, and unbinding it in
+  that window would drop the thread a human was just invited to type in. The pin ends the
+  moment the mapping mentions the thread, so a terminal task still unbinds — and it also
+  **expires on a timer**, because a mapping might never mention the thread at all:
+  a brainstorm cancelled before the first survey that would have published it is named by
+  nothing, and a permanent pin would leave that dead thread bound for the life of the
+  process, swallowing everything typed into it. The expiry is a **duration, not a count of
+  refreshes**, and the difference was a real bug: the window the pin must cover is set by
+  the *supervisor's* `housekeepingSeconds` (default 30s, plus a pull, a drain and a survey),
+  while the bot refreshes on its own unrelated 5s timer. Counting refreshes measured the
+  wrong clock and spent the pin in ~15s, so a human typing in a fresh brainstorm thread was
+  told the thread could not be placed — and that text is dropped, not queued. A pin covers one window; it is not a lease. A message in a
+  thread the bot cannot place produces an **honest reply**, never silence: in a bound thread
+  every message *is* the answer, so saying nothing is indistinguishable from the agent being
+  busy.
+- That honest reply needs the gateway to **deliver** the message the bridge has an answer
+  for, and for one revision it did not. The filter consulted the same `ThreadIndex` the
+  bridge would, so a thread the bridge would call unbound was one the gateway had already
+  dropped, and the branch was reachable only from a direct call in a test. **Routing and
+  delivery are therefore separate questions**: the index says which task owns a thread,
+  while `ThreadRouter` says whether the bridge sees the message at all. `MESSAGE_CREATE`
+  names no parent channel, so deciding "is this a thread of ours?" costs a REST lookup; the
+  router memoises it per channel — **both** answers, since a negative cache is what stops an
+  unrelated busy channel spending a lookup per message — and the main channel and every
+  bound thread stay on the synchronous path. The supervisor's in-process index supplies no
+  `deliverable`, so that path keeps today's behaviour and makes no REST call per message.
+- Redis is **required** for this process, unlike everywhere else in §21. It is the only
+  route to the supervisor, so a bot without it would acknowledge every command and answer
+  none. It refuses to start rather than come up and fail each command individually.
+- The `bot.mode` interlock is checked from **both** sides, because the two failures are
+  different and only one of them was diagnosable. `external` without Redis makes the
+  *supervisor* keep the gateway and warn (`bot.mode-ignored`); running the *bot* binary
+  under any mode but `external` makes it warn in turn (`bot.mode-mismatch`), because the
+  supervisor has then kept the gateway too and both processes act. Nothing downstream
+  catches that pair: they arbitrate by different mechanisms — the supervisor by the git CAS,
+  the bot by the Redis TTL lock — so each is uncontested in its own scheme and every command
+  is answered twice. Both are warnings rather than refusals, so a config slip degrades
+  loudly instead of taking the fleet off Discord.
+
+**Leadership: one replica, plus a Redis lock for the rollout.** The bot Deployment runs
+**one** replica and needs no leadership object at all — `acts()` already treats absent
+leadership as yes. One replica is not one *process*, though: a rolling update overlaps two
+pods, and both would act, which for `/brainstorm` means two threads and two tasks. So the
+bot takes a **Redis key with a TTL** (`chat:holder`, `SET NX EX`, renewed on its own timer,
+released on shutdown so the incoming pod need not wait out the TTL).
+
+Keeping `ChatLeadership` and refreshing it on a timer was considered and is **unbuildable
+here**: `refresh()` goes through `claimStealable`, which is `ls-remote` plus a ref push, and
+that needs exactly the forge credential the split exists to take away. The docstring's old
+objection to a timer — that it would renew while a session blocked the loop — *is* void for
+this process, but the credential constraint decides it instead.
+
+Redis is acceptable for this decision where it is explicitly **not** acceptable for leases
+(§21): losing a task lease means two runners writing one task and a commit that can never
+rebase, while losing the chat lock costs one duplicated Discord message. When Redis is
+unreachable the bot **does not act**, which is the same honest reading `refresh()` takes of
+an unreachable remote, and it composes with the readiness probe below.
+
+**Health is gateway-connectedness and Redis reachability, not a bound port.** `/readyz`
+reports both and fails if either is down; `/healthz` stays cheap and almost always true.
+The split matters: restarting the process does not fix a Redis outage, so a liveness probe
+that reacted to one would turn a dependency's bad minute into a crash loop, while a
+readiness probe that ignored it would keep a pod in the Service that can answer nothing.
+That is `supervisor/loop.ts`'s containment lesson — a process answering probes while doing
+nothing useful is worse than one that exits — applied to the process whose entire job is to
+be reachable.
+
 **One replica of a fleet acts on Discord.** Every replica connects to the gateway — that
 is what keeps the bot online across a rollout, and a connection costs nothing — but
 exactly one may act on what arrives over it, decided by a compare-and-swap on
 `refs/chat/holder` (`claimStealable`) refreshed from the **housekeeping** loop (§6.4). The
 same mechanism as a task lease and as the digest's day ref, because the state repo is the
-only thing the fleet shares and so the only place a fleet-wide decision can be made.
+only thing the fleet shares and so the only place a fleet-wide decision can be made. This
+is the arrangement for a fleet running the bot **in-process**, which remains the default
+and the development path; a split-out bot uses the Redis lock described above instead.
 
 It was refreshed from the single poll loop, and deliberately not from a timer of its own:
 a timer would keep renewing the claim while a session blocked the loop, advertising a
@@ -2055,6 +2170,7 @@ Deployed via ArgoCD from `caesar-deployment`, following the existing conventions
 | `StatefulSet` | the supervisor fleet, N replicas, `RollingUpdate` |
 | `volumeClaimTemplates` | git mirrors + worktrees, and the nix store — **one pair per replica** |
 | `Deployment` | credential holder, **exactly 1** (§9.6) + its own claim + `Service` |
+| `Deployment` | **the Discord bot, exactly 1** (§7) — Discord secret + Redis, no PVC, no forge/LLM credential |
 | `Deployment` | nix pull-through cache, **exactly 1** (§8.1) + its own claim + `Service` |
 | `Secret` (SOPS) | GitHub App PEM, Discord webhook, credential-holder token |
 | `ConfigMap` | capabilities, thresholds, workspace forge host (the repo scope, §9.1) |
@@ -2076,6 +2192,41 @@ replica there is nothing to contend for, and overlapping supervisors were always
 their own — leases handle it. `podManagementPolicy: Parallel`, because these pods do not
 form a quorum: `OrderedReady` would let a wedged `caterpillar-0` stop `caterpillar-1` from
 ever booting, which is the opposite of what a fleet is for.
+
+### The bot is a second Deployment, and deliberately a small one
+
+Splitting the bot out (§7) costs one manifest in `caesar-deployment` and no second image:
+`dist/` is copied whole, so the entrypoint is already there.
+
+```yaml
+command: ["node", "/app/dist/bot.js"]
+```
+
+What it **has**: the `caterpillar-discord` secret, the Redis connection, and its own port
+(`bot.port`, 9091) for `/healthz`, `/readyz` and `/metrics` — its own because the two
+processes share a namespace and one number meaning both is an EADDRINUSE in whichever pod
+loses. Probe **`/readyz`**, not `/healthz`: readiness carries gateway connectedness and
+Redis reachability, liveness deliberately does not.
+
+What it **does not have**, and this is the point rather than an economy:
+
+- **no work PVC.** It runs no sessions and clones nothing, so it needs neither `/work` nor
+  `/nix`. That is also why it can be a Deployment where the supervisors must be a
+  StatefulSet — with no `volumeClaimTemplates` there is nothing to template.
+- **no forge credential, no LLM credential, no ServiceAccount token.** It cannot touch a
+  repo, cannot spend money, and cannot read the cluster. Everything that writes the state
+  repo goes to a supervisor over the Redis inbox, so the blast radius of the process
+  holding a public-facing socket is "it can post a Discord message".
+
+**`replicas: 1`.** Not a constraint of the code — the Redis lock (§7) makes an overlap
+correct — but the intended shape: one bot is all a fleet wants, and the lock is there for
+the seconds of a rolling update rather than as a scaling mechanism. Supervisors scale
+freely underneath it and connect to Discord not at all, which is what the split bought.
+
+The supervisor StatefulSet's ConfigMap gains `bot.mode: "external"` alongside
+`redis.enabled: true`. Both are required: `external` without Redis would leave supervisors
+deaf to Discord and the bot unable to reach them, so the supervisor logs that
+misconfiguration and stays in-process rather than obeying it.
 
 **What actually bounds the replica count** — none of it is this repo:
 

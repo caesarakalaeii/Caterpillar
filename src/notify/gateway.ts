@@ -44,8 +44,18 @@ export interface GatewayOptions {
    * A message in a thread arrives with `channel_id` set to the THREAD and no reference to
    * its parent, so there is no way to recognise one without knowing which threads are
    * ours. Optional: without it only the channel itself is read.
+   *
+   * `deliverable` is the standalone bot's addition (`ThreadRouter`). Without it this filter
+   * asked the same index the bridge asks, so a thread the bridge would answer honestly as
+   * unbound was one this had already dropped — and the honest reply was unreachable in
+   * production. When supplied it gets the final say, and may resolve true for a thread the
+   * index does not know, so the bridge can say so. `knows` alone remains the in-process
+   * behaviour exactly.
    */
-  readonly threads?: { knows(channelId: string): boolean };
+  readonly threads?: {
+    knows(channelId: string): boolean;
+    deliverable?(channelId: string): Promise<boolean>;
+  };
   readonly onMessage: (content: string, author: string, channelId: string) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
@@ -130,12 +140,36 @@ export class DiscordGateway {
   private sequence: number | null = null;
   private sessionId: string | undefined;
   private resumeUrl: string | undefined;
+  /**
+   * Whether a socket is currently identified and acking heartbeats.
+   *
+   * Exists for the standalone bot's health check (`src/bot.ts`). A bot process whose
+   * gateway is down is a bot that answers nothing, and `supervisor/loop.ts:~287`'s lesson
+   * is that a process which answers probes while doing nothing useful is worse than one
+   * that exits — so this has to be observable from outside, not merely logged.
+   *
+   * Set at READY/RESUMED rather than at dial: an open TCP connection that has not
+   * identified delivers nothing, and reporting it as healthy would be the exact lie this
+   * is here to prevent. Cleared on every teardown, including the zombie case.
+   */
+  private live = false;
 
   constructor(options: GatewayOptions) {
     this.options = options;
     this.open = options.socket ?? ((url) => new WebSocket(url) as unknown as SocketLike);
     this.pause = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.random = options.random ?? Math.random;
+  }
+
+  /**
+   * Is there a live, identified connection right now?
+   *
+   * Read by the bot's readiness probe. Deliberately not "has ever connected": a bot that
+   * connected at boot and has been reconnect-looping for ten minutes is not serving
+   * anyone, and reporting it ready keeps a broken pod in the Service.
+   */
+  connected(): boolean {
+    return this.live;
   }
 
   /** Connect, and keep reconnecting until `signal` aborts. Never throws. */
@@ -176,6 +210,9 @@ export class DiscordGateway {
       const shutdown = (why: string): void => {
         if (settled) return;
         settled = true;
+        // Before anything else: from here on this process is not connected, and a probe
+        // arriving during teardown must be told so rather than reading a stale `true`.
+        this.live = false;
         if (heartbeat !== undefined) clearInterval(heartbeat);
         // Before the close, so a presence change landing during teardown cannot be written
         // to a socket this function is about to dispose of.
@@ -315,6 +352,10 @@ export class DiscordGateway {
     }
 
     if (payload.t === "READY" || payload.t === "RESUMED") {
+      // Identified and receiving. This is the earliest point at which the bot can
+      // actually answer a human, which is what the readiness probe means by "up".
+      this.live = true;
+
       if (payload.t === "READY") {
         const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
         this.sessionId = ready.session_id;
@@ -355,18 +396,45 @@ export class DiscordGateway {
     const message = payload.d as MessageCreate;
     const from = message.channel_id;
     if (from === undefined) return;
-    if (from !== channelId && this.options.threads?.knows(from) !== true) return;
     // The bridge reads the channel it posts into. Without this it answers its own
-    // question notifications, which end with a literal `!answer` hint.
+    // question notifications, which end with a literal `!answer` hint. Checked BEFORE any
+    // routing lookup, so the bot's own chatter never costs a REST call.
     if (message.author?.bot === true || message.webhook_id !== undefined) return;
 
     const content = message.content ?? "";
     if (content.length === 0) return;
 
-    void onMessage(content, message.author?.username ?? "someone", from).catch((error: unknown) => {
-      logger.error("gateway.handler-failed", {
-        error: error instanceof Error ? error.message : String(error),
+    const deliver = (): void => {
+      void onMessage(content, message.author?.username ?? "someone", from).catch(
+        (error: unknown) => {
+          logger.error("gateway.handler-failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
+    };
+
+    // The synchronous answer first: the main channel and every bound thread take no await,
+    // which is the shape this filter was written for.
+    if (from === channelId || this.options.threads?.knows(from) === true) {
+      deliver();
+      return;
+    }
+
+    const router = this.options.threads?.deliverable?.bind(this.options.threads);
+    if (router === undefined) return;
+
+    // An unknown channel: ask whether it is a thread of ours, and deliver if so, so the
+    // bridge can answer "I do not know which task this thread belongs to yet" rather than
+    // the message vanishing. A failed lookup is a no — `ThreadRouter` swallows it.
+    void router(from)
+      .then((ok) => {
+        if (ok) deliver();
+      })
+      .catch((error: unknown) => {
+        logger.error("gateway.route-failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
-    });
   }
 }

@@ -60,6 +60,8 @@ const stubDriver = (
   const driver: RedisDriver = {
     get: (key) => record("get", key) as Promise<string | null>,
     set: (...args: readonly unknown[]) => record("set", ...args),
+    eval: (script: string, numKeys: number, ...args: readonly string[]) =>
+      record("eval", script, numKeys, ...args),
     del: (key) => record("del", key),
     rpush: (key, value) => record("rpush", key, value),
     ltrim: (key, start, stop) => record("ltrim", key, start, stop),
@@ -309,4 +311,46 @@ test("closing is bounded, tears down subscribers, and silences later errors", as
 
   // Twice is safe: `index.ts` closes the plane in a `finally` that may already have run.
   await client.close();
+});
+
+test("taking a lock is SET NX EX, and losing it is an answer rather than an error", async () => {
+  const { driver, calls } = stubDriver({ set: null });
+  const client = new IoRedisClient(driver, connection({ keyPrefix: "staging:" }), SILENT_LOGGER);
+
+  // Redis answers nil when NX loses. That is the ANSWER "somebody else holds it" and must
+  // not be read as a failed command — a lock that reported failure on every contended
+  // attempt would degrade to "nobody acts" instead of "exactly one acts".
+  assert.equal(await client.setIfAbsent("chat:holder", "bot-a", 30), false);
+  assert.deepEqual(argsOf(calls, "set"), ["staging:chat:holder", "bot-a", "EX", 30, "NX"]);
+});
+
+test("a lock is renewed and released only while the value is still ours", async () => {
+  const { driver, calls } = stubDriver({ eval: 1 });
+  const client = new IoRedisClient(driver, connection(), SILENT_LOGGER);
+
+  assert.equal(await client.renewIfHeld("chat:holder", "bot-a", 30), true);
+  assert.equal(await client.releaseIfHeld("chat:holder", "bot-a"), true);
+
+  // Both are one round trip carrying the compare AND the write. A GET then a SET would
+  // let the key expire between them, and the holder would take it back from whoever won
+  // it in that gap — two acting bots, which is the whole thing the lock prevents.
+  const evals = calls.filter((call) => call.method === "eval");
+  assert.equal(evals.length, 2);
+  for (const call of evals) {
+    assert.match(String(call.args[0]), /^if redis\.call\('get', KEYS\[1\]\) == ARGV\[1\]/);
+    assert.equal(call.args[1], 1);
+    // Prefixed like every other key, so a staging bot cannot contend for production's lock.
+    assert.equal(call.args[2], "caterpillar:chat:holder");
+    assert.equal(call.args[3], "bot-a");
+  }
+});
+
+test("a renewal the server refuses reports not-held rather than throwing", async () => {
+  const { driver } = stubDriver({ eval: 0 });
+  const client = new IoRedisClient(driver, connection(), SILENT_LOGGER);
+
+  // 0 means the value was somebody else's. The honest reading is "I am not the holder",
+  // which is what makes stepping down the default rather than an exception path.
+  assert.equal(await client.renewIfHeld("chat:holder", "bot-a", 30), false);
+  assert.equal(await client.releaseIfHeld("chat:holder", "bot-a"), false);
 });

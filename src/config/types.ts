@@ -454,6 +454,39 @@ export interface RunnerConfig {
   readonly remediation: RemediationConfig;
   /** The ephemeral cross-process plane (DESIGN.md §21). Off by default. */
   readonly redis: RedisConfig;
+  /** Where the Discord bot runs: in this process, or its own (DESIGN.md §7, §10). */
+  readonly bot: BotConfig;
+}
+
+/**
+ * Which process owns the Discord connection (DESIGN.md §7).
+ *
+ * `mode: "in-process"` is the default and is exactly what every runner has always done:
+ * the supervisor connects to the gateway itself. One replica, no Redis, a laptop — all of
+ * it keeps working with no configuration at all, which is what keeps the existing test
+ * suite meaningful rather than a description of a path nobody runs.
+ *
+ * `mode: "external"` says a SEPARATE process (`caterpillar-bot`) owns Discord, so this
+ * supervisor must not connect. It becomes a pure worker: it drains the inbox, publishes
+ * the snapshot and the thread bindings, and holds no gateway socket.
+ *
+ * The mode is only honoured when `redis.enabled` is also set, and that is a safety
+ * interlock rather than a convenience. Redis is the ONLY way the two processes reach each
+ * other; `external` without it would mean a supervisor that has stopped listening to
+ * Discord and a bot that cannot reach the supervisor — a fleet that silently answers
+ * nobody, produced by a single-line config mistake. So an `external` with no Redis logs
+ * loudly and behaves as `in-process`.
+ */
+export interface BotConfig {
+  readonly mode: "in-process" | "external";
+  /**
+   * Port the standalone bot serves `/healthz` and `/metrics` on.
+   *
+   * Its own field rather than reusing `METRICS_PORT`, because the two processes have
+   * different ports in the same namespace and one number that meant both would be an
+   * EADDRINUSE in whichever pod lost.
+   */
+  readonly port: number;
 }
 
 /**

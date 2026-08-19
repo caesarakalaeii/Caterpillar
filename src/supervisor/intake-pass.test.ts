@@ -103,6 +103,7 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
     commandTimeoutMs: 1000,
     keyPrefix: "caterpillar:",
   },
+  bot: { mode: "in-process" as const, port: 9091 },
   web: {
     enabled: false,
     port: 8080,

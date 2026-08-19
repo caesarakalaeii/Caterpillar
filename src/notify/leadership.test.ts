@@ -9,7 +9,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asRunnerId } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
-import { ChatLeadership, CHAT_HOLDER_REF, type StealableClaims } from "./leadership.ts";
+import { FailingRedisClient, MemoryRedisClient } from "../redis/memory.ts";
+import {
+  ChatLeadership,
+  CHAT_HOLDER_REF,
+  RedisChatLock,
+  type LockableRedis,
+  type StealableClaims,
+} from "./leadership.ts";
 
 const RUNNER = asRunnerId("caterpillar-2");
 
@@ -31,6 +38,10 @@ const claims = (answers: readonly (string | undefined | Error)[]): StealableClai
 
 const leadership = (claimer: StealableClaims): ChatLeadership =>
   new ChatLeadership({ claims: claimer, runner: RUNNER, logger: SILENT_LOGGER });
+
+/** One bot process, over whichever client the test wants. */
+const lock = (redis: LockableRedis, runner: string): RedisChatLock =>
+  new RedisChatLock({ redis, runner: asRunnerId(runner), logger: SILENT_LOGGER });
 
 test("nothing is held until the first refresh", () => {
   // A replica that assumed leadership at construction would act on the events arriving in
@@ -107,4 +118,127 @@ test("a replica can win the claim back after losing it", async () => {
 
   await subject.refresh();
   assert.equal(subject.held(), true);
+});
+
+/* ───────────────── the standalone bot's lock (option c, DESIGN.md §7) ───────────────── */
+
+test("the first bot process to arrive takes the lock, the second does not act", async () => {
+  // The rollout case, and the only reason this lock exists. Two bot pods overlap for a
+  // few seconds; both are connected; exactly one may answer, or a `/brainstorm` mints two
+  // threads and two tasks.
+  const redis = new MemoryRedisClient();
+  const incoming = lock(redis, "caterpillar-bot-1");
+  const outgoing = lock(redis, "caterpillar-bot-2");
+
+  await incoming.refresh();
+  await outgoing.refresh();
+
+  assert.equal(incoming.held(), true);
+  assert.equal(outgoing.held(), false);
+});
+
+test("a holder renews against its own token rather than re-taking the key", async () => {
+  // Attempting NX again would fail against our OWN key and read as a loss, so the bot
+  // would step down on every tick and the fleet would have no bot at all.
+  const redis = new MemoryRedisClient();
+  const bot = lock(redis, "caterpillar-bot-1");
+
+  await bot.refresh();
+  await bot.refresh();
+  await bot.refresh();
+
+  assert.equal(bot.held(), true);
+});
+
+test("a lock released on shutdown is takeable immediately, not after the TTL", async () => {
+  // Without the release an incoming pod waits out the TTL before it can speak, and for
+  // those seconds the bot is online and answers nothing — the liveness failure the split
+  // was meant to fix, reintroduced at every deploy.
+  const redis = new MemoryRedisClient();
+  const outgoing = lock(redis, "caterpillar-bot-1");
+  const incoming = lock(redis, "caterpillar-bot-2");
+
+  await outgoing.refresh();
+  await incoming.refresh();
+  assert.equal(incoming.held(), false);
+
+  await outgoing.stop();
+  await incoming.refresh();
+
+  assert.equal(incoming.held(), true);
+  assert.equal(outgoing.held(), false);
+});
+
+test("a process that already lost the lock cannot evict its successor on the way down", async () => {
+  const redis = new MemoryRedisClient();
+  const first = lock(redis, "caterpillar-bot-1");
+  const second = lock(redis, "caterpillar-bot-2");
+
+  await first.refresh();
+  // The key expires under the first process — a paused pod, a slow network.
+  await redis.del("chat:holder");
+  await second.refresh();
+  assert.equal(second.held(), true);
+
+  // `releaseIfHeld` compares before deleting, so this is a no-op rather than a handover
+  // to nobody.
+  await first.stop();
+  await second.refresh();
+  assert.equal(second.held(), true);
+});
+
+test("an expired lock is taken over, so a killed bot does not silence the fleet", async () => {
+  const redis = new MemoryRedisClient();
+  const dead = lock(redis, "caterpillar-bot-1");
+  const live = lock(redis, "caterpillar-bot-2");
+
+  await dead.refresh();
+  // No clean shutdown — SIGKILL, a node eviction. The TTL is the only thing that recovers.
+  await redis.del("chat:holder");
+
+  await live.refresh();
+  assert.equal(live.held(), true);
+});
+
+test("an unreachable redis means this process does not act", async () => {
+  // The same honest reading `ChatLeadership` takes for an unreachable remote: a claim that
+  // cannot be proved is not held. Acting anyway is how two bots answer one message.
+  const bot = lock(new FailingRedisClient(), "caterpillar-bot-1");
+
+  await bot.refresh();
+  assert.equal(bot.held(), false);
+});
+
+test("a holder that loses redis steps down rather than throwing out of its timer", async () => {
+  const redis = new MemoryRedisClient();
+  const bot = lock(redis, "caterpillar-bot-1");
+  await bot.refresh();
+  assert.equal(bot.held(), true);
+
+  // `refresh` is called from a timer with no handler behind it, so a rejection here would
+  // be an unhandled one — and the process dies on `unhandledRejection` by design.
+  const broken = new RedisChatLock({
+    redis: new FailingRedisClient(),
+    runner: asRunnerId("caterpillar-bot-1"),
+    logger: SILENT_LOGGER,
+  });
+  await broken.refresh();
+  assert.equal(broken.held(), false);
+});
+
+test("nothing is held before the first refresh", () => {
+  // A bot that assumed the lock at construction would act on whatever arrives in the
+  // seconds before its first renewal — which is exactly when a rollout has two of them.
+  assert.equal(lock(new MemoryRedisClient(), "caterpillar-bot-1").held(), false);
+});
+
+test("start() settles the first attempt before returning", async () => {
+  // So the caller can connect the gateway knowing whether this process answers. Without
+  // it the bot is online and declining to act for the length of one renewal interval.
+  const bot = lock(new MemoryRedisClient(), "caterpillar-bot-1");
+
+  await bot.start();
+  assert.equal(bot.held(), true);
+
+  await bot.stop();
 });
