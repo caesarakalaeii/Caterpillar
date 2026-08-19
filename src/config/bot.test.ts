@@ -196,6 +196,30 @@ test("without the gate the supervisor connects exactly as it always did", async 
   assert.notEqual(discord.bot, undefined);
 });
 
+test("an external bot still carries what the supervisor needs to register commands", async () => {
+  // §7.1 registration is a PUT authorised by the bot token, claimed on a git ref keyed by
+  // the commands' digest. The claim is a state-repo push with the forge credential, which
+  // the split defines the bot process as NOT holding — so registration has to stay on the
+  // supervisor even when it has handed the gateway away.
+  //
+  // The risk is a plausible-looking tidy-up: folding registration in behind the same gate
+  // as the bridge, on the reasoning that "the bot process owns the commands". That would
+  // leave the whole fleet with no command set and nothing to report it, because the bot
+  // cannot claim the ref and the supervisor would no longer try.
+  const secrets = await secretsWith({
+    "bot-token": "t",
+    "channel-id": "c",
+    "application-id": "app",
+    "guild-id": "guild",
+  });
+  const discord = await loadDiscord(secrets, SILENT_LOGGER, true);
+
+  assert.equal(discord.gateway, false, "the gateway is the only thing that moved");
+  assert.equal(discord.applicationId, "app");
+  assert.equal(discord.guildId, "guild");
+  assert.notEqual(discord.bot, undefined, "the token authorises the registration PUT");
+});
+
 test("an external bot with no discord secret still declines the gateway", async () => {
   // The branch that used to be a second copy of the ordinary return. A supervisor with no
   // token has no gateway anyway, but it must not report one it would never open.
