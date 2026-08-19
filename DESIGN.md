@@ -384,6 +384,23 @@ the same reason is real history, and the second park means something the first d
 }
 ```
 
+`pr` is the primary repo's pull request and `prs` is one per repo the task opened one in
+(§9.4.1). Both are written together: every reader that only wants something to link to reads
+`pr`, and the completion gates read `prs`.
+
+**It is replaced by `rename`, not by `writeFile`.** `writeFile` truncates and then writes, and
+the store's mutex orders WRITES against each other while doing nothing about reads — which for
+this file are constant and mostly outside it: `survey` reads every task once per poll, the web
+view renders from it, and `/task` answers from a snapshot built out of it. A reader landing in
+that window gets `Unexpected end of JSON input`.
+
+That is worse in the loop than an error would be, because `survey` wraps its read in a `catch`:
+the task drops silently out of that pass's snapshot **and out of its thread bindings**, so a
+listing goes briefly wrong and a message typed in that task's thread finds no binding to route
+to. §7.1 already has an incident about a read being fast without being right; this is the same
+failure arriving through the filesystem. A rename within one directory is atomic on POSIX, so a
+reader sees the whole old file or the whole new one.
+
 ### 4.3 A local commit that can never merge is set aside, not retried
 
 `pull` keeps unpushed commits by rebasing onto the remote rather than resetting over them —
@@ -2320,6 +2337,64 @@ committed into the workspace even in a repo that has not thought to ignore it.
 > involved. The *principle* is the same and already encoded in §9.2: the agent never holds
 > the token. Do not ship `cb-api.sh` into the agent's toolset — expose `open_pr()` instead.
 
+#### The checkout was plural and the completion path was not
+
+The checkout has been plural since this section was written, and every entry point learned to
+produce a list. The *completion path* never did, in three places, and all three silently
+defaulted to `spec.repos[0]`:
+
+- **`open_pr` posted to `repos[0]` unconditionally** and took no repo argument at all.
+- **The CI gate checked `repos[0]`.** A task whose sibling PR was red — or absent — passed on
+  the strength of the primary.
+- **The council merged `repos[0]`.** The rest stayed open with nothing saying so.
+
+So a two-repo task could do all of its work and then only ever half-finish, and the first
+failure hid the second two. `GH-caesarakalaeii-all-chat-543` is the record: both halves built,
+committed, pushed and verified — 22 acceptance commands exiting 0 — and the second pull request
+could not be opened at all. The agent called `open_pr` twice and got a 422 from the wrong
+repository twice (once matching the PR it had already opened on the *primary* repo, once
+refusing `base: …-extension:main` on a repo where that branch does not exist), correctly
+diagnosed it as a tooling limit rather than a permissions problem, and parked on `ask_human`. A
+human opened the PR by hand.
+
+**`open_pr` takes an optional `repo`, and refuses anything outside `spec.repos`.** Optional
+because one repo is what a list of one looks like and the primary is the overwhelming case;
+refusing rather than trusting for `materialise`'s reason one layer down (§9.1) — the argument is
+agent-authored text, and a tool that opened a pull request against any repo the credential could
+reach would be a session naming its own blast radius. The credential activated for the session
+already covers exactly `spec.repos`, so the tool's bound and the token's bound are the same list
+by construction rather than by agreement. The refusal is **prose the model can act on**, not a
+throw: it names what IS allowed, which is the whole of what the raw 422 did not.
+
+**`TaskState.prs` carries one PR per repo, and `pr` still means the primary's.** Both are
+written together, and that is not redundancy — every reader that only wants something to link to
+(the snapshot, the web view, the digest, the council's prompt) reads `pr`, and the gates read
+`prs`. `taskPullRequests` reads a state written before `prs` existed as "just the primary one",
+which is the only PR a session could open then; a rolling deploy has both shapes in the state
+repo at once, so that is a live path rather than a migration nicety.
+
+**The gate checks every repo and stops at the first red.** All of them, because the work is one
+change and half of it being green is not it passing; the first failure rather than a collected
+report, because a red suite in one repo is a full session's work whether or not the other is
+also red. A repo with no CI keeps its existing warning, per repo.
+
+**Merging goes in `spec.repos` order and stops at the first failure.** The order is the one the
+operator typed, which this section already treats as meaningful — `repos[0]` is the working
+directory — and it is the closest thing to a dependency order the supervisor has. The repos of
+one change usually cannot land in either order: `all-chat#734` had to merge before
+`all-chat-extension#113`, because the extension reads a field the gateway does not send yet.
+Continuing past a failure would land exactly that broken intermediate.
+
+A **partial** merge names what did land. It is the one outcome where "could not merge" on its own
+is actively misleading — some of the change is on the default branch, and a human cannot decide
+what to do about the rest without knowing which half. `mergeReviewed` still never fails the
+task, for the reason it never did.
+
+**The system prompt says so.** A tool that can do a thing an agent does not know about is a tool
+that does not exist: the sibling-layout paragraph now says to call `open_pr` once per repo, and
+that completion checks CI in every repo a PR was opened in — so a repo changed without one will
+not merge.
+
 ### 9.5 Task tracker credential (Vikunja)
 
 Everything in `electric-boogaloo` is tracked in Vikunja at `https://tasks.eb.bims.sh`
@@ -2838,7 +2913,9 @@ Two independent gates, both required:
      - npm run check
      - npm test
    ```
-2. **PR open and CI green.**
+2. **PR open and CI green — in every repo the task opened one in.** Every, not the primary's:
+   a task may span several repos (§9.4.1), the work is one change, and half of it being green
+   is not it passing. This checked `repos[0]` alone until §9.4.1's completion-path pass.
 
 Only then `status = done`, Discord gets the terminal message, and the supervisor closes the
 tracker item (§9.5). The agent participates in none of these three steps — it can only
@@ -2901,6 +2978,10 @@ more round, so `BS-1539374658363854934` reached 13 rounds against a cap of 3 by 
 ten times with nothing to say. `sessions` is still never forgiven, for this paragraph's
 original reason — that one is a budget, and raising it is a decision.
 
+**A task spanning several repos merges all of its pull requests, in `spec.repos` order, and
+stops at the first failure** (§9.4.1). The order is the closest thing to a dependency order the
+supervisor has, and the repos of one change usually cannot land in either one.
+
 **Merging needs a second identity.** §9.1 established that "no merging" cannot be a token
 property, and that what actually stops an unreviewed merge is branch protection requiring
 an approving review the App cannot give its own PR. That constraint is unchanged — so the
@@ -2927,7 +3008,7 @@ reads, so a rejection has to arrive there as instructions rather than as a score
 | Tool | Provider | Notes |
 |---|---|---|
 | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | pi built-ins | |
-| `open_pr`, `ask_human`, `handoff`, `done` | supervisor | control-plane verbs, typed |
+| `open_pr`, `ask_human`, `handoff`, `done` | supervisor | control-plane verbs, typed. `open_pr` takes an optional `repo`, one of the task's own (§9.4.1) |
 | web search / fetch | supervisor | fewer human round-trips on unfamiliar libs |
 | Grafana / Jira / Atlassian | MCP | verify impact, pull requirements |
 | `cluster_logs`, `cluster_events`, `cluster_describe` | supervisor | read-only cluster evidence — no writes of any kind |

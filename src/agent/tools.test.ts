@@ -35,14 +35,19 @@ import {
 } from "./tools.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
+/** The second repo of a two-repo task — the one `open_pr` could never reach. */
+const SIBLING: RepoRef = { host: "github.com", owner: "acme", name: "widget-extension" };
 
 class StubForge implements Forge {
   readonly kind = "stub";
+  /** Every repo `openPr` was asked for, in order. The assertion for §9.4.1's fix. */
+  readonly prCalls: RepoRef[] = [];
   async credential(): Promise<GitCredential> {
     return { username: "x", password: "y" };
   }
-  async openPr(_repo: RepoRef, _request: PrRequest): Promise<PrResult> {
-    return { number: 1, url: "https://example.invalid/1" };
+  async openPr(repo: RepoRef, _request: PrRequest): Promise<PrResult> {
+    this.prCalls.push(repo);
+    return { number: this.prCalls.length, url: `https://example.invalid/${repo.name}/${this.prCalls.length}` };
   }
   async checks(): Promise<CheckStatus> {
     return { conclusion: "success", summary: "ok" };
@@ -85,14 +90,17 @@ class FakeReader implements ClusterReader {
 interface Harness {
   readonly ctx: ToolContext;
   readonly reads: { tool: string; outcome: ClusterReadOutcome; seconds: number }[];
+  readonly forge: StubForge;
+  readonly control: ControlSink;
 }
 
 const harness = (cluster?: ClusterReader): Harness => {
   const reads: { tool: string; outcome: ClusterReadOutcome; seconds: number }[] = [];
   const control: ControlSink = {};
+  const forge = new StubForge();
   const ctx: ToolContext = {
-    forge: new StubForge(),
-    repo: REPO,
+    forge,
+    repos: [REPO, SIBLING],
     control,
     ...(cluster === undefined
       ? {}
@@ -101,7 +109,7 @@ const harness = (cluster?: ClusterReader): Harness => {
           recordClusterRead: (tool, outcome, seconds) => reads.push({ tool, outcome, seconds }),
         }),
   };
-  return { ctx, reads };
+  return { ctx, reads, forge, control };
 };
 
 const names = (tools: readonly AgentTool[]): readonly string[] => tools.map((tool) => tool.name);
@@ -296,7 +304,7 @@ test("a non-Error rejection still produces text and a count", async () => {
 test("metrics are optional — a context without the callback still works", async () => {
   const ctx: ToolContext = {
     forge: new StubForge(),
-    repo: REPO,
+    repos: [REPO],
     control: {},
     cluster: new FakeReader("lines"),
   };
@@ -314,4 +322,102 @@ test("controlTools is unchanged by any of this", () => {
     "task_note",
     "publish_artifact",
   ]);
+});
+
+test("open_pr opens against a NAMED repo, not always the primary one", async () => {
+  // THE defect. `open_pr` posted to `spec.repos[0]` unconditionally and took no repo argument,
+  // so on `GH-caesarakalaeii-all-chat-543` the extension half was built, committed and pushed
+  // and then had nowhere to go: two attempts, two 422s from the wrong repository, and a session
+  // that parked on a question a human had to answer by opening the PR themselves.
+  const { ctx, forge, control } = harness();
+
+  const text = await call(controlTools(ctx), "open_pr", {
+    title: "Harden reconnect",
+    body: "…",
+    head: "agent/T-1",
+    base: "main",
+    repo: "acme/widget-extension",
+  });
+
+  assert.deepEqual(forge.prCalls, [SIBLING]);
+  assert.match(text, /acme\/widget-extension/, "the reply should say where it landed");
+  assert.deepEqual(
+    control.prs?.map((pr) => pr.repo.name),
+    ["widget-extension"],
+  );
+});
+
+test("open_pr without a repo still means the primary one", async () => {
+  const { ctx, forge, control } = harness();
+
+  await call(controlTools(ctx), "open_pr", { title: "t", body: "b", head: "h", base: "main" });
+
+  assert.deepEqual(forge.prCalls, [REPO]);
+  assert.deepEqual(control.prs?.map((pr) => pr.repo.name), ["widget"]);
+});
+
+test("a two-repo task carries BOTH pull requests to the gate", async () => {
+  // The half that a repo argument alone would not have fixed: the completion gate reads this
+  // list, so a sink that kept only the last call would leave one PR ungated and unmerged.
+  const { ctx, forge, control } = harness();
+  const tools = controlTools(ctx);
+
+  await call(tools, "open_pr", { title: "a", body: "b", head: "h", base: "main" });
+  await call(tools, "open_pr", { title: "c", body: "d", head: "h", base: "main", repo: "acme/widget-extension" });
+
+  assert.deepEqual(forge.prCalls, [REPO, SIBLING]);
+  assert.deepEqual(control.prs?.map((pr) => `${pr.repo.name}#${pr.number}`), [
+    "widget#1",
+    "widget-extension#2",
+  ]);
+});
+
+test("re-opening against the same repo replaces its entry rather than adding one", async () => {
+  // A session that retries after a failure must not leave the gate two numbers for one repo —
+  // it would check the stale one and merge the stale one.
+  const { ctx, control } = harness();
+  const tools = controlTools(ctx);
+
+  await call(tools, "open_pr", { title: "a", body: "b", head: "h", base: "main" });
+  await call(tools, "open_pr", { title: "a again", body: "b", head: "h", base: "main" });
+
+  assert.equal(control.prs?.length, 1);
+  assert.equal(control.prs?.[0]?.number, 2, "the newer PR wins");
+});
+
+test("a repo the task does not have is refused in prose, and the refusal says what is allowed", async () => {
+  // The failure this replaces was a raw 422 from a repository the agent never asked for. A
+  // refusal it can read is one it can correct inside the same turn; it is also the SCOPE — the
+  // argument is agent-authored text, and a tool that opened a PR anywhere the credential
+  // reaches would be a session choosing its own blast radius (§9.1).
+  const { ctx, forge, control } = harness();
+
+  const text = await call(controlTools(ctx), "open_pr", {
+    title: "t",
+    body: "b",
+    head: "h",
+    base: "main",
+    repo: "acme/somebody-elses-repo",
+  });
+
+  assert.deepEqual(forge.prCalls, [], "nothing may reach the forge");
+  assert.equal(control.prs, undefined);
+  assert.match(text, /not one of this task's repos/);
+  assert.match(text, /acme\/widget, acme\/widget-extension/, "it must name what IS allowed");
+});
+
+test("a bare repo name is accepted — the host is not the agent's to type", async () => {
+  // `spec.repos` is one workspace, so one forge and one host (§3.1). Demanding `github.com/`
+  // in front of what every other surface calls `owner/name` is friction with nothing behind it.
+  const { ctx, forge } = harness();
+
+  await call(controlTools(ctx), "open_pr", {
+    title: "t",
+    body: "b",
+    head: "h",
+    base: "main",
+    repo: "widget-extension",
+  });
+
+  assert.deepEqual(forge.prCalls, [SIBLING]);
 });

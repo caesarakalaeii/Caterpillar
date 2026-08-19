@@ -26,7 +26,7 @@
  * thing being audited (DESIGN.md §9.3).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -377,6 +377,39 @@ interface Hold {
  * made against the previous remote. That is what `exclusively` is for, it is unchanged by
  * this, and no caller has needed it yet.
  */
+/**
+ * Replace a file so that a concurrent reader sees the old contents or the new, never neither.
+ *
+ * `writeFile` truncates and then writes, so there is a window in which the file on disk is
+ * short. The mutex orders WRITES against each other; it does nothing about reads, and reads of
+ * `state.json` are constant and mostly outside it — `survey` reads every task once per poll, the
+ * web view renders from it, `/task` answers from a snapshot built out of it.
+ *
+ * Observed as `SyntaxError: Unexpected end of JSON input` out of `JSON.parse` in `readState`,
+ * under a machine loaded enough to widen the window. In the loop that is worse than an error,
+ * because `survey` wraps its read in a `catch`: the task silently drops out of that pass's
+ * snapshot and out of its thread bindings, so a listing goes briefly wrong and a message typed
+ * in that task's thread finds no binding — a fast read that is not a right one, which §7.1
+ * already has an incident about.
+ *
+ * `rename` within one directory is atomic on POSIX, so the swap is what a reader observes. The
+ * temp name carries the pid and a counter rather than a random suffix, because two writers in
+ * one directory must not be able to choose the same one, and `Math.random` is not a guarantee.
+ */
+let scratchCounter = 0;
+
+const writeAtomic = async (path: string, contents: string): Promise<void> => {
+  const scratch = `${path}.${process.pid}.${++scratchCounter}.tmp`;
+  await writeFile(scratch, contents, "utf8");
+  try {
+    await rename(scratch, path);
+  } catch (error) {
+    // A failed rename leaves the scratch file behind, and `git add -A` would commit it.
+    await rm(scratch, { force: true }).catch(() => undefined);
+    throw error;
+  }
+};
+
 export class StateStore {
   private readonly root: string;
   private readonly git: Git;
@@ -1010,7 +1043,7 @@ export class StateStore {
       const dir = this.taskDir(state.id);
       await mkdir(dir, { recursive: true });
       const next: TaskState = { ...state, updatedAt: new Date().toISOString() };
-      await writeFile(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+      await writeAtomic(join(dir, "state.json"), `${JSON.stringify(next, null, 2)}\n`);
     });
   }
 

@@ -666,6 +666,19 @@ Each cost real debugging. They are encoded in code or tests now; do not "simplif
 - **"No merging" is not expressible as a GitHub permission.** `pull_requests: write`
   authorises merge; branch protection requiring an approving review is what enforces it.
 
+### Multi-repo tasks
+
+- **`spec.repos` is plural everywhere, including the finish.** `open_pr` takes an optional
+  `repo` — one of the task's own — and completion checks CI in every repo a PR was opened in,
+  then merges them in `spec.repos` order. It did none of that until `GH-caesarakalaeii-all-chat-543`
+  hit it: the extension half was built, pushed and verified and the PR could not be opened at
+  all (two 422s from the wrong repository), so the session parked and a human opened
+  `all-chat-extension#113` by hand.
+- **A repo you changed and did not open a PR for will not merge.** The gate reads
+  `state.prs`, not the branches on the remote.
+- **Merging stops at the first failure and says what landed.** The repos of one change usually
+  cannot land in either order, so a partial merge is a real state a human has to be told about.
+
 ### Supervisor behaviour
 
 - **Release the lease LAST.** Anything recording *why* a task failed must write while the

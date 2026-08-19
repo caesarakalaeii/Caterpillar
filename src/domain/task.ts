@@ -256,6 +256,46 @@ export interface PullRequestRef {
 }
 
 /**
+ * One pull request a task opened, and the repo it lives in (DESIGN.md §9.4.1).
+ *
+ * The repo is the whole reason this type exists. A task may span several repos in one
+ * workspace — `spec.repos` has always been a list, `WorktreeManager.checkout` has always laid
+ * the siblings out under `repos/<name>`, and a plan's children have always inherited the whole
+ * list — but everything downstream of the WORK assumed one: `open_pr` posted to `repos[0]`
+ * unconditionally, the CI gate checked `repos[0]`, and the council merged `repos[0]`. A
+ * two-repo task could therefore finish its work and then only ever half-finish.
+ *
+ * Observed on `GH-caesarakalaeii-all-chat-543`: both halves were built, committed and pushed,
+ * and the second PR could not be opened at all — the tool answered 422 from the wrong
+ * repository twice, and the session parked on a question a human had to answer by hand.
+ */
+export interface TaskPullRequest extends PullRequestRef {
+  readonly repo: RepoRef;
+}
+
+/**
+ * Every pull request a task has open.
+ *
+ * `prs` is authoritative and `pr` is the primary repo's, kept because every reader that only
+ * wants something to LINK TO reads it — the snapshot, the web view, the digest, the council's
+ * prompt. Both are written together.
+ *
+ * The fallback is a state written before `prs` existed: it has a `pr` and no repo to go with
+ * it, and the repo it meant is `repos[0]`, because that is the only one `open_pr` could reach.
+ * A rolling deploy has both shapes in the state repo at once, so this is a live path rather
+ * than a migration nicety.
+ */
+export const taskPullRequests = (
+  repos: readonly RepoRef[],
+  state: { readonly pr?: PullRequestRef; readonly prs?: readonly TaskPullRequest[] },
+): readonly TaskPullRequest[] => {
+  if (state.prs !== undefined && state.prs.length > 0) return state.prs;
+  const primary = repos[0];
+  if (state.pr === undefined || primary === undefined) return [];
+  return [{ ...state.pr, repo: primary }];
+};
+
+/**
  * Review council history (DESIGN.md §12.1).
  *
  * `rounds` is the ping-pong guard: a council that requests changes sends the task back
@@ -324,8 +364,20 @@ export interface TaskState {
   readonly usage: UsageTotals;
   readonly progress: ProgressRecord;
   readonly owner?: TaskOwner;
-  /** Set once the agent opens a PR; the completion gate needs it (§12). */
+  /**
+   * The PRIMARY repo's pull request — `repos[0]`'s.
+   *
+   * Kept, and kept meaning exactly what it always meant, because every reader that wants one
+   * thing to link to reads it. `prs` is what the gates read. See `taskPullRequests`.
+   */
   readonly pr?: PullRequestRef;
+  /**
+   * Every pull request the task has open, one per repo it touched (DESIGN.md §9.4.1).
+   *
+   * Absent on state written before it existed, which `taskPullRequests` reads as "just the
+   * primary one" — the only PR a session could open back then.
+   */
+  readonly prs?: readonly TaskPullRequest[];
   /** Absent until the council has run once. Older `state.json` files simply lack it. */
   readonly review?: ReviewRecord;
   /** Set on tasks cut from a plan (§14.3). Absent on everything else. */
@@ -404,8 +456,10 @@ export interface SessionOutcome {
   readonly error?: string;
   /** Set when reason is `provider-unavailable`. */
   readonly outage?: ProviderOutage;
-  /** Set when the agent opened a PR during this session. */
+  /** Set when the agent opened a PR during this session — the primary repo's, if any. */
   readonly pr?: PullRequestRef;
+  /** Every PR open at the end of this session, across every repo the task spans. */
+  readonly prs?: readonly TaskPullRequest[];
   /** Set when reason is `plan-proposed` — the decomposition awaiting the council. */
   readonly plan?: ProposedPlan;
   /** Free-text summary appended to the journal. */

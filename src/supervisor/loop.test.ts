@@ -66,6 +66,14 @@ after(async () => {
 
 const setup = new Git(root);
 await setup.run("init", "--bare", "--initial-branch=main", origin);
+// **No automatic gc in the fixture origin.** Every test in this file pushes to it and several
+// supervisors push concurrently, so it accumulates loose objects fast — and once it crosses
+// git's threshold a `gc --auto` fires DURING somebody else's push, prunes the quarantine
+// directory out from under it, and the push fails with `unable to migrate objects to permanent
+// storage`. Observed in CI on the node 26 job, in `seedTask`, for a test that has nothing to do
+// with the one whose objects triggered it. Nothing here is testing gc, and a hosted origin does
+// not collect mid-push.
+await setup.run("--git-dir", origin, "config", "gc.auto", "0");
 await setup.run("clone", origin, statePath);
 
 const stateGit = new Git(statePath);
@@ -95,7 +103,12 @@ const seed: TaskState = {
  * `ready`, so a task seeded before the test that wants it gets picked up — and failed —
  * by the test that ran first.
  */
-const seedTask = async (id: TaskId, over: Partial<TaskState> = {}): Promise<void> => {
+const seedTask = async (
+  id: TaskId,
+  over: Partial<TaskState> = {},
+  /** Repo slugs for the spec, primary first. One repo unless a test needs §9.4.1's plural. */
+  repos: readonly string[] = ["github.com/acme/widget"],
+): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
   await writeFile(
@@ -104,7 +117,7 @@ const seedTask = async (id: TaskId, over: Partial<TaskState> = {}): Promise<void
       "---",
       "workspace: test",
       "repos:",
-      "  - github.com/acme/widget",
+      ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
       '  - "true"',
       "---",
@@ -3113,8 +3126,15 @@ test("what Discord reads stays current while a session runs", async () => {
   // session can ever put it in front of a human.
   await seedTask(LATER, { status: "awaiting-human" });
 
+  // BOTH conditions, and waited for BEFORE the abort — the sweep that first publishes `LATER`
+  // need not be the one that has already seen `BUSY` go `running`, because those are two
+  // independent pushes and two independent reads. Sampling the view at the instant `LATER`
+  // appears is asserting on which order they landed in, and it failed in CI as
+  // `'ready' !== 'running'` for exactly that reason. The property is "the view catches up".
+  const caughtUp = (): boolean =>
+    view.find(LATER) !== undefined && view.find(BUSY)?.status === "running";
   const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline && view.find(LATER) === undefined) await sleep(100);
+  while (Date.now() < deadline && !caughtUp()) await sleep(100);
 
   controller.abort();
   await running.catch(() => undefined);
@@ -4257,9 +4277,11 @@ test("a park talks in the task's own thread, not in the channel", async () => {
 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
-  for (let attempt = 0; attempt < 200 && kinds.length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  // 30s, matching every other deadline in this file. A shorter one is not a stricter test, it
+  // is a flakier one: `npm test` runs the files in parallel and this waits on a real git clone,
+  // a real CAS and a real push.
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && kinds.length === 0) await sleep(50);
   controller.abort();
   await running.catch(() => undefined);
 
@@ -4298,13 +4320,15 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
     runner: {
       run: async (spec, _state, _signal, steering) => {
         if (spec.id !== STEERED_TASK) throw new Error("session not under test");
-        // Stand in for pi's turn boundary: subscribe, tell the test we are live, and wait for
-        // something to arrive.
+        // Stand in for pi's turn boundary: subscribe, tell the test we are live, and hold the
+        // session open until something arrives. Bounded and SILENT — a throw from here is a
+        // session that errored, which the supervisor answers by parking and re-claiming, so a
+        // broken expectation would come back as a loop that never settles rather than as a
+        // failing assertion. The test asserts on `seen` instead.
         steering?.subscribe((text) => seen.push(text));
         started?.();
-        for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
+        const held = Date.now() + 30_000;
+        while (Date.now() < held && seen.length === 0) await sleep(50);
         return {
           reason: "handoff" as const,
           usage: EMPTY_USAGE,
@@ -4336,9 +4360,8 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
   });
   assert.deepEqual(outcome, { kind: "steered" }, "a running task is steered, never journalled here");
 
-  for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  const arrived = Date.now() + 30_000;
+  while (Date.now() < arrived && seen.length === 0) await sleep(50);
   assert.deepEqual(seen, ["use the existing migration path"], "the live session never got it");
 
   controller.abort();
@@ -4349,4 +4372,179 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
   const journal = await store.readJournal(STEERED_TASK);
   assert.match(String(journal), /Steered by the operator/);
   assert.match(String(journal), /use the existing migration path/);
+});
+
+test("a two-repo task merges both PRs, in the order its repos were named", async () => {
+  // `mergeReviewed` approved and merged `state.pr` against `spec.repos[0]` and stopped. So a
+  // task spanning two repos landed half its change and reported "merged" — and the half left
+  // behind was silent, because nothing said a second PR existed. `/merge` is the shortest path
+  // to the same code the council uses.
+  const BOTH = asTaskId("SMOKE-MULTI-1");
+  await seedTask(
+    BOTH,
+    {
+      status: "parked",
+      pr: { number: 11, url: "https://example.invalid/widget/11" },
+      prs: [
+        // Deliberately reversed, so the assertion reads the SPEC's order and not this one.
+        {
+          number: 22,
+          url: "https://example.invalid/ext/22",
+          repo: { host: "github.com", owner: "acme", name: "widget-extension" },
+        },
+        {
+          number: 11,
+          url: "https://example.invalid/widget/11",
+          repo: { host: "github.com", owner: "acme", name: "widget" },
+        },
+      ],
+    },
+    ["github.com/acme/widget", "github.com/acme/widget-extension"],
+  );
+
+  const merges: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    approve: (repo, pr) => {
+      merges.push(`approve:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    merge: (repo, pr) => {
+      merges.push(`merge:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: BOTH });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "merged", JSON.stringify(outcome));
+  assert.deepEqual(merges, [
+    "approve:widget#11",
+    "merge:widget#11",
+    "approve:widget-extension#22",
+    "merge:widget-extension#22",
+  ]);
+});
+
+test("a merge that fails halfway names what DID land", async () => {
+  // The one outcome where "could not merge" on its own is actively misleading: part of the
+  // change is on the default branch and a human has to know which part.
+  const HALF = asTaskId("SMOKE-MULTI-2");
+  await seedTask(
+    HALF,
+    {
+      status: "parked",
+      prs: [
+        {
+          number: 11,
+          url: "https://example.invalid/widget/11",
+          repo: { host: "github.com", owner: "acme", name: "widget" },
+        },
+        {
+          number: 22,
+          url: "https://example.invalid/ext/22",
+          repo: { host: "github.com", owner: "acme", name: "widget-extension" },
+        },
+      ],
+    },
+    ["github.com/acme/widget", "github.com/acme/widget-extension"],
+  );
+
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    approve: () => Promise.resolve(),
+    merge: (repo) =>
+      repo.name === "widget"
+        ? Promise.resolve()
+        : Promise.reject(new Error("required status check is pending")),
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: HALF });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "not-mergeable");
+  const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
+  assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
+  assert.match(reason, /half-landed/);
 });
