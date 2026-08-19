@@ -1387,3 +1387,53 @@ test("a unit's commit carries only what that unit wrote", async () => {
   assert.match(second, new RegExp(`tasks/${RUNNING}/state\\.json`));
   assert.doesNotMatch(second, new RegExp(`tasks/${FINISHING}`));
 });
+
+test("state.json is replaced atomically, so a concurrent reader never sees half of it", async () => {
+  // Observed in CI as `SyntaxError: Unexpected end of JSON input` from `readState`. `writeFile`
+  // truncates and then writes, and the mutex orders writes against each other while doing
+  // nothing about reads — which for `state.json` are constant and mostly outside it: `survey`
+  // reads every task once per poll and wraps it in a `catch`, so a torn read silently drops the
+  // task from that pass's snapshot AND its thread bindings.
+  const subject = await store();
+  const task = asTaskId("TASK-ATOMIC");
+  const stateFor = (sessions: number): TaskState => ({
+    id: task,
+    status: "running",
+    phase: "implementing",
+    requires: [],
+    sessions,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 0, noProgressStreak: 0 },
+    createdAt: "2026-08-19T00:00:00.000Z",
+    updatedAt: "2026-08-19T00:00:00.000Z",
+  });
+  await subject.writeState(stateFor(0));
+
+  // Hammer the same file while reading it. Without the rename this fails within a few hundred
+  // iterations on a loaded machine; with it, a read can only ever see one whole version.
+  let torn: unknown;
+  const readers = Array.from({ length: 4 }, () =>
+    (async (): Promise<void> => {
+      for (let i = 0; i < 400; i++) {
+        try {
+          const read = await subject.readState(task);
+          assert.equal(read.id, task);
+        } catch (error) {
+          // ENOENT is not the failure under test — a rename target always exists here — but a
+          // parse error is exactly it.
+          if (error instanceof SyntaxError) torn ??= error;
+        }
+      }
+    })(),
+  );
+
+  const writers = (async (): Promise<void> => {
+    for (let i = 0; i < 400; i++) {
+      await subject.writeState(stateFor(i));
+    }
+  })();
+
+  await Promise.all([...readers, writers]);
+  assert.equal(torn, undefined, `a reader saw a partial file: ${String(torn)}`);
+});

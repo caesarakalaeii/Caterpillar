@@ -384,6 +384,23 @@ the same reason is real history, and the second park means something the first d
 }
 ```
 
+`pr` is the primary repo's pull request and `prs` is one per repo the task opened one in
+(§9.4.1). Both are written together: every reader that only wants something to link to reads
+`pr`, and the completion gates read `prs`.
+
+**It is replaced by `rename`, not by `writeFile`.** `writeFile` truncates and then writes, and
+the store's mutex orders WRITES against each other while doing nothing about reads — which for
+this file are constant and mostly outside it: `survey` reads every task once per poll, the web
+view renders from it, and `/task` answers from a snapshot built out of it. A reader landing in
+that window gets `Unexpected end of JSON input`.
+
+That is worse in the loop than an error would be, because `survey` wraps its read in a `catch`:
+the task drops silently out of that pass's snapshot **and out of its thread bindings**, so a
+listing goes briefly wrong and a message typed in that task's thread finds no binding to route
+to. §7.1 already has an incident about a read being fast without being right; this is the same
+failure arriving through the filesystem. A rename within one directory is atomic on POSIX, so a
+reader sees the whole old file or the whole new one.
+
 ### 4.3 A local commit that can never merge is set aside, not retried
 
 `pull` keeps unpushed commits by rebasing onto the remote rather than resetting over them —

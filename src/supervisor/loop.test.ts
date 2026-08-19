@@ -4262,9 +4262,11 @@ test("a park talks in the task's own thread, not in the channel", async () => {
 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
-  for (let attempt = 0; attempt < 200 && kinds.length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  // 30s, matching every other deadline in this file. A shorter one is not a stricter test, it
+  // is a flakier one: `npm test` runs the files in parallel and this waits on a real git clone,
+  // a real CAS and a real push.
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && kinds.length === 0) await sleep(50);
   controller.abort();
   await running.catch(() => undefined);
 
@@ -4303,13 +4305,15 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
     runner: {
       run: async (spec, _state, _signal, steering) => {
         if (spec.id !== STEERED_TASK) throw new Error("session not under test");
-        // Stand in for pi's turn boundary: subscribe, tell the test we are live, and wait for
-        // something to arrive.
+        // Stand in for pi's turn boundary: subscribe, tell the test we are live, and hold the
+        // session open until something arrives. Bounded and SILENT — a throw from here is a
+        // session that errored, which the supervisor answers by parking and re-claiming, so a
+        // broken expectation would come back as a loop that never settles rather than as a
+        // failing assertion. The test asserts on `seen` instead.
         steering?.subscribe((text) => seen.push(text));
         started?.();
-        for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
+        const held = Date.now() + 30_000;
+        while (Date.now() < held && seen.length === 0) await sleep(50);
         return {
           reason: "handoff" as const,
           usage: EMPTY_USAGE,
@@ -4341,9 +4345,8 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
   });
   assert.deepEqual(outcome, { kind: "steered" }, "a running task is steered, never journalled here");
 
-  for (let attempt = 0; attempt < 200 && seen.length === 0; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
+  const arrived = Date.now() + 30_000;
+  while (Date.now() < arrived && seen.length === 0) await sleep(50);
   assert.deepEqual(seen, ["use the existing migration path"], "the live session never got it");
 
   controller.abort();
