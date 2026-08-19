@@ -218,18 +218,54 @@ test("a thread that becomes bound is known synchronously by the router", () => {
   assert.equal(route.knows(THREAD), true);
 });
 
+/** A pin is a duration, so its tests move a clock rather than counting calls. */
+const clocked = (): { readonly index: ThreadIndex; readonly advance: (ms: number) => void } => {
+  let now = 1_000_000;
+  return {
+    index: new ThreadIndex({ now: () => now }),
+    advance: (ms) => {
+      now += ms;
+    },
+  };
+};
+
 test("a pin expires, so a thread no mapping will ever name does not stay bound forever", () => {
-  // The leak the generation counter closes. A brainstorm whose task goes terminal before
-  // the first survey that would have published it is never named by any mapping, and a
-  // permanent pin would leave the dead thread bound for the life of the process — where
-  // every message typed there is read as an answer to a finished task and gets silence.
-  const index = new ThreadIndex();
+  // The leak the expiry closes. A brainstorm whose task goes terminal before the first
+  // survey that would have published it is never named by any mapping, and a permanent
+  // pin would leave the dead thread bound for the life of the process — where every
+  // message typed there is read as an answer to a finished task and gets silence.
+  const { index, advance } = clocked();
   index.bind(THREAD, asTaskId("BS-1"));
 
-  // Several passes that never mention it, as a cancelled brainstorm's never would.
-  for (let pass = 0; pass < 10; pass++) index.replace([]);
+  // Long past any plausible publishing delay, as a cancelled brainstorm's would be.
+  advance(10 * 60_000);
+  index.replace([]);
 
   assert.equal(index.knows(THREAD), false, "an unnameable pinned thread must eventually unbind");
+});
+
+test("a pin is not spent by refreshes — it outlives a whole housekeeping interval", () => {
+  // The regression that made the pin a duration instead of a count of `replace` calls.
+  // The bot refreshes every 5s, but the mapping it is waiting for cannot arrive until the
+  // supervisor's housekeeping pass (default 30s, and only then a pull, a drain and a
+  // survey). A pin measured in refreshes was spent in ~15s, so the human typing in a
+  // brand-new brainstorm thread was told "I do not know which task this thread belongs
+  // to yet" — and that text is dropped, not queued.
+  const { index, advance } = clocked();
+  index.bind(THREAD, asTaskId("BS-1"));
+
+  // A minute of 5s refreshes, none of which has heard of the thread yet: twice the
+  // default housekeeping interval, and twelve times what a 3-generation pin survived.
+  for (let pass = 0; pass < 12; pass++) {
+    advance(5_000);
+    index.replace([]);
+  }
+
+  assert.equal(
+    index.taskFor(THREAD),
+    asTaskId("BS-1"),
+    "frequent refreshes must not consume a pin that exists to cover the publisher's latency",
+  );
 });
 
 test("a pin still covers the window it exists for", () => {

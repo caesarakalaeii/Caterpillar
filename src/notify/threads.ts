@@ -67,19 +67,39 @@ export class ThreadIndex {
   private readonly local = new Map<string, number>();
 
   /**
-   * How many `replace` calls a pin survives before it is treated as ordinary.
+   * How long a pin lasts, as a DURATION rather than a count of `replace` calls.
    *
    * A pin covers ONE window: the gap between this process binding a thread and the first
-   * published mapping that mentions it. That is a refresh or two, so a small number is
-   * generous. It has to be finite, though, because the mapping might never mention the
-   * thread at all — a brainstorm whose task reaches a terminal status before the survey
-   * that would have published it (an immediate `/cancel`) is never named by any mapping,
-   * and a permanent pin would leave that dead thread bound for the life of the process,
-   * reading every message typed there as an answer to a finished task and saying nothing.
-   * That is the exact silent-swallowing failure `threadBindings` drops terminal tasks to
-   * avoid, so the pin must not be able to reintroduce it.
+   * published mapping that mentions it. The unit matters, and getting it wrong is the bug
+   * this constant replaced. The window is set by the SUPERVISOR's publishing cadence —
+   * `housekeepingSeconds`, which defaults to `pollSeconds` (30s), and only then a git
+   * pull, an inbox drain and a survey before `publish` runs. The bot's own refresh
+   * interval is unrelated to it (5s, `bot.ts:THREAD_REFRESH_MS`). Counting refreshes
+   * therefore measured the wrong clock: three of them is 15s, so on default config the
+   * pin routinely expired BEFORE the first mapping naming the thread could arrive, and a
+   * human typing in a fresh `/brainstorm` thread got "I do not know which task this thread
+   * belongs to yet" instead of having their answer queued. Their text is not requeued
+   * later; it is lost.
+   *
+   * Two minutes comfortably exceeds one housekeeping interval plus that tail, with room
+   * for a slow pull, and it does not depend on how often the bot happens to refresh.
+   *
+   * It stays FINITE because the mapping might never mention the thread at all — a
+   * brainstorm whose task reaches a terminal status before the survey that would have
+   * published it (an immediate `/cancel`) is never named by any mapping, and a permanent
+   * pin would leave that dead thread bound for the life of the process, reading every
+   * message typed there as an answer to a finished task and saying nothing. That is the
+   * exact silent-swallowing failure `threadBindings` drops terminal tasks to avoid, so the
+   * pin must not be able to reintroduce it.
    */
-  private static readonly PIN_GENERATIONS = 3;
+  private static readonly PIN_MS = 120_000;
+
+  /** Injection seam: tests move the pin's clock instead of waiting two real minutes. */
+  private readonly now: () => number;
+
+  constructor(options: { readonly now?: () => number } = {}) {
+    this.now = options.now ?? ((): number => Date.now());
+  }
 
   /**
    * Bind a thread this process knows about first-hand.
@@ -94,7 +114,7 @@ export class ThreadIndex {
    */
   bind(threadId: string, task: TaskId): void {
     this.byThread.set(threadId, task);
-    this.local.set(threadId, ThreadIndex.PIN_GENERATIONS);
+    this.local.set(threadId, this.now() + ThreadIndex.PIN_MS);
   }
 
   /** Stop listening to a thread. Takes effect immediately, before the next poll. */
@@ -120,14 +140,10 @@ export class ThreadIndex {
     for (const threadId of [...this.byThread.keys()]) {
       if (incoming.has(threadId)) continue;
 
-      // Never mentioned, and ours: keep it, but spend one generation of the pin. A pin
-      // that never expired would strand a thread no mapping will ever name — see
-      // `PIN_GENERATIONS`.
-      const left = this.local.get(threadId);
-      if (left !== undefined && left > 1) {
-        this.local.set(threadId, left - 1);
-        continue;
-      }
+      // Never mentioned, and ours: keep it until the pin expires. A pin that never
+      // expired would strand a thread no mapping will ever name — see `PIN_MS`.
+      const until = this.local.get(threadId);
+      if (until !== undefined && this.now() < until) continue;
 
       this.local.delete(threadId);
       this.byThread.delete(threadId);
