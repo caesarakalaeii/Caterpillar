@@ -1297,6 +1297,20 @@ answer a capped list cannot give, and names the exact command that shows the nex
 the previous wording was `…and 14 more.`, which announces that something is missing and
 offers no way to reach it.
 
+**A holder gives the claim back on the way out.** `refs/chat/holder` is stealable on staleness —
+`lease.staleAfterSeconds`, 300 — so a holder that simply dies leaves the ref behind carrying the
+commit time of its last renewal, and every replica that comes up refuses to claim until that
+window passes. The bot is then deaf for the remainder of it, and deaf *silently*: `acts()` is
+checked at both inbound doors and a non-holder returns without logging, so a slash command in the
+gap shows Discord's own "This interaction failed" and a message typed in a thread is simply gone.
+
+Observed on the 2026-08-19 rollout — pods restarted 20:03–20:05, the ref went stale at 20:09:58,
+exactly 300s after the dead holder's last renewal. Shutdown now deletes the ref if this replica
+holds it, CAS'd on the oid it wrote so a replica that quietly lost the claim cannot delete its
+successor's. The next replica takes it on its first housekeeping pass. It is the same move
+`PresenceRegistry.depart` already makes one line later in the same `finally`, for the same
+reason: leave the display before closing the connection.
+
 **Buttons can only come from the bot.** Discord refuses interactive components from a
 webhook the application does not own, and `webhook-url` is a webhook created in the
 channel's settings. A question notification with an Answer button on it is therefore not
@@ -2356,6 +2370,26 @@ repository twice (once matching the PR it had already opened on the *primary* re
 refusing `base: …-extension:main` on a repo where that branch does not exist), correctly
 diagnosed it as a tooling limit rather than a permissions problem, and parked on `ask_human`. A
 human opened the PR by hand.
+
+**`open_pr` is idempotent: a duplicate adopts the pull request that is already open.** GitHub
+answers a second POST for the same head with a 422 (`A pull request already exists for …`) and
+Forgejo with a 409, and both are statements about the world already being the way the caller
+wanted. Treating that as a failure made a class of situation unrecoverable from inside a
+session: a handoff whose successor re-opens from the journal, a push whose state write was lost,
+or a human who opened it by hand while the task was parked — which is exactly how
+`all-chat-extension#113` came to exist, and it would have left that task unable to record its own
+PR ever again. In every one the branch, base and intent are identical, so the existing PR is the
+one being asked for.
+
+Narrow deliberately: only that status, only when the branch actually has an open PR against the
+requested base, and matched on head+base rather than on title. A 422 about an unusable base still
+throws — that is the one an agent has to read, and it is the error GitHub gave rather than a
+summary of it. The title and body are **not** applied to an adopted PR: rewriting a description a
+human may have edited is not this call's business.
+
+Both forges implement it because `open_pr` is one verb with one contract. An agent that had to
+know which forge it was talking to in order to know whether "already open" is a failure would be
+reasoning about the thing the tool exists to hide.
 
 **`open_pr` takes an optional `repo`, and refuses anything outside `spec.repos`.** Optional
 because one repo is what a list of one looks like and the primary is the overwhelming case;

@@ -78,9 +78,11 @@ import type { Logger } from "../obs/log.ts";
 /** `refs/chat/holder` — one per fleet, not per task or per day. */
 export const CHAT_HOLDER_REF = "refs/chat/holder";
 
-/** What leadership needs from `LeaseManager`, narrowed to one method. */
+/** What leadership needs from `LeaseManager`, narrowed to what it actually calls. */
 export interface StealableClaims {
   claimStealable(ref: string, message: string, held?: string): Promise<string | undefined>;
+  /** Delete a ref this runner holds. Never deletes someone else's — see `standDown`. */
+  releaseRef(ref: string, oid: string): Promise<void>;
 }
 
 export interface ChatLeadershipOptions {
@@ -101,6 +103,45 @@ export class ChatLeadership {
   /** Read synchronously, on every inbound Discord event. Never does IO. */
   held(): boolean {
     return this.oid !== undefined;
+  }
+
+  /**
+   * Give the claim up on the way out, so the next replica does not wait for it to go stale.
+   *
+   * **This is what makes a rollout cost a poll instead of five minutes.** A holder that just
+   * dies leaves `refs/chat/holder` behind with the commit time of its last renewal, and
+   * `claimStealable` refuses a ref that is not yet stale — `lease.staleAfterSeconds`, 300 by
+   * default. So every replica came up, connected its gateway, and then acted on nothing for the
+   * remainder of that window, in complete silence: `acts()` is checked at both inbound doors and
+   * a non-holder returns without logging, so a slash command in the gap shows Discord's own
+   * "This interaction failed" and a message typed in a thread is simply gone.
+   *
+   * Observed on the 2026-08-19 rollout: pods restarted 20:03–20:05, the ref went stale at
+   * 20:09:58 — exactly 300s after the dead holder's last renewal — and the bot was deaf between.
+   *
+   * The same shape as `PresenceRegistry.depart`, which this shutdown path already calls for the
+   * same reason one line further down: leave the display before closing the connection.
+   *
+   * CAS on the oid WE wrote, so a replica that quietly lost the claim cannot delete the ref its
+   * successor is now holding. Never throws: shutdown must not be the path that fails, and the
+   * cost of a failed stand-down is exactly the behaviour that existed before this.
+   */
+  async standDown(): Promise<void> {
+    const { claims, runner, logger } = this.options;
+    const held = this.oid;
+    if (held === undefined) return;
+
+    this.oid = undefined;
+    try {
+      await claims.releaseRef(CHAT_HOLDER_REF, held);
+      logger.info("chat.stood-down", { runner });
+    } catch (error) {
+      // The next replica waits for staleness, as it always did. Worth a line, never a throw.
+      logger.warn("chat.stand-down-failed", {
+        runner,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**

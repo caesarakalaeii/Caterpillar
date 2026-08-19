@@ -929,6 +929,10 @@ that crosses two is refused in the thread rather than quietly narrowed to one (�
 extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
 child tasks inherit the whole list.
 
+`open_pr` is idempotent: calling it for a branch that already has an open pull request **adopts
+that PR** rather than failing, so a handoff, a lost state write, or a human who opened it by hand
+does not leave the task unable to record it.
+
 A task spanning several repos opens **one pull request per repo** it changed, and completion
 checks CI in every one of them — so a repo it changed without opening a PR for will not merge.
 Merging goes in the order the repos were named, stopping at the first failure, because the repos
