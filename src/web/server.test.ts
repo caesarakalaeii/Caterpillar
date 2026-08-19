@@ -79,6 +79,9 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
     ],
   ]),
   pollSeconds: 30,
+  // The default, stated. Every existing test describes a one-task-at-a-time runner and
+  // must keep describing one — see DESIGN.md §6.4.
+  concurrency: 1,
   housekeepingSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: true, hour: 18, timeZone: "Europe/Berlin", summarise: true },

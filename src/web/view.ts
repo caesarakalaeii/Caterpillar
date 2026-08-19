@@ -661,6 +661,15 @@ export interface RunnerExport {
   readonly runnerId: string;
   readonly capabilities: readonly Capability[];
   readonly pollSeconds: number;
+  /**
+   * How many tasks this runner works at once (§6.4).
+   *
+   * OPTIONAL for the reason `workspace` below is: the aggregating viewer (§18) renders a
+   * REMOTE runner's export with this same template, and a replica still on an image that
+   * predates slots sends no such key. Required here would make the viewer answer `/runner`
+   * with an error page for every pod mid-rollout, over a number that is 1 on all of them.
+   */
+  readonly concurrency?: number;
   readonly lease: { readonly heartbeatSeconds: number; readonly staleAfterSeconds: number };
   readonly handoff: { readonly thresholdFraction: number };
   readonly limits: {
@@ -737,6 +746,7 @@ export const runnerExport = (config: RunnerConfig): RunnerExport => ({
   runnerId: config.runnerId,
   capabilities: config.capabilities,
   pollSeconds: config.pollSeconds,
+  concurrency: config.concurrency,
   lease: {
     heartbeatSeconds: config.lease.heartbeatSeconds,
     staleAfterSeconds: config.lease.staleAfterSeconds,

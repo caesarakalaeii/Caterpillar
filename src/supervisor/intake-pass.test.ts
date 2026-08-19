@@ -86,6 +86,9 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
   },
   workspaces: new Map(),
   pollSeconds: 1,
+  // The default, stated. Every existing test describes a one-task-at-a-time runner and
+  // must keep describing one — see DESIGN.md §6.4.
+  concurrency: 1,
   housekeepingSeconds: 1,
   secretsDir: join(root, "secrets"),
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },

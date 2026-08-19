@@ -153,6 +153,9 @@ const config: RunnerConfig = {
   },
   workspaces: new Map(),
   pollSeconds: 1,
+  // The default, stated. Every existing test describes a one-task-at-a-time runner and
+  // must keep describing one — see DESIGN.md §6.4.
+  concurrency: 1,
   housekeepingSeconds: 1,
   secretsDir: join(root, "secrets"),
   // No web view in the loop's tests: these exercise the supervisor, and a listening
