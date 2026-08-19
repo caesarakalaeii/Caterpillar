@@ -106,8 +106,63 @@ export const renderVerdict = (verdict: CouncilVerdict): string => {
   return lines.join("\n").trim();
 };
 
-/** One-line form for Discord and the log. */
+/**
+ * One-line form for the log and a message header.
+ *
+ * The all-abstained case is spelled out rather than falling through the blocker list. It
+ * reaches here — `decide` returns `changes` when every reviewer abstained, and by
+ * construction that verdict has no blockers — and the join over an empty list produced
+ * `blocked by` with nothing after it, in the one outcome where the reader most needs to be
+ * told that no review happened at all.
+ */
 export const summariseVerdict = (verdict: CouncilVerdict): string =>
   verdict.decision === "pass"
     ? `passed ${verdict.verdicts.length} lens(es)`
-    : `blocked by ${verdict.blockers.map((b) => b.lens).join(", ")}`;
+    : verdict.blockers.length === 0
+      ? `no reviewer completed a review (${verdict.abstentions.length} abstained)`
+      : `blocked by ${verdict.blockers.map((b) => b.lens).join(", ")}`;
+
+/** Findings quoted per blocking lens. The rest are in `reviews/NNN-verdict.md`. */
+const FINDINGS_SHOWN = 3;
+
+/**
+ * WHY it was sent back, short enough for a chat message.
+ *
+ * `summariseVerdict` names the lenses that objected; this says what they objected TO, and
+ * the difference is the whole reason this exists. A one-line summary is all Discord ever
+ * showed, and `blocked by feasibility, decomposition` names two lenses and nothing a human
+ * can act on — the reasons were in `reviews/NNN-verdict.md`, in a repo they would have to
+ * clone to read. Someone watching a brainstorm get rejected three times in a row could see
+ * that it happened and never once see why.
+ *
+ * The most actionable material comes FIRST, per blocker: its own summary, then its
+ * findings. Callers fit this to Discord's limit (`notify/discord.ts`) and a truncated tail
+ * costs the least there. `FINDINGS_SHOWN` bounds it before truncation gets involved, so
+ * what survives is whole findings rather than a sentence cut mid-word, and the count of
+ * what was dropped is stated rather than left to look like the end of the list.
+ */
+export const explainVerdict = (verdict: CouncilVerdict): string => {
+  if (verdict.decision === "pass") {
+    return `No blocking objections from ${verdict.verdicts.length} lens(es).`;
+  }
+
+  if (verdict.blockers.length === 0) {
+    return (
+      `No reviewer completed a review — ${verdict.abstentions.length} abstained, and an ` +
+      `abstention is not an approval. Nobody has objected to anything in the work itself; ` +
+      `it goes back as it is and is reviewed again.`
+    );
+  }
+
+  const lines: string[] = [];
+  for (const blocker of verdict.blockers) {
+    lines.push(`**${blocker.title}** — ${blocker.summary.trim()}`);
+    for (const finding of blocker.findings.slice(0, FINDINGS_SHOWN)) {
+      lines.push(`- \`${finding.where}\` — ${finding.what}`);
+    }
+    const hidden = blocker.findings.length - FINDINGS_SHOWN;
+    if (hidden > 0) lines.push(`- …and ${hidden} more, in the full verdict.`);
+    lines.push("");
+  }
+  return lines.join("\n").trim();
+};

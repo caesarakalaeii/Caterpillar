@@ -593,6 +593,13 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
   assert.equal(settled?.review?.rounds, 2, "the round cap is what stops it");
   assert.equal(convenedWhenParked, 2, "the council must be convened once per completion claim");
 
+  // WHY, in the state file — the only copy `/task` can reach. A count of rounds in a repo
+  // full of verdict files nobody can read from Discord is how this parked three times
+  // without ever saying what the objection was.
+  assert.match(settled?.review?.reason ?? "", /Correctness/);
+  assert.match(settled?.review?.reason ?? "", /Throws on an empty repo list/);
+  assert.match(settled?.review?.reason ?? "", /runner\.ts:107/);
+
   // The verdict is a document, not just a log line: the next session reads the journal,
   // and a human reads the file.
   const verdict = await new Git(origin).tryRun(

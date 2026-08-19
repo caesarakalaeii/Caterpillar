@@ -45,7 +45,15 @@ export type Notification =
   | {
       readonly kind: "verdict";
       readonly task: TaskId;
+      /** The one-line form — which lenses objected. */
       readonly summary: string;
+      /**
+       * WHAT they objected to. Required, not optional, because this notification without it
+       * is the thing that made a rejection unreadable: `blocked by feasibility` names a
+       * lens and nothing to act on, and a reader watching the same task come back three
+       * times had no way to tell whether the objection was even the same one twice.
+       */
+      readonly detail: string;
       readonly prUrl?: string;
     }
   /**
@@ -57,6 +65,8 @@ export type Notification =
       readonly task: TaskId;
       readonly rounds: number;
       readonly summary: string;
+      /** The blocking objections themselves — see `verdict.detail`. */
+      readonly detail: string;
       readonly prUrl?: string;
       /**
        * Whether a Merge button would actually work. False without a reviewer identity:
@@ -64,6 +74,22 @@ export type Notification =
        * button would fail every time it was pressed (§9.1).
        */
       readonly canMerge: boolean;
+    }
+  /**
+   * A brainstorm's plan was refused often enough to stop trying (DESIGN.md §14.3).
+   *
+   * `review-stalled`'s counterpart for the plan path, and separate from it because the two
+   * offer different things. A stalled implementation has a PR, so the human's option is to
+   * merge it anyway; a stalled brainstorm has produced no change at all, so the only way
+   * forward is to tell it what to do differently and resume it. Sending the implementation
+   * notification here offered a Merge button for a pull request that does not exist.
+   */
+  | {
+      readonly kind: "plan-stalled";
+      readonly task: TaskId;
+      readonly rounds: number;
+      readonly summary: string;
+      readonly detail: string;
     }
   /** A brainstorm's plan cleared the council and became real tasks (DESIGN.md §14.3). */
   | {
@@ -550,6 +576,9 @@ export const componentsFor = (
     // pressing anything here.
     case "alert-task":
     case "alert-refused":
+    // A stalled plan has no PR to link and nothing to merge — what it needs is prose, and
+    // the reply that carries it is the next message in the thread.
+    case "plan-stalled":
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -605,24 +634,47 @@ const frame = (notification: Notification, hint: boolean): string => {
         `**${task}** done — ${text}${note === undefined ? "" : `\n${note}`}`,
       );
     }
+    // For all three review outcomes the objections are the PROSE and everything else is
+    // the frame, which is what decides what survives Discord's limit: `fit` truncates only
+    // what it is given, so the header saying which lenses objected and the footer saying
+    // whose move it is are both safe from a verdict that runs long.
     case "verdict":
-      return fit(
-        notification.summary,
-        (text) => `**${task}** — review council requested changes.\n${text}\nBack to the agent.`,
+      return fit(notification.detail, (text) =>
+        [
+          `**${task}** — the review council requested changes (${notification.summary}).`,
+          "",
+          text,
+          "",
+          `Back to the agent by itself — no action needed. To steer the next attempt, say ` +
+            `what to change in this thread${hint ? ` or \`!answer ${task} <what to change>\`` : ""}.`,
+        ].join("\n"),
       );
     case "review-stalled":
-      return fit(
-        notification.summary,
-        (text) =>
-          [
-            `**${task}** parked — the review council requested changes ${notification.rounds} times.`,
-            "",
-            text,
-            "",
-            notification.canMerge
-              ? "Merge it as it stands, or leave it parked and pick it up by hand."
-              : "No reviewer identity is configured, so merging is yours to do.",
-          ].join("\n"),
+      return fit(notification.detail, (text) =>
+        [
+          `**${task}** parked — the review council requested changes ${notification.rounds} times (${notification.summary}).`,
+          "",
+          text,
+          "",
+          notification.canMerge
+            ? `Merge it as it stands, or say what to change and \`/resume ${task}\`.`
+            : `No reviewer identity is configured, so merging is yours to do. Otherwise say ` +
+              `what to change and \`/resume ${task}\`.`,
+        ].join("\n"),
+      );
+    case "plan-stalled":
+      return fit(notification.detail, (text) =>
+        [
+          `**${task}** parked — the plan was sent back ${notification.rounds} times (${notification.summary}).`,
+          "",
+          text,
+          "",
+          // Named explicitly, because this is the park where a human most reliably assumed
+          // there was nothing they could do: no PR, no change, and a reason that used to
+          // read "the plan was rejected 3 times" and stop there.
+          `The council and the agent are not converging on their own. Say what to change — ` +
+            `here in this thread — then \`/resume ${task}\` to try again.`,
+        ].join("\n"),
       );
     case "plan-ready": {
       const waves = new Map<number, TaskId[]>();

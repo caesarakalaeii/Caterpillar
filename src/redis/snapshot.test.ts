@@ -47,6 +47,42 @@ test("serialise/deserialise is a round trip, prUrl included and excluded", () =>
   assert.equal("prUrl" in (deserialise(serialise(tasks))?.[0] ?? {}), false);
 });
 
+test("the review record survives the round trip, reason and all", () => {
+  // With Redis configured the process answering `/task` is the standalone bot, which holds
+  // no state repo: this key is the only thing it knows. `parseSummary` rebuilds every field
+  // by hand, so a field it forgets is dropped in silence — and "why does this keep getting
+  // rejected" would be answerable on a single runner and unanswerable on the fleet.
+  const tasks: readonly TaskSummary[] = [
+    summary({
+      review: {
+        rounds: 3,
+        last: "changes",
+        reason: "**Decomposition** — the five proposed tasks are one task.",
+      },
+    }),
+  ];
+
+  const back = deserialise(serialise(tasks));
+  assert.deepEqual(back, tasks);
+  assert.equal(back?.[0]?.review?.reason, "**Decomposition** — the five proposed tasks are one task.");
+});
+
+test("a task with no review history keeps the field absent, not undefined", () => {
+  // `exactOptionalPropertyTypes`, the same reason `prUrl` is asserted above.
+  const back = deserialise(serialise([summary()]));
+  assert.equal("review" in (back?.[0] ?? {}), false);
+});
+
+test("a malformed review record costs the history, not the task", () => {
+  // The review history is the least important thing a summary carries. Dropping the whole
+  // task to protect it would take it out of the autocomplete that names it.
+  const raw = JSON.stringify([{ ...summary(), review: { rounds: "three", last: "nope" } }]);
+  const back = deserialise(raw);
+
+  assert.equal(back?.length, 1, "the task itself must survive");
+  assert.equal(back?.[0]?.review, undefined);
+});
+
 test("suggest() keeps its ranking across the round trip", async () => {
   const redis = new MemoryRedisClient();
   const writer = new RedisSnapshotStore({ redis, logger: SILENT_LOGGER, cacheTtlMs: 0 });

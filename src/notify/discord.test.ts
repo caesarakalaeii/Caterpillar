@@ -278,3 +278,73 @@ test("a pause says what broke, that no task is at fault, and when it retries", (
   assert.match(content, /nothing is at fault/);
   assert.match(content, /30 minutes/);
 });
+
+test("a rejection says what was objected to, and what to do about it", () => {
+  // The message this whole path exists for. `blocked by feasibility` was the entire body:
+  // it named a lens, said nothing about the objection, and offered no next step — so a
+  // brainstorm rejected three times running looked like a task that was simply stuck.
+  const content = render({
+    kind: "verdict",
+    task: TASK,
+    summary: "blocked by feasibility",
+    detail: "**Feasibility** — task 2 declares no command that exercises the new endpoint.",
+  });
+
+  assert.match(content, /blocked by feasibility/, "the one-liner still names the lens");
+  assert.match(content, /exercises the new endpoint/, "and the body says what it objected to");
+  assert.match(content, /no action needed/, "an informational verdict must not read as a prompt");
+  assert.match(content, /say what to change/, "…while still saying how to steer it");
+});
+
+test("the next step outlives a verdict too long to fit", () => {
+  // `fit` truncates the prose it is GIVEN, so the objections are the prose and everything
+  // that tells a reader what to do is the frame. Put the guidance inside the prose and the
+  // longest, most contested verdicts are exactly the ones that arrive with no way forward.
+  const content = render({
+    kind: "verdict",
+    task: TASK,
+    summary: "blocked by design",
+    detail: "the same objection restated ".repeat(200),
+  });
+
+  assert.ok(size(content) <= CONTENT_LIMIT, `content was ${size(content)} code points`);
+  assert.match(content, /SMOKE-1/);
+  assert.match(content, /blocked by design/);
+  assert.match(content, /say what to change/, "the next step must survive truncation");
+  assert.match(content, /truncated/, "and a reader must be able to tell prose was cut");
+});
+
+test("a stalled plan offers prose and a resume, never a merge", () => {
+  // A brainstorm that stalls has produced no change and has no PR, so `review-stalled`'s
+  // offer to "merge it as it stands" pointed at nothing. This is the park where a human
+  // most reliably concluded there was nothing they could do.
+  const content = render({
+    kind: "plan-stalled",
+    task: TASK,
+    rounds: 3,
+    summary: "blocked by decomposition",
+    detail: "**Decomposition** — the five proposed tasks are one task.",
+  });
+
+  assert.match(content, /sent back 3 times/);
+  assert.match(content, /five proposed tasks are one task/);
+  assert.match(content, /\/resume SMOKE-1/);
+  assert.doesNotMatch(content, /merge/i, "there is no pull request to merge");
+});
+
+test("a stalled review keeps the merge, and names the alternative to it", () => {
+  const content = render({
+    kind: "review-stalled",
+    task: TASK,
+    rounds: 3,
+    summary: "blocked by correctness",
+    detail: "**Correctness** — throws on an empty repo list.",
+    prUrl: "https://example.invalid/pr/9",
+    canMerge: true,
+  });
+
+  assert.match(content, /requested changes 3 times/);
+  assert.match(content, /throws on an empty repo list/);
+  assert.match(content, /Merge it as it stands/);
+  assert.match(content, /\/resume SMOKE-1/);
+});

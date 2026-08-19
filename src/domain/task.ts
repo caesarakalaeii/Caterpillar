@@ -266,7 +266,38 @@ export interface PullRequestRef {
 export interface ReviewRecord {
   readonly rounds: number;
   readonly last?: "pass" | "changes";
+  /**
+   * Why the last round sent it back, in prose, when it did.
+   *
+   * Duplicated from `reviews/NNN-verdict.md` and the journal, deliberately, because those
+   * are FILES: reading them means cloning the state repo or reaching the web view, and
+   * neither is available to `/task` — which answers from the in-memory snapshot inside
+   * Discord's three-second interaction budget (`supervisor/snapshot.ts`). Without it here
+   * `rounds: 3` was the whole answer to "why does this keep getting rejected", and a count
+   * is not a reason.
+   *
+   * Bounded by `REASON_LIMIT` before it is written. A verdict is agent prose and can run to
+   * pages; `state.json` is rewritten on every transition and read on every poll by every
+   * runner, and the authoritative copy is the verdict file either way.
+   *
+   * Absent when `last` is `pass`, and absent on state written before this existed.
+   */
+  readonly reason?: string;
 }
+
+/**
+ * How much of a rejection's prose is kept in `state.json`. Roughly a screen: enough for the
+ * blocking objections themselves, short of the findings that elaborate them.
+ */
+export const REASON_LIMIT = 1200;
+
+/** `reason` for a `ReviewRecord`, bounded. Marks the cut so a truncated tail is not read as the end. */
+export const recordedReason = (text: string): string => {
+  const points = [...text.trim()];
+  return points.length <= REASON_LIMIT
+    ? points.join("")
+    : `${points.slice(0, REASON_LIMIT).join("")}… (full text in the task's verdict)`;
+};
 
 /**
  * A task's place in a plan (DESIGN.md §14.3).
