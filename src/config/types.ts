@@ -444,6 +444,26 @@ export interface RunnerConfig {
    * claiming would reintroduce the very latency the split exists to remove.
    */
   readonly housekeepingSeconds: number;
+  /**
+   * How many tasks this runner works AT ONCE (DESIGN.md §6.4).
+   *
+   * **Defaults to 1, which is exactly what every runner did before this existed.** That is
+   * not timidity about the scheduler: concurrency here is bounded by the model provider,
+   * not by the box. A weekly token allowance divided between four sessions is exhausted in
+   * a quarter of the time and every one of them then meets the same wall — the provider
+   * cooldown (§6.3) is runner-scoped precisely because that wall is shared. So the number
+   * an operator can afford is a fact about their account, and the fleet must not guess it.
+   *
+   * The motivation for it being configurable at all is semi-local inference: with the model
+   * on hardware the operator owns, the limit stops being a weekly allowance and becomes how
+   * many sessions the machine can run, which is a number only the operator knows.
+   *
+   * What it does NOT change: leasing (§5) is what makes concurrent claims safe, and it
+   * already worked across the fleet — four replicas at N=1 and one replica at N=4 claim
+   * through the identical compare-and-swap. Raising this is local bookkeeping about how
+   * many slots this process fills, never a new coordination mechanism.
+   */
+  readonly concurrency: number;
   /** Directory of mounted secret files, keyed by `secretRef`. */
   readonly secretsDir: string;
   readonly log: LogConfig;

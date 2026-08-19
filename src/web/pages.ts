@@ -926,6 +926,21 @@ const diskSection = (exported: RunnerExport, disk: DiskView | undefined): Html =
   }
 </section>`;
 
+/**
+ * How many tasks this runner works at once, in words the page can be read for.
+ *
+ * `undefined` is NOT rendered as 1, and the difference is the whole reason this is a
+ * function. The field is optional so the aggregating viewer (§18) can render a replica
+ * still on an older image (see `RunnerExport.concurrency`), and printing "1 task at a
+ * time" for a runner that never said so would be the viewer inventing a configuration
+ * value — which is exactly what an operator would then go looking for in a ConfigMap that
+ * does not contain it.
+ */
+const concurrencyLabel = (concurrency: number | undefined): string => {
+  if (concurrency === undefined) return "not reported";
+  return concurrency === 1 ? "1 task at a time" : `up to ${concurrency} tasks at once`;
+};
+
 export const runnerPage = (exported: RunnerExport, disk?: DiskView): Html => html`<main>
   <div class="page-head">
     <div class="eyebrow">configuration · no credentials</div>
@@ -939,6 +954,7 @@ export const runnerPage = (exported: RunnerExport, disk?: DiskView): Html => htm
       <div><dt>runner id</dt><dd>${exported.runnerId}</dd></div>
       <div><dt>capabilities</dt><dd><div class="chips">${exported.capabilities.map((c) => html`<span class="chip on">${c}</span>`)}</div></dd></div>
       <div><dt>poll interval</dt><dd>${exported.pollSeconds}s</dd></div>
+      <div><dt>concurrency</dt><dd>${concurrencyLabel(exported.concurrency)}</dd></div>
       <div><dt>log level</dt><dd>${exported.log.level}</dd></div>
       <div><dt>intake interval</dt><dd>${exported.intake.intervalSeconds}s</dd></div>
     </dl>

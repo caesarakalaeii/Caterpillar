@@ -83,6 +83,7 @@ interface RawConfig {
   readonly workspaces?: Record<string, unknown>;
   readonly pollSeconds?: unknown;
   readonly housekeepingSeconds?: unknown;
+  readonly concurrency?: unknown;
   readonly secretsDir?: unknown;
   readonly log?: { readonly level?: unknown };
   readonly intake?: { readonly intervalSeconds?: unknown };
@@ -524,6 +525,17 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
   // three copies of the same `num(..., 30)` are three places for the default to drift.
   const poll = num(raw.pollSeconds, "pollSeconds", 30);
 
+  // Default 1, so a runner that says nothing behaves exactly as every runner did before
+  // slots existed. Refused rather than clamped when it is nonsense: `concurrency: 0` is a
+  // runner that claims nothing and looks perfectly healthy doing it, and `concurrency: 2.5`
+  // is a typo whose silent correction an operator would never find out about. Both are
+  // configuration mistakes with no reading that is more likely than "this was meant to be a
+  // count of slots", so they stop the boot rather than the throughput.
+  const concurrency = num(raw.concurrency, "concurrency", 1);
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new ConfigError("concurrency must be a whole number of at least 1");
+  }
+
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
@@ -626,6 +638,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     // alone would silently break it. Faster is allowed — housekeeping costs a fetch and a
     // few array filters, and a human waiting on `/resume` is the thing being optimised.
     housekeepingSeconds: Math.min(num(raw.housekeepingSeconds, "housekeepingSeconds", poll), poll),
+    concurrency,
     secretsDir: str(raw.secretsDir, "secretsDir"),
     log: { level: logLevel(raw.log?.level) },
     intake: {

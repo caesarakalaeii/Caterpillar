@@ -244,6 +244,21 @@ const journalShardName = (session: number, at: Date, runner: string): string => 
   return `${String(session).padStart(4, "0")}-${stamp}-${runner}.md`;
 };
 
+/**
+ * Every top-level directory the supervisor writes, and therefore the broadest thing a
+ * commit may stage.
+ *
+ * Used by `stageCommitPush` only when there is NO write-then-commit unit to scope to — see
+ * there.
+ *
+ * Deliberately NOT shared with `pullNow`'s sweep list, which is `tasks`, `intake`, `alerts`
+ * and leaves `digests` alone. That difference predates this constant and is left as it was:
+ * changing what a `reset --hard` reaches is not a change to make while passing through, and
+ * the two lists answer different questions — this one is "what may this commit carry", that
+ * one is "what may a refresh destroy".
+ */
+const WRITABLE_TREE: readonly string[] = ["tasks", "intake", "digests", "alerts"];
+
 /** What `pull` moved aside, and where it put it. */
 export interface SalvagedCommits {
   /** `refs/salvaged/<oid>` — local to this checkout, and on its volume. */
@@ -265,6 +280,23 @@ export interface SalvagedCommits {
 export interface ExclusiveTree {
   commitAndPush(message: string, remote: string, branch: string): Promise<void>;
   pull(remote: string, branch: string): Promise<"pulled" | "skipped">;
+}
+
+/**
+ * What one exclusive hold on the checkout knows about itself.
+ *
+ * Carried in an `AsyncLocalStorage` so that a write and the commit that persists it can
+ * recognise each other without being passed a token by hand — which matters because the
+ * writes are made through the store's ordinary public methods, several call frames down
+ * from whoever took the hold.
+ *
+ * `wrote` is the reason this is an object rather than the `true` it used to be. See
+ * `StateStore.pending`: a commit inside a hold stages the paths that hold wrote, and
+ * nothing else, which is what keeps N concurrent sessions out of each other's commits.
+ */
+interface Hold {
+  /** Pathspecs written under this hold and not yet committed by it. */
+  readonly wrote: Set<string>;
 }
 
 /**
@@ -357,7 +389,7 @@ export class StateStore {
    * inside a hold is recognised as the holder's own rather than queued behind it. See
    * `exclusive`.
    */
-  private readonly holder = new AsyncLocalStorage<true>();
+  private readonly holder = new AsyncLocalStorage<Hold>();
 
   /**
    * True once something has been written into the working tree and not yet committed.
@@ -376,6 +408,50 @@ export class StateStore {
    * the flag left set for the next commit to clear. See the class docstring.
    */
   private writeGeneration = 0;
+
+  /**
+   * Pathspecs written and not yet committed, relative to the checkout root.
+   *
+   * **This is what makes a commit carry only its own writer's files, and it became
+   * necessary when one runner started working N tasks at once (DESIGN.md §6.4).**
+   *
+   * `stageCommitPush` used to run `git add -A tasks` (and `intake`, `digests`, `alerts`),
+   * which stages the WHOLE directory regardless of who wrote what. With a single session
+   * per runner that was harmless to the point of being invisible: the only other writer was
+   * housekeeping, and whatever it swept in was a different task's file landing under a
+   * slightly imprecise message. With N sessions it stops being cosmetic — the supervisor
+   * writes `state.json` at `transition("running")` and deliberately does not push it, so at
+   * any moment every OTHER in-flight task has an uncommitted `state.json` sitting in this
+   * tree, and the first session to finish committed all of them under its own message.
+   *
+   * The mutex cannot fix that and neither can `exclusively`: the file has been on disk for
+   * the whole of a session, so there is no window to close. The staging itself has to be
+   * narrowed, which is what this does — each write records the path it touched, and the
+   * commit stages exactly the recorded set.
+   *
+   * Cleared only when a commit actually carries them, in the same place `dirty` is cleared
+   * and under the same generation check. A path recorded twice costs nothing (it is a set),
+   * and a path recorded for a write whose commit turns out to be a no-op costs one
+   * `git add` of a file with no changes.
+   *
+   * **Two scopes, and the distinction is the whole of the fix.** A write made INSIDE a hold
+   * (`exclusively`) records its path on that hold, and the commit inside the same hold
+   * stages only those — so a session commits its own three files and nobody else's. A write
+   * made outside any hold records here, and the next unscoped `commitAndPush` stages these.
+   *
+   * Without the split, scoping the staging would have achieved nothing: `transition
+   * ("running")` writes a `state.json` at the START of a session and never commits it, so
+   * every other in-flight task's path is in this set for the whole of a session and the
+   * first commit to come along would take them all. That is a window minutes wide that no
+   * lock can close, because it was already open before the lock was taken.
+   *
+   * It errs the same way `dirty` does — towards staging — for the same reason: a path
+   * staged unnecessarily costs nothing, and a path not staged is a write that never reaches
+   * the remote. Which is why a path recorded on a HOLD is also recorded here: if that hold's
+   * commit is a no-op, or it throws before committing, the path must still be waiting for
+   * somebody.
+   */
+  private readonly pending = new Set<string>();
 
   /**
    * Called when `pull` had to move unmergeable local commits aside. Optional because a
@@ -453,18 +529,23 @@ export class StateStore {
    * locked and are unaffected.
    */
   exclusively<T>(body: (tree: ExclusiveTree) => Promise<T>): Promise<T> {
-    return this.exclusive(() =>
-      body({
-        commitAndPush: (message, remote, branch) => this.stageCommitPush(message, remote, branch),
-        pull: async (remote, branch) => {
-          // Same gate as the public `pull`, for the same reason: a caller holding the tree
-          // for a write-then-commit unit may still want a refresh at the top of it, and it
-          // is no safer here than anywhere else while something is uncommitted.
-          if (this.dirty) return "skipped";
-          await this.pullNow(remote, branch);
-          return "pulled";
-        },
-      }),
+    return this.exclusive(
+      () =>
+        body({
+          commitAndPush: (message, remote, branch) =>
+            this.stageCommitPush(message, remote, branch),
+          pull: async (remote, branch) => {
+            // Same gate as the public `pull`, for the same reason: a caller holding the tree
+            // for a write-then-commit unit may still want a refresh at the top of it, and it
+            // is no safer here than anywhere else while something is uncommitted.
+            if (this.dirty) return "skipped";
+            await this.pullNow(remote, branch);
+            return "pulled";
+          },
+        }),
+      // A UNIT: writes made in here get a staging set of their own, so this commit carries
+      // this caller's files and no concurrent slot's. See `exclusive`'s second parameter.
+      true,
     );
   }
 
@@ -501,12 +582,23 @@ export class StateStore {
    * flag errs towards "yes" by design (see the class docstring): a pull skipped for no
    * reason costs an interval, and a pull taken over a half-written file costs a task.
    */
-  private write<T>(body: () => Promise<T>): Promise<T> {
+  private write<T>(
+    /**
+     * What this write touches, relative to the root — `tasks/<id>`, `intake`, `digests`,
+     * `alerts/refusals`. A DIRECTORY rather than a file, deliberately: several writes put
+     * several files under one task, `git add -A <dir>` picks up a removal as readily as a
+     * creation (which `clearIntakeRejection` needs), and per-file bookkeeping would have to
+     * be right about names this class computes in a dozen places. The unit that matters for
+     * attribution is the task, and `tasks/<id>` is exactly that unit.
+     */
+    pathspec: string,
+    body: () => Promise<T>,
+  ): Promise<T> {
     return this.exclusive(async () => {
       try {
         return await body();
       } finally {
-        this.touched();
+        this.touched(pathspec);
       }
     });
   }
@@ -530,9 +622,27 @@ export class StateStore {
    * The hazard `Serial`'s docstring warns of — a public method quietly calling another —
    * remains visible: nothing in this class does it, and a reader can still grep for it.
    */
-  private exclusive<T>(body: () => Promise<T>): Promise<T> {
-    if (this.holder.getStore() === true) return body();
-    return this.serial.run(() => this.holder.run(true, body));
+  private exclusive<T>(
+    body: () => Promise<T>,
+    /**
+     * Whether this acquisition is a write-then-commit UNIT rather than one call taking the
+     * lock for itself. Only `exclusively` passes true.
+     *
+     * The distinction decides what the commit inside it stages, and getting it wrong is not
+     * subtle in either direction. A unit gets a write set of its own, so its commit carries
+     * its own files and no sibling slot's (see `pending`). A bare `commitAndPush` — the
+     * bootstrap path, a CLI, the digest — must NOT get one: it wrote nothing under this
+     * hold, so a scoped set would be empty and it would stage nothing at all, leaving a
+     * `git commit` with an empty index and a `GitError` about a commit with no changes.
+     */
+    unit = false,
+  ): Promise<T> {
+    // A nested acquisition runs on the hold it already has, INCLUDING that hold's write set:
+    // `applyOutcome` calling `park` is one unit and must commit as one, so the inner call's
+    // writes have to join the outer call's staging rather than starting a set of their own.
+    if (this.holder.getStore() !== undefined) return body();
+    if (!unit) return this.serial.run(body);
+    return this.serial.run(() => this.holder.run({ wrote: new Set<string>() }, body));
   }
 
   /**
@@ -541,9 +651,18 @@ export class StateStore {
    * Every write path goes through `write`, which calls this. It is a method rather than a
    * bare assignment so that the one place the flag is set is greppable.
    */
-  private touched(): void {
+  private touched(pathspec: string): void {
     this.dirty = true;
     this.writeGeneration += 1;
+    // Recorded even when the write threw — `write` calls this from a `finally` — for
+    // `dirty`'s reason: a half-written file must be staged by the next commit rather than
+    // left for a `pull` to reset over.
+    //
+    // BOTH scopes, always. The hold's set is what its own commit stages; the store's is the
+    // backstop for a hold that commits nothing, throws, or never commits at all. See
+    // `pending`.
+    this.holder.getStore()?.wrote.add(pathspec);
+    this.pending.add(pathspec);
   }
 
   taskDir(task: TaskId): string {
@@ -636,7 +755,7 @@ export class StateStore {
    * delimiter, where `readSpec`'s regex takes everything remaining as prose.
    */
   async writeSpec(spec: TaskSpec): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${spec.id}`, async () => {
       const dir = this.taskDir(spec.id);
       const path = join(dir, "spec.md");
       if (existsSync(path)) {
@@ -725,7 +844,7 @@ export class StateStore {
   }
 
   async writeIntakeRejection(task: TaskId, record: IntakeRejection): Promise<void> {
-    return this.write(async () => {
+    return this.write("intake", async () => {
       await mkdir(join(this.root, "intake"), { recursive: true });
       await writeFile(
         this.intakePath(task),
@@ -737,7 +856,7 @@ export class StateStore {
 
   /** Idempotent: the success path clears unconditionally. */
   async clearIntakeRejection(task: TaskId): Promise<void> {
-    return this.write(async () => {
+    return this.write("intake", async () => {
       await rm(this.intakePath(task), { force: true });
     });
   }
@@ -801,7 +920,7 @@ export class StateStore {
   }
 
   async writeAlertRefusal(fingerprint: string, record: AlertRefusal): Promise<void> {
-    return this.write(async () => {
+    return this.write("alerts/refusals", async () => {
       // The fingerprint becomes a file name, so it is checked rather than trusted: it
       // arrives in an HTTP body from outside this process, and `..` is a legal directory
       // name that resolves out of `alerts/` — the same trap a task id is guarded against.
@@ -819,7 +938,7 @@ export class StateStore {
 
   /** Idempotent, like `clearIntakeRejection`: the success path clears unconditionally. */
   async clearAlertRefusal(fingerprint: string): Promise<void> {
-    return this.write(async () => {
+    return this.write("alerts/refusals", async () => {
       if (!isAlertFingerprint(fingerprint)) return;
       await rm(this.alertRefusalPath(fingerprint), { force: true });
     });
@@ -887,7 +1006,7 @@ export class StateStore {
   }
 
   async writeState(state: TaskState): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${state.id}`, async () => {
       const dir = this.taskDir(state.id);
       await mkdir(dir, { recursive: true });
       const next: TaskState = { ...state, updatedAt: new Date().toISOString() };
@@ -911,7 +1030,7 @@ export class StateStore {
    * same session, and the runner id separates two runners that managed both.
    */
   async appendJournal(task: TaskId, session: number, body: string): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "journal");
       await mkdir(dir, { recursive: true });
 
@@ -972,7 +1091,7 @@ export class StateStore {
 
   /** Overwritten every handoff — this file must not grow without bound. */
   async writeHandoff(task: TaskId, body: string): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = this.taskDir(task);
       await mkdir(dir, { recursive: true });
       await writeFile(join(dir, "handoff.md"), `${body.trim()}\n`, "utf8");
@@ -991,7 +1110,7 @@ export class StateStore {
     session: number,
     jsonl: string,
   ): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "sessions");
       await mkdir(dir, { recursive: true });
       const name = `${String(session).padStart(3, "0")}.jsonl.gz`;
@@ -1107,7 +1226,7 @@ export class StateStore {
   }
 
   async writeQuestion(task: TaskId, index: number, question: string): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "questions");
       await mkdir(dir, { recursive: true });
       const name = `${String(index).padStart(3, "0")}-question.md`;
@@ -1117,7 +1236,7 @@ export class StateStore {
 
   /** Mirror of `writeQuestion`. The file's existence is what marks a question answered. */
   async writeAnswer(task: TaskId, index: number, answer: string): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "questions");
       await mkdir(dir, { recursive: true });
       const name = `${String(index).padStart(3, "0")}-answer.md`;
@@ -1151,7 +1270,7 @@ export class StateStore {
    * these are the documents.
    */
   async writeVerdict(task: TaskId, index: number, body: string): Promise<void> {
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "reviews");
       await mkdir(dir, { recursive: true });
       const name = `${String(index).padStart(3, "0")}-verdict.md`;
@@ -1181,7 +1300,7 @@ export class StateStore {
     // `listArtifacts` is a READ, and reads deliberately do not take the mutex — so calling
     // it from inside `write` is safe. A public write calling another public WRITE would
     // deadlock (`Serial` is re-entrant-hostile on purpose); none does.
-    return this.write(async () => {
+    return this.write(`tasks/${task}`, async () => {
       if (!isArtifactName(name)) {
         throw new Error(
           `'${name}' is not a usable artifact name — letters, digits, dot, dash, underscore`,
@@ -1230,7 +1349,7 @@ export class StateStore {
    * turn that bug into a released claim and a day published by nobody.
    */
   async writeDigest(date: string, body: string): Promise<void> {
-    return this.write(async () => {
+    return this.write("digests", async () => {
       if (!isDigestDate(date)) throw new Error(`'${date}' is not a date this can be filed under`);
 
       const dir = join(this.root, "digests");
@@ -1310,27 +1429,79 @@ export class StateStore {
     // including one racing the very first `git add` — moves it. See the docstring above.
     const staged = this.writeGeneration;
 
+    // **Exactly what this writer wrote, and nothing else.** See `pending` for the whole
+    // argument; the short version is that `git add -A tasks` stages every OTHER in-flight
+    // task's uncommitted `state.json` too — `transition("running")` leaves one there for the
+    // whole of a session — so on a runner working N tasks at once that is N-1 tasks' state
+    // committed under this task's message while their own commits find a clean tree and
+    // record nothing.
+    //
+    // **Narrow inside a unit, broad outside one, and the asymmetry is the design.**
+    //
+    // Inside a unit (`StateStore.exclusively`, which is what `Supervisor.unit` takes) the
+    // hold names the paths that unit wrote, and those are the only ones staged. That is what
+    // keeps N concurrent sessions out of each other's commits.
+    //
+    // Outside one — a bare `commitAndPush` from the bootstrap path, a CLI, or intake — the
+    // whole of the writable tree is staged, exactly as it always was. Not laziness: such a
+    // caller has no unit to scope to, and it is the ONLY thing that ever commits a change
+    // made past this class. `alerts/refusals/` is the concrete case (§20) — a refusal left
+    // on disk by a pod that died between its write and its commit was never recorded here,
+    // so a narrow stage would leave it forever: uncommitted, and therefore untracked, and
+    // therefore swept away by the next `pull`'s `clean -ffdq` with nothing in git to show it
+    // had ever existed. `store.test.ts` pins that.
+    //
+    // The broad list is `tasks`, `intake`, `digests`, `alerts`. `alerts/` also holds the
+    // operator's `policy.yaml`, which the supervisor never writes — staging a path it does
+    // not write costs nothing.
+    //
+    // Sampled and cleared rather than iterated in place: a write landing during the `add`
+    // loop must be staged by the NEXT commit, not silently dropped from this one because the
+    // set was mutated while being walked.
+    const hold = this.holder.getStore();
+    const staging = hold === undefined ? WRITABLE_TREE : [...hold.wrote];
+    hold?.wrote.clear();
+    // Whatever this commit is about to stage is no longer outstanding, however it was
+    // selected. Only those paths: a unit's commit must not clear a path some other writer
+    // recorded and this commit is not staging.
+    if (hold === undefined) this.pending.clear();
+    else for (const path of staging) this.pending.delete(path);
+
     // Each path is staged only when it exists: `git add` fails the WHOLE command on a
     // pathspec that matches nothing (`fatal: pathspec 'tasks' did not match any files`),
-    // and none of these directories is guaranteed. A freshly bootstrapped state repo has
-    // no `tasks/` at all, a repo that has never refused an intake item has no `intake/`,
-    // and one whose first digest is not yet due has no `digests/` — so the first rejection
-    // on a new runner would otherwise throw here rather than record anything.
-    //
-    // `alerts/` is in the list because it is the only thing that makes an alert refusal
-    // reach the remote at all (§20). It is also where the operator's `policy.yaml` lives,
-    // which the supervisor never writes — staging a path it does not write costs nothing.
-    for (const path of ["tasks", "intake", "digests", "alerts"]) {
+    // and none of these directories is guaranteed. A freshly bootstrapped state repo has no
+    // `tasks/` at all, a repo that has never refused an intake item has no `intake/`, one
+    // whose first digest is not yet due has no `digests/` — and inside a unit, a write that
+    // threw before its `mkdir` still recorded its pathspec (see `touched`), and
+    // `clearIntakeRejection` can remove the last file under one.
+    for (const path of staging) {
       if (existsSync(join(this.root, path))) await this.git.run("add", "-A", path);
     }
-    if (await this.git.hasUncommittedChanges()) {
+    // The INDEX, not the working tree. `hasUncommittedChanges` would answer yes because a
+    // sibling slot has an uncommitted `state.json` in this same checkout (see the staging
+    // note above), and `git commit` against an empty index fails with an error carrying no
+    // message. See `Git.hasStagedChanges`.
+    if (await this.git.hasStagedChanges()) {
       await this.git.run("commit", "-m", message);
     }
     // Everything written into the tree BEFORE this commit began is now in it, so `pull` may
     // safely run again: it rebases local commits rather than discarding them. If a write
     // landed while we were committing, the generation moved and the flag stays set — that
     // file may not be in the commit, and a pull must keep declining until one carries it.
-    if (this.writeGeneration === staged) this.dirty = false;
+    //
+    // **`pending` is the second condition, and it is what narrow staging made necessary.**
+    // The generation check alone assumed a commit carried EVERYTHING outstanding, which was
+    // true while staging was `git add -A tasks`. It is not true inside a unit: a commit that
+    // staged its own three files leaves every other in-flight task's uncommitted `state.json`
+    // exactly where it was. Clearing the flag on the generation alone would then let the very
+    // next `pull` do a `reset --hard` and `clean -ffdq` over `tasks/` — which is the incident
+    // this flag was introduced for (see `pullNow`), reintroduced by its own fix and aimed at
+    // a task that is mid-session rather than one that is mid-write.
+    //
+    // Both conditions, so the flag errs towards "dirty" exactly as the class docstring says
+    // it should: a pull skipped for no reason costs an interval, and a pull taken over an
+    // uncommitted file costs a session.
+    if (this.writeGeneration === staged && this.pending.size === 0) this.dirty = false;
 
     // NOT `else return`. A clean tree does not mean there is nothing to push: after a
     // rejected push the tree is clean and the commit is still local. Returning here made
@@ -1467,6 +1638,28 @@ export class StateStore {
    * commits at defined points (`Supervisor.recordSession`, `Supervisor.push`) and the very
    * next tick after one of those finds a clean tree. The failure mode of the alternative
    * is not symmetrical — it is a destroyed task.
+   *
+   * **One flag for the whole checkout, so a runner working several tasks at once skips more
+   * often** (DESIGN.md §6.5). `transition("running")` leaves an uncommitted `state.json` for
+   * the length of a session, so at `concurrency: N` the tree is clean only when every slot
+   * is momentarily between commits. That is a refresh RATE rather than a correctness
+   * property — skipping is the safe direction, per the asymmetry above — but it is worth
+   * knowing, because the work loop's pre-claim pull is what stops this runner opening a
+   * session on already-merged work (§6.2) and it is the same call.
+   *
+   * What keeps it bounded is that a slot commits several times per session and empties at
+   * the end of one, so a runner whose slots are not all permanently occupied still refreshes.
+   * Two fixes were considered and both rejected, which is why this is written down rather
+   * than solved:
+   *
+   *   - **Per-path dirtiness.** `reset --hard` and `clean -ffdq` are whole-tree, so a
+   *     narrower check would let a pull revert a directory another session is mid-write in.
+   *     That is a task destroyed to save an interval.
+   *   - **Pushing the `running` transition.** It clears the flag promptly and it makes the
+   *     fleet's view of a running task honest — but it also makes the task visible as
+   *     `running` before the session it names exists, so a `/cancel` arriving in that window
+   *     is answered by a park with no session to stop. `loop.test.ts` pins that, and it is
+   *     pinning something real.
    */
   pull(remote: string, branch: string): Promise<"pulled" | "skipped"> {
     return this.exclusive(async () => {

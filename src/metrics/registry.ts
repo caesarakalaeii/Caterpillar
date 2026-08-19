@@ -159,6 +159,52 @@ export class AgentMetrics {
   );
 
   /**
+   * Tasks this runner has a session open for RIGHT NOW (DESIGN.md §6.4).
+   *
+   * Labelled `runner` and not `task`, because the question it answers is about the runner:
+   * is this replica doing one thing, four things, or nothing? A per-task series would be
+   * `caterpillar_task_status` with extra steps, and would leave one stale sample per task
+   * this runner has ever worked — gauges here never expire.
+   */
+  readonly tasksInFlight = this.registry.gauge(
+    "caterpillar_tasks_in_flight",
+    "tasks this runner has a session open for right now",
+  );
+
+  /**
+   * Slots this runner could still fill — `concurrency` minus `tasksInFlight`.
+   *
+   * Derivable from the two gauges above and published anyway, because the alert an
+   * operator actually wants is "this runner has been at zero free slots for an hour", and
+   * expressing that as a subtraction across two series is how a dashboard ends up
+   * silently comparing samples from different scrapes. It also states `concurrency`
+   * itself: with no in-flight tasks this reads the configured N, so the configuration is
+   * legible from the metrics without anyone reading a ConfigMap.
+   */
+  readonly slotsFree = this.registry.gauge(
+    "caterpillar_slots_free",
+    "task slots this runner could still fill",
+  );
+
+  /**
+   * Claimable tasks this runner walked past because every slot was full.
+   *
+   * The series that distinguishes "the fleet has nothing to do" from "the fleet is
+   * saturated", which look identical from every other metric: in both cases nothing new
+   * starts. A rate that is persistently non-zero is the signal to raise `concurrency` or
+   * add a replica, and a rate that is flat at zero while tasks sit `ready` says the
+   * bottleneck is somewhere else entirely.
+   *
+   * A counter and not a gauge: it counts events, and a gauge that went back to zero the
+   * moment a slot freed would be invisible to any scrape that did not land inside the
+   * window.
+   */
+  readonly claimsRejectedFull = this.registry.counter(
+    "caterpillar_claims_rejected_full_total",
+    "claim attempts skipped because every task slot on this runner was busy",
+  );
+
+  /**
    * Local commits this runner could not rebase and had to move to `refs/salvaged/`
    * (DESIGN.md §4.3).
    *

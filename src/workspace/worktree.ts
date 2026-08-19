@@ -9,6 +9,7 @@ import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/pr
 import { existsSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Git } from "../state/git.ts";
+import { Serial } from "../state/serial.ts";
 import type { CommitIdentity, WorktreeReapConfig } from "../config/types.ts";
 import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
 import { taskSocketPath } from "../credential/service.ts";
@@ -130,9 +131,61 @@ export class WorktreeManager {
 
   private readonly options: WorktreeOptions;
 
+  /**
+   * One mutex per mirror path — the whole of what makes this class safe for N concurrent
+   * tasks (DESIGN.md §6.4).
+   *
+   * **Nothing else on this instance is mutable**, and that is deliberate rather than
+   * lucky: `git` and `options` are set once in the constructor and every path is derived
+   * from arguments, so two checkouts running through the same manager share no field. The
+   * hazard was never this object's state — it is the MIRROR, which is one directory on
+   * disk that two tasks on the same repo both fetch into, add worktrees to and prune.
+   *
+   * git's own locking is not enough, and its failure mode is the expensive kind. A fetch
+   * takes `index.lock` / `shallow.lock` and a concurrent `worktree add` takes the same
+   * ones; the loser does not wait, it exits non-zero with `Unable to create '…/index.lock':
+   * File exists`. That surfaces as a session that died in its first thirty seconds, on a
+   * task with nothing wrong with it, reproducible only when two tasks on one repo happen to
+   * start together — i.e. as a flaky task failure, which is the worst possible way to find
+   * out about a race.
+   *
+   * Keyed by mirror PATH rather than by `RepoRef` so the key is the resource: two refs that
+   * differ only in case, or a sibling repo reached through a different `RepoRef` literal,
+   * still land on one lock because they land on one directory.
+   *
+   * Per mirror and not one global lock, because the point is throughput: two tasks on
+   * DIFFERENT repos have nothing to contend over, and serialising them would give back
+   * exactly the concurrency slots were added for. `pruneAllMirrors` is the one caller that
+   * touches every mirror, and it takes each one's lock in turn for that reason.
+   *
+   * The map is never pruned. One `Serial` per repo this runner has ever mirrored is a
+   * handful of objects on a volume that holds the mirrors themselves, and an entry removed
+   * while a caller is queued behind it is a lock two callers could then both hold.
+   */
+  private readonly mirrorLocks = new Map<string, Serial>();
+
   constructor(options: WorktreeOptions) {
     this.options = options;
     this.git = options.git.withoutCredentials();
+  }
+
+  /**
+   * Run `body` with exclusive access to one mirror.
+   *
+   * Re-entrant-HOSTILE, inheriting `Serial`'s rule and for its reason: calling this from
+   * inside itself on the same mirror deadlocks. So the public methods take the lock exactly
+   * once at their boundary and the private helpers below — `syncMirrorLocked`,
+   * `addWorktreeLocked` — assume it is already held. A new public method must take it; a
+   * new private helper must not.
+   */
+  private onMirror<T>(mirror: string, body: () => Promise<T>): Promise<T> {
+    const key = resolve(mirror);
+    let lock = this.mirrorLocks.get(key);
+    if (lock === undefined) {
+      lock = new Serial();
+      this.mirrorLocks.set(key, lock);
+    }
+    return lock.run(body);
   }
 
   /** A Git bound to a worktree, for callers that need to inspect or commit there. */
@@ -168,7 +221,15 @@ export class WorktreeManager {
    */
   async syncMirror(repo: RepoRef, task?: TaskId): Promise<string> {
     const path = mirrorPath(this.options.mirrorsDir, repo);
+    return this.onMirror(path, () => this.syncMirrorLocked(repo, path, task));
+  }
 
+  /** `syncMirror`'s body. The caller must already hold this mirror's lock. */
+  private async syncMirrorLocked(
+    repo: RepoRef,
+    path: string,
+    task: TaskId | undefined,
+  ): Promise<string> {
     if (!existsSync(join(path, "HEAD"))) {
       // Leave no half-built mirror behind on failure, so a retry is a clean clone
       // rather than a permanently poisoned path.
@@ -307,8 +368,28 @@ export class WorktreeManager {
     return path;
   }
 
-  /** Create or reuse a worktree for `repo` at an explicit path. */
-  private async addWorktreeAt(repo: RepoRef, task: TaskId, path: string): Promise<void> {
+  /**
+   * Create or reuse a worktree for `repo` at an explicit path.
+   *
+   * Takes the mirror's lock around the WHOLE of it, not around the `worktree add` alone.
+   * The fetch, the `worktree add` and the config writes are one transaction against one
+   * mirror: a concurrent fetch landing between the `revParse` and the `worktree add` can
+   * move `refs/heads/agent/<other task>` under us, and the config writes below all target
+   * the mirror's COMMON config (see `configureShared`), so two of them interleaving is two
+   * processes editing one file.
+   */
+  private addWorktreeAt(repo: RepoRef, task: TaskId, path: string): Promise<void> {
+    const mirror = mirrorPath(this.options.mirrorsDir, repo);
+    return this.onMirror(mirror, () => this.addWorktreeLocked(repo, mirror, task, path));
+  }
+
+  /** `addWorktreeAt`'s body. The caller must already hold this mirror's lock. */
+  private async addWorktreeLocked(
+    repo: RepoRef,
+    mirrorDir: string,
+    task: TaskId,
+    path: string,
+  ): Promise<void> {
     const branch = `agent/${task}`;
 
     // An existing worktree is checked out already, and fetching the mirror would not
@@ -325,7 +406,7 @@ export class WorktreeManager {
       return;
     }
 
-    const mirror = await this.syncMirror(repo, task);
+    const mirror = await this.syncMirrorLocked(repo, mirrorDir, task);
     // Before the worktree exists, so the very first `worktree add` already lands in a
     // mirror whose linked checkouts will not be born bare.
     await this.enableWorktreeConfig(mirror);
@@ -426,7 +507,15 @@ export class WorktreeManager {
       siblings.set(`${repo.owner}/${repo.name}`, path);
     }
 
-    if (siblings.size > 0) await this.excludeLocally(root, "repos/");
+    // Under the WORKSPACE mirror's lock: `info/exclude` lives in the common directory, so
+    // this is a read-modify-write of a file every worktree of that mirror shares. Two tasks
+    // on the same workspace repo doing it unsynchronised is a lost update — and the pattern
+    // it loses is what stops a sibling checkout being committable.
+    if (siblings.size > 0) {
+      await this.onMirror(mirrorPath(this.options.mirrorsDir, workspace), () =>
+        this.excludeLocally(root, "repos/"),
+      );
+    }
 
     return { root, siblings };
   }
@@ -458,7 +547,11 @@ export class WorktreeManager {
     const mirror = mirrorPath(this.options.mirrorsDir, repo);
     if (!existsSync(mirror)) return;
     const path = join(this.options.tasksDir, task, repo.name);
-    await this.git.at(mirror).tryRun("worktree", "remove", "--force", path);
+    // `worktree remove` rewrites the mirror's administrative directory, so it contends
+    // with a concurrent `worktree add` for another task on the same repo.
+    await this.onMirror(mirror, () =>
+      this.git.at(mirror).tryRun("worktree", "remove", "--force", path),
+    );
   }
 
   /**
@@ -514,19 +607,24 @@ export class WorktreeManager {
       if (!existsSync(mirror)) continue;
       const git = this.git.at(mirror);
 
-      // Both places `ensureTaskCheckout` can have put this repo. Passing a path that was
-      // never a worktree of this mirror is not an error — git says "is not a working
-      // tree" and `tryRun` swallows it — so asking about both is cheaper than working out
-      // which one applies from a `repos` array whose order the caller chose.
-      await git.tryRun("worktree", "remove", "--force", join(root, repo.name));
-      if (workspace !== undefined && repo !== workspace) {
-        await git.tryRun(
-          "worktree",
-          "remove",
-          "--force",
-          join(root, workspace.name, "repos", repo.name),
-        );
-      }
+      // One acquisition per mirror rather than one per command: the two removals below are
+      // about the same task's directories, and letting another task's `worktree add` land
+      // between them buys nothing and widens the window.
+      await this.onMirror(mirror, async () => {
+        // Both places `ensureTaskCheckout` can have put this repo. Passing a path that was
+        // never a worktree of this mirror is not an error — git says "is not a working
+        // tree" and `tryRun` swallows it — so asking about both is cheaper than working out
+        // which one applies from a `repos` array whose order the caller chose.
+        await git.tryRun("worktree", "remove", "--force", join(root, repo.name));
+        if (workspace !== undefined && repo !== workspace) {
+          await git.tryRun(
+            "worktree",
+            "remove",
+            "--force",
+            join(root, workspace.name, "repos", repo.name),
+          );
+        }
+      });
     }
 
     await this.removeTree(root);
@@ -659,15 +757,31 @@ export class WorktreeManager {
       const mirror = mirrorPath(this.options.mirrorsDir, repo);
       if (seen.has(mirror) || !existsSync(mirror)) continue;
       seen.add(mirror);
-      await this.git.at(mirror).tryRun("worktree", "prune");
+      await this.prune(mirror);
     }
   }
 
   /** Prune every mirror on this volume — the sweep's only option. See `reapStaleWorktrees`. */
   private async pruneAllMirrors(): Promise<void> {
     for (const mirror of await findMirrors(this.options.mirrorsDir)) {
-      await this.git.at(mirror).tryRun("worktree", "prune");
+      await this.prune(mirror);
     }
+  }
+
+  /**
+   * `git worktree prune` on one mirror, under that mirror's lock.
+   *
+   * The lock matters more here than the command's cost suggests. A prune deletes the
+   * administrative record of every worktree whose directory has gone, and a `worktree add`
+   * for a DIFFERENT task is creating one of those records at the same time — git writes it
+   * in two steps, and a prune landing in the middle sees a record with no gitdir and
+   * removes it, leaving a checkout on disk that its own mirror does not know about.
+   *
+   * Taken per mirror in turn, never over all of them at once: `pruneAllMirrors` holds one
+   * lock at a time, so a sweep does not stop tasks on unrelated repos.
+   */
+  private async prune(mirror: string): Promise<void> {
+    await this.onMirror(mirror, () => this.git.at(mirror).tryRun("worktree", "prune"));
   }
 
   /**

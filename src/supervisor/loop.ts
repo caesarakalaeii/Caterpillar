@@ -384,6 +384,80 @@ export interface SupervisorDeps {
  */
 const RESUMABLE: readonly TaskStatus[] = ["parked", "failed"];
 
+/**
+ * One task's session, as everything outside `workTask` needs to see it (DESIGN.md §6.4).
+ *
+ * **This type exists so that nothing task-scoped lives on the `Supervisor` instance any
+ * more.** The loop was written throughout as "the current task": three fields —
+ * `sessionInFlight`, `inFlightTask`, `cancelInFlight` — described the one session a runner
+ * could have, and every terminal path assumed exclusivity over them. At N slots those
+ * fields stop being a description and become a race: task B starting would overwrite task
+ * A's cancel hook, and task A finishing would clear the flag task B is relying on.
+ *
+ * So a slot is a VALUE, one per in-flight task, and the supervisor holds a map of them.
+ * The rule that replaces the old exclusivity assumption is: anything scoped to a task
+ * lives here; anything scoped to the runner stays a field. `cooldown` is the load-bearing
+ * example of the second kind — the provider is shared by every slot, so what one task
+ * learned about it is true for all of them (§6.3).
+ */
+interface TaskSlot {
+  readonly id: TaskId;
+  readonly spec: TaskSpec;
+  /**
+   * The live claim, renewed by THIS slot's own heartbeat and nobody else's.
+   *
+   * Per slot rather than one heartbeat for the runner, because a lost lease has to fail
+   * exactly one task. `LeaseLostError` for A means another runner owns A; it is evidence
+   * about nothing else, and B's lease may be perfectly healthy. One shared renewal loop
+   * would have to decide what a single failure means for every task at once, and every
+   * answer to that is wrong.
+   *
+   * Mutable because a slot is registered at the instant its CAS wins, which is before
+   * anything is renewing it: `openSlot` puts a `heldLease` snapshot here and `workTask`
+   * replaces it with the real heartbeat. Nothing between those two points writes state,
+   * so the snapshot is never used as a fence.
+   */
+  lease: LeaseHandle & { readonly stop: () => void };
+  /**
+   * Everything that may stop THIS session in flight, as one signal: shutdown, a lost
+   * lease, a `/cancel` naming this task, the wall clock.
+   *
+   * Its scope is the containment boundary. Aborting it must never reach another slot, and
+   * because it is created per slot rather than shared, that is structural rather than a
+   * rule someone has to remember.
+   */
+  readonly interrupt: AbortController;
+  /**
+   * Stop this session, for a `/cancel` housekeeping drained (see `applyChatRequests`).
+   *
+   * On the slot rather than on the supervisor, which is the fix for the sharpest of the
+   * three old fields: a single `cancelInFlight` on a two-slot runner would route every
+   * cancel to whichever session installed itself last, so cancelling task A would stop
+   * task B and leave A running — with the human told it had worked.
+   */
+  readonly cancel: () => void;
+  /** True once a `/cancel` has been honoured for this task, so it is only logged once. */
+  cancelled: boolean;
+  /** Set by this slot's heartbeat when its own lease goes; never by any other slot's. */
+  lost: LeaseLostError | undefined;
+  /**
+   * The outage ANOTHER slot met, if one has been fanned out to this one (§6.3).
+   *
+   * The one field a slot does not set for itself, and it exists because the provider is
+   * the one resource slots genuinely share. A cooldown is runner-scoped — what one task
+   * learned about the account is true for all of them — so an outage has to stop this
+   * runner claiming AND let go of what it is already holding. Without the fan-out, the
+   * slot that met the wall would release and the other N-1 would keep hammering the same
+   * refused endpoint until each met it separately, which is precisely the stampede
+   * `ProviderCooldown` exists to prevent, divided by nothing.
+   *
+   * Read by `workTask` when its session comes back `interrupted`: with this set the task
+   * goes down `releaseAfterOutage` instead of the plain interruption path, so it is
+   * released to `ready` and charged nothing rather than left `running`.
+   */
+  outage: ProviderOutage | undefined;
+}
+
 export class Supervisor {
   /** 0 means "never ran", so the first pass happens at boot. */
   private lastIntakeAt = 0;
@@ -408,42 +482,34 @@ export class Supervisor {
   private readonly cooldown: ProviderCooldown;
 
   /**
-   * Whether `workTask` is running right now.
+   * Every task this runner has a session open for, keyed by id. Empty when idle.
    *
-   * Set by the work loop, read only by housekeeping, and only for the one thing that
-   * genuinely must not happen beside a session: collecting the nix store. It is
-   * deliberately NOT a lock — housekeeping is supposed to run during a session; that is
-   * the whole point of it existing separately.
+   * **The one piece of task-scoped state left on the supervisor, and it is a collection
+   * rather than a task** — which is the whole shape of the change. It replaces
+   * `sessionInFlight` (now `size > 0`), `inFlightTask` (now `has(id)`) and
+   * `cancelInFlight` (now `get(id)?.cancel`), each of which described the one session a
+   * runner could have and each of which two slots would have fought over.
+   *
+   * A slot is added the INSTANT its lease is won and removed in `workTask`'s `finally`,
+   * so the window it covers includes the claim itself — see `claimUpTo` for why that
+   * matters to a `/cancel` arriving between the CAS and the first turn.
+   *
+   * Read from both loops and mutated only from the work loop. No mutex: JavaScript runs
+   * one thing at a time, and every read here is a single synchronous `get`/`has`/`size`
+   * with no await inside it, so no reader can observe the map between two writes.
    */
-  private sessionInFlight = false;
+  private readonly slots = new Map<TaskId, TaskSlot>();
 
   /**
-   * The task the work loop is running right now, if any.
+   * Sessions that have been started and not yet settled, so shutdown can wait for them.
    *
-   * Read by `applyChatRequests` for one narrow purpose: that task's `/cancel` requests
-   * must not go to `applyPark`, which would claim-and-fail against the session's own
-   * lease. See `CANCEL_POLL_MS` and `cancelInFlight`.
+   * Separate from `slots` because the two have different lifetimes on purpose: a slot is
+   * removed the moment its session's `finally` runs, and this promise settles after the
+   * whole of `workOnce`'s error handling — the park, the reap, the log line — has
+   * finished. `workLoop` awaits these on the way out so an aborting runner does not
+   * abandon a task mid-park.
    */
-  private inFlightTask: TaskId | undefined;
-
-  /**
-   * Stop the in-flight session, for a `/cancel` that housekeeping drained.
-   *
-   * Installed by `workTask` for the duration of the session and cleared in its `finally`,
-   * so it is defined exactly when `inFlightTask` is a task that has actually started. It
-   * aborts the session and settles the request `cancelling` — the same two things the
-   * `CANCEL_POLL_MS` watcher does, because it is the same function.
-   *
-   * It exists because a queue may not be able to take selectively (`ChatDrainer.
-   * selective`). Against such a queue the watcher's `takeWhere` returns empty forever, so
-   * the drain is the ONLY path a cancel can arrive by, and having drained it housekeeping
-   * cannot hand it back — the request is off the list and the submitter is waiting. So it
-   * calls this instead of `applyPark`.
-   *
-   * Not a substitute for the watcher on a selective queue: see `CANCEL_POLL_MS` for why
-   * that one keeps its own tighter interval.
-   */
-  private cancelInFlight: (() => void) | undefined;
+  private readonly running = new Map<TaskId, Promise<void>>();
 
   constructor(deps: SupervisorDeps) {
     this.deps = deps;
@@ -560,15 +626,25 @@ export class Supervisor {
     // shared with every worktree and mirror on a 20Gi volume so collecting is a
     // requirement rather than hygiene, but a collection racing a session on this same
     // runner is a risk with no upside — there is always another idle pass.
-    if (!this.sessionInFlight) await this.deps.toolchain.maybeCollectGarbage();
+    if (this.slots.size === 0) await this.deps.toolchain.maybeCollectGarbage();
   }
 
   /**
-   * Claim and work one task, forever, one at a time.
+   * Claim tasks and work them, forever, up to `concurrency` at a time (DESIGN.md §6.4).
    *
-   * Deliberately holds no housekeeping. The sleep here is a claim BACKOFF — how long an
-   * idle runner waits before looking for work again — and nothing a human is waiting on
-   * depends on it any more.
+   * **It stopped being "claim one, block until it finishes" and became a scheduler.** The
+   * old loop awaited `workTask` inline, so the loop body's duration WAS the session's, and
+   * that is exactly what made a second slot impossible. Now each session runs as its own
+   * promise in `running`, and this loop's only job is to keep free slots filled and to nap
+   * between passes.
+   *
+   * At `concurrency: 1` — the default — this is the same behaviour it always had, arrived
+   * at differently: one slot fills, every later pass finds it full, and the loop naps until
+   * it frees. Nothing about a single-task runner changes.
+   *
+   * Deliberately holds no housekeeping. The sleep here is a claim BACKOFF — how long a
+   * runner with a free slot waits before looking for work again — and nothing a human is
+   * waiting on depends on it.
    */
   private async workLoop(signal: AbortSignal): Promise<void> {
     const { config, logger } = this.deps;
@@ -577,18 +653,49 @@ export class Supervisor {
       try {
         await this.workOnce(signal);
       } catch (error) {
-        if (signal.aborted) return;
+        if (signal.aborted) break;
         logger.error("poll.failed", errorFields(error));
         await this.nap(config.pollSeconds * 1000, signal);
       }
     }
+
+    // Sessions outlive the loop that started them, so shutting down means waiting for
+    // them rather than walking away. Each has its own `finally` that stops a heartbeat,
+    // releases a lease and closes a cancel subscription; abandoning one here would leave
+    // the lease held until it went stale, which is the delay a redeploy pays before
+    // another replica can pick the task up.
+    //
+    // `allSettled`, because every one of these already contains its own error handling
+    // and a rejection at this point would take the other sessions' cleanup with it.
+    await Promise.allSettled([...this.running.values()]);
   }
 
-  /** One iteration of the work loop. Throws only what the caller should log and retry. */
+  /**
+   * One pass of the scheduler: fill what slots are free, then nap.
+   *
+   * Throws only what the caller should log and retry. **Never throws on behalf of an
+   * in-flight task** — a session's failure is contained inside its own promise (see
+   * `startSlot`), so a task that dies here cannot unwind a pass that another task's
+   * session is depending on.
+   */
   private async workOnce(signal: AbortSignal): Promise<void> {
     const { config, logger, store } = this.deps;
 
+    // Runner-scoped, and it gates the CLAIM rather than the sessions already running:
+    // an outage stops this runner taking on anything new, and `releaseAfterOutage` is
+    // what lets go of what it already has (§6.3).
     if (await this.coolingDown(signal)) return;
+
+    // Full, so there is nothing to decide. Returning before the pull and the survey is
+    // not only an optimisation: `pull` declines while any session holds the tree dirty,
+    // and a saturated runner would otherwise walk `tasks/` once a poll to reach a claim
+    // it already knows it cannot make.
+    if (this.free() === 0) {
+      this.publishSlots();
+      logger.debug("poll.saturated", { inFlight: this.slots.size, concurrency: config.concurrency });
+      await this.nap(config.pollSeconds * 1000, signal);
+      return;
+    }
 
     // BEFORE the claim, and not left to the housekeeping loop, even though housekeeping
     // pulls on its own timer. The old single loop did pull-then-claim in one pass, so a
@@ -609,20 +716,24 @@ export class Supervisor {
     // exactly when a claim is about to be made.
     await store.pull("origin", config.stateRepo.branch);
 
-    // Bound rather than inlined into `claimNext`, because the reap below needs the SAME
+    // Bound rather than inlined into `claimUpTo`, because the reap below needs the SAME
     // survey this claim was decided from. Re-surveying for it would cost a second walk of
     // `tasks/` and, worse, could disagree with the claim: a task that appeared between the
     // two reads would be absent from the live set the sweep is handed.
     const records = await this.survey();
 
-    // `claimNext` sets `inFlightTask` as it wins a lease (see there). If it throws after
-    // that point the flag would otherwise outlive the attempt, and every subsequent
-    // `/cancel` for that task would be left queued for a session that never started.
-    const claimed = await this.claimNext(records).catch((error: unknown) => {
-      this.inFlightTask = undefined;
-      throw error;
-    });
-    if (claimed === undefined) {
+    // Fills every free slot in one pass rather than one per poll: at `concurrency: 4` a
+    // runner coming up to a queue of ready work would otherwise take four poll intervals
+    // to reach full, for no reason other than the shape of the old loop.
+    //
+    // Each claim registers its slot as it wins the lease, and `startSlot` takes ownership
+    // from there — including of removing it. A throw out of `claimUpTo` therefore leaves
+    // behind only slots that ARE running, which is what the `catch` inside it guarantees.
+    const claimed = await this.claimUpTo(records, this.free());
+    for (const { lease, spec } of claimed) this.startSlot(lease, spec, signal);
+    this.publishSlots();
+
+    if (this.slots.size === 0) {
       // The worktree half of the janitor (§3.1). On the WORK loop's idle branch and not in
       // housekeeping beside the nix collection, by the same test that put the usage walk
       // here: the nix collection spends its time inside nix, and this spends it inside THIS
@@ -630,9 +741,11 @@ export class Supervisor {
       // `node_modules` per task. Housekeeping is what a human waiting on `/resume` is
       // waiting for, and it must not be blocked for either.
       //
-      // Reaching it only when the claim came back empty is also what makes the live set
-      // honest. `claimed === undefined` means this runner holds nothing, so no directory
-      // the sweep can see belongs to a session in flight here.
+      // The condition is now "no slot is occupied" rather than "the claim came back
+      // empty", and that is a correction the extra slots forced rather than a
+      // simplification. What makes the live set honest is that this runner holds NOTHING;
+      // a pass that claimed nothing while three sessions were running would, on the old
+      // wording, have swept the volume those three sessions are working in.
       await this.maybeReapWorktrees(records);
 
       // Idle-only, and left on the WORK loop rather than moved to housekeeping with the
@@ -646,50 +759,134 @@ export class Supervisor {
       // Debug, not info: at the default poll interval this is the single noisiest
       // line the supervisor could emit, and an idle runner is not news.
       logger.debug("poll.idle", { pollSeconds: config.pollSeconds });
-      await this.nap(config.pollSeconds * 1000, signal);
-      return;
     }
 
-    try {
-      // Around the whole of it, cleared in a `finally`: a flag left set by a session that
-      // threw would stop this runner ever collecting the nix store again, and the symptom
-      // would be a full volume weeks later with nothing in the logs pointing here.
-      this.sessionInFlight = true;
-      // `inFlightTask` is already this task — `claimNext` sets it as it wins the lease, so
-      // the cancel-exclusion window covers the claim itself. Reasserted rather than
-      // assumed, because the `finally` below clears it unconditionally.
-      this.inFlightTask = claimed.spec.id;
-      await this.workTask(claimed.lease, claimed.spec, signal);
-    } catch (error) {
-      if (error instanceof LeaseLostError) {
-        // Another runner owns this task now. Drop everything without writing.
-        logger.warn("lease.lost", { task: claimed.spec.id, ...errorFields(error) });
-        // And drop the checkout with it. Whoever holds the lease now is working the task
-        // in their OWN `tasksDir`, from the branch on the remote; this runner's copy will
-        // never be resumed and nothing will ever name it again, which is precisely the
-        // orphan the periodic sweep exists to catch days later. Catching it here costs
-        // one `rm -rf` and saves the disk in between.
-        await this.reapTask(claimed.spec, "lease-lost");
-        return;
+    // Always, whether or not anything was claimed. This is the scheduler's tick, and
+    // without it a runner with a free slot and nothing claimable would spin on `pull` and
+    // `survey` as fast as git can answer.
+    await this.nap(config.pollSeconds * 1000, signal);
+  }
+
+  /**
+   * Run one session, and refuse to start one against a signal that has ALREADY aborted.
+   *
+   * A `SessionRunner` is handed the signal and is expected to honour it — every test in
+   * `loop.test.ts` that pins "the abort must reach the session" is asserting exactly that,
+   * and this deliberately does not weaken it: a signal that aborts DURING a session goes to
+   * the runner and nowhere else, so a runner that ignores one is still a bug and still
+   * visible as one.
+   *
+   * What it will not do is hand over a signal that aborted before the call. `AbortSignal`
+   * fires a listener added after the abort exactly never, so a runner that subscribes to the
+   * event — which is the obvious way to write one — waits forever for something that has
+   * already happened. `workTask` then awaits a promise that will never settle, holding a
+   * slot and a lease, with `/healthz` green: the runner-that-looks-healthy of §6.4, reached
+   * through a dependency instead of through a hung command.
+   *
+   * **The window is real and this task widened it.** A `/cancel` may arrive between the CAS
+   * that won the lease and the first turn — `openSlot` installs the cancel hook precisely so
+   * that it can — and pushing the `running` transition put another network round trip in
+   * there, which is also what makes the task visible as `running` early enough for an
+   * operator to cancel it that fast. It is checked HERE, at the last statement before the
+   * call, rather than at the top of the session loop, because everything in between (the
+   * limits check, the reachability check, the transition and its push) is an await.
+   *
+   * `interrupted` is the right outcome to synthesise: it is what all four abort reasons
+   * already produce, and `workTask` reads the slot's own flags to tell which one it was.
+   */
+  private async runSession(
+    spec: TaskSpec,
+    state: TaskState,
+    signal: AbortSignal,
+  ): Promise<SessionOutcome> {
+    if (signal.aborted) {
+      return {
+        reason: "interrupted",
+        usage: EMPTY_USAGE,
+        contextTokens: 0,
+        summary: "the session was stopped before it started",
+      };
+    }
+    return this.deps.runner.run(spec, state, signal);
+  }
+
+  /** Slots this runner could still fill. Never negative. */
+  private free(): number {
+    return Math.max(0, this.deps.config.concurrency - this.slots.size);
+  }
+
+  /** Publish the two slot gauges. Cheap, and called wherever `slots` changed. */
+  private publishSlots(): void {
+    const { metrics, config } = this.deps;
+    metrics.tasksInFlight.set({ runner: config.runnerId }, this.slots.size);
+    metrics.slotsFree.set({ runner: config.runnerId }, this.free());
+  }
+
+  /**
+   * Start one task's session as its own promise, and own its whole lifetime.
+   *
+   * **This is where per-slot containment is enforced**, and it is the load-bearing half of
+   * working N tasks at once. `workOnce` used to `await workTask` inside its own
+   * `try`/`catch`, so a task's failure was on the work loop's stack — which was fine while
+   * there was one task, because unwinding the pass and unwinding the task were the same
+   * act. With slots they are not: a throw reaching `workOnce` would abandon the pass that
+   * every OTHER in-flight task's cleanup and reclaim depends on.
+   *
+   * So the promise here settles rather than rejects. Everything the old `catch` did is
+   * still done, per task, in a place where doing it cannot reach a sibling:
+   *
+   *   - `LeaseLostError` drops THIS task and reaps THIS task's checkout. Another runner
+   *     owns it now; that is a statement about one lease and about nothing else, so no
+   *     other slot is touched.
+   *   - any other failure is logged and the slot freed — the containment reasoning that
+   *     used to read "a failure belongs to the TASK, not the supervisor" now has to hold
+   *     per slot, and it does, because the boundary is this function rather than the loop.
+   *
+   * Deliberately NOT awaited by the caller. Awaiting it is what the old loop did and is
+   * precisely what a slot is not allowed to do; `workLoop` awaits the collection once, on
+   * shutdown.
+   */
+  private startSlot(lease: Lease, spec: TaskSpec, signal: AbortSignal): void {
+    const { logger } = this.deps;
+
+    const session = (async (): Promise<void> => {
+      try {
+        await this.workTask(lease, spec, signal);
+      } catch (error) {
+        if (error instanceof LeaseLostError) {
+          // Another runner owns this task now. Drop everything without writing.
+          logger.warn("lease.lost", { task: spec.id, ...errorFields(error) });
+          // And drop the checkout with it. Whoever holds the lease now is working the task
+          // in their OWN `tasksDir`, from the branch on the remote; this runner's copy will
+          // never be resumed and nothing will ever name it again, which is precisely the
+          // orphan the periodic sweep exists to catch days later. Catching it here costs
+          // one `rm -rf` and saves the disk in between.
+          await this.reapTask(spec, "lease-lost");
+          return;
+        }
+
+        // Any other failure belongs to the TASK, not the supervisor — and now, with more
+        // than one slot, not to any other task either. Rethrowing would reach the work
+        // loop, and because the claim is durable a restarted supervisor re-claims the same
+        // task and dies again: one malformed task wedges the whole runner permanently, and
+        // at N slots takes N-1 healthy sessions down on the way.
+        //
+        // `workTask` parks anything attributable to the task while it still holds the
+        // lease, so reaching here means the failure escaped that path. A shutdown is not
+        // logged as one of these: an aborted session is the pod stopping, not the task
+        // misbehaving.
+        if (signal.aborted) {
+          logger.info("session.abandoned", { task: spec.id, ...errorFields(error) });
+          return;
+        }
+        logger.error("supervisor.unhandled", { task: spec.id, ...errorFields(error) });
+      } finally {
+        this.running.delete(spec.id);
+        this.publishSlots();
       }
-      if (signal.aborted) throw error;
+    })();
 
-      // Any other failure belongs to the TASK, not the supervisor. Rethrowing here
-      // exits the process, and because the claim is durable the restarted
-      // supervisor re-claims the same task and dies again — one malformed task
-      // wedges the whole runner permanently.
-      //
-      // `workTask` parks anything attributable to the task while it still holds the
-      // lease, so reaching this point means the failure escaped that path. Log it
-      // and keep polling rather than exiting.
-      logger.error("supervisor.unhandled", {
-        task: claimed.spec.id,
-        ...errorFields(error),
-      });
-    } finally {
-      this.sessionInFlight = false;
-      this.inFlightTask = undefined;
-    }
+    this.running.set(spec.id, session);
   }
 
   /**
@@ -1077,11 +1274,31 @@ export class Supervisor {
     return records;
   }
 
-  /** First claimable task whose requirements this runner satisfies. */
-  private async claimNext(
+  /**
+   * Claim up to `slots` claimable tasks this runner satisfies the requirements of.
+   *
+   * The bounded form of what used to be `claimNext`, and the change is entirely local
+   * bookkeeping: **leasing already made concurrent claims safe across the fleet** (§5,
+   * `state/lease.ts`), because a claim is a compare-and-swap on a git ref and has been
+   * exclusive against every other replica since the day it was written. Four replicas at
+   * one slot each and one replica at four slots race through the identical CAS. What is
+   * new is only that this process now has more than one thing to keep track of.
+   *
+   * Returns what it won, in claim order, capped at `slots`. Zero is a normal answer and
+   * the overwhelmingly common one — an idle fleet has nothing claimable.
+   *
+   * Tasks already in a slot on THIS runner are skipped before the CAS is attempted. The
+   * CAS would refuse them anyway (this runner holds the lease, and `claim` declines a live
+   * one), but reaching it would cost an `ls-remote` per in-flight task per poll, and —
+   * worse — a stale lease belonging to this very process is one this process would
+   * cheerfully steal from itself, ending with two sessions on one worktree.
+   */
+  private async claimUpTo(
     records: readonly TaskRecord[],
-  ): Promise<{ readonly lease: Lease; readonly spec: TaskSpec } | undefined> {
-    const { store, leases, config } = this.deps;
+    slots: number,
+  ): Promise<readonly { readonly lease: Lease; readonly spec: TaskSpec }[]> {
+    const { store, leases, config, metrics, logger } = this.deps;
+    if (slots <= 0) return [];
 
     const statusOf = (id: TaskId): TaskStatus | undefined =>
       records.find((record) => record.id === id)?.state.status;
@@ -1100,12 +1317,29 @@ export class Supervisor {
     const candidates: { readonly id: TaskId; readonly spec: TaskSpec; readonly state: TaskState }[] =
       [];
     for (const { id, state } of records) {
+      // Ours already — see the docstring. Before `isClaimable`, because a task this runner
+      // is working reads `running`, which IS claimable (§6.2) by design.
+      if (this.slots.has(id)) continue;
       if (!isClaimable(state, statusOf)) continue;
       if (!capabilitiesSatisfy(config.capabilities, state.requires)) continue;
 
       const spec = await store.readSpec(id).catch(() => undefined);
       if (spec === undefined) continue;
       candidates.push({ id, spec, state });
+    }
+
+    // Counted BEFORE the claims, over what this runner would have taken had it had room.
+    // This is the series that separates "the fleet has nothing to do" from "the fleet is
+    // saturated", and both look like an idle runner from every other metric. `slots` is
+    // what `workOnce` had free at the top of the pass, so the arithmetic is honest even
+    // when a claim below loses its CAS to another replica.
+    if (candidates.length > slots) {
+      metrics.claimsRejectedFull.inc({ runner: config.runnerId }, candidates.length - slots);
+      logger.debug("claim.capped", {
+        claimable: candidates.length,
+        slots,
+        concurrency: config.concurrency,
+      });
     }
 
     // A waiting human first, then earlier waves, then by id. Without the sort this is
@@ -1118,56 +1352,121 @@ export class Supervisor {
       ),
     );
 
+    const won: { readonly lease: Lease; readonly spec: TaskSpec }[] = [];
+
     for (const { id, spec, state } of candidates) {
+      if (won.length >= slots) break;
+
       const lease = await leases.claim(id);
       if (lease === undefined) continue;
 
-      // Marked as ours the INSTANT the lease is won, not when `workOnce` gets the result
-      // back. Several awaits follow before that (the reclaim journal, the mirror), and
-      // housekeeping drains chat throughout them: a `/cancel` naming this task arriving in
-      // that window would be taken by the drain rather than left for the in-session
+      // Registered as ours the INSTANT the lease is won, not when `startSlot` gets the
+      // result back. Several awaits follow before that (the reclaim journal, the mirror),
+      // and housekeeping drains chat throughout them: a `/cancel` naming this task arriving
+      // in that window would be taken by the drain rather than left for the in-session
       // watcher, fail `leases.claim` against the lease just taken here, and answer the
       // human "not-parkable: running" about a task this very process is about to start —
       // the exact reply `applyChatRequests` excludes the request to avoid. Recoverable by
       // retrying, but it reads as a bug to the person typing it.
-      this.inFlightTask = id;
+      //
+      // The slot is PROVISIONAL until `workTask` installs the real heartbeat and cancel
+      // hook — see `openSlot`. A cancel landing in this window aborts the controller
+      // before the session ever reads it, and `workTask` sees an already-aborted signal
+      // and unwinds, which is the outcome the human asked for.
+      const slot = this.openSlot(id, spec, lease);
 
-      // The CAS is what established this was safe to take, so by here the previous
-      // holder is gone. Say so: a reclaim is a pod that died mid-task, and the whole
-      // failure used to be invisible — the task simply stopped, with no line anywhere
-      // connecting it to the deploy that killed it.
-      if (state.status === "running") {
-        this.deps.logger.warn("task.reclaimed", {
+      // Anything from here to the return is a claim that has been WON and could still
+      // throw — the reclaim journal writes the state repo, the tracker mirror reaches the
+      // network. The slot must not outlive a failure to start, or every later `/cancel`
+      // for that task is silently swallowed: the drain keeps leaving it for an in-session
+      // watcher that does not exist. Releasing the lease too, because nothing is going to
+      // work this task and holding it just delays whoever would.
+      try {
+        // The CAS is what established this was safe to take, so by here the previous
+        // holder is gone. Say so: a reclaim is a pod that died mid-task, and the whole
+        // failure used to be invisible — the task simply stopped, with no line anywhere
+        // connecting it to the deploy that killed it.
+        if (state.status === "running") {
+          logger.warn("task.reclaimed", {
+            task: id,
+            runner: lease.runner,
+            sessions: state.sessions,
+          });
+          await store.appendJournal(
+            id,
+            state.sessions,
+            "The runner holding this task stopped without parking or finishing it — a " +
+              "restart, a lost lease, or a killed pod. The lease has since gone stale, so " +
+              `${lease.runner} has taken it over. Work already pushed to the task branch ` +
+              "is intact; anything the previous session had not committed is not.",
+          );
+        }
+
+        logger.info("task.claimed", {
           task: id,
           runner: lease.runner,
+          workspace: spec.workspace,
           sessions: state.sessions,
+          inFlight: this.slots.size,
+          concurrency: config.concurrency,
         });
-        await store.appendJournal(
-          id,
-          state.sessions,
-          "The runner holding this task stopped without parking or finishing it — a " +
-            "restart, a lost lease, or a killed pod. The lease has since gone stale, so " +
-            `${lease.runner} has taken it over. Work already pushed to the task branch ` +
-            "is intact; anything the previous session had not committed is not.",
-        );
+        await this.mirror(spec, { kind: "claimed", runner: lease.runner });
+      } catch (error) {
+        // Contained per CLAIM, for `startSlot`'s reason one step earlier: at N slots a
+        // throw here would abandon the tasks already claimed in this same pass, which have
+        // leases held and no session started. Logged and skipped instead — the task stays
+        // exactly as it was and the next pass may claim it again.
+        this.closeSlot(slot);
+        await leases.release(lease).catch(() => undefined);
+        logger.error("claim.failed", { task: id, ...errorFields(error) });
+        continue;
       }
 
-      this.deps.logger.info("task.claimed", {
-        task: id,
-        runner: lease.runner,
-        workspace: spec.workspace,
-        sessions: state.sessions,
-      });
-      await this.mirror(spec, { kind: "claimed", runner: lease.runner });
-      return { lease, spec };
+      won.push({ lease, spec });
     }
-    // Nothing claimed, so nothing is in flight. This also undoes the optimistic set above
-    // for a candidate whose lease was won but whose journal or mirror then threw: the
-    // throw leaves `claimNext` without reaching `workOnce`'s `finally`, and a stale id
-    // here would silently swallow every later `/cancel` for that task — the drain would
-    // keep leaving it for an in-session watcher that does not exist.
-    this.inFlightTask = undefined;
-    return undefined;
+
+    return won;
+  }
+
+  /**
+   * Register a provisional slot the moment its lease is won.
+   *
+   * Provisional in exactly one respect: the lease handle is a `heldLease` snapshot rather
+   * than a heartbeat, because nothing renews a claim until `workTask` starts one. Every
+   * other field is final, and `cancel` in particular works from this instant — a
+   * `/cancel` arriving between the CAS and the first turn aborts the controller, and
+   * `workTask` finds the signal already aborted and unwinds without running anything.
+   */
+  private openSlot(id: TaskId, spec: TaskSpec, lease: Lease): TaskSlot {
+    const interrupt = new AbortController();
+    const slot: TaskSlot = {
+      id,
+      spec,
+      lease: { ...heldLease(lease), stop: () => undefined },
+      interrupt,
+      cancelled: false,
+      lost: undefined,
+      outage: undefined,
+      cancel: () => {
+        if (slot.cancelled) return;
+        this.deps.logger.info("task.cancel-requested", { task: id });
+        slot.cancelled = true;
+        interrupt.abort();
+      },
+    };
+
+    this.slots.set(id, slot);
+    this.publishSlots();
+    return slot;
+  }
+
+  /** Give a slot back. Idempotent, and the only place `slots` shrinks. */
+  private closeSlot(slot: TaskSlot): void {
+    // By identity, not by id: a task claimed, released and re-claimed within one process
+    // has two slot objects, and deleting by id alone would let the FIRST one's cleanup
+    // evict the second one's live entry.
+    if (this.slots.get(slot.id) === slot) this.slots.delete(slot.id);
+    this.publishSlots();
   }
 
   /**
@@ -1179,11 +1478,24 @@ export class Supervisor {
   private async workTask(lease: Lease, spec: TaskSpec, signal: AbortSignal): Promise<void> {
     const { store, leases, config, metrics, logger } = this.deps;
 
-    // Everything that may stop a session in flight, as one signal. Losing the lease used
-    // to set a flag that was only read at the TOP of the loop, so a lease lost at t=60s
-    // let the session run out the rest of its budget — still minting tokens for every
-    // push — while another runner worked the same branch.
-    const interrupt = new AbortController();
+    // The slot `claimUpTo` registered when this task's CAS won. Everything that used to be
+    // a field on the supervisor now lives in it, which is what lets a second session run
+    // beside this one without either of them noticing.
+    //
+    // Its absence is a programming error rather than a condition to handle: a slot is
+    // opened before this is called and closed in the `finally` below, so a missing one
+    // means someone called `workTask` outside the scheduler.
+    const slot = this.slots.get(spec.id);
+    if (slot === undefined) throw new Error(`no slot is open for ${spec.id}`);
+
+    // Everything that may stop THIS session in flight, as one signal. Losing the lease
+    // used to set a flag that was only read at the TOP of the loop, so a lease lost at
+    // t=60s let the session run out the rest of its budget — still minting tokens for
+    // every push — while another runner worked the same branch.
+    //
+    // On the slot rather than local to this call, so a `/cancel` that arrives during the
+    // claim (`openSlot`) reaches the same controller this session is about to read.
+    const interrupt = slot.interrupt;
     const stopOnShutdown = (): void => interrupt.abort();
     signal.addEventListener("abort", stopOnShutdown, { once: true });
 
@@ -1192,23 +1504,22 @@ export class Supervisor {
     // repo, writing means claiming the lease, and the lease is held by the session being
     // cancelled. So this watches for that one request kind and `applyChatRequests` leaves
     // it alone. See `CANCEL_POLL_MS`.
-    let cancelled = false;
-    const stop = (): void => {
-      if (cancelled) return;
-      logger.info("task.cancel-requested", { task: spec.id });
-      cancelled = true;
-      interrupt.abort();
-    };
+    //
+    // `slot.cancel` and not a local closure: with N slots a cancel has to reach ONE
+    // session, and the routing is by task id through `this.slots`. A single supervisor
+    // field — which is what this was — would send every cancel to whichever session
+    // installed itself last, so cancelling A would stop B and leave A running.
+    const stop = slot.cancel;
 
     // THREE paths to the same abort, because a cancel can arrive from three places.
     //
-    // The handler is for a cancel that HOUSEKEEPING drained. It has to exist because a
-    // queue may have no selective take (`ChatDrainer.selective`), in which case the drain
-    // takes every request including this one, and having taken it off the list it cannot
-    // leave it for the interval below. `applyChatRequests` calls this and settles the
-    // request itself. Cleared in the `finally` at the end of the session, so a stale
-    // closure cannot abort the NEXT session on a cancel for the last one.
-    this.cancelInFlight = stop;
+    // The FIRST is `slot.cancel` itself, for a cancel that HOUSEKEEPING drained. It has to
+    // exist because a queue may have no selective take (`ChatDrainer.selective`), in which
+    // case the drain takes every request including this one, and having taken it off the
+    // list it cannot leave it for the interval below. `applyChatRequests` looks the slot up
+    // by task, calls this and settles the request itself. The slot is removed in the
+    // `finally` at the end of the session, so a stale hook cannot abort a LATER session on
+    // a cancel for this one.
 
     // The interval is the original one and covers a cancel submitted IN THIS PROCESS to a
     // queue that CAN take selectively: the request is sitting in the in-process queue, and
@@ -1237,13 +1548,22 @@ export class Supervisor {
     // Redis this is the in-process implementation and costs nothing.
     const cancelWatch = await this.deps.cancels?.watch(spec.id, stop);
 
-    let lost: LeaseLostError | undefined;
+    // **One heartbeat per slot, renewing one lease.** The renewal is a CAS on
+    // `refs/leases/<task>`, so the fencing `assertHeld` performs is per lease and stays so
+    // however many slots are open: each slot's pushes are checked against its own ref and
+    // no other's.
+    //
+    // What the split buys is containment of the FAILURE. Everything the `onLost` callback
+    // does below is scoped to this slot — its own `lost` field, its own credential, its own
+    // abort controller — so a stalled renewal for task A drops A and leaves B running with
+    // a lease that was never in question. A shared heartbeat could not have that property
+    // at all: one CAS failure would have to be read as evidence about every task at once.
     const heartbeat = startHeartbeat(
       leases,
       lease,
       config.lease.heartbeatSeconds,
       (error) => {
-        lost = error;
+        slot.lost = error;
         // Immediately, not at the next loop iteration. The credential goes with it: this
         // task's entry outlived the lease that justified it, so a session that had already
         // lost its claim kept getting fresh tokens minted on demand.
@@ -1256,12 +1576,49 @@ export class Supervisor {
         interrupt.abort();
       },
     );
+    // Replaces the `heldLease` snapshot `openSlot` put there. From here on anything asking
+    // the slot for its lease gets a token that tracks the renewals.
+    slot.lease = heartbeat;
 
     try {
       while (!signal.aborted) {
-        if (lost !== undefined) throw lost;
+        if (slot.lost !== undefined) throw slot.lost;
 
         let state = await store.readState(spec.id);
+
+        // **Nothing is started against a signal that has already aborted.** The loop's own
+        // condition watches the POD's signal; this watches THIS SLOT's, and they are not the
+        // same question — a `/cancel`, a lost lease and the wall clock all abort the slot
+        // while the pod is perfectly healthy.
+        //
+        // The window is real and this task widened it. A cancel can arrive between the CAS
+        // that won the lease and the first turn (`openSlot` installs the hook precisely so
+        // that it can), and everything in between — the reclaim journal, the reachability
+        // check, and now the `running` push below — is a network round trip. Without this,
+        // the session was started anyway and `SessionRunner.run` was handed an
+        // already-aborted signal: correct implementations return at once, but one that only
+        // subscribes to `abort` waits for an event that has already happened and never
+        // fires. That is not a hypothetical implementation — it is what the fixture in
+        // `loop.test.ts` does, and it hung the file rather than failing it.
+        //
+        // Treated exactly like a session that ran and was interrupted, because that is what
+        // it is from the task's point of view: nothing is recorded (no session count, no
+        // journal entry — §6.4), and a cancel still parks, because stopping a session is
+        // not the same as cancelling a task and an interrupted task is left claimable.
+        if (interrupt.signal.aborted) {
+          logger.info("session.pre-empted", {
+            task: spec.id,
+            session: state.sessions + 1,
+            cancelled: slot.cancelled,
+            leaseLost: slot.lost !== undefined,
+            providerOutage: slot.outage !== undefined,
+          });
+          if (slot.cancelled && slot.lost === undefined) {
+            await this.deps.cancels?.clear(spec.id);
+            await this.park(heartbeat, spec, state, "cancelled from chat");
+          }
+          return;
+        }
 
         const verdict = checkLimits(state, state.limits, {
           noProgressLimit: config.limits.noProgressLimit,
@@ -1286,6 +1643,21 @@ export class Supervisor {
           return;
         }
 
+        // Written and NOT pushed, deliberately — whatever this session commits next
+        // carries it. Pushing it here was tried and reverted: it makes the task visible as
+        // `running` before the session it names has started, and a `/cancel` arriving in
+        // that window is then answered by a park with no session to stop. `loop.test.ts`
+        // pins that ("a cancel from another process reaches a session in flight"), and it
+        // is pinning something real rather than an accident of timing.
+        //
+        // The cost is that `StateStore.dirty` — one flag for the whole checkout — stays set
+        // for the length of every session, so at `concurrency: N` the tree is clean only
+        // when every slot is momentarily between commits and `pull` declines more often
+        // than it used to. That is a REFRESH RATE, not a correctness property: the state
+        // repo is authoritative but never urgent, skipping is the safe direction (see
+        // `StateStore.pull`), and a slot commits several times per session. It is worth
+        // knowing about, and §6.5 records it as the one thing about slots that gets worse
+        // rather than better with N.
         state = await this.transition(heartbeat, state, "running");
         metrics.sessions.inc({ task: spec.id });
 
@@ -1316,7 +1688,7 @@ export class Supervisor {
 
         let outcome: SessionOutcome;
         try {
-          outcome = await this.deps.runner.run(spec, state, interrupt.signal);
+          outcome = await this.runSession(spec, state, interrupt.signal);
         } finally {
           clearTimeout(deadline);
           stopTyping();
@@ -1346,10 +1718,33 @@ export class Supervisor {
           logger.info("session.interrupted", {
             task: spec.id,
             session: state.sessions + 1,
-            cancelled,
-            leaseLost: lost !== undefined,
+            cancelled: slot.cancelled,
+            leaseLost: slot.lost !== undefined,
             shuttingDown: signal.aborted,
+            providerOutage: slot.outage !== undefined,
           });
+
+          // A FOURTH reason to be interrupted, and the only one slots introduced: another
+          // task on this runner met the provider wall and `fanOutOutage` aborted this
+          // session too. Handled here rather than left to the plain interruption path,
+          // because the two want opposite things from the task's state — an interruption
+          // leaves it `running` (claimable, so the next poll resumes it), and an outage has
+          // to leave it `ready` with the cooldown recorded, or this runner would re-claim it
+          // on the very next pass and meet the same wall.
+          //
+          // The lease still has to be ours. A cancel or a lost lease that raced the fan-out
+          // has better standing than this does, and `park`/`push` fence anyway.
+          if (slot.outage !== undefined && !slot.cancelled && slot.lost === undefined) {
+            await this.releaseAfterOutage(
+              heartbeat,
+              spec,
+              state,
+              slot.outage,
+              outcome.usage,
+              "session",
+            );
+            return;
+          }
 
           // A CANCEL is different from the other three, and this is the half that is easy
           // to miss: stopping the session is not cancelling the task. An interrupted task
@@ -1359,7 +1754,7 @@ export class Supervisor {
           //
           // Only when the lease is still ours: a cancel that raced a lost lease has no
           // standing to write, and `park` fences anyway.
-          if (cancelled && lost === undefined) {
+          if (slot.cancelled && slot.lost === undefined) {
             // Cleared before the park, so a task cancelled and then resumed inside the
             // signal TTL does not immediately cancel itself again on the session that
             // resumes it. Never throws — see `redis/guarded.ts`.
@@ -1415,9 +1810,13 @@ export class Supervisor {
       heartbeat.stop();
       clearInterval(watchCancels);
       // Before anything that can throw or await: housekeeping runs concurrently, and a
-      // handler outliving its session would abort the NEXT one on a `/cancel` naming the
-      // task that just ended.
-      this.cancelInFlight = undefined;
+      // slot outliving its session would route a `/cancel` naming this task to a hook that
+      // aborts nothing, having told the human it was cancelling. Giving the slot back here
+      // rather than in `startSlot`'s `finally` is deliberate — the slot is what a claim
+      // consumes, and by this point the session is over: the terminal write has landed and
+      // the only thing left is cleanup, so holding a slot through it would idle a session's
+      // worth of capacity behind an `rm -rf`.
+      this.closeSlot(slot);
       // Or a long-lived supervisor accumulates one subscriber connection per task it has
       // ever run. Swallowed, because a failure to unsubscribe from a socket that is
       // already gone must not be the thing that fails a finished session.
@@ -1428,29 +1827,38 @@ export class Supervisor {
   }
 
   /**
-   * Hand the runner back when someone is waiting on a brainstorm (DESIGN.md §14.3).
+   * Hand back ONE SLOT when someone is waiting on a brainstorm (DESIGN.md §14.3).
    *
-   * `workTask` drives ONE task through as many sessions as it needs, and the WORK loop —
-   * and with it the next claim — is blocked for all of them. A task that keeps handing off
-   * therefore owns the runner indefinitely, which is how a human typing `/brainstorm` got
-   * a thread that opened and then said nothing: twenty minutes and six sessions, in the
-   * run this was written from.
+   * **It used to hand back the whole runner, and that is the part slots changed.** The
+   * original reasoning was sound while it held: `workTask` drives one task through as many
+   * sessions as it needs, the work loop was blocked for all of them, so a task that keeps
+   * handing off owned the runner indefinitely — which is how a human typing `/brainstorm`
+   * got a thread that opened and then said nothing for twenty minutes and six sessions.
+   * With one slot, "give up the slot" and "give up the runner" were the same act, so the
+   * bluntness cost nothing.
    *
-   * The housekeeping split (§6.4) does NOT make this redundant, and it is worth being
-   * precise about what each fixes. Housekeeping means the brainstorm request is drained,
-   * the task created and the thread answered while this session runs — so the human is no
-   * longer talking to silence. But the runner still works one task at a time, so the
-   * brainstorm cannot be CLAIMED until this task lets go, and that is what this does.
-   * Draining without yielding would produce a task that exists and never starts.
+   * At N slots they are different acts and the difference matters in both directions:
    *
-   * The check is `some`, not `takeWhere`, precisely because housekeeping now owns the
-   * serving of it: taking the request to look at it would strand the human it exists for.
+   *   - It is still NEEDED, including at the default N=1. Housekeeping (§6.4) drains the
+   *     request, creates the task and answers the thread while this session runs, so the
+   *     human is no longer talking to silence — but a brainstorm still cannot be CLAIMED
+   *     until a slot frees, and on a saturated runner nothing frees one. Draining without
+   *     yielding produces a task that exists and never starts.
+   *   - It must no longer fire when a slot is already free. A runner at `concurrency: 4`
+   *     with one session running has three slots the very next pass will claim the
+   *     brainstorm into; releasing this task as well would cost a session boundary, a state
+   *     push and a re-claim to solve a problem that does not exist. So the yield is
+   *     conditional on `free() === 0`, and at N=1 that condition is always true — which is
+   *     why nothing about a single-slot runner changes.
    *
    * Deliberately NOT an interrupt. `/cancel` aborts a session because the human's whole
    * intent is to stop it; here the session is doing legitimate work, and an interrupted
    * session records nothing at all (§6.4) — so cutting one short to start a conversation
    * would throw away everything it had done since the last boundary. Waiting for the
    * boundary costs the human the tail of one session and costs the task nothing.
+   *
+   * The check is `some`, not `takeWhere`, precisely because housekeeping owns the serving
+   * of it: taking the request to look at it would strand the human it exists for.
    *
    * The task is put back to `ready` rather than left `running`. Both are claimable, but
    * `running` is the crash-recovery path: re-claiming one logs `task.reclaimed` and
@@ -1465,13 +1873,25 @@ export class Supervisor {
     spec: TaskSpec,
     state: TaskState,
   ): Promise<boolean> {
-    const { inbox, logger } = this.deps;
+    const { inbox, logger, config } = this.deps;
     if (inbox === undefined) return false;
+    // A slot is already free, so the next pass claims the brainstorm without anybody
+    // giving anything up. Checked BEFORE the queue: `some` may reach the network, and
+    // asking a question whose answer cannot change the outcome is a round trip per session
+    // boundary on every runner with room.
+    if (this.free() > 0) return false;
     if (!(await inbox.some((request) => request.kind === "brainstorm"))) return false;
 
-    logger.info("task.yielded", { task: spec.id, sessions: state.sessions, to: "brainstorm" });
-    await this.transition(lease, state, "ready");
-    await this.push(lease, `chore(${spec.id}): released for a waiting brainstorm`);
+    logger.info("task.yielded", {
+      task: spec.id,
+      sessions: state.sessions,
+      to: "brainstorm",
+      concurrency: config.concurrency,
+    });
+    await this.unit(async () => {
+      await this.transition(lease, state, "ready");
+      await this.push(lease, `chore(${spec.id}): released a slot for a waiting brainstorm`);
+    });
     return true;
   }
 
@@ -1505,21 +1925,6 @@ export class Supervisor {
       noProgressStreak: progress.noProgressStreak,
     });
 
-    await store.appendJournal(
-      spec.id,
-      session,
-      [
-        `**Exit:** ${outcome.reason}`,
-        `**Context at exit:** ${outcome.contextTokens} tokens`,
-        "",
-        outcome.summary,
-      ].join("\n"),
-    );
-
-    if (outcome.reason === "handoff" || outcome.reason === "blocked") {
-      await store.writeHandoff(spec.id, outcome.summary);
-    }
-
     metrics.noProgress.set({ task: spec.id }, progress.noProgressStreak);
 
     const next: TaskState = {
@@ -1532,8 +1937,30 @@ export class Supervisor {
       ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
     };
 
-    await store.writeState(next);
-    await this.push(lease, `chore(${spec.id}): session ${session} — ${outcome.reason}`);
+    // Three files and a commit as ONE unit — the journal shard, the handoff and the state.
+    // This is the unit two slots collided over, and both halves of the fix are needed: the
+    // unit stops a sibling session writing INTO this window, and `StateStore.pending` stops
+    // its already-written files being staged by this commit. The probe above stays outside:
+    // it runs git in the task's own worktree and has nothing to do with the state checkout.
+    await this.unit(async () => {
+      await store.appendJournal(
+        spec.id,
+        session,
+        [
+          `**Exit:** ${outcome.reason}`,
+          `**Context at exit:** ${outcome.contextTokens} tokens`,
+          "",
+          outcome.summary,
+        ].join("\n"),
+      );
+
+      if (outcome.reason === "handoff" || outcome.reason === "blocked") {
+        await store.writeHandoff(spec.id, outcome.summary);
+      }
+
+      await store.writeState(next);
+      await this.push(lease, `chore(${spec.id}): session ${session} — ${outcome.reason}`);
+    });
     void config;
     return next;
   }
@@ -1560,8 +1987,10 @@ export class Supervisor {
       case "blocked": {
         // Capability re-routing: release so a runner that can do it picks it up.
         const requires = outcome.requires ?? state.requires;
-        await this.transition(lease, { ...state, requires }, "ready");
-        await this.push(lease, `chore(${spec.id}): needs ${requires.join(", ")}`);
+        await this.unit(async () => {
+          await this.transition(lease, { ...state, requires }, "ready");
+          await this.push(lease, `chore(${spec.id}): needs ${requires.join(", ")}`);
+        });
         return true;
       }
 
@@ -1576,9 +2005,14 @@ export class Supervisor {
         // claimed by this runner as often as not. Deleting the checkout while a human
         // types would buy disk for exactly as long as it takes them to answer.
         logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
-        await store.writeQuestion(spec.id, index, question);
-        await this.transition(lease, state, "awaiting-human");
-        await this.push(lease, `chore(${spec.id}): awaiting human input`);
+        await this.unit(async () => {
+          await store.writeQuestion(spec.id, index, question);
+          await this.transition(lease, state, "awaiting-human");
+          await this.push(lease, `chore(${spec.id}): awaiting human input`);
+        });
+        // OUTSIDE the unit, both of them. The tracker and Discord are views, git is
+        // authoritative, and holding the state checkout across a network round trip to
+        // either would block every other slot's writes on an unrelated service.
         await this.mirror(spec, { kind: "question", question });
         await this.notifyTask(state, { kind: "question", task: spec.id, question, phase: state.phase });
         return true;
@@ -1595,13 +2029,15 @@ export class Supervisor {
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.
-          await store.appendJournal(
-            spec.id,
-            state.sessions,
-            `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
-          );
-          await this.transition(lease, state, "ready");
-          await this.push(lease, `chore(${spec.id}): completion claim rejected`);
+          await this.unit(async () => {
+            await store.appendJournal(
+              spec.id,
+              state.sessions,
+              `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
+            );
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): completion claim rejected`);
+          });
           return false;
         }
 
@@ -1624,8 +2060,10 @@ export class Supervisor {
         await this.deps.leases.assertHeld(await lease.current());
 
         const merge = await this.mergeReviewed(spec, reviewed.state);
-        await this.transition(lease, reviewed.state, "done");
-        await this.push(lease, `chore(${spec.id}): done`);
+        await this.unit(async () => {
+          await this.transition(lease, reviewed.state, "done");
+          await this.push(lease, `chore(${spec.id}): done`);
+        });
         // Mirrored only here, after every gate passed and git already says done.
         const prUrl = result.prUrl ?? reviewed.state.pr?.url ?? "(no PR recorded)";
         logger.info("task.done", {
@@ -1659,8 +2097,10 @@ export class Supervisor {
           // The tool sets both or neither, so this is unreachable. Back to `ready` rather
           // than parking: a session that ended with nothing to act on is a lost session,
           // not a broken task.
-          await this.transition(lease, state, "ready");
-          await this.push(lease, `chore(${spec.id}): plan session produced nothing`);
+          await this.unit(async () => {
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): plan session produced nothing`);
+          });
           return false;
         }
         return this.applyPlan(lease, spec, state, plan);
@@ -1691,8 +2131,10 @@ export class Supervisor {
           session: state.sessions,
           error: outcome.error ?? outcome.summary,
         });
-        await this.transition(lease, state, "failed");
-        await this.push(lease, `chore(${spec.id}): failed`);
+        await this.unit(async () => {
+          await this.transition(lease, state, "failed");
+          await this.push(lease, `chore(${spec.id}): failed`);
+        });
         await this.notifyTask(state, {
           kind: "failed",
           task: spec.id,
@@ -1745,17 +2187,13 @@ export class Supervisor {
       return true;
     }
 
-    let rejection: string | undefined;
-    if (reviewed.verdict !== undefined) {
-      const text = renderVerdict(reviewed.verdict);
-      await store.writeVerdict(spec.id, state.sessions, text);
-      await store.appendJournal(spec.id, state.sessions, text);
-      if (reviewed.verdict.decision === "changes") rejection = summariseVerdict(reviewed.verdict);
-    }
+    const rejection =
+      reviewed.verdict?.decision === "changes" ? summariseVerdict(reviewed.verdict) : undefined;
 
     // Materialisation validates too — cycles, missing acceptance criteria, unknown
     // capabilities — and a plan the council liked can still be unbuildable. Both refusals
-    // come back the same way, so the agent has one thing to react to.
+    // come back the same way, so the agent has one thing to react to. Pure, so it is above
+    // the unit: nothing it does touches the checkout.
     const cut = rejection === undefined
       ? materialise(plan, {
           parent: spec.id,
@@ -1773,58 +2211,79 @@ export class Supervisor {
       usage: addUsage(state.usage, reviewed.usage),
       review: { rounds, last: cut.kind === "rejected" ? "changes" : "pass" },
     };
-    await store.writeState(next);
 
-    if (cut.kind === "rejected") {
+    // A whole plan's worth of writes as ONE unit — see `unit`, and this is the largest one
+    // in the loop: a verdict, a journal entry, the brainstorm's own state, and then a
+    // `state.json` and a `spec.md` PER CHILD TASK. Split across two commits by a sibling
+    // slot's `git add -A tasks`, half a plan would land in a commit belonging to another
+    // task, and the wave that half describes would be claimable with no spec to read.
+    const outcome = await this.unit(async () => {
+      if (reviewed.verdict !== undefined) {
+        const text = renderVerdict(reviewed.verdict);
+        await store.writeVerdict(spec.id, state.sessions, text);
+        await store.appendJournal(spec.id, state.sessions, text);
+      }
+
+      await store.writeState(next);
+
+      if (cut.kind === "rejected") {
+        await store.appendJournal(
+          spec.id,
+          state.sessions,
+          `**The plan was not accepted:**\n\n${cut.reason}`,
+        );
+
+        if (rounds >= config.limits.maxReviewRounds) {
+          await this.park(lease, spec, next, `the plan was rejected ${rounds} times`);
+          return "parked" as const;
+        }
+
+        await this.transition(lease, next, "ready");
+        await this.push(lease, `chore(${spec.id}): plan sent back`);
+        return "sent-back" as const;
+      }
+
+      for (const child of cut.tasks) {
+        // ORDER IS LOAD-BEARING, exactly as at intake: state first, spec last. `hasTask`
+        // keys on `spec.md`, so a crash between the two leaves a task the claim loop skips
+        // and the next pass can recreate cleanly.
+        await store.writeState({
+          id: child.spec.id,
+          status: "ready",
+          phase: "planning",
+          requires: child.spec.requires,
+          sessions: 0,
+          limits: { maxSessions: config.limits.maxSessionsPerTask },
+          usage: EMPTY_USAGE,
+          progress: { lastProgressSession: 0, noProgressStreak: 0 },
+          plan: child.plan,
+          ...(next.chat === undefined ? {} : { chat: next.chat }),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        await store.writeSpec(child.spec);
+      }
+
       await store.appendJournal(
         spec.id,
         state.sessions,
-        `**The plan was not accepted:**\n\n${cut.reason}`,
+        [
+          `**Plan accepted: ${plan.title}**`,
+          "",
+          ...cut.tasks.map((c) => `- \`${c.spec.id}\` — wave ${c.plan.wave}`),
+        ].join("\n"),
       );
+      await this.transition(lease, next, "done");
+      await this.push(lease, `chore(${spec.id}): plan cut into ${cut.tasks.length} task(s)`);
+      return "cut" as const;
+    });
 
-      if (rounds >= config.limits.maxReviewRounds) {
-        await this.park(lease, spec, next, `the plan was rejected ${rounds} times`);
-        return true;
-      }
-
-      await this.transition(lease, next, "ready");
-      await this.push(lease, `chore(${spec.id}): plan sent back`);
-      await this.notifyTask(next, { kind: "verdict", task: spec.id, summary: cut.reason });
+    if (outcome === "parked") return true;
+    if (outcome === "sent-back") {
+      await this.notifyTask(next, { kind: "verdict", task: spec.id, summary: rejection ?? "" });
       return false;
     }
-
-    for (const child of cut.tasks) {
-      // ORDER IS LOAD-BEARING, exactly as at intake: state first, spec last. `hasTask`
-      // keys on `spec.md`, so a crash between the two leaves a task the claim loop skips
-      // and the next pass can recreate cleanly.
-      await store.writeState({
-        id: child.spec.id,
-        status: "ready",
-        phase: "planning",
-        requires: child.spec.requires,
-        sessions: 0,
-        limits: { maxSessions: config.limits.maxSessionsPerTask },
-        usage: EMPTY_USAGE,
-        progress: { lastProgressSession: 0, noProgressStreak: 0 },
-        plan: child.plan,
-        ...(next.chat === undefined ? {} : { chat: next.chat }),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
-      await store.writeSpec(child.spec);
-    }
-
-    await store.appendJournal(
-      spec.id,
-      state.sessions,
-      [
-        `**Plan accepted: ${plan.title}**`,
-        "",
-        ...cut.tasks.map((c) => `- \`${c.spec.id}\` — wave ${c.plan.wave}`),
-      ].join("\n"),
-    );
-    await this.transition(lease, next, "done");
-    await this.push(lease, `chore(${spec.id}): plan cut into ${cut.tasks.length} task(s)`);
+    if (cut.kind === "rejected") return false;
 
     logger.info("plan.materialised", {
       task: spec.id,
@@ -1875,9 +2334,6 @@ export class Supervisor {
     const text = renderVerdict(verdict);
     const rounds = (state.review?.rounds ?? 0) + (verdict.decision === "changes" ? 1 : 0);
 
-    await store.writeVerdict(spec.id, state.sessions, text);
-    await store.appendJournal(spec.id, state.sessions, text);
-
     const next: TaskState = {
       ...state,
       // The council's own tokens belong to the task that convened it, or a reviewed
@@ -1885,32 +2341,50 @@ export class Supervisor {
       usage: addUsage(state.usage, usage),
       review: { rounds, last: verdict.decision },
     };
-    await store.writeState(next);
-    metrics.council.inc({ task: spec.id, decision: verdict.decision });
 
-    if (verdict.decision === "pass") {
-      await this.push(lease, `chore(${spec.id}): review council passed`);
-      return { state: next, decision: "pass" };
-    }
+    // The verdict, the journal entry, the state and whichever push follows, as one unit —
+    // see `unit`. The council REVIEW is deliberately above it: that takes minutes (§5.1
+    // records 207s), and holding the state checkout across one would stop every other slot
+    // writing and stop housekeeping pulling for the whole of it.
+    //
+    // `park` below is itself a unit and nests harmlessly: `StateStore.exclusive` recognises
+    // the async context already holding the lock, so the inner acquisition runs immediately
+    // rather than deadlocking on this one.
+    const stalled = await this.unit(async () => {
+      await store.writeVerdict(spec.id, state.sessions, text);
+      await store.appendJournal(spec.id, state.sessions, text);
+      await store.writeState(next);
+      metrics.council.inc({ task: spec.id, decision: verdict.decision });
 
-    if (rounds >= config.limits.maxReviewRounds) {
-      // The council and the agent are not converging. Parking beats a fourth attempt:
-      // from outside, a task trading itself back and forth looks identical to one that
-      // is working.
-      logger.warn("council.stalled", { task: spec.id, rounds });
-      await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
-        kind: "review-stalled",
-        task: spec.id,
-        rounds,
-        summary: summariseVerdict(verdict),
-        ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
-        canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
-      });
-      return { state: next, decision: "stalled" };
-    }
+      if (verdict.decision === "pass") {
+        await this.push(lease, `chore(${spec.id}): review council passed`);
+        return false;
+      }
 
-    await this.transition(lease, next, "ready");
-    await this.push(lease, `chore(${spec.id}): review council requested changes`);
+      if (rounds >= config.limits.maxReviewRounds) {
+        // The council and the agent are not converging. Parking beats a fourth attempt:
+        // from outside, a task trading itself back and forth looks identical to one that
+        // is working.
+        logger.warn("council.stalled", { task: spec.id, rounds });
+        await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
+          kind: "review-stalled",
+          task: spec.id,
+          rounds,
+          summary: summariseVerdict(verdict),
+          ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
+          canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
+        });
+        return true;
+      }
+
+      await this.transition(lease, next, "ready");
+      await this.push(lease, `chore(${spec.id}): review council requested changes`);
+      return false;
+    });
+
+    if (verdict.decision === "pass") return { state: next, decision: "pass" };
+    if (stalled) return { state: next, decision: "stalled" };
+
     await this.notifyTask(next, {
       kind: "verdict",
       task: spec.id,
@@ -1962,13 +2436,22 @@ export class Supervisor {
       const { revision } = await maintainer.revise(spec, state, siblings);
       if (revision === undefined) return;
 
-      const changed = await this.applyRevision(membership.parent, records, revision, open);
+      // The revision rewrites a `state.json` PER SIBLING and then commits, so it is one
+      // unit — see `unit`. A partial one is worse than none: waves are recomputed across
+      // the whole graph (`relayer`), so half of them landing in a sibling slot's commit
+      // leaves the plan describing a schedule nobody proposed. The maintainer's own model
+      // call stays above it.
+      const changed = await this.unit(async () => {
+        const applied = await this.applyRevision(membership.parent, records, revision, open);
+        if (applied === 0) return 0;
+        await this.push(lease, `chore(${membership.parent}): plan graph revised`);
+        return applied;
+      });
       if (changed === 0) {
         logger.info("plan.unchanged", { plan: membership.parent, note: revision.note });
         return;
       }
 
-      await this.push(lease, `chore(${membership.parent}): plan graph revised`);
       await this.notifyTask(state, {
         kind: "plan-revised",
         task: membership.parent,
@@ -2132,6 +2615,15 @@ export class Supervisor {
    *
    * The runner then stops claiming until the cooldown expires, which is the part that
    * turns one refused request into a pause instead of a sweep through the whole queue.
+   *
+   * **And it fans the outage out to every OTHER slot** (`fanOutOutage`), which is the half
+   * slots added. The cooldown was always runner-scoped — an account limit is a property of
+   * the account, not of the task that happened to trip it — but with one slot "stop
+   * claiming" and "let go of what you hold" were the same sentence. With N they are not,
+   * and releasing only the slot that met the wall would leave N-1 sessions hammering the
+   * same refused endpoint until each met it separately: N journal entries, N cooldown
+   * records extending the back-off geometrically, and the stampede the cooldown exists to
+   * prevent, arriving one task at a time.
    */
   private async releaseAfterOutage(
     lease: LeaseHandle,
@@ -2147,6 +2639,13 @@ export class Supervisor {
 
     const entry = this.cooldown.record(Date.now(), outage);
     const waitSeconds = Math.ceil(entry.waitMs / 1000);
+
+    // BEFORE this task's own release, and deliberately: the release below writes the state
+    // repo and reaches Discord, so it takes seconds during which the other sessions are
+    // still spending requests against a provider that has already refused one. Signalling
+    // first costs nothing — the fan-out is synchronous and only sets flags and aborts — and
+    // each of those sessions then unwinds through this same function on its own.
+    this.fanOutOutage(spec.id, outage);
 
     metrics.providerOutages.inc({ kind: outage.kind });
     metrics.providerCooldown.set({ runner: config.runnerId }, waitSeconds);
@@ -2164,19 +2663,6 @@ export class Supervisor {
 
     // A session that got a token back happened; one that did not, did not.
     const counts = origin === "session" && spent.outputTokens > 0;
-    if (counts) {
-      await store.appendJournal(
-        spec.id,
-        state.sessions + 1,
-        [
-          `**Interrupted:** ${outage.detail}`,
-          "",
-          "The model provider stopped answering mid-session. Nothing about this task " +
-            "caused it and nothing here is a verdict on the work; the next session " +
-            "picks up from the branch as usual.",
-        ].join("\n"),
-      );
-    }
 
     const released: TaskState = {
       ...state,
@@ -2184,14 +2670,41 @@ export class Supervisor {
       usage: addUsage(state.usage, spent),
     };
 
-    // ALWAYS pushed, even when nothing else changed. Only `ready` is claimable, and a
-    // task last pushed as `running` — which is every task past its first session — would
-    // otherwise be stranded there by an outage no human is going to hear about in time.
-    await this.transition(lease, released, "ready");
-    await this.push(lease, `chore(${spec.id}): released — the provider stopped answering`);
+    // One unit, and here it matters more than anywhere else: the fan-out sends every other
+    // in-flight task down this same path within milliseconds, so this is the one write
+    // sequence N slots are GUARANTEED to attempt simultaneously rather than merely likely
+    // to. Without the unit, four tasks released by one spend limit would produce one commit
+    // carrying four `state.json` files under one task's message, and three tasks whose
+    // release was never recorded — left `running`, which no human hears about.
+    await this.unit(async () => {
+      if (counts) {
+        await store.appendJournal(
+          spec.id,
+          state.sessions + 1,
+          [
+            `**Interrupted:** ${outage.detail}`,
+            "",
+            "The model provider stopped answering mid-session. Nothing about this task " +
+              "caused it and nothing here is a verdict on the work; the next session " +
+              "picks up from the branch as usual.",
+          ].join("\n"),
+        );
+      }
+
+      // ALWAYS pushed, even when nothing else changed. Only `ready` is claimable, and a
+      // task last pushed as `running` — which is every task past its first session — would
+      // otherwise be stranded there by an outage no human is going to hear about in time.
+      await this.transition(lease, released, "ready");
+      await this.push(lease, `chore(${spec.id}): released — the provider stopped answering`);
+    });
 
     // Once per incident. The runner re-checks on a back-off, and a message per attempt
     // would be this failure mode wearing a different hat.
+    //
+    // `entry.first` is what keeps that true across slots as well as across attempts: the
+    // fan-out sends N-1 more tasks through this function within seconds, and every one of
+    // them finds the streak already non-zero. So four concurrent tasks meeting one spend
+    // limit produce one Discord message, not four.
     if (entry.first) {
       await this.notifyTask(state, {
         kind: "provider-unavailable",
@@ -2199,6 +2712,39 @@ export class Supervisor {
         detail: outage.detail,
         retryInSeconds: waitSeconds,
       });
+    }
+  }
+
+  /**
+   * Tell every OTHER in-flight task that the provider has stopped answering (§6.3).
+   *
+   * Synchronous, and does nothing but set a flag and abort: it is called from inside one
+   * task's release path, and a fan-out that awaited anything would let the other sessions
+   * spend more requests while it did so — or, worse, fail and leave them running with the
+   * outage already recorded.
+   *
+   * It does NOT release the other tasks itself, and that boundary is the point. Releasing
+   * task B means writing B's state and pushing under B's lease, and doing that from inside
+   * A's stack is exactly the cross-task coupling slots are supposed to remove: a push that
+   * failed for B would surface as A's failure, and A's `catch` would park A. So each slot
+   * is interrupted and unwinds through its OWN `releaseAfterOutage`, under its own lease,
+   * with its own error handling.
+   *
+   * At `concurrency: 1` this always has nothing to do — there is no other slot — which is
+   * why a single-task runner behaves exactly as it did before.
+   */
+  private fanOutOutage(met: TaskId, outage: ProviderOutage): void {
+    const { logger } = this.deps;
+
+    for (const slot of this.slots.values()) {
+      if (slot.id === met) continue;
+      // Already told. A second abort is harmless, but a second log line would make one
+      // incident look like several.
+      if (slot.outage !== undefined) continue;
+
+      logger.warn("provider.fanned-out", { task: slot.id, from: met, kind: outage.kind });
+      slot.outage = outage;
+      slot.interrupt.abort();
     }
   }
 
@@ -2269,9 +2815,14 @@ export class Supervisor {
   ): Promise<void> {
     const { store, logger } = this.deps;
     logger.warn("task.parked", { task: spec.id, sessions: state.sessions, reason });
-    await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
-    await this.transition(lease, state, "parked");
-    await this.push(lease, `chore(${spec.id}): parked`);
+    // Journal, state and commit as one unit — see `unit`. The tracker and the notification
+    // stay outside it: both are views of what git already says, and holding the state
+    // checkout across a Discord round trip would stall every other slot's writes.
+    await this.unit(async () => {
+      await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
+      await this.transition(lease, state, "parked");
+      await this.push(lease, `chore(${spec.id}): parked`);
+    });
     await this.mirror(spec, { kind: "parked", reason });
     await this.notify(notification ?? { kind: "parked", task: spec.id, reason });
   }
@@ -2330,14 +2881,24 @@ export class Supervisor {
     const { logger, inbox } = this.deps;
     if (inbox === undefined) return;
 
-    // A `/cancel` for the task this runner is running right now must not reach
-    // `applyPark`: parking claims the lease, the session is holding it, and the human
-    // would be told "not-parkable: running" about a task this very process is running.
-    // Only in-session code can stop a session. There are two ways to keep that request
-    // away from `applyPark`, and which one applies depends on the queue.
-    const mine = this.inFlightTask;
+    // A `/cancel` for a task this runner is running right now must not reach `applyPark`:
+    // parking claims the lease, the session is holding it, and the human would be told
+    // "not-parkable: running" about a task this very process is running. Only in-session
+    // code can stop a session. There are two ways to keep that request away from
+    // `applyPark`, and which one applies depends on the queue.
+    //
+    // **A membership test over the slots, not a comparison against one id.** This was
+    // `request.task === this.inFlightTask`, which at N slots would have answered "not
+    // mine" for every session but one — so a cancel for task A while B was also running
+    // went to `applyPark`, failed its CAS against A's own live lease, and told the human
+    // "not-parkable: running" about the exact task they were watching this process work.
     const isMyCancel = (request: ChatRequest): boolean =>
-      request.kind === "park" && mine !== undefined && request.task === mine;
+      request.kind === "park" && this.slots.has(request.task);
+
+    // Whether ANY of my tasks could be the subject of a cancel in this drain. The
+    // selective path costs a `takeWhere` with a predicate, and with no slots open there is
+    // nothing for it to exclude.
+    const mine = this.slots.size > 0;
 
     // LEAVE IT QUEUED, when the queue can take selectively: the `CANCEL_POLL_MS` watcher
     // inside the session picks it up on its own tighter interval.
@@ -2347,10 +2908,10 @@ export class Supervisor {
     // drain nothing at all for the whole of a session, which is the exact defect the
     // housekeeping split exists to remove, and would additionally strand the cancel,
     // since the in-session watcher polls that same empty `takeWhere`. So on a
-    // non-selective queue the drain takes everything and `cancelInFlight` stops the
-    // session directly. See `redis/inbox.ts`.
+    // non-selective queue the drain takes everything and the slot's own `cancel` hook stops
+    // that one session directly. See `redis/inbox.ts`.
     const taken =
-      mine !== undefined && inbox.selective
+      mine && inbox.selective
         ? await inbox.takeWhere((request) => !isMyCancel(request))
         : await inbox.drain();
 
@@ -2359,9 +2920,14 @@ export class Supervisor {
         // Off the list already, so it cannot be handed back to the watcher. Settled
         // `cancelling` rather than `parked` for the watcher's reason: the session unwinds
         // at a turn boundary and the park lands after that.
-        if (isMyCancel(request) && this.cancelInFlight !== undefined) {
-          logger.info("chat.cancel-routed", { task: mine });
-          this.cancelInFlight();
+        //
+        // Routed to the ONE slot the request names. That is what makes a cancel targeted
+        // rather than a broadcast: `slot.cancel` aborts that slot's own controller, and no
+        // other slot shares it.
+        const cancelling = request.kind === "park" ? this.slots.get(request.task) : undefined;
+        if (cancelling !== undefined) {
+          logger.info("chat.cancel-routed", { task: cancelling.id });
+          cancelling.cancel();
           request.settle({ kind: "cancelling" });
           continue;
         }
@@ -2488,23 +3054,29 @@ export class Supervisor {
     });
 
     const now = new Date().toISOString();
-    // Same load-bearing order as intake: state first, spec last, because `hasTask` keys
-    // on `spec.md` (§14).
-    await store.writeState({
-      id,
-      status: "ready",
-      phase: "planning",
-      requires: [],
-      sessions: 0,
-      limits: { maxSessions: config.limits.maxSessionsPerTask },
-      usage: EMPTY_USAGE,
-      progress: { lastProgressSession: 0, noProgressStreak: 0 },
-      chat: { threadId: request.threadId },
-      createdAt: now,
-      updatedAt: now,
+    // One unit — see `unit`. Housekeeping runs on a single thread of control, so this used
+    // to have only the work loop's ONE session to race; with N slots it has N, and a state
+    // written here with its spec swept into a session's commit is a task the claim loop
+    // skips forever (`hasTask` keys on `spec.md`).
+    await this.unit(async () => {
+      // Same load-bearing order as intake: state first, spec last, because `hasTask` keys
+      // on `spec.md` (§14).
+      await store.writeState({
+        id,
+        status: "ready",
+        phase: "planning",
+        requires: [],
+        sessions: 0,
+        limits: { maxSessions: config.limits.maxSessionsPerTask },
+        usage: EMPTY_USAGE,
+        progress: { lastProgressSession: 0, noProgressStreak: 0 },
+        chat: { threadId: request.threadId },
+        createdAt: now,
+        updatedAt: now,
+      });
+      await store.writeSpec(spec);
+      await store.commitAndPush(`chore(${id}): brainstorm started`, "origin", config.stateRepo.branch);
     });
-    await store.writeSpec(spec);
-    await store.commitAndPush(`chore(${id}): brainstorm started`, "origin", config.stateRepo.branch);
 
     logger.info("brainstorm.created", {
       task: id,
@@ -2528,25 +3100,30 @@ export class Supervisor {
       return { kind: "not-waiting", status: state.status };
     }
 
-    await store.writeAnswer(request.task, pending.index, request.text);
-    await store.appendJournal(
-      request.task,
-      state.sessions,
-      `**Answer from the operator:**\n\n${request.text}`,
-    );
-    await store.writeState({
-      ...state,
-      status: "ready",
-      // The streak that made the task park is not the next session's fault, and a
-      // task resumed at the limit parks again on the very next claim without ever
-      // running. Answering IS the progress.
-      progress: { ...state.progress, noProgressStreak: 0 },
+    // One unit — see `unit`. The answer FILE is the record of the answer (§4.1), and a
+    // sibling slot's commit sweeping it up while this one commits nothing is how an answer
+    // reported `applied` and was never readable by the session it was written for.
+    await this.unit(async () => {
+      await store.writeAnswer(request.task, pending.index, request.text);
+      await store.appendJournal(
+        request.task,
+        state.sessions,
+        `**Answer from the operator:**\n\n${request.text}`,
+      );
+      await store.writeState({
+        ...state,
+        status: "ready",
+        // The streak that made the task park is not the next session's fault, and a
+        // task resumed at the limit parks again on the very next claim without ever
+        // running. Answering IS the progress.
+        progress: { ...state.progress, noProgressStreak: 0 },
+      });
+      await store.commitAndPush(
+        `chore(${request.task}): answered question ${pending.index}`,
+        "origin",
+        config.stateRepo.branch,
+      );
     });
-    await store.commitAndPush(
-      `chore(${request.task}): answered question ${pending.index}`,
-      "origin",
-      config.stateRepo.branch,
-    );
 
     logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
     return { kind: "applied", index: pending.index };
@@ -2584,9 +3161,11 @@ export class Supervisor {
 
     try {
       const handle = heldLease(lease);
-      await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
-      await this.transition(handle, state, "parked");
-      await this.push(handle, `chore(${request.task}): parked from chat`);
+      await this.unit(async () => {
+        await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
+        await this.transition(handle, state, "parked");
+        await this.push(handle, `chore(${request.task}): parked from chat`);
+      });
       logger.info("task.cancelled", { task: request.task, previous: state.status });
 
       // After the push, never before: the thread's last word must describe what git
@@ -2661,15 +3240,17 @@ export class Supervisor {
 
     try {
       const handle = heldLease(lease);
-      await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
-      // `lastProgressSession` is history and stays put; only the streak is forgiven, so
-      // the journal can still show how long the task has actually been stalled.
-      await this.transition(
-        handle,
-        { ...state, progress: { ...state.progress, noProgressStreak: 0 } },
-        "ready",
-      );
-      await this.push(handle, `chore(${request.task}): resumed from chat`);
+      await this.unit(async () => {
+        await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
+        // `lastProgressSession` is history and stays put; only the streak is forgiven, so
+        // the journal can still show how long the task has actually been stalled.
+        await this.transition(
+          handle,
+          { ...state, progress: { ...state.progress, noProgressStreak: 0 } },
+          "ready",
+        );
+        await this.push(handle, `chore(${request.task}): resumed from chat`);
+      });
       logger.info("task.resumed", {
         task: request.task,
         sessions: state.sessions,
@@ -2742,9 +3323,11 @@ export class Supervisor {
       // it parked would invite a human to pick up something already shipped.
       const handle = heldLease(lease);
       try {
-        await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
-        await this.transition(handle, state, "done");
-        await this.push(handle, `chore(${request.task}): merged from chat`);
+        await this.unit(async () => {
+          await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
+          await this.transition(handle, state, "done");
+          await this.push(handle, `chore(${request.task}): merged from chat`);
+        });
       } catch (error) {
         // The merge already happened; failing to record it is worth a log, not a retry.
         logger.warn("merge.unrecorded", { task: request.task, ...errorFields(error) });
@@ -2875,6 +3458,48 @@ export class Supervisor {
     await this.deps.store.writeState(next);
     this.deps.metrics.taskStatus.set({ task: state.id, status }, 1);
     return next;
+  }
+
+  /**
+   * Run `body` — a write-then-push unit — with the state checkout to this slot alone.
+   *
+   * **This is what N slots made mandatory, and `StateStore.exclusively` was kept for it.**
+   * That method's own docstring says so: "Nothing in the supervisor calls this yet… the cost
+   * of that route is attribution (another writer's commit may carry these files) rather than
+   * durability. This exists for a caller that cannot accept even that cost." A runner with
+   * one slot could accept it, because the only other writer was housekeeping, whose writes
+   * belong to a DIFFERENT task and land in a commit whose message is at worst imprecise.
+   *
+   * At N slots it stops being about tidiness. Two sessions ending within a millisecond of
+   * each other each write a journal shard, a `handoff.md` and a `state.json`, and then each
+   * commits; without the hold, whichever gets there first stages the other's half-written
+   * files under its own message and the second finds a clean tree and commits nothing.
+   * `Serial` does not prevent it: every individual git call is properly ordered, and the
+   * damage happens in the interval between one writer's last `writeFile` and its own
+   * `git add`, which it had handed to whoever asked next. Not hypothetical —
+   * `loop.test.ts`'s "two slots writing state at once" reproduced it on the first run, with
+   * `chore(CONC-WRITE-A): session 1` carrying six files across two tasks.
+   *
+   * **This is one of TWO halves and neither is sufficient.** The other is
+   * `StateStore.pending`: staging is now scoped to the paths a writer actually wrote,
+   * because `transition("running")` deliberately leaves a `state.json` uncommitted for the
+   * whole of a session, so at any instant every other in-flight task has one sitting in
+   * this tree — a window no lock can close, since it has been open for minutes. This hold
+   * stops a concurrent writer entering; that scoping stops an already-written file being
+   * swept up.
+   *
+   * The unit is therefore the whole of a logical operation, from its first write to its
+   * push, and never any wider. In particular it must NOT span a session: the model call
+   * takes minutes and holding the state checkout across one would stop every other slot
+   * writing and stop housekeeping pulling.
+   *
+   * Re-entrant within one async context by construction (`StateStore.exclusive` keys on
+   * `AsyncLocalStorage`), so a unit nested inside a unit — `applyOutcome` calling `park`,
+   * `convene` calling `releaseAfterOutage` — runs immediately on the hold it already has
+   * rather than deadlocking on it.
+   */
+  private unit<T>(body: () => Promise<T>): Promise<T> {
+    return this.deps.store.exclusively(() => body());
   }
 
   /**

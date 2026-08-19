@@ -9,7 +9,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { Git } from "../state/git.ts";
+import { Git, type GitResult } from "../state/git.ts";
 import { asTaskId, type RepoRef } from "../domain/task.ts";
 import { assertInside, WorktreeManager } from "./worktree.ts";
 
@@ -937,4 +937,148 @@ test("a mirror and worktree left by the OLD shared-socket scheme are migrated in
     (await new Git(existing, hermetic).run("rev-parse", "--is-bare-repository")).trim(),
     "false",
   );
+});
+
+test("two concurrent checkouts against one mirror do not corrupt it", async () => {
+  // Two tasks on the SAME repo, checked out at the same time — the case N concurrent
+  // sessions per runner introduces (DESIGN.md §6.4) and the one that cannot be discovered
+  // by reading the code, because git's own locking makes it intermittent rather than
+  // wrong.
+  //
+  // `ensureTaskCheckout` fetches the mirror, adds a worktree to it and writes its common
+  // config. Every one of those wants `index.lock`, and git does NOT queue for it: the loser
+  // exits non-zero with `Unable to create '…/index.lock': File exists`. So without the
+  // per-mirror lock this is a session that dies in its first thirty seconds, on a task with
+  // nothing wrong with it, only when two tasks on one repo happen to start together — a
+  // flaky task failure, which is the worst possible way to find out about a race.
+  //
+  // Started in the same tick and awaited together, which is what makes this a test of the
+  // lock rather than of two sequential calls: if `onMirror` advanced its chain after an
+  // await instead of synchronously, both would see the same predecessor and both would run.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const a = asTaskId("MIRROR-CONC-A");
+  const b = asTaskId("MIRROR-CONC-B");
+
+  // **The order of git invocations is the subject, and it has to be, because the damage is
+  // not reliably reproducible from the outside.** Two `worktree add`s against a
+  // three-commit mirror on a warm page cache finish in single-digit milliseconds, so the
+  // `index.lock` collision that wrecks a production mirror lands maybe once in a hundred
+  // runs here — and a test that catches a race one run in a hundred is a test that reports
+  // the fix works while the bug is still in. Asserting on interleaving instead makes the
+  // property deterministic, which is exactly the argument `loop.test.ts` makes for testing
+  // the state-store mutex on ORDER rather than on the absence of a crash.
+  //
+  // The recorded delay is what a real fetch costs against a real remote, injected so that
+  // an unsynchronised second caller has somewhere to interleave INTO. Without it both
+  // callers race to completion and "they did not interleave" is a statement about the
+  // scheduler rather than about the lock.
+  const order: string[] = [];
+  const MUTATING = new Set(["fetch", "clone", "worktree", "config"]);
+
+  class TracingGit extends Git {
+    override async tryRun(...args: readonly string[]): Promise<GitResult> {
+      await this.trace(args);
+      return super.tryRun(...args);
+    }
+
+    override async run(...args: readonly string[]): Promise<string> {
+      await this.trace(args);
+      return super.run(...args);
+    }
+
+    private async trace(args: readonly string[]): Promise<void> {
+      const [subcommand] = args;
+      if (subcommand === undefined || !MUTATING.has(subcommand)) return;
+      // Which TASK this call belongs to, read off the arguments: every mirror-mutating call
+      // in a checkout either names the task's path or its credential socket.
+      const joined = args.join(" ");
+      const task = joined.includes(a) ? a : joined.includes(b) ? b : undefined;
+      if (task === undefined) return;
+      order.push(`${task}:${subcommand}`);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+
+    override at(cwd: string): Git {
+      return new TracingGit(cwd, HERMETIC);
+    }
+
+    override withoutCredentials(): Git {
+      return this;
+    }
+  }
+
+  const subject = new WorktreeManager({
+    git: new TracingGit(root, HERMETIC),
+    mirrorsDir: join(root, "mirrors"),
+    tasksDir: join(root, "tasks"),
+    helperPath: "/usr/local/bin/caterpillar-cred",
+    socketDir: "/run/caterpillar/cred",
+    identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+  });
+
+  const [first, second] = await Promise.all([
+    subject.ensureTaskCheckout([REPO], a),
+    subject.ensureTaskCheckout([REPO], b),
+  ]);
+
+  // Nothing belonging to one task may appear between the first and last call of the other.
+  // That is the whole property: a checkout's fetch, `worktree add` and config writes are
+  // one transaction against one mirror, and git's own locking refuses rather than queues.
+  const owners = order.map((entry) => entry.split(":")[0]);
+  const switches = owners.filter((owner, index) => index > 0 && owner !== owners[index - 1]);
+  assert.ok(order.length >= 4, `the trace saw nothing to interleave: ${order.join(" ")}`);
+  assert.equal(
+    switches.length,
+    1,
+    `one mirror admits one checkout at a time; the trace changed hands ${switches.length} ` +
+      `times: ${order.join(" ")}`,
+  );
+
+  // Both checkouts exist, on their own branches. A lost `worktree add` shows up here.
+  assert.ok(existsSync(join(first.root, ".git")), "task A has no checkout");
+  assert.ok(existsSync(join(second.root, ".git")), "task B has no checkout");
+
+  const mirror = mirrorDir(root);
+  const mirrorGit = new Git(mirror, HERMETIC);
+
+  // The mirror itself must still be a coherent repository. `fsck` is the assertion that
+  // covers what a half-written ref or a torn administrative record actually looks like —
+  // "it did not throw" is true of a corrupted mirror right up until the next task uses it.
+  await mirrorGit.run("fsck", "--no-progress");
+
+  // And it must know about exactly the two worktrees, each on its own branch. A record
+  // clobbered by a concurrent `worktree add` leaves a checkout on disk the mirror cannot
+  // see, which `checkedOutBranches` then omits from the fetch refspec — so the NEXT task
+  // on this repo fails with `refusing to fetch into branch … checked out at …`, naming a
+  // branch it has never touched.
+  const listed = await mirrorGit.run("worktree", "list", "--porcelain");
+  const branches = listed
+    .split("\n")
+    .filter((line) => line.startsWith("branch "))
+    .map((line) => line.slice("branch ".length).trim())
+    .sort();
+  assert.deepEqual(
+    branches,
+    [`refs/heads/agent/${a}`, `refs/heads/agent/${b}`],
+    `the mirror must list both worktrees, on their own branches:\n${listed}`,
+  );
+
+  // Each worktree is on its own branch and neither has been left detached or pointed at
+  // the other's. This is the failure the `revParse`-then-`worktree add` window produces
+  // when a concurrent fetch moves a ref between the two calls.
+  for (const [task, checkout] of [[a, first], [b, second]] as const) {
+    const head = await new Git(checkout.root, HERMETIC).run("rev-parse", "--abbrev-ref", "HEAD");
+    assert.equal(head.trim(), `agent/${task}`, `${task} is not on its own branch`);
+  }
+
+  // The shared config each checkout writes is identical between tasks — which is why those
+  // writes are safe to share at all — and the per-task credential helper is NOT, which is
+  // why that one lives in worktree scope. Both must have survived two writers.
+  for (const [task, checkout] of [[a, first], [b, second]] as const) {
+    const git = new Git(checkout.root, HERMETIC);
+    assert.equal((await git.run("config", "remote.origin.push")).trim(), "HEAD");
+    assert.match(await git.run("config", "credential.helper"), new RegExp(task));
+  }
 });

@@ -147,6 +147,27 @@ export class Git {
     return out.length > 0;
   }
 
+  /**
+   * Is anything STAGED — that is, would `git commit` produce a commit?
+   *
+   * Deliberately narrower than `hasUncommittedChanges`, and the difference is what made it
+   * necessary. That one runs `status --porcelain`, which reports the whole working tree,
+   * staged or not. That was the same question while a commit staged everything; it stopped
+   * being the same question when `StateStore` began staging only the paths one writer wrote
+   * (see `StateStore.pending`), because a runner working several tasks at once ALWAYS has
+   * another task's uncommitted `state.json` in the tree. Asked the old way, a commit that
+   * staged nothing of its own would be told "yes, there are changes", run `git commit`
+   * against an empty index, and fail with a `GitError` carrying no message at all.
+   *
+   * `diff --cached --quiet` exits 1 when the index differs from HEAD and 0 when it does not,
+   * which is exactly the question. It is also correct on the very first commit of an empty
+   * repository, where there is no HEAD to diff against: git compares against the empty tree.
+   */
+  async hasStagedChanges(): Promise<boolean> {
+    const result = await this.tryRun("diff", "--cached", "--quiet");
+    return result.code !== 0;
+  }
+
   /** Commit timestamp as epoch seconds. */
   async commitTime(oid: string): Promise<number> {
     const out = await this.run("show", "-s", "--format=%ct", oid);

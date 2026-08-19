@@ -1317,3 +1317,73 @@ test("a write that races a DESTRUCTIVE pull is not destroyed by it", async () =>
   );
   assert.equal(subject.hasUncommittedState, true, "and the write must still be pending a commit");
 });
+
+test("a unit's commit carries only what that unit wrote", async () => {
+  // The staging rule N concurrent sessions per runner made necessary (DESIGN.md §6.4).
+  //
+  // `stageCommitPush` ran `git add -A tasks`, which stages the whole directory whatever
+  // wrote it. That was invisible with one session per runner. It is not invisible with
+  // several, because the supervisor writes `state.json` at `transition("running")` and
+  // deliberately does not push it — so at any instant every OTHER in-flight task has an
+  // uncommitted `state.json` sitting in this checkout, and the first session to finish
+  // committed all of them under its own message while their own commits found a clean tree
+  // and recorded nothing.
+  //
+  // Neither the mutex nor `exclusively` can fix that on its own: the file has been on disk
+  // for the whole of a session, so there is no window left to close. The staging has to be
+  // narrowed, and this is that.
+  const { store: subject, bare } = await sharedStateRepo();
+
+  const RUNNING = asTaskId("STAGE-RUNNING");
+  const FINISHING = asTaskId("STAGE-FINISHING");
+
+  const seedState = {
+    phase: "implementing",
+    requires: [],
+    sessions: 0,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 0, noProgressStreak: 0 },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } as const;
+
+  // Task A is mid-session: its state is written and NOT committed, exactly as
+  // `transition("running")` leaves it. Nothing here will commit it.
+  await subject.writeState({ ...seedState, id: RUNNING, status: "running" });
+
+  // Task B now finishes, as one write-then-commit unit — what `Supervisor.unit` does.
+  await subject.exclusively(async (tree) => {
+    await subject.writeState({ ...seedState, id: FINISHING, status: "done" });
+    await subject.appendJournal(FINISHING, 1, "finished");
+    await tree.commitAndPush(`chore(${FINISHING}): done`, "origin", "main");
+  });
+
+  // B's commit names B's files and nothing else. This is the assertion that fails on
+  // `git add -A tasks`.
+  const named = await bare.run("show", "--name-only", "--format=", "main");
+  assert.match(named, new RegExp(`tasks/${FINISHING}/state\\.json`));
+  assert.doesNotMatch(
+    named,
+    new RegExp(`tasks/${RUNNING}`),
+    `a unit's commit must not carry another task's in-flight state:\n${named}`,
+  );
+
+  // And A's state is still uncommitted rather than lost, so the store keeps declining a
+  // pull over it and A's own commit will carry it. The alternative failure — A's file
+  // swept into B's commit — would have left A with nothing of its own to commit at all.
+  assert.equal(
+    await subject.pull("origin", "main"),
+    "skipped",
+    "the in-flight task's write must still be waiting for its own commit",
+  );
+
+  // Which it then gets, under its own message, when its session ends.
+  await subject.exclusively(async (tree) => {
+    await subject.writeState({ ...seedState, id: RUNNING, status: "parked" });
+    await tree.commitAndPush(`chore(${RUNNING}): parked`, "origin", "main");
+  });
+  const second = await bare.run("show", "--name-only", "--format=", "main");
+  assert.match(second, new RegExp(`tasks/${RUNNING}/state\\.json`));
+  assert.doesNotMatch(second, new RegExp(`tasks/${FINISHING}`));
+});
