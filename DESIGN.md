@@ -831,31 +831,58 @@ touch git. Two mechanisms, and both are needed:
    durability: a commit message occasionally undersells its contents. That is the right way
    round.
 
-   The flag is backed by a monotonic write counter, because writes deliberately do *not*
-   take the mutex. `commitAndPush` samples the counter before its first `add` and clears
-   the flag only if it has not moved, so a write that lands *during* a commit — after the
-   `add` that would have staged it — leaves the tree marked dirty rather than being lost
-   to the next `pull`. That window is only a few subprocess spawns wide, but a session's
-   `publishArtifact` can fall into it and then go hours before its own commit.
+   The flag is backed by a monotonic write counter. `commitAndPush` samples it before its
+   first `add` and clears the flag only if it has not moved, so a write that lands *during*
+   a commit — after the `add` that would have staged it — leaves the tree marked dirty
+   rather than being lost to the next `pull`; and `pullNow` re-reads it after its `fetch`
+   and abandons the refresh if it moved, reporting `"skipped"`. That second one is the
+   original five-task incident, still reachable after the flag alone was added: it stopped
+   being theoretical the moment the work loop began pulling before each claim, which put a
+   pull in the same instant as a `/brainstorm` creating a task — the spec was written
+   between the fetch and the clean, and the `commitAndPush` immediately after found nothing
+   to commit and reported success. A task acknowledged to a human that existed nowhere.
 
-   The same counter closes the mirror-image window *inside* `pull`, and this is the one
-   that bites. `dirty` is a sample, and `pull` does a network `fetch` — hundreds of
-   milliseconds — before it touches anything. A write landing in that gap is invisible to
-   the check at the top and deleted by the `clean -ffdq` at the bottom, which is the
-   original five-task incident still reachable after the flag was added. `pullNow`
-   therefore re-reads the generation after its fetch and abandons the refresh if it moved,
-   reporting `"skipped"`. It stopped being theoretical the moment the work loop began
-   pulling before each claim: that put a pull in the same instant as a `/brainstorm`
-   creating a task, the spec was written between the fetch and the clean, and the
-   `commitAndPush` immediately after found nothing to commit and reported success — a task
-   acknowledged to a human that existed nowhere. Read it as one rule with two instances:
-   anything that samples `dirty` and then spends time before touching the tree must
-   re-check that nothing was written while it was not looking.
+3. **Writes take the mutex too — one write at a time.** This is the third mechanism, and it
+   exists because the first two are not enough however carefully the counter is placed.
+   `dirty` is a *sample*, and both destructive paths spend several subprocess spawns in the
+   working tree **after the last moment they could check it**: `pullNow` between its
+   post-fetch re-check and its `clean -ffdq`, and `rebaseOnto` between its `reset --hard
+   HEAD` and the end of its salvage. An unlocked write landing in there is deleted having
+   been visible to nothing, and no additional flag can see it — the check would have to
+   happen after the damage.
+
+   It was not found by reasoning about the window. It was found as a **flaky test**: one CI
+   run in three, `an answer from the bridge unparks the task on the REMOTE`. An answer typed
+   in Discord reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work
+   loop's pre-claim pull, and then pushed a `state.json` saying the question had been
+   answered — the answer gone from the one file the next session reads it out of (§4.1),
+   while every status said it had been recorded. The same red job also skipped the image
+   build, so that deploy silently did not happen.
+
+   The objection this design started with — that holding the mutex across a session's
+   minutes-long write-then-commit window is a deadlock waiting to happen — is answered by
+   **scope**: the lock is held for one `writeFile`, never for a write-then-commit unit. What
+   a write can now do is wait out a fetch. Losing it was the alternative.
+
+   The one real deadlock this did introduce is worth writing down, because it hung a test
+   file rather than failing it. `exclusively` exists so that a write and its commit are one
+   unit — so the holder of the tree writing through it deadlocks on its own hold the instant
+   writes acquire. So acquisition is **scoped to the async context that holds the lock**
+   (`AsyncLocalStorage`, in `StateStore.exclusive`): the holder's own write runs immediately,
+   anyone else's queues. `Serial` stays re-entrant-hostile and is not weakened, because the
+   re-entrancy turns on *identity* — a boolean saying "someone holds it" would wave through
+   the very concurrent write the lock exists to order.
+
+   The counter checks stay as the second line rather than the only one: `serial` is
+   injectable, so something else can share the checkout, and a guard whose incident is
+   written down is not one to delete because it has become hard to reach. What the mutex
+   still does not make atomic is a read-then-write — a caller that reads state, decides, and
+   writes it back can have a pull land in the middle. That is what `exclusively` is for.
 
    `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
    needs the two to be one unit. **No production path uses it today** — the supervisor's
-   writes go through `writeState`/`appendJournal` and rely entirely on the dirty flag and
-   its counter, which is what makes sessions safe. It exists because the gap it closes is
+   writes go through `writeState`/`appendJournal`, which now take the mutex individually and
+   are covered by the dirty flag and its counter between them. It exists because the gap it closes is
    real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
    then commits can have its files swept into another writer's commit under the wrong
    message. That costs attribution, not durability, which is precisely why the supervisor
@@ -989,10 +1016,12 @@ fifteen minutes, and a housekeeping pass that waits on a git fetch still can. So
 acknowledged immediately with what is knowable at click time, and the real outcome arrives
 afterwards as an ordinary channel message from the bot.
 
-Reads never take that path at all. `/tasks`, `/task` and autocomplete are served from an
-in-memory snapshot, refreshed by the same sweep that decides what to claim. Going through
-the inbox for a listing would mean waiting on a session to finish before being told what it
-is doing.
+Reads never take that path at all. `/tasks`, `/task` and task-id autocomplete are served
+from an in-memory snapshot, refreshed by the same sweep that decides what to claim. Going
+through the inbox for a listing would mean waiting on a session to finish before being told
+what it is doing. `/brainstorm`'s `repo:` box is the one autocomplete answered from
+somewhere else — the workspaces' forges (§9.1.1) — and it is bounded and failure-isolated
+for the same 3-second reason.
 
 The **housekeeping** loop refreshes it, not only the work loop (§6.4), and that is not
 belt-and-braces. The sweep publishes the snapshot on its way to picking a task, so on the
@@ -1239,11 +1268,40 @@ id addressing a different task. A button from an older deploy is refused rather 
 guessed at — Discord keeps message history forever, and every button in it outlives the
 code that rendered it.
 
-Commands are registered **per guild**, at deploy time, by `npm run discord:register`.
-Guild registration takes effect instantly where global registration is
-eventually-consistent, registration is a full replace so re-running it is a no-op, and it
-is not done at boot because the supervisor restarts on every deploy and would otherwise
-write the identical command set once per pod per rollout.
+Commands are registered **per guild**, and the runner does it **itself, at boot, once per
+change across the whole fleet, ever**. Guild registration takes effect instantly where
+global registration is eventually-consistent, and it is a full REPLACE — the `COMMANDS`
+array is the entire surface, so a command deleted from it disappears from the client.
+
+It used to be a deploy-time step run by hand, for one real reason: the supervisor restarts
+on every deploy and there are four of it, so a naive call in `main()` writes the identical
+command set once per pod per rollout. That objection is about redundant *writes*, not about
+who does it — and the cost of answering it with a human was paid in full when `/brainstorm`'s
+autocompleted `repo:` box (§9.1.1) shipped as code and stayed a plain text field in Discord,
+because the step was forgotten.
+
+So the write is claimed, on `refs/commands/<digest>`, where the digest covers the commands
+AND the guild. The same compare-and-swap as a task claim (§5), in the same shape the daily
+digest uses (§19), with the same four properties:
+
+- **the ref's existence IS the record** that this exact set has been published, so a restart
+  registers nothing and there is no in-memory flag to lose
+- **a changed set is a changed digest**, so the first boot after a deploy publishes it and
+  every boot after that does not
+- **a claim that errors is not a claim someone else won** — a rejected push is also what a
+  dead network looks like, and reading it as a win would mark a set published that nobody
+  published
+- **a failed write hands the claim back**, because a claimed-but-unregistered set is
+  invisible and nothing would ever revisit it
+
+It is fire-and-forget and cannot fail a boot. A registration Discord refuses is a 403 for a
+missing `applications.commands` scope, which no retry fixes and which stops nothing else: the
+bridge still runs, and `!answer` and the buttons never depended on it.
+
+`npm run discord:register` remains, and remains unconditional — it is the escape hatch for
+what a digest cannot see. Commands edited or deleted **in Discord** leave the ref saying
+"published" and the guild disagreeing, and it is also how a command set is iterated on
+against a test guild from a workstation, with no pod and no state repo.
 
 ### 7.2 The presence says what the fleet is working on
 
@@ -1574,7 +1632,117 @@ With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec sa
   OAuth code).
 
 Run `npm run verify:github-app` after installing — it confirms the JWT signs, prints
-the installation id, and proves per-task repo scoping works, without printing a token.
+the installation id, proves the installation can reach the repo you name, and proves
+per-task repo scoping works, without printing a token.
+
+### 9.1.1 A repo the credential cannot reach is refused at the door
+
+Everything above bounds which repos a task is *allowed* to name. Nothing asked whether
+the credential can *reach* the ones it named — and the answer arrived at the worst
+possible moment.
+
+```
+BS-1539331435477860432 parked — session failed: git clone --mirror
+  https://github.com/caesarakalaeii/allchat.git failed (128):
+  caterpillar-cred: GitHub /app/installations/153385932/access_tokens failed with 422:
+    the App is not installed on one of the requested repositories
+  fatal: could not read Username for '…': terminal prompts disabled
+```
+
+The repo is called **`all-chat`**. Somebody typed `allchat` into `/brainstorm`, and every
+check on the way in passed: it parses as `owner/name` (§domain), it is on the workspace's
+host, it is not the state repo, so it resolved to a workspace and became a task. A runner
+claimed it, spent a session, and died on the first thing a session does. The park reason
+named an installation id and a git exit code; the one word that mattered — `all-chat` —
+appeared nowhere.
+
+**Why the mint cannot say it.** `POST /access_tokens` answers **422 for a repo that does
+not exist and 422 for a repo the App is not installed on**, with a body of
+`{"message": "Unprocessable Entity"}`, and it takes `repositories` as *names* — so it does
+not even echo which one it refused. A 422 is not evidence about an installation. Reading
+it as one sent the operator to the App's settings page for what was a dash.
+
+The question is therefore asked from the other side: **`GET /installation/repositories`**
+returns the list, so the difference can be computed here, and a list makes the useful
+sentence possible — *"`caesarakalaeii/allchat` is not one of the 65 repositories this
+workspace's GitHub App can see. Did you mean `caesarakalaeii/all-chat`?"* Near misses are
+ranked by a squashed comparison first (`-`, `_`, `.` and case are what people retype
+wrong: `AllChat`, `all_chat`, `allchat` are all one edit from nothing) and then by bounded
+edit distance. `ForgeFactory` answers it — one per workspace, which is the unit a
+credential belongs to — and Forgejo answers the same question from what it has: a token
+configured for the owner, and a `GET /repos/{owner}/{name}` that is not a 404.
+
+Asked in three places, each the first moment the answer is cheap:
+
+- **the `/brainstorm` door** (`applyBrainstorm`) — a refusal typed back into the channel
+  before a task exists. This is where the incident above was avoidable.
+- **intake** (`Ingester`) — an `agent` block's `repos` list is free text too, and on that
+  path nobody is watching: the refusal becomes a comment on the item, recorded and
+  suppressed exactly like every other intake refusal (§14.2).
+- **before every session** (`workTask`) — the net under both, and the only one that
+  catches a repo that became unreachable *after* the task was created, or one that arrived
+  through a plan (`materialise` resolves repos from agent free text and is synchronous, so
+  it does not ask; its children are caught here). The task parks with the sentence instead
+  of with a git exit code, and no session is spent.
+
+Re-asked per session rather than cached per task, because the answer changes without the
+task changing: an App uninstalled mid-task, or one installed a minute ago by the human who
+read the last park reason. The listing behind it is cached for five minutes, so the steady
+state costs one request per workspace per five minutes — the same budget §14.2 rations.
+
+A **hit is served from that cache and a miss is not**: an absence is re-read from GitHub
+before it becomes a refusal. A repo installed a minute ago is absent from a five-minute-old
+list, and "your brand-new repo does not exist" is the one wrong answer this check exists to
+stop being given. It is affordable exactly because misses are rare, and it is bounded to one
+re-read per call however many repos miss.
+
+**Every one of the three fails OPEN.** A forge that throws has told us nothing: a 500, a
+DNS blip, an expired key. Refusing a `/brainstorm`, or parking a task, over that would be
+strictly worse than the clone failure this exists to pre-empt — so a refusal only ever
+comes from a forge that *answered*, and a listing that could not be read to completion is
+an error rather than a short list (the same reasoning as the check-run cap in §12).
+
+**And the mint still explains itself**, because the check is a usability layer and not a
+boundary: a 422 now asks the installation what it *can* see and names the repos that are
+missing, with the same near miss. That is the message the credential helper prints into a
+failing `git clone`, so it is the last place a human is told anything at all.
+
+**The refusal is the floor, not the fix.** The better outcome is never typing the name: the
+same list answers forwards as well as backwards, so `/brainstorm`'s `repo:` option is
+**autocompleted** from the repos the runner can actually reach (`RepoCatalog`, the mirror of
+`RepoReach`). A name that cannot be reached is a name that is never offered.
+
+Four things make that box behave:
+
+- **The ranking is forgiving in exactly the way the incident was.** Prefix, then substring,
+  then the *squashed* comparison — so `allchat` finds `all-chat` while it is still being
+  typed — then bounded edit distance for `all-chta`. An empty query lists the catalogue
+  rather than nothing: an empty suggestion box is indistinguishable from a bot that has
+  stopped working.
+- **`repo:` takes several repos** (§14.3), and Discord replaces the *entire* option value
+  with the chosen suggestion — so each choice carries the repos already typed plus the new
+  one. A choice carrying only its own repo would silently delete the others, which is the
+  same "plan about half a system" the cross-workspace refusal exists to prevent. A
+  completion that would exceed Discord's 100-character ceiling is dropped rather than sent,
+  because that ceiling rejects the *whole* response and shows the human no suggestions at
+  all.
+- **One catalogue over every workspace**, because `/brainstorm` does not name one — the loop
+  derives the workspace from the repo. Each workspace's contribution is bounded (1.5s) and
+  failure-isolated: one forge being slow or refusing costs it its place in the list, not the
+  list.
+- **It never throws.** An autocomplete accepts exactly one response and no other kind, so an
+  unanswered interaction is a spinner that never resolves — worse than no suggestions. A
+  bridge with no catalogue at all (a standalone bot process holds no forge credential) is a
+  supported shape and behaves as it did before the box was completed.
+
+GitHub's catalogue is the installation listing already described. Forgejo's is `GET
+/user/repos` narrowed to the owners a token covers, falling back to the configured per-repo
+slugs when the token is repository-scoped and not permitted to list — so the box is as good
+as what the credential can enumerate, and empty rather than wrong when it can enumerate
+nothing.
+
+`COMMANDS` changed, and nothing has to be remembered for the box to appear: the first runner
+to boot on the new image registers the new set and the rest of the fleet does not (§7.1).
 
 ### 9.2 Why the agent never holds the token
 

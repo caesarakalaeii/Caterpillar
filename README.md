@@ -50,6 +50,12 @@ Repos are bounded too: an item may only name repos on its workspace's own forge,
 never the state repo (§9.1). A `codeberg.org/...` sibling in a GitHub workspace is
 refused rather than half-working.
 
+A repo the workspace's credential cannot **reach** is refused the same way, with the near
+miss named: `acme/allchat` for a repo called `all-chat` used to become a task, get claimed,
+and die in `git clone` a session later on a 422 that named the App installation rather than
+the repo (§9.1.1). If the forge cannot be asked at that moment the item goes through
+anyway — a 500 from GitHub is not evidence that an App was uninstalled.
+
 In Vikunja the editor cannot put `agent` on the fence line, so put it as the first line
 *inside* a code block instead — intake accepts either position.
 
@@ -124,7 +130,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
-| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). |
+| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). `reach.ts` / `catalog.ts` answer whether a named repo can be reached, and offer the ones that can (§9.1.1). |
 | `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
@@ -732,8 +738,9 @@ different places (DESIGN.md §9.7).
 npm run verify:github-app -- --pem <key.pem> --app-id <id> --repo <owner/name>
 ```
 
-Signs a JWT, prints the installation id, mints a repo-scoped token, and echoes the
-granted permissions. Never prints the token.
+Signs a JWT, prints the installation id, checks the installation can actually reach the
+repo you named — suggesting the near miss when it cannot (§9.1.1) — mints a repo-scoped
+token, and echoes the granted permissions. Never prints the token.
 
 ## Verifying the reviewer App
 
@@ -841,7 +848,7 @@ exist in the mounted `caterpillar-discord` secret:
 |---|---|---|
 | `webhook-url` | outbound notifications (§11.2) | `NullNotifier` — the supervisor runs silently, unless a bot token is set |
 | `bot-token` + `channel-id` | inbound `!answer`, slash commands, buttons (§7) — and outbound notifications *with* buttons | a question waits until a human commits the answer file |
-| `application-id` + `guild-id` | `npm run discord:register` (§7.1) | `/answer` and friends never appear in the client; `!answer` still works |
+| `application-id` + `guild-id` | the slash commands, registered by the runner itself at boot (§7.1) | `/answer` and friends never appear in the client; `!answer` still works |
 
 Where both a webhook and a bot token exist, **the bot sends the notifications**. Discord
 refuses interactive components from a webhook the application does not own, so a question
@@ -904,6 +911,18 @@ that crosses two is refused in the thread rather than quietly narrowed to one (�
 extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
 child tasks inherit the whole list.
 
+**The `repo:` box autocompletes** from the repos the runner can actually reach, so the name
+is picked rather than typed — and the ranking is deliberately forgiving: typing `allchat`
+offers `caesarakalaeii/all-chat`. With several repos in the box, a suggestion keeps the ones
+already there.
+
+A repo the App cannot reach is still refused **before the task exists**, for the times
+somebody types past the suggestions, and the refusal names the near miss:
+`repo:caesarakalaeii/allchat` answers *"not one of the 65 repositories this workspace's
+GitHub App can see — did you mean `caesarakalaeii/all-chat`?"* rather than opening a thread
+that spends a session and parks on a git exit code (§9.1.1). Retype it and run the command
+again; nothing was created.
+
 Opens a thread and creates a brainstorm task in it. The agent reads the repos and asks one
 question at a time — answer in the thread, where the task id is implied, so `!answer yes`
 is the whole command. When the shape is settled it proposes a decomposition, the review
@@ -943,19 +962,32 @@ through a rollout; acting four times is what would open four threads for one
 
 ## Registering the slash commands
 
+**Nothing to run.** The runner registers the command set itself at boot, once per change
+across the whole fleet, claimed on `refs/commands/<digest>` — so the first pod up on a new
+image publishes the new commands and the other three write nothing (§7.1). A changed
+`COMMANDS` array is a changed digest; an unchanged one is a boot that registers nothing.
+Guild-scoped, so what it publishes appears instantly.
+
+That claim is why this stopped being a chore: it used to be a deploy-time step, and the one
+time it was forgotten, an autocompleted `repo:` box shipped as code and stayed a plain text
+field in Discord (§9.1.1).
+
+By hand, when you need it:
+
 ```bash
 npm run discord:register     # reads bot-token, application-id and guild-id from the secret
 DISCORD_BOT_TOKEN=... DISCORD_APPLICATION_ID=... DISCORD_GUILD_ID=... npm run discord:register
 ```
 
-Guild-scoped, so the commands appear instantly. Registration is a full replace: the
-`COMMANDS` array in `src/notify/slash.ts` **is** the surface, and re-running this is a
-no-op rather than a duplicate. It is a deploy-time step, not a boot-time one — the
-supervisor restarts on every rollout and would otherwise write the same set once per pod.
+Unconditional, and the escape hatch for what a digest cannot see: commands edited or deleted
+**in Discord** leave the ref saying "published" and the guild disagreeing. It is also how a
+command set is iterated on against a test guild from a workstation, with no pod and no state
+repo. Registration is a full replace either way — the `COMMANDS` array in
+`src/notify/slash.ts` **is** the surface.
 
 The bot must have been invited with the `applications.commands` scope. An invite built
 with `scope=bot` alone joins the guild and registers nothing, and the failure is a 403
-that reads like a bad token.
+that reads like a bad token — logged as `commands.failed`, and it stops nothing else.
 
 Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
 live topology, the credential rules, and an unresolved security note.

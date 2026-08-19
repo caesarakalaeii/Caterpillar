@@ -1202,25 +1202,118 @@ test("a write that races a pull is not destroyed by it", async () => {
   // the window open.
   assert.equal(subject.hasUncommittedState, false);
 
-  // The write lands while the pull is inside its fetch. Not awaited first: the whole point
-  // is that it happens after the gate was checked and before the tree is touched.
+  // Issued while the pull is inside its fetch, and not awaited first: the whole point is
+  // that it is submitted after the gate was checked and before the tree is touched.
   const pulling = subject.pull("origin", "main");
-  await subject.appendJournal(created, 1, "written while the pull was fetching");
+  const writing = subject.appendJournal(created, 1, "written while the pull was fetching");
   const outcome = await pulling;
+  await writing;
 
   assert.match(
     (await subject.readJournal(created)) ?? "",
     /while the pull was fetching/,
     "a pull must not delete a write that landed after it sampled the dirty flag",
   );
-  assert.equal(
-    outcome,
-    "skipped",
-    "and it must report that it declined, rather than claiming a refresh it abandoned",
-  );
 
-  // Deferred, not dropped: committing clears the flag and the next pull runs normally.
+  // It used to have to DECLINE to keep that promise, and the assertion here was `skipped`.
+  // Writes take the mutex now, so this write waits out the fetch instead of racing it: the
+  // pull has the tree to itself and completes, and the write lands after it. Same survival,
+  // one fewer deferred refresh — and the survival no longer depends on the pull noticing.
+  assert.equal(outcome, "pulled", "a write that waits its turn is not a reason to decline");
+
+  // And it is still pending a commit, so the next pull defers to it rather than sweeping it.
+  assert.equal(subject.hasUncommittedState, true);
   await subject.commitAndPush(`chore(${created}): created`, "origin", "main");
   assert.equal(await subject.pull("origin", "main"), "pulled");
   assert.match((await subject.readJournal(created)) ?? "", /while the pull was fetching/);
+});
+
+test("a write waits for whoever holds the tree — unless it IS the holder", async () => {
+  // Both halves of what `write` taking the mutex means, because getting either backwards
+  // reintroduces a bug this change exists to remove.
+  //
+  // A write from ANOTHER async context must wait: that is the whole fix. `dirty` cannot do
+  // this job alone — it is a sample, and every destructive step after it is sampled is a
+  // window (see the DESTRUCTIVE pull test below).
+  //
+  // A write from the HOLDER's own context must not: `exclusively` exists so a write and its
+  // commit are one unit, so a holder that deadlocked on its own hold the moment it wrote
+  // would make the API unusable. It is scoped to the holding context and not a "someone
+  // holds it" flag, because a flag would wave through the concurrent write the lock is for.
+  const { subject } = await storeAt();
+  const outside = asTaskId("HELD-1");
+  const inside = asTaskId("HELD-2");
+
+  let release: () => void = () => {};
+  const holding = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  let heldTheirs: string | undefined;
+  let heldOwn: string | undefined;
+  const held = subject.exclusively(async () => {
+    // The holder's own write, through the ordinary public method: it must land here and now.
+    await subject.appendJournal(inside, 1, "the holder writes");
+    heldOwn = await subject.readJournal(inside);
+    await holding;
+  });
+
+  // Issued from outside the hold, and long enough that an unlocked write would have
+  // finished several times over.
+  const writing = subject.appendJournal(outside, 1, "written while the tree was held");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  heldTheirs = await subject.readJournal(outside);
+
+  release();
+  await held;
+  await writing;
+
+  assert.match(heldOwn ?? "", /the holder writes/, "the holder must not deadlock on itself");
+  assert.equal(heldTheirs, undefined, "another context's write must wait, not race");
+  assert.match(
+    (await subject.readJournal(outside)) ?? "",
+    /while the tree was held/,
+    "and it must then land, rather than be dropped",
+  );
+});
+
+test("a write that races a DESTRUCTIVE pull is not destroyed by it", async () => {
+  // The sibling of "a write that races a pull", and the one that actually broke CI. That
+  // test lands its write during the `fetch`, which the post-fetch generation re-check
+  // catches — the pull declines and the write survives. This one lands it AFTER that check,
+  // inside the `reset --hard` + `clean -ffdq` that follows, which no re-check can undo:
+  // several subprocess spawns wide, and on a loaded runner that is hundreds of milliseconds.
+  //
+  // It cost a whole afternoon as a flake in `loop.test.ts` — an answer from Discord that
+  // reported `applied`, wrote `questions/004-answer.md`, had it deleted by the work loop's
+  // pre-claim pull, and then pushed a `state.json` saying the question was answered. The
+  // task resumes with the answer missing from the one place the next session reads it.
+  const { store: subject, git, other } = await sharedStateRepo();
+  const task = asTaskId("PULL-RACE-2");
+
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+  const remoteHead = (await other.run("rev-parse", "HEAD")).trim();
+
+  const pulling = subject.pull("origin", "main");
+
+  // The tracking ref moving is how the fetch announces that the destructive phase is next —
+  // which is precisely the point the `dirty` gate has stopped being able to help.
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const tracking = await git.tryRun("rev-parse", "refs/remotes/origin/main");
+    if (tracking.code === 0 && tracking.stdout.trim() === remoteHead) break;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+
+  await subject.writeAnswer(task, 4, "Use the existing migration path.");
+  await pulling;
+
+  assert.match(
+    (await subject.readAnswer(task, 4)) ?? "",
+    /Use the existing migration path\./,
+    "a pull already past its own gate must still not delete a write",
+  );
+  assert.equal(subject.hasUncommittedState, true, "and the write must still be pending a commit");
 });

@@ -54,6 +54,7 @@ const harness = (
   over: {
     readonly threads?: ThreadIndex;
     readonly leadership?: { readonly held: () => boolean };
+    readonly repos?: { reachable: () => Promise<readonly string[]> };
   } = {},
 ): {
   readonly bridge: DiscordBridge;
@@ -82,6 +83,7 @@ const harness = (
     ...(over.threads === undefined ? {} : { threads: over.threads }),
     // Absent means "act", so every test written before the fleet existed still applies.
     ...(over.leadership === undefined ? {} : { leadership: over.leadership }),
+    ...(over.repos === undefined ? {} : { repos: over.repos }),
     fetch,
   });
 
@@ -501,4 +503,64 @@ test("an ordinary message in the main channel is still ignored", async () => {
 
   assert.equal(inbox.size, 0);
   assert.deepEqual(calls, [], "the channel is not a thread and silence is correct there");
+});
+
+test("the repo box is completed from the workspaces' repos, not from task ids", async () => {
+  // The whole point of §9.1.1's second half: `allchat` must find `all-chat` while it is
+  // still being typed, so the name that parked a task cannot be committed to at all.
+  const { bridge, calls } = harness({
+    repos: {
+      reachable: () => Promise.resolve(["caesarakalaeii/Caterpillar", "caesarakalaeii/all-chat"]),
+    },
+  });
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "allchat", focused: true }] },
+    }),
+  );
+
+  const ack = callback(calls);
+  assert.equal(ack.body["type"], RESPONSE.autocomplete);
+  const data = ack.body["data"] as { readonly choices: readonly { readonly value: string }[] };
+  assert.deepEqual(
+    data.choices.map((choice) => choice.value),
+    ["caesarakalaeii/all-chat"],
+  );
+});
+
+test("a forge that cannot be asked answers with an empty box, not a dead interaction", async () => {
+  // An autocomplete accepts one response and no other kind. A throw out of here is a
+  // spinner that never resolves, which is worse than no suggestions.
+  const { bridge, calls } = harness({
+    repos: { reachable: () => Promise.reject(new Error("GitHub 500")) },
+  });
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "all", focused: true }] },
+    }),
+  );
+
+  const ack = callback(calls);
+  assert.equal(ack.body["type"], RESPONSE.autocomplete);
+  const data = ack.body["data"] as { readonly choices: readonly unknown[] };
+  assert.deepEqual(data.choices, []);
+});
+
+test("a runner with no catalogue still answers the box", async () => {
+  // No forge configured for the bridge is a supported shape (a standalone bot process has
+  // no credentials at all), and it must behave as it did before the box was completed.
+  const { bridge, calls } = harness();
+
+  await bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.autocomplete,
+      data: { name: "brainstorm", options: [{ name: "repo", value: "all", focused: true }] },
+    }),
+  );
+
+  assert.equal(callback(calls).body["type"], RESPONSE.autocomplete);
 });

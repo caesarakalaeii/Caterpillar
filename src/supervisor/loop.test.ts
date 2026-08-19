@@ -18,6 +18,7 @@ import {
   asWorkspaceName,
   EMPTY_USAGE,
   isTerminal,
+  type RepoRef,
   type RunnerId,
   type SessionOutcome,
   type TaskId,
@@ -47,6 +48,7 @@ import {
   Supervisor,
   type ProgressProbe,
   type SessionRunner,
+  type SupervisorDeps,
   type Verifier,
   type WorktreeReaper,
 } from "./loop.ts";
@@ -671,7 +673,18 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
           ]),
         }),
     },
-    reviewers: new Map([[asWorkspaceName("test"), { forTask: () => Promise.resolve(reviewerForge) }]]),
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        // The reviewer identity never checks anything out, so reachability is not its
+        // question — it approves and merges through the API alone (§12.1).
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
     logger: SILENT_LOGGER,
@@ -907,6 +920,7 @@ const resumeSupervisor = (
   store: StateStore,
   inbox: InMemoryChatQueue,
   over: Partial<RunnerConfig> = {},
+  extra: Partial<SupervisorDeps> = {},
 ): Supervisor =>
   new Supervisor({
     config: { ...config, ...over },
@@ -929,6 +943,7 @@ const resumeSupervisor = (
     logger: SILENT_LOGGER,
     toolchain: TEST_TOOLCHAIN,
     inbox,
+    ...extra,
   });
 
 /** Run one inbox request against a live supervisor and stop it again. */
@@ -936,9 +951,10 @@ const throughInbox = async (
   store: StateStore,
   intent: Parameters<InMemoryChatQueue["submit"]>[0],
   over: Partial<RunnerConfig> = {},
+  extra: Partial<SupervisorDeps> = {},
 ): Promise<ChatOutcome> => {
   const inbox = new InMemoryChatQueue();
-  const supervisor = resumeSupervisor(store, inbox, over);
+  const supervisor = resumeSupervisor(store, inbox, over, extra);
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
   const outcome = await inbox.submit(intent);
@@ -1944,6 +1960,109 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
   assert.match(outcome.kind === "refused" ? outcome.reason : "", /stranger/);
 });
 
+/**
+ * A repo nobody can reach is refused at the door (DESIGN.md §9.1).
+ *
+ * 2026-08-18: `/brainstorm caesarakalaeii/allchat` — for a repo called `all-chat` — was
+ * accepted, claimed, and spent its session reaching `git clone --mirror`, where the App's
+ * 422 became `fatal: could not read Username`. The name was one dash out and nothing on
+ * the way in had asked the only question that would have caught it.
+ */
+const reachStub = (unreachable: readonly string[]): Partial<SupervisorDeps> => ({
+  forges: new Map([
+    [
+      asWorkspaceName("caesar"),
+      {
+        unreachable: (repos: readonly RepoRef[]) =>
+          Promise.resolve(
+            repos
+              .filter((repo) => unreachable.includes(`${repo.owner}/${repo.name}`))
+              .map((repo) => ({
+                repo,
+                reason: `\`${repo.owner}/${repo.name}\` is not one of the 65 repositories this workspace's GitHub App can see. Did you mean \`acme/widget\`?`,
+              })),
+          ),
+      },
+    ],
+  ]),
+});
+
+test("a brainstorm naming a repo the credential cannot reach is refused with the near miss", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widgit"],
+      threadId: "1539331435477860432",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    reachStub(["acme/widgit"]),
+  );
+
+  assert.equal(outcome.kind, "refused");
+  const reason = outcome.kind === "refused" ? outcome.reason : "";
+  assert.match(reason, /acme\/widgit/, "the refusal names what was typed");
+  assert.match(reason, /acme\/widget/, "and what to type instead");
+
+  assert.equal(
+    await store.hasTask(asTaskId("BS-1539331435477860432")),
+    false,
+    "a brainstorm nothing can clone must not become a task",
+  );
+});
+
+test("a reachable brainstorm is unaffected by the check", async () => {
+  const store = new StateStore(statePath, stateGit);
+  const BRAINSTORM = asTaskId("BS-1539331435477860433");
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widget"],
+      threadId: "1539331435477860433",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    reachStub(["acme/widgit"]),
+  );
+
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+  await retire(BRAINSTORM);
+});
+
+test("a forge that cannot answer lets the brainstorm through rather than refusing it", async () => {
+  // Fail OPEN, deliberately. A 500 from GitHub is not evidence about an installation, and
+  // refusing work because the forge hiccuped is worse than the clone failure this avoids.
+  const store = new StateStore(statePath, stateGit);
+  const BRAINSTORM = asTaskId("BS-1539331435477860434");
+  const outcome = await throughInbox(
+    store,
+    {
+      kind: "brainstorm",
+      topic: "refine the widget",
+      repos: ["acme/widget"],
+      threadId: "1539331435477860434",
+      author: "caesar",
+    },
+    TWO_WORKSPACES,
+    {
+      forges: new Map([
+        [
+          asWorkspaceName("caesar"),
+          { unreachable: () => Promise.reject(new Error("GitHub /installation/repositories failed with 500")) },
+        ],
+      ]),
+    },
+  );
+
+  assert.deepEqual(outcome, { kind: "started", task: BRAINSTORM });
+  await retire(BRAINSTORM);
+});
+
 test("a brainstorm with no repos at all is refused by the loop too", async () => {
   // The slash layer already refuses it, but the inbox is a public seam — anything that
   // can submit a request can submit an empty list, and creating a brainstorm with nothing
@@ -2658,6 +2777,15 @@ test("a survey that came back empty does not sweep the whole volume", async () =
  * supervisor arms for a session is unref'd, so a bare Supervisor with no metrics port and
  * no credential socket would otherwise let node end the test with the loop half-drained.
  */
+/**
+ * How long a test may wait for this runner to claim something and start a session.
+ *
+ * `npm test` also carries `--test-timeout`, which is the backstop for a wait that never
+ * ends; this is the budget for one that is merely slow. Both exist because the failure mode
+ * they cover is not a red test — it is a green-looking job that never finishes.
+ */
+const CLAIM_BUDGET_MS = 90_000;
+
 const hangingSession = (): { readonly runner: SessionRunner; started: () => boolean } => {
   let begun = false;
   return {
@@ -2666,8 +2794,10 @@ const hangingSession = (): { readonly runner: SessionRunner; started: () => bool
       run: (_spec, _state, signal) =>
         new Promise<SessionOutcome>((resolve) => {
           begun = true;
+          // Ref'd deliberately: it is what keeps the process alive while this fake session
+          // "runs", and an unref'd one would let node exit out from under the test.
           const keepalive = setInterval(() => {}, 1_000);
-          signal.addEventListener("abort", () => {
+          const stop = (): void => {
             clearInterval(keepalive);
             resolve({
               reason: "interrupted",
@@ -2675,7 +2805,19 @@ const hangingSession = (): { readonly runner: SessionRunner; started: () => bool
               contextTokens: 0,
               summary: "stopped from outside",
             });
-          });
+          };
+
+          // A signal that is ALREADY aborted never fires the event, and this promise is what
+          // `run()` awaits — so without this line an abort landing between the claim and this
+          // call left the supervisor unable to unwind, the keepalive holding the loop open,
+          // and the whole FILE hanging rather than failing. That is not hypothetical: it is
+          // what turned one failed assertion in the presence test into a 20-minute CI job,
+          // and because `build` needs `check` to pass, a deploy that silently did not happen.
+          if (signal.aborted) {
+            stop();
+            return;
+          }
+          signal.addEventListener("abort", stop, { once: true });
         }),
     },
   };
@@ -2728,7 +2870,11 @@ test("a /resume submitted during a long session is served without waiting for it
   const running = supervisor.run(controller.signal);
 
   // The session must genuinely be in flight, or this is a test of an idle poll.
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2777,7 +2923,11 @@ test("intake keeps running while a session holds the runner", async () => {
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2820,7 +2970,11 @@ test("the Discord holder claim is refreshed during a session, not after it", asy
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2860,7 +3014,11 @@ test("what Discord reads stays current while a session runs", async () => {
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -2956,7 +3114,11 @@ test("housekeeping does not reset over a session's uncommitted state", async () 
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3120,7 +3282,11 @@ test("a queue with no selective take is still drained during a session", async (
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3164,7 +3330,11 @@ test("a /cancel for the running task is served even when the queue cannot take s
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
@@ -3258,11 +3428,15 @@ test("the Discord presence keeps up with a session it is describing", async () =
   const controller = new AbortController();
   const running = supervisor.run(controller.signal);
 
-  const busy = Date.now() + 30_000;
+  // Generous, because what is being waited for is a whole claim: a pull, a lease CAS, a
+  // toolchain resolution and a session start, all git-heavy, on a runner sharing four cores
+  // with three other test files. 30s was enough locally and not in CI, where this failed —
+  // BEFORE the abort below, which is how it hung the file rather than failing it.
+  const busy = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < busy && !session.started()) await sleep(50);
   assert.ok(session.started(), "the fixture must actually occupy the runner");
 
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + CLAIM_BUDGET_MS;
   while (Date.now() < deadline && !published.some((name) => name.startsWith(`${BUSY} · `)))
     await sleep(100);
 

@@ -33,9 +33,15 @@
  *
  * WHAT IT OWNS. The gateway (`notify/gateway.ts`), the bot's REST half
  * (`notify/bot.ts`), the bridge (`notify/bridge.ts`) and the thread index
- * (`notify/threads.ts`). Slash commands are NOT registered here — registration is a
- * deploy-time step (`cli/register-commands.ts`), and doing it at boot would be one
- * identical write per pod per rollout.
+ * (`notify/threads.ts`). Slash commands are NOT registered here, and the reason is now
+ * the split itself rather than the old "registration is a deploy-time step": §7.1 makes
+ * the supervisor publish the set once per change across the fleet, claimed on a git ref
+ * keyed by the commands' digest (`notify/register.ts`). That claim is a push to the state
+ * repo with the forge credential — exactly what this process is defined not to hold. So
+ * registration stays on the supervisor side, which still runs it when `bot.mode` is
+ * external because it is an OUTBOUND write like the notification and the typing
+ * indicator; only READING the channel moved here. `npm run discord:register` remains the
+ * manual escape hatch.
  *
  * WHAT IT NEEDS. Redis, and the Discord secret. Redis is not optional for this process
  * the way it is for a supervisor: it IS the connection to the supervisor, so a bot with
