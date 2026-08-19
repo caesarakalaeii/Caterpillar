@@ -31,6 +31,8 @@ export interface MemoryRedisOptions {
 export class MemoryRedisClient implements RedisClient {
   private readonly strings = new Map<string, Entry>();
   private readonly lists = new Map<string, string[]>();
+  /** List expiry, kept beside `lists` because a list is not an `Entry`. See `rpush`. */
+  private readonly listExpiry = new Map<string, number>();
   private readonly sorted = new Map<string, Map<string, number>>();
   private readonly channels = new Map<string, Set<(message: string) => void>>();
   private readonly now: () => number;
@@ -91,18 +93,33 @@ export class MemoryRedisClient implements RedisClient {
     return Promise.resolve();
   }
 
-  rpush(key: string, value: string, cap?: number): Promise<void> {
+  rpush(key: string, value: string, cap?: number, ttlSeconds?: number): Promise<void> {
+    this.expireList(key);
     const list = this.lists.get(key) ?? [];
     list.push(value);
     if (cap !== undefined && list.length > cap) list.splice(0, list.length - cap);
     this.lists.set(key, list);
+    // Refreshed on every push, exactly as Redis's EXPIRE is, so the clock measures silence
+    // and not the age of the first entry.
+    if (ttlSeconds === undefined) this.listExpiry.delete(key);
+    else this.listExpiry.set(key, this.now() + Math.max(1, Math.ceil(ttlSeconds)) * 1000);
     return Promise.resolve();
   }
 
   drain(key: string): Promise<readonly string[]> {
+    this.expireList(key);
     const list = this.lists.get(key) ?? [];
     this.lists.delete(key);
+    this.listExpiry.delete(key);
     return Promise.resolve(list);
+  }
+
+  /** Lazily, on touch — the same discipline the string keys use. See the file header. */
+  private expireList(key: string): void {
+    const until = this.listExpiry.get(key);
+    if (until === undefined || until > this.now()) return;
+    this.lists.delete(key);
+    this.listExpiry.delete(key);
   }
 
   zrangeByScore(key: string, min: number): Promise<readonly RedisScored[]> {

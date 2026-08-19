@@ -11,7 +11,7 @@
  * is what lets the gateway consult it synchronously, on every message, without touching
  * git — which the bridge is forbidden from doing anyway (§7).
  */
-import { isTerminal, type TaskId, type TaskStatus } from "../domain/task.ts";
+import type { TaskId, TaskStatus } from "../domain/task.ts";
 
 /** What the index needs to know about a task to decide whether its thread is live. */
 export interface ThreadOwner {
@@ -23,22 +23,33 @@ export interface ThreadOwner {
 /**
  * Which threads are still worth listening to, and which task owns each. Pure.
  *
- * Two rules, both learned the hard way:
+ * Three rules, all learned the hard way:
  *
- *   A TERMINAL task's thread is not bound. Its conversation is over, and since a message
- *   in a bound thread is now an answer, leaving it bound means an abandoned thread
- *   silently swallows everything typed into it — the loop answers `not-waiting` and the
- *   bridge, correctly, says nothing.
+ *   A thread is bound unless the only thing behind it is `done`. The rule this replaced
+ *   dropped every TERMINAL task, and the argument for it was that a bound thread with
+ *   nothing behind it swallows what is typed into it — the loop answered `not-waiting` and
+ *   the bridge, correctly, said nothing. That argument was about SWALLOWING and not about
+ *   terminality, and `parked` is where it broke: a park notification asks for guidance
+ *   "here in this thread" and offers `/resume`, and unbinding the thread made both
+ *   impossible in the same instant. Every one of those messages was addressed to a thread
+ *   this function had just dropped. A message in a `parked` or `failed` task's thread is
+ *   now guidance the loop acts on, so nothing is swallowed and there is nothing left to
+ *   unbind for. `done` alone stays out: it is the one status `/resume` refuses, so there is
+ *   genuinely nothing a message there could ask for.
  *
- *   Several tasks can share one thread: a plan's children inherit their brainstorm's.
- *   So the parent going `done` must not close the thread its children still talk in, and
- *   when more than one is live the one AWAITING AN ANSWER owns it — that is the task a
- *   human replying is replying to. Ties break on id, so every runner agrees.
+ *   Several tasks can share one thread: a plan's children inherit their brainstorm's. So
+ *   the parent going `done` must not close the thread its children still talk in.
+ *
+ *   When more than one shares it, `rank` decides. The task AWAITING AN ANSWER owns it —
+ *   that is the task a human replying is replying to — and below that a task that can
+ *   still move on its own outranks one that needs a human to restart it, so guidance meant
+ *   for a running child is not filed against a parked sibling. Ties break on id, so every
+ *   runner sorting the same set agrees.
  */
 export const threadBindings = (
   tasks: readonly ThreadOwner[],
 ): readonly (readonly [string, TaskId])[] => {
-  const live = tasks.filter((t) => t.threadId !== undefined && !isTerminal(t.status));
+  const live = tasks.filter((t) => t.threadId !== undefined && t.status !== "done");
 
   const owners = new Map<string, ThreadOwner>();
   for (const task of live) {
@@ -50,10 +61,32 @@ export const threadBindings = (
   return [...owners].map(([threadId, task]) => [threadId, task.id] as const);
 };
 
+/**
+ * Who a message in a shared thread is most likely for. Lower wins.
+ *
+ * Ordered by what the human's next message can achieve, not by how healthy the task is: a
+ * question is answerable now, a live task will read the journal at its next session, and a
+ * terminal one does nothing at all until somebody resumes it.
+ */
+const rank = (task: ThreadOwner): number => {
+  switch (task.status) {
+    case "awaiting-human":
+      return 0;
+    case "running":
+    case "ready":
+      return 1;
+    case "parked":
+    case "failed":
+      return 2;
+    case "done":
+      // Filtered out above; here so the switch stays exhaustive as statuses are added.
+      return 3;
+  }
+};
+
 const betterOwner = (candidate: ThreadOwner, held: ThreadOwner): boolean => {
-  const waiting = (t: ThreadOwner): number => (t.status === "awaiting-human" ? 0 : 1);
-  const byWaiting = waiting(candidate) - waiting(held);
-  return byWaiting !== 0 ? byWaiting < 0 : candidate.id.localeCompare(held.id) < 0;
+  const byRank = rank(candidate) - rank(held);
+  return byRank !== 0 ? byRank < 0 : candidate.id.localeCompare(held.id) < 0;
 };
 
 export class ThreadIndex {
@@ -85,12 +118,11 @@ export class ThreadIndex {
    * for a slow pull, and it does not depend on how often the bot happens to refresh.
    *
    * It stays FINITE because the mapping might never mention the thread at all — a
-   * brainstorm whose task reaches a terminal status before the survey that would have
-   * published it (an immediate `/cancel`) is never named by any mapping, and a permanent
-   * pin would leave that dead thread bound for the life of the process, reading every
-   * message typed there as an answer to a finished task and saying nothing. That is the
-   * exact silent-swallowing failure `threadBindings` drops terminal tasks to avoid, so the
-   * pin must not be able to reintroduce it.
+   * brainstorm whose task is `done` before the survey that would have published it is
+   * never named by any mapping, and a permanent pin would leave that dead thread bound for
+   * the life of the process, reading every message typed there as an answer to a finished
+   * task. That is the silent-swallowing failure `threadBindings` keeps `done` out for, so
+   * the pin must not be able to reintroduce it.
    */
   private static readonly PIN_MS = 120_000;
 
@@ -130,10 +162,10 @@ export class ThreadIndex {
    * Locally bound threads (see `bind`) are kept when the incoming mapping does not mention
    * them, because it not mentioning them means "I have not heard of this yet", not "this
    * is over". The moment it DOES mention one the incoming value wins and the pin is
-   * dropped: from then on the publisher is the authority, so a terminal task's thread
-   * still unbinds on the pass after it disappears from the mapping. That is the property
-   * `threadBindings` unbinds terminal tasks for — a bound thread with nothing behind it
-   * swallows everything typed into it in silence — and pinning must not cost it.
+   * dropped: from then on the publisher is the authority, so a `done` task's thread still
+   * unbinds on the pass after it disappears from the mapping. That is the property
+   * `threadBindings` keeps `done` out for — a bound thread with nothing behind it swallows
+   * everything typed into it in silence — and pinning must not cost it.
    */
   replace(entries: readonly (readonly [string, TaskId])[]): void {
     const incoming = new Map(entries);

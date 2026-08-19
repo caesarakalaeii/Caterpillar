@@ -48,6 +48,7 @@ import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { buildPrompt, systemPromptFor } from "./prompt.ts";
 import { runSession } from "./session.ts";
+import type { SteeringFeed } from "./steering.ts";
 import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
 
 void _gzipSync;
@@ -128,7 +129,12 @@ export class AgentSessionRunner {
     this.options = options;
   }
 
-  async run(spec: TaskSpec, state: TaskState, signal?: AbortSignal): Promise<SessionOutcome> {
+  async run(
+    spec: TaskSpec,
+    state: TaskState,
+    signal?: AbortSignal,
+    steering?: SteeringFeed,
+  ): Promise<SessionOutcome> {
     const { credentials, worktrees, store, llm, metrics, live } = this.options;
 
     const forgeFactory = this.options.bindings.forges.get(spec.workspace);
@@ -283,6 +289,7 @@ export class AgentSessionRunner {
         budget,
         control,
         ...(signal === undefined ? {} : { signal }),
+        ...(steering === undefined ? {} : { steering }),
         ...(live === undefined ? {} : { onMessage: (message) => live.record(message) }),
       });
 

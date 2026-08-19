@@ -71,6 +71,17 @@ export interface Interaction {
   readonly type: number;
   readonly application_id?: string;
   readonly channel_id?: string;
+  /**
+   * The channel the interaction came from, as a partial object.
+   *
+   * `parent_id` is why this is modelled. `MESSAGE_CREATE` names no parent, which is what
+   * `ThreadRouter` exists to work around with a REST lookup — but an INTERACTION does carry
+   * one, so "is this a thread of our channel" is answerable from the payload, for free,
+   * without a binding and without a round trip inside Discord's three-second budget. That
+   * matters for the one command whose audience is a task the index has no binding for:
+   * `/resume` on something parked.
+   */
+  readonly channel?: { readonly id?: string; readonly parent_id?: string };
   readonly guild_id?: string;
   readonly data?: InteractionData;
   /** Present for component interactions: the message the button is attached to. */

@@ -32,7 +32,7 @@ import { AgentMetrics } from "./metrics/registry.ts";
 import { BotNotifier, BotPresence, BotThreadCloser, DiscordBot } from "./notify/bot.ts";
 import { DiscordBridge } from "./notify/bridge.ts";
 import { registerCommandsOnce } from "./notify/register.ts";
-import { threadBindings, ThreadIndex, type ThreadOwner } from "./notify/threads.ts";
+import { threadBindings, ThreadIndex, ThreadRouter, type ThreadOwner } from "./notify/threads.ts";
 import { ChatLeadership } from "./notify/leadership.ts";
 import { DiscordNotifier, NullNotifier, type Notifier } from "./notify/discord.ts";
 import { FleetActivity } from "./notify/activity.ts";
@@ -298,7 +298,7 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
-  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels
+  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels, steering
   // (DESIGN.md §21). With `redis.enabled` false, which is the default, this is the four
   // in-process objects the supervisor has always used and the behaviour is unchanged.
   // With it on, the same four interfaces are served from Redis so a SEPARATE bot process
@@ -411,6 +411,7 @@ const main = async (): Promise<void> => {
     snapshot,
     ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
+    steering: plane.steering,
     runners: plane.runners,
     // The supervisor→bot half of the thread index (§7.2). Always passed, never gated on
     // the mode: with Redis off this is the in-memory store nobody else reads and the
@@ -888,16 +889,38 @@ const runBridge = (deps: {
   readonly activity?: FleetActivity;
 }): Promise<void> => {
   const { bot, inbox, snapshot, threads, logger, leadership, repos, activity } = deps;
+
+  // The in-process bridge had NO router, and the omission was invisible because the index it
+  // consulted instead is written by this very process and so is never stale — except about a
+  // thread no binding names. That is not a corner: it is every parked task (§7.1), and a
+  // message typed in one was dropped by the gateway filter before the bridge could answer it.
+  // The standalone bot has had this since `ThreadRouter` was written; the two paths now agree.
+  const router = new ThreadRouter({
+    channelId: bot.channelId,
+    index: threads,
+    parentOf: (channelId) => bot.parentChannel(channelId),
+  });
+
   // Every replica connects; one acts (§7). The connection is what keeps the bot online
   // through a rollout, and it costs nothing — it is acting four times that broke things.
-  const bridge = new DiscordBridge({ bot, inbox, snapshot, threads, logger, leadership, repos });
+  const bridge = new DiscordBridge({
+    bot,
+    inbox,
+    snapshot,
+    threads,
+    router,
+    logger,
+    leadership,
+    repos,
+  });
 
   return new DiscordGateway({
     token: bot.token,
     channelId: bot.channelId,
-    threads,
+    threads: router,
     logger,
-    onMessage: (content, author, channelId) => bridge.handleMessage(content, author, channelId),
+    onMessage: (content, author, channelId, messageId) =>
+      bridge.handleMessage(content, author, channelId, messageId),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
     // Passed WITHOUT a leadership check, unlike everything else the bridge does. Presence
     // is idempotent and identical on every replica — all four render from the same surveyed

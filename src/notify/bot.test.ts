@@ -126,3 +126,37 @@ test("a malformed body resolves to undefined rather than throwing", async () => 
     await close();
   }
 });
+
+test("a reaction is a PUT on the message, with the emoji encoded into the path", async () => {
+  // The same class of defect `parentChannel` shipped: the emoji is a PATH SEGMENT and a
+  // multi-byte one, so an unencoded 👀 is a malformed request line rather than a 400 the code
+  // could read. Driven over the real `fetch` for that reason — a stub would accept anything.
+  const { bot, received, close } = await harness((send) => send(204, "{}"));
+
+  const ok = await bot.react("1537785980415778816", "5551212", "\u{1F440}");
+  await close();
+
+  assert.equal(ok, true);
+  assert.equal(received.method, "PUT");
+  assert.equal(
+    received.url,
+    "/channels/1537785980415778816/messages/5551212/reactions/%F0%9F%91%80/@me",
+  );
+  assert.equal(received.authorization, "Bot tok");
+  // Not `""`. Every request from this client carries `content-type: application/json`, and
+  // Discord answers an empty body under that header with a 400 rather than ignoring it.
+  assert.equal(received.body, "{}");
+});
+
+test("a bot without ADD_REACTIONS reports the failure rather than swallowing it", async () => {
+  // The whole reason `react` returns a boolean. An acknowledgement that silently does not
+  // happen is the defect §7.3 replaced, so the caller has to be able to fall back to words.
+  const { bot, close } = await harness((send) =>
+    send(403, JSON.stringify({ message: "Missing Permissions", code: 50013 })),
+  );
+
+  const ok = await bot.react("1537785980415778816", "5551212", "\u{1F440}");
+  await close();
+
+  assert.equal(ok, false);
+});

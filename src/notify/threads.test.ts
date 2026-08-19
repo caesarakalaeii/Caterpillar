@@ -24,13 +24,25 @@ test("a live task's thread is bound", () => {
   ]);
 });
 
-test("a cancelled task's thread is NOT bound", () => {
-  // Otherwise the abandoned thread keeps accepting messages as answers, the loop replies
-  // `not-waiting`, and the bridge — correctly — says nothing. Everything typed into it
-  // disappears with no feedback at all.
-  for (const status of ["parked", "done", "failed"] as const) {
-    assert.deepEqual(threadBindings([owner("BS-1", status, THREAD)]), [], status);
+test("a RESUMABLE task's thread stays bound", () => {
+  // The correction. `parked` and `failed` are terminal, and unbinding them left the thread
+  // of a stalled brainstorm addressable by nothing: `/resume` typed in it was refused with
+  // "I only act in #caterpillar and its threads", and the guidance the park notification
+  // asked for was answered with "I do not know which task this thread belongs to yet".
+  // Every instruction on that notification pointed at a thread the index had just dropped.
+  for (const status of ["parked", "failed"] as const) {
+    assert.deepEqual(
+      threadBindings([owner("BS-1", status, THREAD)]),
+      [[THREAD, asTaskId("BS-1")]],
+      status,
+    );
   }
+});
+
+test("a DONE task's thread is not bound", () => {
+  // The one status where coming back is not a recovery, so there is nothing a message
+  // typed into the thread could ask for. `done` is also the only status `/resume` refuses.
+  assert.deepEqual(threadBindings([owner("BS-1", "done", THREAD)]), []);
 });
 
 test("a plan's children keep their brainstorm's thread alive after it finishes", () => {
@@ -53,6 +65,39 @@ test("when several live tasks share a thread, the one WAITING owns it", () => {
   ]);
 
   assert.deepEqual(bindings, [[THREAD, asTaskId("BS-1-02")]]);
+});
+
+test("a live task outranks a parked sibling on the same thread", () => {
+  // Now that a parked thread stays bound, the ranking has to say which of several tasks a
+  // message belongs to. `awaiting-human` still wins; below it, the task that can still
+  // move on its own outranks one that needs a human to restart it — otherwise guidance
+  // meant for the running child would be filed against a parked sibling and the child
+  // would never see it.
+  const bindings = threadBindings([
+    owner("BS-1-01", "parked", THREAD),
+    owner("BS-1-02", "running", THREAD),
+  ]);
+
+  assert.deepEqual(bindings, [[THREAD, asTaskId("BS-1-02")]]);
+});
+
+test("a waiting task still outranks everything", () => {
+  const bindings = threadBindings([
+    owner("BS-1-01", "running", THREAD),
+    owner("BS-1-02", "awaiting-human", THREAD),
+    owner("BS-1-03", "parked", THREAD),
+  ]);
+
+  assert.deepEqual(bindings, [[THREAD, asTaskId("BS-1-02")]]);
+});
+
+test("a parked task owns the thread its done parent has left", () => {
+  const bindings = threadBindings([
+    owner("BS-1", "done", THREAD),
+    owner("BS-1-01", "parked", THREAD),
+  ]);
+
+  assert.deepEqual(bindings, [[THREAD, asTaskId("BS-1-01")]]);
 });
 
 test("ties break on id, so every runner agrees", () => {

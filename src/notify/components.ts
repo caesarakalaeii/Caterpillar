@@ -90,9 +90,10 @@ export interface Modal {
  * What a button asks the supervisor to do.
  *
  * Kept short deliberately — every character spends the 100 a `custom_id` has, and the
- * task id needs most of them.
+ * task id needs most of them. `res` is `/resume`: a park notification is the one message
+ * whose entire content is "a human has to act", and the act is always the same one.
  */
-export type Verb = "ans" | "park" | "merge" | "back" | "plan-ok" | "plan-no";
+export type Verb = "ans" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -139,7 +140,7 @@ export const decodeCustomId = (raw: string): ButtonAction | undefined => {
   return { verb, task, ...(arg === undefined ? {} : { arg }) };
 };
 
-const VERBS: readonly string[] = ["ans", "park", "merge", "back", "plan-ok", "plan-no"];
+const VERBS: readonly string[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no"];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
 

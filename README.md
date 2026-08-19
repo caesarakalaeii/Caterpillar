@@ -147,6 +147,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
+| `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
 | `src/agent/runner.ts` | Assembles a session: worktree, tools, prompt, budget. |
 | `src/intake/spec.ts` | Tracker item → `TaskSpec`. Pure, no IO (§14). |
 | `src/intake/ingest.ts` | Idempotent tracker → state-repo ingestion (§14). |
@@ -205,6 +206,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/redis/snapshot.ts` | The task list as ONE key, cached in process for autocomplete (§21). |
 | `src/redis/presence.ts` | Which runners are alive. Advisory, for display only (§21). |
 | `src/redis/cancel.ts` | `/cancel` reaching a session that is already running (§21). |
+| `src/redis/steering.ts` | A human's guidance reaching that same session (§7.3, §21). |
 | `src/redis/plane.ts` | One decision at boot: Redis, or the objects that were already there (§21). |
 
 ## Invariants worth not breaking
@@ -514,10 +516,10 @@ about a 401, a 403 or an empty Loki result.
 ## Turning on Redis
 
 Nothing needs it. `redis.enabled` defaults to false and every runner has run that way from
-the beginning — the chat inbox, the task snapshot, presence and cancels are four objects in
-the supervisor's heap. Turn it on when something else needs to see them, which for now means
-one thing: the Discord bot becoming its own process, in its own pod, unable to reach into a
-heap it is not in.
+the beginning — the chat inbox, the task snapshot, presence, cancels, steering and the thread
+bindings are six objects in the supervisor's heap. Turn it on when something else needs to see
+them, which for now means one thing: the Discord bot becoming its own process, in its own pod,
+unable to reach into a heap it is not in.
 
 ```json
 "redis": {
@@ -545,8 +547,15 @@ a key that can evaporate fails *open*, which is how two runners end up working o
 through `RedisGuard`, which logs one throttled `redis.degraded` line per operation per 30
 seconds and returns the in-memory answer. A cancel that cannot be read is *not pending*; a
 presence that cannot be written is *one runner missing from a page*; a snapshot that cannot
-be fetched is *the last one this process saw*. The supervisor keeps claiming and working
-tasks throughout, because none of that is where the work lives.
+be fetched is *the last one this process saw*; a steer that cannot be pushed is *guidance the
+human is told did not land*, rather than one they are told did. The supervisor keeps claiming
+and working tasks throughout, because none of that is where the work lives.
+
+Steering is the one of the six that changes what a human is *told* when Redis is off, and it
+says so deliberately: with no Redis the supervisor can steer a session in its own process and
+nothing else, so a message for a task running on another machine is answered "I could not reach
+the runner working it" rather than "sent to the session". Two machines sharing a state repo with
+no Redis is a supported arrangement, and it is the one where the difference is visible.
 
 ```
 redis.degraded    operation=presence.heartbeat failures=3 error=...
@@ -853,6 +862,12 @@ exist in the mounted `caterpillar-discord` secret:
 | `bot-token` + `channel-id` | inbound `!answer`, slash commands, buttons (§7) — and outbound notifications *with* buttons | a question waits until a human commits the answer file |
 | `application-id` + `guild-id` | the slash commands, registered by the runner itself at boot (§7.1) | `/answer` and friends never appear in the client; `!answer` still works |
 
+The bot's Discord permissions want **Add Reactions** as well as Send Messages, Create Public
+Threads and Manage Messages. It is not required: reactions are how a steer typed in a thread is
+acknowledged (§7.3), and without the permission the bot says it in words instead. That is one
+extra line per steer in a conversation of many short lines, which is the noise the reaction
+exists to avoid.
+
 Where both a webhook and a bot token exist, **the bot sends the notifications**. Discord
 refuses interactive components from a webhook the application does not own, so a question
 with an Answer button on it can only come from the bot; the webhook remains the fallback
@@ -939,6 +954,28 @@ the tail of one session, not however long the current task runs. Start talking i
 thread immediately; what you type before the agent picks it up is kept, not dropped
 (§14.3).
 
+### Talking to a task while it works, and after it stops
+
+Everything typed in a task's thread reaches the task; what it *does* depends on what the task
+is doing at the time, and there is no command to remember (§7.3):
+
+| the task is | your message |
+|---|---|
+| asking a question | answers it — the next session reads it and continues |
+| **running** | **steers the live session.** It reads it at the end of the step it is on, keeps its context and its work, and does not restart. Acknowledged with 👀 on your own message |
+| `ready` | is journalled, and read at the start of the next session |
+| **`parked` or `failed`** | is journalled, **resets the review council's round count**, and comes back with a **Resume** button |
+| `done` | says so, and points at `/brainstorm` |
+
+The parked row is the one that matters after a plan stalls. A rejected plan parks at
+`maxReviewRounds` (default 3), and resuming it *without saying anything* buys exactly one more
+round before it parks again — the council refuses the same plan for the same reason. Guidance is
+what breaks that, which is why it is the thing that resets the count and why the notification
+says resuming alone will not get past it.
+
+`/resume`, `/cancel` and `/task` take **no task id inside a thread** — the thread is the id.
+Typed with one they still address whatever you name, from anywhere.
+
 To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
 so, then archived. It works on a task that is *running*, not only on an idle one: the
 session stops at the next turn boundary, nothing from it is recorded, and the park lands
@@ -953,6 +990,10 @@ without a usable model credential will fail whatever it claims — and a plan's 
 are blocked by whatever failed, so a handful of unrelated failures can stall a whole plan.
 `done` is the one status `/resume` refuses; coming back from that is a re-run, not a
 recovery.
+
+Resuming forgives the no-progress streak and — when guidance was given — the review council's
+round count. It never forgives `sessions`: if the task has used its session budget the reply
+says so rather than letting you find out when it parks itself again thirty seconds later.
 
 Waves describe what **may** run concurrently. Whether anything actually does is a separate
 setting: `concurrency` is how many tasks one replica works at once and defaults to 1, so out

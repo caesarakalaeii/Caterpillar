@@ -44,6 +44,37 @@ export type ChatOutcome =
   | { readonly kind: "unknown-task" }
   /** The request was well-formed but could not be acted on — a repo nothing owns, say. */
   | { readonly kind: "refused"; readonly reason: string }
+  /**
+   * Guidance recorded against a task that was not waiting on a question (DESIGN.md §7.3).
+   *
+   * What `not-waiting` used to be, and the difference is the whole point. `not-waiting` was
+   * a refusal: the text was read, matched against `awaiting-human`, and DISCARDED — while
+   * three separate notifications were telling the human to "say what to change in this
+   * thread". Nothing carried it anywhere, and the bridge said nothing about that, so a
+   * rejected plan could only ever be re-run unchanged.
+   *
+   * `notes` is how many pieces of guidance the task now carries; `resumable` says whether it
+   * needs a human to restart it, which decides whether the reply offers a Resume button; and
+   * `roundsCleared` reports the council budget being forgiven, because a resume that did not
+   * forgive it buys exactly one more round before parking again.
+   */
+  | {
+      readonly kind: "guided";
+      readonly notes: number;
+      readonly resumable: boolean;
+      readonly roundsCleared: boolean;
+    }
+  /**
+   * Guidance handed to a session that is running right now (DESIGN.md §7.3).
+   *
+   * Distinct from `guided` because nothing was written: the task's lease is held by the
+   * session, so the state repo cannot be touched from here at all. The message travels on the
+   * steering plane instead, the session injects it at its next turn boundary, and the journal
+   * entry is written by that session's own `recordSession`.
+   */
+  | { readonly kind: "steered" }
+  /** Talking to a task that is `done`. Nothing to steer, and `/resume` refuses it. */
+  | { readonly kind: "finished" }
   /** Answering a task that is not waiting on a question. */
   | { readonly kind: "not-waiting"; readonly status: string }
   /** Parking a task that is already terminal. */

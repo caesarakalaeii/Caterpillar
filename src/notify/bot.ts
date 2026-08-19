@@ -99,6 +99,39 @@ export class DiscordBot {
   }
 
   /**
+   * React to a message as the bot. Returns whether the reaction landed.
+   *
+   * The acknowledgement for a steer (DESIGN.md §7.3), and a reaction rather than a reply
+   * because of what a thread is used for: refining an idea is many short messages (§14.3),
+   * and a line of confirmation under each one turns a conversation into a wall of receipts.
+   * §7.1 chose SILENCE over that, and was right about the noise and wrong about the silence —
+   * a human could not tell "delivered to the session" from "discarded", and for a long time
+   * it was discarded.
+   *
+   * The boolean is the point. Reactions need `ADD_REACTIONS`, which an existing installation
+   * may not have granted, and an ack that silently does not happen is the failure this is
+   * fixing. The caller falls back to saying it in words.
+   */
+  async react(channelId: string, messageId: string, emoji: string): Promise<boolean> {
+    // Percent-encoded whole: the emoji is a path segment, and `@me` after it is Discord's
+    // way of saying "the current user" rather than a user id.
+    const encoded = encodeURIComponent(emoji);
+    const response = await postJson({
+      url: `${this.apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`,
+      // `{}` and not `""`. The endpoint takes no body, but every request from this client
+      // carries `content-type: application/json`, and Discord answers an empty body under
+      // that header with a 400 rather than ignoring it.
+      body: "{}",
+      what: "reaction",
+      method: "PUT",
+      headers: { authorization: `Bot ${this.options.token}` },
+      ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+    }).catch(() => undefined);
+    return response !== undefined;
+  }
+
+  /**
    * Show the typing indicator in a channel. Discord keeps it up for ~10 seconds.
    *
    * Best-effort and deliberately silent on failure: it is a comfort signal, and a

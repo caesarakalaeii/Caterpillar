@@ -77,8 +77,15 @@ export interface RedisClient {
   /** Drop `key` only while it still holds exactly `value`. For stepping down cleanly. */
   releaseIfHeld(key: string, value: string): Promise<boolean>;
   del(key: string): Promise<void>;
-  /** Append to the right of a list, and bound it: older entries beyond `cap` are dropped. */
-  rpush(key: string, value: string, cap?: number): Promise<void>;
+  /**
+   * Append to the right of a list, and bound it: older entries beyond `cap` are dropped.
+   *
+   * `ttlSeconds` refreshes the whole list's expiry on every push. A list nobody drains has
+   * to be able to go away by itself — see `STEER_TTL_SECONDS` for the case that needs it —
+   * and refreshing rather than setting-once means the clock measures silence rather than
+   * age, so an active conversation is never cut off mid-way.
+   */
+  rpush(key: string, value: string, cap?: number, ttlSeconds?: number): Promise<void>;
   /** Take every element of a list and delete it, atomically. */
   drain(key: string): Promise<readonly string[]>;
   /** Members of a sorted set with a score at or above `min`, with their scores. */
@@ -199,6 +206,7 @@ export interface RedisDriver {
   eval(script: string, numKeys: number, ...args: string[]): Promise<unknown>;
   del(key: string): Promise<unknown>;
   rpush(key: string, value: string): Promise<unknown>;
+  expire(key: string, seconds: number): Promise<unknown>;
   ltrim(key: string, start: number, stop: number): Promise<unknown>;
   lrange(key: string, start: number, stop: number): Promise<string[]>;
   zrangebyscore(
@@ -335,7 +343,7 @@ export class IoRedisClient implements RedisClient {
     await this.run("del", () => this.driver.del(this.key(key)));
   }
 
-  async rpush(key: string, value: string, cap?: number): Promise<void> {
+  async rpush(key: string, value: string, cap?: number, ttlSeconds?: number): Promise<void> {
     const full = this.key(key);
     await this.run("rpush", async () => {
       await this.driver.rpush(full, value);
@@ -344,6 +352,9 @@ export class IoRedisClient implements RedisClient {
       // loop grows this list until the server's maxmemory policy starts evicting keys
       // that other structures depend on.
       if (cap !== undefined) await this.driver.ltrim(full, -cap, -1);
+      // After the push, never before: EXPIRE on a key that does not exist yet is a no-op,
+      // and the list would then have no expiry at all.
+      if (ttlSeconds !== undefined) await this.driver.expire(full, ttlTo(ttlSeconds));
     });
   }
 
