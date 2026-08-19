@@ -146,6 +146,13 @@ const main = async (): Promise<void> => {
   await refreshThreads(plane.threads, threads, logger);
 
   const controller = new AbortController();
+  // No `repos`, and it cannot be otherwise: the `/brainstorm repo:` catalogue (§9.1.1) is
+  // `mergedCatalog` over the configured FORGES, and a forge credential is the thing this
+  // process is defined not to hold. `suggestRepos` treats an absent catalogue as an empty
+  // suggestion list, which is the same answer a refusing forge gets and is why an
+  // autocomplete never hangs. The box is therefore typed by hand here rather than
+  // completed — the brainstorm still starts, because the supervisor validates the repo
+  // when it drains the intent, where the credential actually lives.
   const bridge = new DiscordBridge({
     bot,
     inbox: plane.chat,

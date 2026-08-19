@@ -1133,6 +1133,20 @@ What moves with it, and what does not:
 - The supervisor keeps everything **outbound**: the notification with an Answer button, the
   typing indicator, closing a cancelled task's thread. Only *reading* the channel has to be
   exclusive, so `external` turns off the gateway and nothing else.
+- **Registering the command set (§7.1) also stays with the supervisor**, which looks
+  backwards until you follow the credential. Publishing is a PUT authorised by the bot
+  token, but it is claimed on a git ref keyed by the commands' digest so that it happens
+  once per change across the fleet — and that claim is a push to the state repo with the
+  forge credential, the one thing this split defines the bot process as not holding. So the
+  bot registers nothing, and the supervisor keeps registering even when it has handed the
+  gateway away. Folding registration in behind the same gate as the bridge would leave the
+  fleet with no command set and nothing to report it.
+- The `/brainstorm repo:` **autocomplete is not completed in the split**, for the same
+  reason: the catalogue is built from the configured forges (§9.1.1). An absent catalogue
+  produces an empty suggestion list — the same answer a refusing forge gets, so the
+  interaction never hangs — and the repo is typed by hand. Nothing is lost but the
+  convenience: the supervisor parses and validates it when it drains the intent, and an
+  unparseable or cross-workspace repo comes back as a `refused` outcome with a reason.
 - The **thread↔task index** cannot be rebuilt from the state repo in a process that has
   none, so the supervisor publishes the bindings its survey already derives (`chat:threads`)
   and the bot consumes them on a timer. Design consequences, both load-bearing: the bot may
