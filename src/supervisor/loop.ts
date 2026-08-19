@@ -26,12 +26,14 @@ import {
   isTerminal,
   recordedReason,
   repoSlug,
+  taskPullRequests,
   type ProposedPlan,
   type RepoRef,
   type ProviderOutage,
   type SessionOutcome,
   type TaskId,
   type TaskPhase,
+  type TaskPullRequest,
   type TaskSpec,
   type TaskState,
   type TaskStatus,
@@ -389,6 +391,31 @@ export interface SupervisorDeps {
    */
   readonly closer?: ThreadCloser;
 }
+
+/**
+ * A task's pull requests in `spec.repos` order.
+ *
+ * The order is the one the operator typed, which §14.3 already treats as meaningful — `repos[0]`
+ * is the agent's working directory, so the first repo named is the one the change is centred on.
+ * It is the closest thing to a dependency order the supervisor has, and merging is where that
+ * matters: the repos of one change usually cannot land in either order.
+ *
+ * Anything not named by `spec.repos` keeps its relative place at the end rather than being
+ * dropped — a PR is a fact about the forge, and silently omitting one from a merge would leave
+ * it open with nothing saying so.
+ */
+const ordered = (
+  repos: readonly RepoRef[],
+  prs: readonly TaskPullRequest[],
+): readonly TaskPullRequest[] => {
+  const rank = (pr: TaskPullRequest): number => {
+    const index = repos.findIndex(
+      (repo) => repo.owner === pr.repo.owner && repo.name === pr.repo.name,
+    );
+    return index === -1 ? repos.length : index;
+  };
+  return [...prs].sort((a, b) => rank(a) - rank(b));
+};
 
 /**
  * Terminal statuses `/resume` may bring back.
@@ -2001,8 +2028,11 @@ export class Supervisor {
       usage: addUsage(state.usage, outcome.usage),
       progress,
       // A PR opened this session must survive into later ones — the completion gate
-      // looks it up from state, not from the transcript.
+      // looks it up from state, not from the transcript. Both shapes, for
+      // `taskPullRequests`' reason: `prs` is what the gates read and `pr` is what every
+      // display reader already reads.
       ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
+      ...(outcome.prs !== undefined ? { prs: outcome.prs } : {}),
     };
 
     // Three files and a commit as ONE unit — the journal shard, the handoff and the state.
@@ -2720,9 +2750,8 @@ export class Supervisor {
   ): Promise<{ readonly merged: boolean; readonly note: string }> {
     const { reviewers, logger } = this.deps;
 
-    const pr = state.pr;
-    const repo = spec.repos[0];
-    if (pr === undefined || repo === undefined) {
+    const prs = taskPullRequests(spec.repos, state);
+    if (prs.length === 0) {
       return { merged: false, note: "No PR was recorded, so nothing was merged." };
     }
 
@@ -2732,16 +2761,44 @@ export class Supervisor {
     }
 
     const forge = await factory.forTask(spec);
+    const merged: string[] = [];
     try {
-      await forge.approve(repo, pr.number, "Approved by the caterpillar review council.");
-      await forge.merge(repo, pr.number);
-      logger.info("pr.merged", { task: spec.id, pr: pr.number });
-      return { merged: true, note: "Approved by the review council and merged." };
+      // IN `spec.repos` ORDER, and stopping at the first failure. The order is the one the
+      // human typed and the one §14.3 already treats as meaningful — `repos[0]` is the working
+      // directory — and it is the closest thing to a dependency order this has. Continuing past
+      // a failure would land a later repo whose counterpart did not land, which for the change
+      // that motivated this (`viewer_public` read by an extension before the gateway sends it)
+      // is exactly the broken intermediate state the split was arranged to avoid.
+      for (const pr of ordered(spec.repos, prs)) {
+        await forge.approve(pr.repo, pr.number, "Approved by the caterpillar review council.");
+        await forge.merge(pr.repo, pr.number);
+        logger.info("pr.merged", { task: spec.id, repo: repoSlug(pr.repo), pr: pr.number });
+        merged.push(`${repoSlug(pr.repo)}#${pr.number}`);
+      }
+      return {
+        merged: true,
+        note:
+          merged.length === 1
+            ? "Approved by the review council and merged."
+            : `Approved by the review council and merged: ${merged.join(", ")}.`,
+      };
     } catch (error) {
-      logger.warn("pr.merge-failed", { task: spec.id, pr: pr.number, ...errorFields(error) });
+      logger.warn("pr.merge-failed", {
+        task: spec.id,
+        merged: merged.join(", "),
+        ...errorFields(error),
+      });
+      const reason = error instanceof Error ? error.message : String(error);
+      // What DID merge is named, always. A partial merge is the one outcome where "could not
+      // merge" on its own is actively misleading: some of the change is on the default branch
+      // and a human has to know which half before deciding what to do about the rest.
       return {
         merged: false,
-        note: `Could not merge: ${error instanceof Error ? error.message : String(error)}`,
+        note:
+          merged.length === 0
+            ? `Could not merge: ${reason}`
+            : `Merged ${merged.join(", ")}, then could not merge the rest: ${reason}. ` +
+              `The remaining pull request(s) are open and the change is half-landed.`,
       };
     } finally {
       await forge.revoke().catch(() => undefined);
@@ -3612,10 +3669,13 @@ export class Supervisor {
 
     const state = await store.tryReadState(request.task);
     if (state === undefined) return { kind: "unknown-task" };
-    if (state.pr === undefined) return { kind: "not-mergeable", reason: "no PR was ever opened" };
-
     const spec = await store.readSpec(request.task).catch(() => undefined);
     if (spec === undefined) return { kind: "not-mergeable", reason: "the task has no readable spec" };
+    // After the spec, because knowing whether a PR exists now needs the repos to pair a legacy
+    // `pr` with (`taskPullRequests`).
+    if (taskPullRequests(spec.repos, state).length === 0) {
+      return { kind: "not-mergeable", reason: "no PR was ever opened" };
+    }
     if (this.deps.reviewers?.get(spec.workspace) === undefined) {
       return {
         kind: "not-mergeable",
@@ -3659,7 +3719,10 @@ export class Supervisor {
         logger.warn("merge.unrecorded", { task: request.task, ...errorFields(error) });
       }
 
-      return { kind: "merged", prUrl: state.pr.url };
+      // The primary's url, which is what the reply renders. `merge.note` already names every
+      // repo when there was more than one, so the count is not lost.
+      const primary = state.pr ?? taskPullRequests(spec.repos, state)[0];
+      return { kind: "merged", prUrl: primary?.url ?? "(merged)" };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

@@ -929,6 +929,12 @@ that crosses two is refused in the thread rather than quietly narrowed to one (�
 extra repos are checked out beside the first as `repos/<name>` (§9.4.1), and the plan's
 child tasks inherit the whole list.
 
+A task spanning several repos opens **one pull request per repo** it changed, and completion
+checks CI in every one of them — so a repo it changed without opening a PR for will not merge.
+Merging goes in the order the repos were named, stopping at the first failure, because the repos
+of one change usually cannot land in either order. If a merge does stop halfway, the message
+names which pull requests already landed.
+
 **The `repo:` box autocompletes** from the repos the runner can actually reach, so the name
 is picked rather than typed — and the ranking is deliberately forgiving: typing `allchat`
 offers `caesarakalaeii/all-chat`. With several repos in the box, a suggestion keeps the ones

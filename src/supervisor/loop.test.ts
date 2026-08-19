@@ -95,7 +95,12 @@ const seed: TaskState = {
  * `ready`, so a task seeded before the test that wants it gets picked up — and failed —
  * by the test that ran first.
  */
-const seedTask = async (id: TaskId, over: Partial<TaskState> = {}): Promise<void> => {
+const seedTask = async (
+  id: TaskId,
+  over: Partial<TaskState> = {},
+  /** Repo slugs for the spec, primary first. One repo unless a test needs §9.4.1's plural. */
+  repos: readonly string[] = ["github.com/acme/widget"],
+): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
   await writeFile(
@@ -104,7 +109,7 @@ const seedTask = async (id: TaskId, over: Partial<TaskState> = {}): Promise<void
       "---",
       "workspace: test",
       "repos:",
-      "  - github.com/acme/widget",
+      ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
       '  - "true"',
       "---",
@@ -4349,4 +4354,179 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
   const journal = await store.readJournal(STEERED_TASK);
   assert.match(String(journal), /Steered by the operator/);
   assert.match(String(journal), /use the existing migration path/);
+});
+
+test("a two-repo task merges both PRs, in the order its repos were named", async () => {
+  // `mergeReviewed` approved and merged `state.pr` against `spec.repos[0]` and stopped. So a
+  // task spanning two repos landed half its change and reported "merged" — and the half left
+  // behind was silent, because nothing said a second PR existed. `/merge` is the shortest path
+  // to the same code the council uses.
+  const BOTH = asTaskId("SMOKE-MULTI-1");
+  await seedTask(
+    BOTH,
+    {
+      status: "parked",
+      pr: { number: 11, url: "https://example.invalid/widget/11" },
+      prs: [
+        // Deliberately reversed, so the assertion reads the SPEC's order and not this one.
+        {
+          number: 22,
+          url: "https://example.invalid/ext/22",
+          repo: { host: "github.com", owner: "acme", name: "widget-extension" },
+        },
+        {
+          number: 11,
+          url: "https://example.invalid/widget/11",
+          repo: { host: "github.com", owner: "acme", name: "widget" },
+        },
+      ],
+    },
+    ["github.com/acme/widget", "github.com/acme/widget-extension"],
+  );
+
+  const merges: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    approve: (repo, pr) => {
+      merges.push(`approve:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    merge: (repo, pr) => {
+      merges.push(`merge:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: BOTH });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "merged", JSON.stringify(outcome));
+  assert.deepEqual(merges, [
+    "approve:widget#11",
+    "merge:widget#11",
+    "approve:widget-extension#22",
+    "merge:widget-extension#22",
+  ]);
+});
+
+test("a merge that fails halfway names what DID land", async () => {
+  // The one outcome where "could not merge" on its own is actively misleading: part of the
+  // change is on the default branch and a human has to know which part.
+  const HALF = asTaskId("SMOKE-MULTI-2");
+  await seedTask(
+    HALF,
+    {
+      status: "parked",
+      prs: [
+        {
+          number: 11,
+          url: "https://example.invalid/widget/11",
+          repo: { host: "github.com", owner: "acme", name: "widget" },
+        },
+        {
+          number: 22,
+          url: "https://example.invalid/ext/22",
+          repo: { host: "github.com", owner: "acme", name: "widget-extension" },
+        },
+      ],
+    },
+    ["github.com/acme/widget", "github.com/acme/widget-extension"],
+  );
+
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    approve: () => Promise.resolve(),
+    merge: (repo) =>
+      repo.name === "widget"
+        ? Promise.resolve()
+        : Promise.reject(new Error("required status check is pending")),
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: HALF });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "not-mergeable");
+  const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
+  assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
+  assert.match(reason, /half-landed/);
 });

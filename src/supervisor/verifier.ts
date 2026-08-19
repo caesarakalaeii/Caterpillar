@@ -9,7 +9,7 @@
  * them, and does not report the result. `done` only triggers this check.
  */
 import { execFile } from "node:child_process";
-import type { RepoRef, TaskSpec, TaskState } from "../domain/task.ts";
+import { repoSlug, taskPullRequests, type RepoRef, type TaskSpec, type TaskState } from "../domain/task.ts";
 import type { Forge, ForgeFactory } from "../forge/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import {
@@ -78,7 +78,7 @@ export class AcceptanceVerifier {
     const acceptance = await this.runAcceptance(spec, repo);
     if (!acceptance.passed) return acceptance;
 
-    return this.checkCi(spec, state, repo);
+    return this.checkCi(spec, state);
   }
 
   /** Gate 1 — the declared commands, run by us in the task's worktree. */
@@ -102,14 +102,19 @@ export class AcceptanceVerifier {
     return { passed: false, detail: `Acceptance criteria failed.\n\n${detail}` };
   }
 
-  /** Gate 2 — a PR exists and CI is green on the task branch. */
-  private async checkCi(
-    spec: TaskSpec,
-    state: TaskState,
-    repo: RepoRef,
-  ): Promise<VerificationResult> {
-    const pr = state.pr;
-    if (pr === undefined) {
+  /**
+   * Gate 2 — a PR exists and CI is green, in EVERY repo the task opened one in.
+   *
+   * Every repo, not the primary one, and the difference is the whole point of this pass. A task
+   * may span several repos (§9.4.1) and this checked `repos[0]` alone — so a two-repo task
+   * whose sibling PR was red, or whose sibling PR did not exist at all, passed the gate on the
+   * strength of the primary. The work is one change; half of it being green is not it passing.
+   *
+   * `repo` is no longer a parameter: taking one invited exactly the assumption this removes.
+   */
+  private async checkCi(spec: TaskSpec, state: TaskState): Promise<VerificationResult> {
+    const prs = taskPullRequests(spec.repos, state);
+    if (prs.length === 0) {
       return {
         passed: false,
         detail: "no pull request has been opened — call open_pr before claiming done",
@@ -121,27 +126,44 @@ export class AcceptanceVerifier {
       return { passed: false, detail: `no forge configured for workspace '${spec.workspace}'` };
     }
 
+    // The primary's, for the ONE url every caller displays. `prs` carries the rest.
+    const prUrl = (state.pr ?? prs[0])?.url;
+
     const forge: Forge = await forgeFactory.forTask(spec);
     try {
-      const status = await forge.checks(repo, `agent/${spec.id}`);
+      const notes: string[] = [];
+      for (const pr of prs) {
+        const status = await forge.checks(pr.repo, `agent/${spec.id}`);
+        const where = prs.length === 1 ? "" : `${repoSlug(pr.repo)}: `;
 
-      switch (status.conclusion) {
-        case "success":
-          return { passed: true, detail: `acceptance passed; ${status.summary}`, prUrl: pr.url };
-        case "pending":
-          return { passed: false, detail: `CI has not finished: ${status.summary}` };
-        case "failure":
-          return { passed: false, detail: `CI is red: ${status.summary}` };
-        case "none":
-          // No CI configured is not the same as CI passing, but failing here would
-          // make the task unfinishable in a repo without CI. Accept with a warning
-          // recorded in the journal so the gap is visible rather than silent.
-          return {
-            passed: true,
-            detail: `acceptance passed; NOTE: ${status.summary} — completion rests on acceptance criteria alone`,
-            prUrl: pr.url,
-          };
+        switch (status.conclusion) {
+          case "success":
+            notes.push(`${where}${status.summary}`);
+            break;
+          // Returned on the FIRST failure rather than collected: the detail is what the next
+          // session is told to fix, and a red suite in one repo is a full session's work
+          // whether or not the other is also red.
+          case "pending":
+            return { passed: false, detail: `CI has not finished — ${where}${status.summary}` };
+          case "failure":
+            return { passed: false, detail: `CI is red — ${where}${status.summary}` };
+          case "none":
+            // No CI configured is not the same as CI passing, but failing here would
+            // make the task unfinishable in a repo without CI. Accept with a warning
+            // recorded in the journal so the gap is visible rather than silent.
+            notes.push(`${where}NOTE: ${status.summary}`);
+            break;
+        }
       }
+
+      const clean = notes.every((note) => !note.includes("NOTE:"));
+      return {
+        passed: true,
+        detail: clean
+          ? `acceptance passed; ${notes.join("; ")}`
+          : `acceptance passed; ${notes.join("; ")} — completion rests on acceptance criteria alone where CI is absent`,
+        ...(prUrl === undefined ? {} : { prUrl }),
+      };
     } finally {
       await forge.revoke().catch(() => undefined);
     }

@@ -1,10 +1,14 @@
 /**
- * Gate 1 of §12, and specifically the environment it runs in.
+ * Gate 1 of §12 and the environment it runs in, and gate 2 now that it counts repos.
  *
  * The acceptance gate and the agent's own shell used to disagree — pi's `sh -c` with the
  * inherited environment on one side, a LOGIN `bash -lc` on the other. These tests pin the
  * two properties that stop them diverging again: the resolved environment reaches the
  * command, and the shell does not source a profile that could replace it.
+ *
+ * Gate 2 is here too, since it learned to count. It checked `repos[0]` alone, so a task spanning
+ * two repos passed on the strength of the primary while the sibling's CI was red — or absent
+ * entirely. The work is one change and half of it being green is not it passing.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -125,4 +129,114 @@ test("the acceptance shell does not source a login profile", async () => {
   const result = await verifier.verify(specWith(['test -z "$CATERPILLAR_PROFILE"']), state);
 
   assert.equal(result.detail, NO_PR);
+});
+
+/* ───────────────────────────── gate 2: CI, per repo ───────────────────────────── */
+
+const PRIMARY: RepoRef = { host: "github.com", owner: "o", name: "r" };
+const SIBLING: RepoRef = { host: "github.com", owner: "o", name: "r-extension" };
+
+const twoRepoSpec: TaskSpec = { ...specWith(["true"]), repos: [PRIMARY, SIBLING] };
+
+/** A forge whose CI answer is chosen per repo, and which records what it was asked. */
+const ciForge = (
+  answers: Record<string, "success" | "failure" | "pending" | "none">,
+): { readonly bindings: WorkspaceBindings; readonly asked: string[] } => {
+  const asked: string[] = [];
+  const forge = {
+    kind: "stub",
+    credential: () => Promise.resolve({ username: "x", password: "y" }),
+    openPr: () => Promise.resolve({ number: 1, url: "u" }),
+    checks: (repo: RepoRef) => {
+      asked.push(`${repo.owner}/${repo.name}`);
+      const conclusion = answers[`${repo.owner}/${repo.name}`] ?? "success";
+      return Promise.resolve({ conclusion, summary: `${repo.name} ${conclusion}` });
+    },
+    approve: () => Promise.resolve(),
+    merge: () => Promise.resolve(),
+    revoke: () => Promise.resolve(),
+  };
+  const bindings: WorkspaceBindings = {
+    forges: new Map([[asWorkspaceName("test"), { forTask: () => Promise.resolve(forge) }]]) as never,
+    trackers: new Map(),
+  };
+  return { bindings, asked };
+};
+
+const ciVerifier = (worktree: string, bindings: WorkspaceBindings): AcceptanceVerifier =>
+  new AcceptanceVerifier({
+    worktrees: {
+      ensureWorktree: () => Promise.resolve(worktree),
+    } as unknown as WorktreeManager,
+    bindings,
+    toolchain: new ToolchainResolver({
+      logger: SILENT_LOGGER,
+      config: DEFAULT_TOOLCHAIN_CONFIG,
+      tasksDir: worktree,
+    }),
+  });
+
+test("gate 2 checks EVERY repo the task opened a PR in", async () => {
+  const worktree = await scratch();
+  const { bindings, asked } = ciForge({});
+  const result = await ciVerifier(worktree, bindings).verify(twoRepoSpec, {
+    ...state,
+    pr: { number: 1, url: "https://example.invalid/r/1" },
+    prs: [
+      { number: 1, url: "https://example.invalid/r/1", repo: PRIMARY },
+      { number: 2, url: "https://example.invalid/r-extension/2", repo: SIBLING },
+    ],
+  });
+
+  assert.equal(result.passed, true, result.detail);
+  assert.deepEqual(asked, ["o/r", "o/r-extension"]);
+  assert.match(result.detail, /r-extension/, "the sibling's status belongs in the detail");
+});
+
+test("a red sibling fails the gate, and the detail names which repo", async () => {
+  // THE defect. This passed, on the primary's green alone.
+  const worktree = await scratch();
+  const { bindings } = ciForge({ "o/r-extension": "failure" });
+  const result = await ciVerifier(worktree, bindings).verify(twoRepoSpec, {
+    ...state,
+    pr: { number: 1, url: "https://example.invalid/r/1" },
+    prs: [
+      { number: 1, url: "https://example.invalid/r/1", repo: PRIMARY },
+      { number: 2, url: "https://example.invalid/r-extension/2", repo: SIBLING },
+    ],
+  });
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /CI is red/);
+  assert.match(result.detail, /o\/r-extension/, "which repo is the whole of what the fix needs");
+});
+
+test("a state written before `prs` existed is read as the primary repo's PR", async () => {
+  // A rolling deploy has both shapes in the state repo at once, so this is a live path. The
+  // legacy `pr` has no repo, and the one it meant is `repos[0]` — the only one reachable then.
+  const worktree = await scratch();
+  const { bindings, asked } = ciForge({});
+  const result = await ciVerifier(worktree, bindings).verify(twoRepoSpec, {
+    ...state,
+    pr: { number: 1, url: "https://example.invalid/r/1" },
+  });
+
+  assert.equal(result.passed, true, result.detail);
+  assert.deepEqual(asked, ["o/r"], "it must not invent a PR for a repo that has none");
+});
+
+test("a repo with no CI still passes, and says so once per repo", async () => {
+  const worktree = await scratch();
+  const { bindings } = ciForge({ "o/r-extension": "none" });
+  const result = await ciVerifier(worktree, bindings).verify(twoRepoSpec, {
+    ...state,
+    prs: [
+      { number: 1, url: "https://example.invalid/r/1", repo: PRIMARY },
+      { number: 2, url: "https://example.invalid/r-extension/2", repo: SIBLING },
+    ],
+  });
+
+  assert.equal(result.passed, true, result.detail);
+  assert.match(result.detail, /NOTE:/);
+  assert.match(result.detail, /acceptance criteria alone/);
 });

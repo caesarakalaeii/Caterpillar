@@ -27,6 +27,7 @@ import type { ClusterReader } from "../cluster/client.ts";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
+import { repoSlug } from "../domain/task.ts";
 import type {
   RepoRef,
   SessionOutcome,
@@ -171,7 +172,10 @@ export class AgentSessionRunner {
       const cluster = spec.kind === "remediation" ? this.options.cluster : undefined;
       const toolContext: ToolContext = {
         forge,
-        repo,
+        // Every repo, primary first — `open_pr` needs to reach the siblings and needs to refuse
+        // anything else (§9.4.1). The credential activated above already covers exactly this
+        // list, so the tool's bound and the token's bound are the same list by construction.
+        repos: spec.repos,
         control,
         publish: (name, path, note) => this.publishArtifact(spec, worktree, name, path, note),
         ...(tracker !== undefined ? { tracker } : {}),
@@ -242,12 +246,20 @@ export class AgentSessionRunner {
         ...(await this.stagedSection(spec, state)),
       });
 
+      // The last line is not decoration. `open_pr` defaults to the primary repo, so an agent
+      // that does not know a sibling PR is a thing it can ask for will finish the work, push the
+      // branch, and then have nowhere to put it — which is what `GH-caesarakalaeii-all-chat-543`
+      // did before the tool grew a `repo` argument, and it cost a park and a hand-opened PR.
       const layout =
         checkout.siblings.size === 0
           ? ""
           : `\n\nSibling repositories are checked out inside it:\n${[...checkout.siblings]
               .map(([slug, path]) => `- ${slug} → ${path}`)
-              .join("\n")}\nEach is its own git repository on branch agent/${spec.id}.`;
+              .join("\n")}\nEach is its own git repository on branch agent/${spec.id}. Commit and ` +
+            `push in each one that you change, and call \`open_pr\` once per repo — pass ` +
+            `\`repo\` to open one anywhere but ${repoSlug(repo)}. Completion checks CI in every ` +
+            `repo you opened a pull request in, so a repo you changed and did not open one for ` +
+            `will not merge.`;
 
       // Said out loud, because a model that does not know its environment was prepared
       // reaches for `apt install` or `pip install --user` the moment something is missing,
@@ -305,12 +317,22 @@ export class AgentSessionRunner {
         metrics.contextOverruns.inc({ task: spec.id });
       }
 
-      // Only the PR is lifted off the sink here. A proposed plan is not, because unlike
-      // a PR it is not consumed by a later gate — `buildOutcome` carries it directly.
-      const pr = control.pr;
+      // Only the pull requests are lifted off the sink here. A proposed plan is not, because
+      // unlike a PR it is not consumed by a later gate — `buildOutcome` carries it directly.
+      //
+      // BOTH shapes are returned. `prs` is what the completion gate and the merge read, and
+      // `pr` is the PRIMARY repo's — the one field every display reader already reads, and the
+      // one a state written by an older deploy has. Deriving the primary here rather than
+      // trusting call order means a session that opened the sibling's PR first still records
+      // the right one.
+      const prs = control.prs ?? [];
+      const primary = prs.find(
+        (opened) => opened.repo.owner === repo.owner && opened.repo.name === repo.name,
+      );
       return {
         ...result.outcome,
-        ...(pr !== undefined ? { pr: { number: pr.number, url: pr.url } } : {}),
+        ...(prs.length > 0 ? { prs } : {}),
+        ...(primary !== undefined ? { pr: { number: primary.number, url: primary.url } } : {}),
       };
     } finally {
       // Cleared on every exit, including a throw: the transcript is on disk by now, and a

@@ -22,12 +22,14 @@
  */
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type {
-  Capability,
-  ProposedPlan,
-  RepoRef,
-  SessionExitReason,
-  TaskKind,
+import {
+  repoSlug,
+  type Capability,
+  type ProposedPlan,
+  type RepoRef,
+  type SessionExitReason,
+  type TaskKind,
+  type TaskPullRequest,
 } from "../domain/task.ts";
 import type { ClusterReader } from "../cluster/client.ts";
 import { NamespaceNotAllowedError } from "../cluster/guard.ts";
@@ -47,8 +49,14 @@ export interface ControlSignal {
 /** Mutable sink the tools write their decision into. */
 export interface ControlSink {
   signal?: ControlSignal;
-  /** Set by `open_pr` so the supervisor can verify CI against it later. */
-  pr?: PrResult;
+  /**
+   * Set by `open_pr` so the supervisor can verify CI against them later — one per repo.
+   *
+   * A list because a task may span several repos and the completion gate has to see all of
+   * them; re-opening against a repo already here REPLACES its entry rather than appending, so
+   * a session that retries a failed call does not leave the gate two numbers for one repo.
+   */
+  prs?: TaskPullRequest[];
   /** Set by `submit_plan` on a brainstorm session (DESIGN.md §14.3). */
   plan?: ProposedPlan;
 }
@@ -60,6 +68,13 @@ const OpenPrParams = Type.Object({
   body: Type.String({ description: "Pull request description, markdown" }),
   head: Type.String({ description: "Branch containing the work" }),
   base: Type.String({ description: "Branch to merge into" }),
+  repo: Type.Optional(
+    Type.String({
+      description:
+        "owner/name of the repo to open it in. One of the task's own repos. " +
+        "Omit for the primary repo, which is where your working directory is.",
+    }),
+  ),
 });
 
 const AskHumanParams = Type.Object({
@@ -93,8 +108,20 @@ export interface ToolContext {
   readonly forge: Forge;
   readonly tracker?: Tracker;
   readonly trackerRef?: TrackerRef;
-  /** Repo PRs are opened against — always the task's primary repo. */
-  readonly repo: RepoRef;
+  /**
+   * Every repo this task spans, primary first (DESIGN.md §9.4.1).
+   *
+   * A list rather than the primary alone, and that is the fix rather than a generalisation:
+   * `open_pr` took `repo` and posted to it unconditionally, so on a task spanning two repos the
+   * second half of the work could be committed and pushed and then had nowhere to go. The
+   * session's only remaining move was `ask_human`.
+   *
+   * It is also the SCOPE. `open_pr` refuses a repo that is not in here, for `materialise`'s
+   * reason one layer down (§9.1): the argument is agent-authored text, and a tool that opened a
+   * pull request against any repo the credential could reach would be a session naming its own
+   * blast radius.
+   */
+  readonly repos: readonly RepoRef[];
   readonly control: ControlSink;
   /**
    * Stores a small artifact and returns what to tell the agent (DESIGN.md §17).
@@ -124,22 +151,70 @@ export interface ToolContext {
 /** `denied` is a refused namespace or kind; `error` is everything the cluster got wrong. */
 export type ClusterReadOutcome = "ok" | "denied" | "error";
 
-export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrResult> => ({
+/**
+ * `details` is nullable because a refusal is a RESULT, not a throw.
+ *
+ * A repo the task does not have is the agent asking for something outside its bound, and §20's
+ * cluster tools already answer that class in prose — the model can read it and correct itself
+ * inside the same turn. A throw would end the turn with an error it has to interpret, which is
+ * what the raw 422 did.
+ */
+export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrResult | null> => ({
   name: "open_pr",
   label: "Open PR",
   description:
     "Open a pull request. You never handle credentials — the supervisor performs " +
-    "the call on your behalf.",
+    "the call on your behalf. On a task spanning several repos, call it once per repo " +
+    "that has work to land, naming each in `repo`.",
   parameters: OpenPrParams,
   execute: async (_id, params: Static<typeof OpenPrParams>) => {
-    const pr = await ctx.forge.openPr(ctx.repo, params);
-    ctx.control.pr = pr;
+    const repo = resolveTaskRepo(ctx.repos, params.repo);
+    // A refusal the agent can act on, not a throw. It names what IS allowed, because the
+    // failure this replaces was a raw 422 from a repository the agent had not asked for —
+    // twice, on `GH-caesarakalaeii-all-chat-543`, and neither told it what the tool could do.
+    if (repo === undefined) {
+      return text(
+        `\`${params.repo ?? ""}\` is not one of this task's repos. Open pull requests ` +
+          `against: ${ctx.repos.map(repoSlug).join(", ")}.`,
+      );
+    }
+
+    const pr = await ctx.forge.openPr(repo, params);
+    const opened: TaskPullRequest = { ...pr, repo };
+    // Replaced rather than appended, keyed on the repo: a session that retries after a failed
+    // call must not leave the completion gate two numbers for one repository.
+    const existing = ctx.control.prs ?? [];
+    ctx.control.prs = [...existing.filter((p) => !sameRepo(p.repo, repo)), opened];
+
     return {
-      content: [{ type: "text" as const, text: `Opened PR #${pr.number}: ${pr.url}` }],
+      content: [
+        { type: "text" as const, text: `Opened PR #${pr.number} in ${repoSlug(repo)}: ${pr.url}` },
+      ],
       details: pr,
     };
   },
 });
+
+/**
+ * The repo an `open_pr` call names, or undefined when it names one the task does not have.
+ *
+ * Matched on `owner/name` and not on the host: `spec.repos` is one workspace, so one forge and
+ * one host (§3.1), and requiring the agent to type `github.com/` in front of what every other
+ * surface calls `owner/name` is friction with nothing behind it.
+ */
+const resolveTaskRepo = (
+  repos: readonly RepoRef[],
+  named: string | undefined,
+): RepoRef | undefined => {
+  if (named === undefined || named.trim().length === 0) return repos[0];
+  const wanted = named.trim().toLowerCase();
+  return repos.find(
+    (repo) => repoSlug(repo).toLowerCase() === wanted || repo.name.toLowerCase() === wanted,
+  );
+};
+
+const sameRepo = (a: RepoRef, b: RepoRef): boolean =>
+  a.host === b.host && a.owner === b.owner && a.name === b.name;
 
 export const askHumanTool = (ctx: ToolContext): AgentTool<typeof AskHumanParams, null> => ({
   name: "ask_human",
