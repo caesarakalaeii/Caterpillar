@@ -270,10 +270,12 @@ awkward, the change is probably wrong.
     published and never published is silent, and nothing would ever revisit it (§19).
 12. **No command from the agent's shell runs without a ceiling.** pi's bash tool
     documents its `timeout` as *"Defaults to no timeout"*, so without one the model
-    decides whether a command may block forever — and everything in the supervisor is
-    single-threaded, so a hung command stops the poll loop, the chat drain and intake
-    while the heartbeat keeps renewing the lease and `/healthz` keeps answering 200. A
-    runner that looks healthier the longer it is wedged. `BoundedExecutionEnv` both
+    decides whether a command may block forever — and a hung command holds its task's slot
+    for as long as it hangs, while the heartbeat keeps renewing that lease and `/healthz`
+    keeps answering 200. A runner that looks healthier the longer it is wedged. The
+    housekeeping loop and any other slot keep running (`concurrency`, §6.5), which makes it
+    worse to find rather than better: at the default of one slot the runner does nothing and
+    still reports itself healthy. `BoundedExecutionEnv` both
     defaults *and* clamps `limits.commandTimeoutSeconds` (900), in the agent's shell and
     the review council's — it was the council's that wedged, for 2h42m, on an `npm test`
     whose subprocess never exited. `limits.maxSessionSeconds` is the backstop, not the
@@ -362,8 +364,9 @@ Three properties of the walk are deliberate and worth knowing before reading a g
 
 - **Idle-only and hourly.** It runs from the same branch of the poll loop as the nix store
   collection, because it is one `stat` per file over a tree with a `node_modules` per task
-  and the loop is single-threaded. On a runner that is never idle it never runs, which is
-  why the page shows a timestamp as prominently as the bytes.
+  and it spends that time inside this process rather than inside nix. Idle means no slot is
+  occupied, so on a runner that is never idle it never runs — which is why the page shows a
+  timestamp as prominently as the bytes.
 - **Apparent size**, like `du --apparent-size`, not allocated blocks. It is what a human
   means by "this checkout is 400 MB". The "is the volume full" question is answered exactly
   by `kind="free"`, which needs no summing at all.
@@ -951,9 +954,12 @@ are blocked by whatever failed, so a handful of unrelated failures can stall a w
 `done` is the one status `/resume` refuses; coming back from that is a re-run, not a
 recovery.
 
-Waves describe what **may** run concurrently. One runner still works one task at a time —
-actual parallelism means scaling the StatefulSet, which the git-ref leasing already makes
-safe. A rejected plan creates nothing.
+Waves describe what **may** run concurrently. Whether anything actually does is a separate
+setting: `concurrency` is how many tasks one replica works at once and defaults to 1, so out
+of the box a wave is worked one task at a time by each replica. Raising it, or scaling the
+StatefulSet, both work and both are safe for the same reason — the git-ref leasing does not
+care whether the competing claimant is another replica or another slot in the same process
+(§6.5). A rejected plan creates nothing.
 
 In a fleet, **every replica connects to Discord but exactly one acts on it**, decided by a
 compare-and-swap on `refs/chat/holder`. The connections are what keep the bot online

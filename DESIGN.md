@@ -29,7 +29,7 @@ and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment
 | Context strategy | **Hard handoff** at a token threshold — new session, not compaction |
 | Mutual exclusion | **Atomic git ref CAS** on `refs/leases/<TASK>`, heartbeat + steal-on-stale |
 | Multi-machine | **Capability-matched runner daemons** that poll and claim |
-| K8s shape | **StatefulSet** of supervisor loops, one task at a time per replica (§10) |
+| K8s shape | **StatefulSet** of supervisor loops, `concurrency` tasks at a time per replica — default 1 (§6.5, §10) |
 | Workspace | **Per-replica PVC** bare mirrors + one **git worktree** per task, reaped when the task ends |
 | LLM access | All runners → **in-cluster credential holder**; the traffic is direct (§9.6) |
 | Git credentials | **GitHub App**, supervisor-minted, scoped per task; repo-scoped tokens on Codeberg |
@@ -70,7 +70,7 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 │                                                            │
 │  supervisor (StatefulSet, N replicas)                      │
 │    ├─ claim loop (git ref CAS)   ← the only coordination   │
-│    ├─ pi Agent instance  ← one task at a time, per replica │
+│    ├─ pi Agent instances ← `concurrency` each, default 1   │
 │    ├─ GitHub App token minting                             │
 │    ├─ own /work + /nix volume    ← no RWX in this cluster  │
 │    └─ /metrics                                             │
@@ -442,6 +442,16 @@ git push origin <new-lease-commit>:refs/leases/TASK-123 \
 **Steal** — if the lease commit's timestamp is older than 5 minutes, another runner may
 CAS from the stale OID to its own.
 
+**A claimant is not the same thing as a replica.** Nothing above distinguishes them, and
+that is the property §6.5 leans on: one replica working four tasks at once races through
+exactly the same CAS as four replicas working one each, because the ref is per *task* and
+the compare-and-swap is exclusive against whoever else is asking. Concurrency within a
+process therefore needed no new coordination — only local bookkeeping about how many slots
+that process is filling. The one thing it does need is for a process not to steal from
+itself: a lease this runner holds looks stale to nobody but is `running` in local state,
+which `isClaimable` accepts (§6.2), so `claimUpTo` skips tasks already in one of its own
+slots before it reaches the CAS.
+
 ### 5.1 Fencing
 
 The heartbeat *is* the fence. A partitioned runner whose lease was stolen discovers this
@@ -497,12 +507,17 @@ seconds against a 60s interval, and losing it costs an unwound task, not a corru
 
 ## 6. Session lifecycle
 
+The shape below is **one task's** lifecycle. A runner works `concurrency` of them at once,
+default 1 (§6.5); at N > 1 this loop runs N times over, independently, one per slot.
+
 ```
-supervisor loop:
+work loop:
   fetch state repo
   candidates = tasks where status == ready and requires ⊆ my capabilities
-  task = first candidate successfully claimed (lease CAS)
+  claim up to (concurrency - in flight) of them (lease CAS each)
+  start each as its own session; keep polling
 
+per claimed task:
   prepare worktree from PVC mirror
   mint GitHub token scoped to task.repos
 
@@ -774,11 +789,15 @@ So the timing is split in two, in `src/supervisor/loop.ts`:
   `applyChatRequests`, `maybeIngest`, `drainAlerts`, `maybeDigest`, and
   `toolchain.maybeCollectGarbage()` when idle. It runs whether or not a session is in
   flight.
-- **The work loop**, on `pollSeconds`: `store.pull` → `coolingDown` → `claimNext` →
-  `workTask`. It blocks for the session, as it always did. `pollSeconds` is now a claim
-  *backoff* — how long an idle runner waits before looking for work again — and nothing a
-  human waits on depends on it. `housekeepingSeconds` defaults to `pollSeconds` and is
-  clamped to it.
+- **The work loop**, on `pollSeconds`: `store.pull` → `coolingDown` → `claimUpTo` →
+  `startSlot` per claim. `pollSeconds` is a claim *backoff* — how long a runner with a free
+  slot waits before looking for work again — and nothing a human waits on depends on it.
+  `housekeepingSeconds` defaults to `pollSeconds` and is clamped to it.
+
+  It no longer blocks for the session. It used to, and that is what §6.5 changed: each
+  session now runs as its own promise and the loop's job is to keep free slots filled. At
+  `concurrency: 1` — the default — the observable behaviour is identical: one slot fills,
+  every later pass finds it full, and the loop naps until it frees.
 
   The work loop pulls too, and that is not redundant with housekeeping's pull. The single
   loop did pull-then-claim in one pass, so a claim was always decided from a checkout
@@ -792,9 +811,14 @@ So the timing is split in two, in `src/supervisor/loop.ts`:
   the call is a no-op `"skipped"`; it is only ever a real pull when the tree is clean,
   which is exactly when a claim is about to be made.
 
-This is **not** task concurrency, and §6's one-session-at-a-time rule is unchanged: there
-is one work loop, so there is one `workTask`. What is concurrent is housekeeping against a
-session. Both loops contain their own failures for the reason the single loop did — a
+This was **not** task concurrency, and for a long time §6's one-session-at-a-time rule was
+unchanged by it: there was one work loop, so there was one `workTask`. What this section
+made concurrent was housekeeping against a session. Task concurrency came later and
+separately — §6.5 — and it is built on the two mechanisms this section introduced rather
+than alongside them: the shared-checkout mutex below is what makes N writers safe, and it
+was put there for two.
+
+Both loops contain their own failures for the reason the single loop did — a
 throw out of `run()` reaches main's `finally`, which closes `/healthz` and the credential
 socket and then blocks forever on `await bridge`, leaving a live process that polls nothing
 and that systemd never restarts because it never exited. Splitting the loop doubled the
@@ -824,12 +848,22 @@ touch git. Two mechanisms, and both are needed:
    a clean tree. The failure modes are not symmetrical — a deferred refresh costs one
    interval and a taken one costs a task.
 
-   One flag covers both writers, which looks too simple and is not. `commitAndPush` stages
-   `tasks`, `intake`, `digests` and `alerts` with `add -A` — the whole of what the
-   supervisor writes — so whichever loop commits carries the other's pending files with it
-   and the tree afterwards really is clean. What the two lose is attribution, not
-   durability: a commit message occasionally undersells its contents. That is the right way
-   round.
+   One flag covered both writers, which looked too simple and was not — while there were
+   two. `commitAndPush` staged `tasks`, `intake`, `digests` and `alerts` with `add -A` — the
+   whole of what the supervisor writes — so whichever loop committed carried the other's
+   pending files with it and the tree afterwards really was clean. What the two lost was
+   attribution, not durability: a commit message occasionally undersold its contents.
+
+   **That trade stopped being acceptable at §6.5, and the flag needed a second condition.**
+   Broad staging is fine when the other writer's files are ones nobody else is about to
+   commit; it is not fine when there are N sessions, because two ending in the same tick
+   produce one commit carrying both tasks' files and a second commit that finds a clean tree
+   and records *nothing*. So staging is now scoped to the paths one writer wrote (see §6.5),
+   and `dirty` is cleared only when the write counter has not moved **and** nothing is left
+   outstanding — because a commit that carried only its own files no longer proves the tree
+   is clean, and clearing the flag on the counter alone would hand the next `pull` a
+   `reset --hard` over a mid-session `state.json`. That is this same five-task incident,
+   reintroduced by its own fix and aimed at a different victim.
 
    The flag is backed by a monotonic write counter. `commitAndPush` samples it before its
    first `add` and clears the flag only if it has not moved, so a write that lands *during*
@@ -880,13 +914,17 @@ touch git. Two mechanisms, and both are needed:
    writes it back can have a pull land in the middle. That is what `exclusively` is for.
 
    `StateStore.exclusively` holds the checkout across write *and* commit, for a caller that
-   needs the two to be one unit. **No production path uses it today** — the supervisor's
-   writes go through `writeState`/`appendJournal`, which now take the mutex individually and
-   are covered by the dirty flag and its counter between them. It exists because the gap it closes is
-   real and narrow: `git add -A` stages the whole tree, so a writer that writes, releases,
-   then commits can have its files swept into another writer's commit under the wrong
-   message. That costs attribution, not durability, which is precisely why the supervisor
-   accepts it rather than restructuring every session write into a held-lock unit.
+   needs the two to be one unit. It was written with **no production path using it**, kept
+   deliberately against one concrete prospect, and named that prospect in its own docstring:
+   "the cost of that route is attribution (another writer's commit may carry these files)
+   rather than durability. This exists for a caller that cannot accept even that cost."
+
+   **§6.5 is that caller.** Every write-then-push unit in the supervisor now goes through it
+   (`Supervisor.unit`), because with N sessions the cost is no longer attribution: the writer
+   whose files were swept up commits nothing, so its state push silently does not happen.
+   The boundary is one logical operation and never wider — the model call, the council review
+   and the progress probe all stay outside it, since holding the state checkout across one
+   would stop every other slot writing and stop housekeeping pulling for minutes.
 
 **`/cancel` keeps its own interval, and it is not redundant.** Housekeeping drains the
 inbox during a session now, which is what `CANCEL_POLL_MS` was built to work around — but
@@ -913,11 +951,16 @@ task (§6.2).
 
 So `ChatDrainer` carries an explicit `selective` flag and the loop branches on it. Where it
 is true, the behaviour above stands. Where it is false, housekeeping drains *everything*
-and routes a park naming the in-flight task to the session directly, through a handler
-`workTask` installs for its own duration and clears in its `finally`. The handler settles
-`cancelling` and aborts the session — the same two things the watcher does, because it is
-the same function. A queue that cannot take selectively must say so rather than answering
-"nothing matched" to every question.
+and routes a park naming an in-flight task to that task's session directly, through the
+hook its slot carries (§6.5). The hook settles `cancelling` and aborts that one session —
+the same two things the watcher does, because it is the same function. A queue that cannot
+take selectively must say so rather than answering "nothing matched" to every question.
+
+The routing is a **lookup by task**, not a comparison against "the current task", and §6.5
+is why. A single field naming one in-flight task would answer "not mine" for every session
+but one, so a cancel for A while B was also running went to `applyPark`, failed its CAS
+against A's own live lease, and replied "not-parkable: running" about the exact task the
+human was watching this process work.
 
 Stopping the session is **not** cancelling the task, and the difference is easy to miss:
 an interrupted task is left `running`, which is claimable (§6.2), so an abort on its own
@@ -925,6 +968,153 @@ means the next poll re-claims it and starts over while the operator watches the 
 they cancelled carry on working. `workTask` therefore parks it under the lease it still
 holds, before releasing. A cancel that raced a lost lease does not — it has no standing
 to write, and `park` fences anyway.
+
+### 6.5 N tasks at once, and why the number is the operator's
+
+`concurrency` says how many tasks one replica works simultaneously. **It defaults to 1, and
+at 1 nothing about a runner's behaviour changes** — which is deliberate rather than
+cautious, because the ceiling is not a property of the box.
+
+The bound today is the model provider. A weekly token allowance divided between four
+sessions is exhausted in a quarter of the time, and every one of those sessions then meets
+the same wall — which is exactly why the provider cooldown (§6.3) is runner-scoped. So the
+number an operator can afford is a fact about their account, and the fleet must not guess
+it. What makes it worth configuring at all is semi-local inference: with the model on
+hardware the operator owns, the limit stops being an allowance and becomes how many
+sessions the machine can run, and that is a number only they know.
+
+`concurrency` is refused rather than clamped when it is not a whole number of at least 1. A
+runner with 0 slots claims nothing and looks perfectly healthy doing it.
+
+#### What it did *not* require: a new coordination mechanism
+
+Leasing already made concurrent claims safe, and had since it was written. A claim is a
+compare-and-swap on `refs/leases/<task>` (§5), exclusive against every other claimant in the
+fleet, and it does not care whether the competition is another replica or another slot in
+this process. **Four replicas at one slot each and one replica at four slots race through
+the identical CAS.** Raising this number is local bookkeeping about how many slots one
+process fills.
+
+Three things follow from that and are worth stating, because each is a place the old code
+assumed exclusivity:
+
+- **Leases are per task, so heartbeats are per slot.** Renewal is a CAS on that task's own
+  ref, so `assertHeld` fencing (§5.1) was already per lease and stays so however many slots
+  are open. What the split buys is containment of the *failure*: a stalled renewal for A
+  drops A — its credential revoked by task id, its session aborted, its checkout reaped —
+  and leaves B running under a lease that was never in question. A shared heartbeat could
+  not have that property, because it would have to read one CAS failure as evidence about
+  every task at once.
+- **Worktrees were already per task** (`<tasksDir>/<task>/<repo>`), so nothing there moved.
+- **Mirrors were not.** See below.
+
+#### A slot is a value, because "the current task" was three fields
+
+`Supervisor` was written throughout as *the* current task: `sessionInFlight`,
+`inFlightTask`, `cancelInFlight`. Those described the one session a runner could have, and
+every terminal path assumed exclusivity over them. At N slots they stop being a description
+and become a race — task B starting overwrites task A's cancel hook, task A finishing clears
+a flag B relies on.
+
+So each in-flight task owns a `TaskSlot`: its lease heartbeat, spec, abort controller, cancel
+hook, and its own `cancelled` / `lost` / `outage` flags. The rule that replaces the old
+assumption is that anything task-scoped lives there and anything runner-scoped stays a field.
+Every field was audited against it. `cooldown` stays, because the provider is genuinely
+shared. `lastIntakeAt` and `lastReapAt` stay, because they rate-limit a runner rather than a
+task.
+
+#### Containment is per slot, and that moved the boundary
+
+The old work loop did `await workTask(...)` inside its own `try`/`catch`. That was correct
+while there was one task, because unwinding the pass and unwinding the task were the same
+act. They are not the same act with N: a throw reaching the loop abandons the pass that
+every *other* in-flight task's cleanup and reclaim depends on.
+
+Each session therefore runs as its own promise (`startSlot`), which **settles rather than
+rejects**. `LeaseLostError` drops one task and reaps one checkout; anything else is logged
+and frees one slot. The comment that used to read *"any other failure belongs to the TASK,
+not the supervisor"* now has to hold per slot, and what makes it hold is that the boundary
+is a function rather than a loop. On shutdown the loop awaits the collection once, so an
+aborting runner does not walk away from a task mid-park.
+
+#### An outage is runner-scoped, so it fans out
+
+With one slot, "stop claiming" and "let go of what you hold" were the same sentence. With N
+they are not, and releasing only the slot that met the wall would leave the other N-1
+hammering an endpoint that has already refused one — N journal entries, N cooldown records
+extending the back-off geometrically, and the stampede §6.3 exists to prevent, arriving one
+task at a time.
+
+`releaseAfterOutage` therefore signals every other slot before recording its own release:
+set a flag, abort the session. It deliberately does **not** release them itself. Releasing
+task B means writing B's state and pushing under B's lease, and doing that from inside A's
+stack is precisely the cross-task coupling slots exist to remove — a push that failed for B
+would surface as A's failure, and A's `catch` would park A. So each slot unwinds through its
+own `releaseAfterOutage`, under its own lease. One incident still produces one Discord
+message, because the cooldown's `first` flag is what the notification is gated on and the
+fan-out arrives inside the same incident.
+
+#### `yieldToBrainstorm` yields a slot now, not the runner
+
+It hands the runner back at a session boundary when a `/brainstorm` is queued, because a task
+that keeps handing off would otherwise own the runner indefinitely — twenty minutes and six
+sessions of a thread that opened and said nothing, in the run it was written from.
+
+It is **kept**, including at the default N=1, and the housekeeping split did not make it
+redundant: housekeeping drains the request, creates the task and answers the thread, but the
+brainstorm still cannot be *claimed* until a slot frees, and on a saturated runner nothing
+frees one. Draining without yielding produces a task that exists and never starts.
+
+What changed is that it must no longer fire when a slot is already free. A runner at
+`concurrency: 4` with one session running has three slots the very next pass will claim the
+brainstorm into, and releasing a working task to solve that costs a session boundary, a
+state push and a re-claim for nothing. So the yield is gated on there being no free slot —
+which at N=1 is always true, which is why a single-slot runner is unchanged.
+
+#### One mirror, two sessions
+
+Worktrees are per task; **mirrors are per repo**, and two tasks on the same repo fetch,
+`worktree add` into, and prune one bare directory on the volume. Git does not queue for
+`index.lock` — the loser exits non-zero with `Unable to create '…/index.lock': File exists`.
+That surfaces as a session dying thirty seconds in, on a task with nothing wrong with it,
+only when two tasks on one repo happen to start together: a flaky task failure, which is the
+worst possible way to discover a race.
+
+`WorktreeManager` therefore holds one mutex **per mirror path** and takes it around every
+mirror-mutating operation — clone, fetch, `worktree add`/`remove`, prune, and the config
+writes that go with them. Per mirror and not one global lock, because two tasks on different
+repos have nothing to contend over and serialising them would give back the concurrency
+slots were added for. Keyed by resolved path rather than by `RepoRef`, so the key is the
+resource.
+
+Two related facts, both checked rather than assumed:
+
+- **Nothing else on that class is mutable.** `git` and `options` are set once and every path
+  is derived from arguments, so two checkouts through one manager share no field. What needed
+  serialising was the disk, not the object.
+- **`configure()` writes the mirror's COMMON git config**, as its own comment says. Those
+  writes — `user.name`, `commit.gpgsign`, `remote.origin.push`, `credential.useHttpPath` —
+  are identical for every task on a repo, which is why sharing them is wanted and why two
+  concurrent writers of the same values are harmless. The exception is `info/exclude`, which
+  is a read-modify-write and would lose an update; it takes the workspace mirror's lock. The
+  per-task `credential.helper` was already in worktree scope for a different reason (§9.2)
+  and is unaffected.
+
+#### The one thing that genuinely did not survive the change
+
+`git add -A tasks` did not, and it took two mechanisms to replace. That is written up where
+it belongs, under the shared-checkout discussion in §6.4 — the short version is that the
+supervisor leaves a `state.json` uncommitted for the whole of a session, so broad staging
+means the first session to finish commits every other in-flight task's state under its own
+message while their own commits find a clean tree and record nothing.
+
+#### What it is observable as
+
+`caterpillar_tasks_in_flight` and `caterpillar_slots_free`, both labelled `runner`, and
+`caterpillar_claims_rejected_full_total`. The last is the one that earns its place: a
+saturated fleet and an idle one look identical from every other metric, because in both cases
+nothing new starts. A rate that is persistently non-zero says raise `concurrency` or add a
+replica; a rate flat at zero while tasks sit `ready` says the bottleneck is somewhere else.
 
 ## 7. Human interaction
 
@@ -2651,14 +2841,22 @@ running. Priority is a tie-break ahead of the existing order, never a replacemen
 — waves still order among themselves and the id is still the final key, so two runners
 sorting the same queue reach the same answer.
 
-*A session in flight yields at its boundary.* `workTask` drives one task through as many
-sessions as it needs, and the **work** loop is blocked for all of them. Since the
-housekeeping split (§6.4) the chat drain is no longer blocked with it, so the brainstorm
-request is drained, answered and turned into a task on schedule — but the runner it needs
-is still occupied, and a claim is what only the work loop can make. So the runner checks
-the inbox at each session boundary and, if a brainstorm is waiting, puts the task back to
-`ready` and hands the runner over. Housekeeping fixed the latency of *acknowledging*; this
-fixes the latency of *starting*, and neither substitutes for the other.
+*A session in flight yields a slot at its boundary.* `workTask` drives one task through as
+many sessions as it needs, so a task that keeps handing off holds its slot indefinitely.
+Since the housekeeping split (§6.4) the chat drain is no longer blocked with it, so the
+brainstorm request is drained, answered and turned into a task on schedule — but the slot it
+needs is still occupied, and a claim is what only the work loop can make. So the runner
+checks the inbox at each session boundary and, if a brainstorm is waiting **and no slot is
+free**, puts the task back to `ready` and gives its slot up. Housekeeping fixed the latency
+of *acknowledging*; this fixes the latency of *starting*, and neither substitutes for the
+other.
+
+The free-slot condition arrived with §6.5 and is what keeps this proportionate. It used to
+hand back the whole runner, which cost nothing when a runner was one slot; at
+`concurrency: 4` with one session running there are three slots the very next pass will
+claim the brainstorm into, and releasing a working task to solve that would cost a session
+boundary, a state push and a re-claim for nothing. At the default N=1 there is never a free
+slot while a session runs, so the behaviour is exactly what it was.
 
 The check reads the queue without taking from it — the request is left for
 `applyChatRequests` on the housekeeping loop, which is what actually creates the task now.
@@ -2677,8 +2875,12 @@ queued ahead of anything typed afterwards and `drain` preserves that order, so b
 an answer is applied its task exists. A refusal takes the binding back, because a bound
 thread with no task behind it swallows what is typed into it in silence.
 
-None of this makes the runner concurrent. It still works one task at a time (§6); what
-changed is which task it picks up next and how soon it is free to pick.
+None of this made the runner concurrent, and for a long time it did not need to: what these
+three fixed was which task a one-slot runner picks up next and how soon it is free to pick.
+Concurrency came separately, in §6.5, and it does not replace any of them — the claim
+ordering still decides which of several claimable tasks fills a slot first, and the yield
+still applies when every slot is full. It only makes "every slot is full" a question with
+more than one answer.
 
 **The agent proposes the decomposition, the supervisor performs it.** `submit_plan` carries
 local ids; real `TaskId`s are assigned by the supervisor, for the same reason it assigns
