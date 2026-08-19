@@ -1796,8 +1796,10 @@ export class Supervisor {
       to: "brainstorm",
       concurrency: config.concurrency,
     });
-    await this.transition(lease, state, "ready");
-    await this.push(lease, `chore(${spec.id}): released a slot for a waiting brainstorm`);
+    await this.unit(async () => {
+      await this.transition(lease, state, "ready");
+      await this.push(lease, `chore(${spec.id}): released a slot for a waiting brainstorm`);
+    });
     return true;
   }
 
@@ -1831,21 +1833,6 @@ export class Supervisor {
       noProgressStreak: progress.noProgressStreak,
     });
 
-    await store.appendJournal(
-      spec.id,
-      session,
-      [
-        `**Exit:** ${outcome.reason}`,
-        `**Context at exit:** ${outcome.contextTokens} tokens`,
-        "",
-        outcome.summary,
-      ].join("\n"),
-    );
-
-    if (outcome.reason === "handoff" || outcome.reason === "blocked") {
-      await store.writeHandoff(spec.id, outcome.summary);
-    }
-
     metrics.noProgress.set({ task: spec.id }, progress.noProgressStreak);
 
     const next: TaskState = {
@@ -1858,8 +1845,30 @@ export class Supervisor {
       ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
     };
 
-    await store.writeState(next);
-    await this.push(lease, `chore(${spec.id}): session ${session} — ${outcome.reason}`);
+    // Three files and a commit as ONE unit — the journal shard, the handoff and the state.
+    // This is the unit two slots collided over, and both halves of the fix are needed: the
+    // unit stops a sibling session writing INTO this window, and `StateStore.pending` stops
+    // its already-written files being staged by this commit. The probe above stays outside:
+    // it runs git in the task's own worktree and has nothing to do with the state checkout.
+    await this.unit(async () => {
+      await store.appendJournal(
+        spec.id,
+        session,
+        [
+          `**Exit:** ${outcome.reason}`,
+          `**Context at exit:** ${outcome.contextTokens} tokens`,
+          "",
+          outcome.summary,
+        ].join("\n"),
+      );
+
+      if (outcome.reason === "handoff" || outcome.reason === "blocked") {
+        await store.writeHandoff(spec.id, outcome.summary);
+      }
+
+      await store.writeState(next);
+      await this.push(lease, `chore(${spec.id}): session ${session} — ${outcome.reason}`);
+    });
     void config;
     return next;
   }
@@ -1886,8 +1895,10 @@ export class Supervisor {
       case "blocked": {
         // Capability re-routing: release so a runner that can do it picks it up.
         const requires = outcome.requires ?? state.requires;
-        await this.transition(lease, { ...state, requires }, "ready");
-        await this.push(lease, `chore(${spec.id}): needs ${requires.join(", ")}`);
+        await this.unit(async () => {
+          await this.transition(lease, { ...state, requires }, "ready");
+          await this.push(lease, `chore(${spec.id}): needs ${requires.join(", ")}`);
+        });
         return true;
       }
 
@@ -1902,9 +1913,14 @@ export class Supervisor {
         // claimed by this runner as often as not. Deleting the checkout while a human
         // types would buy disk for exactly as long as it takes them to answer.
         logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
-        await store.writeQuestion(spec.id, index, question);
-        await this.transition(lease, state, "awaiting-human");
-        await this.push(lease, `chore(${spec.id}): awaiting human input`);
+        await this.unit(async () => {
+          await store.writeQuestion(spec.id, index, question);
+          await this.transition(lease, state, "awaiting-human");
+          await this.push(lease, `chore(${spec.id}): awaiting human input`);
+        });
+        // OUTSIDE the unit, both of them. The tracker and Discord are views, git is
+        // authoritative, and holding the state checkout across a network round trip to
+        // either would block every other slot's writes on an unrelated service.
         await this.mirror(spec, { kind: "question", question });
         await this.notifyTask(state, { kind: "question", task: spec.id, question, phase: state.phase });
         return true;
@@ -1921,13 +1937,15 @@ export class Supervisor {
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.
-          await store.appendJournal(
-            spec.id,
-            state.sessions,
-            `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
-          );
-          await this.transition(lease, state, "ready");
-          await this.push(lease, `chore(${spec.id}): completion claim rejected`);
+          await this.unit(async () => {
+            await store.appendJournal(
+              spec.id,
+              state.sessions,
+              `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
+            );
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): completion claim rejected`);
+          });
           return false;
         }
 
@@ -1950,8 +1968,10 @@ export class Supervisor {
         await this.deps.leases.assertHeld(await lease.current());
 
         const merge = await this.mergeReviewed(spec, reviewed.state);
-        await this.transition(lease, reviewed.state, "done");
-        await this.push(lease, `chore(${spec.id}): done`);
+        await this.unit(async () => {
+          await this.transition(lease, reviewed.state, "done");
+          await this.push(lease, `chore(${spec.id}): done`);
+        });
         // Mirrored only here, after every gate passed and git already says done.
         const prUrl = result.prUrl ?? reviewed.state.pr?.url ?? "(no PR recorded)";
         logger.info("task.done", {
@@ -1985,8 +2005,10 @@ export class Supervisor {
           // The tool sets both or neither, so this is unreachable. Back to `ready` rather
           // than parking: a session that ended with nothing to act on is a lost session,
           // not a broken task.
-          await this.transition(lease, state, "ready");
-          await this.push(lease, `chore(${spec.id}): plan session produced nothing`);
+          await this.unit(async () => {
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): plan session produced nothing`);
+          });
           return false;
         }
         return this.applyPlan(lease, spec, state, plan);
@@ -2017,8 +2039,10 @@ export class Supervisor {
           session: state.sessions,
           error: outcome.error ?? outcome.summary,
         });
-        await this.transition(lease, state, "failed");
-        await this.push(lease, `chore(${spec.id}): failed`);
+        await this.unit(async () => {
+          await this.transition(lease, state, "failed");
+          await this.push(lease, `chore(${spec.id}): failed`);
+        });
         await this.notifyTask(state, {
           kind: "failed",
           task: spec.id,
@@ -2071,17 +2095,13 @@ export class Supervisor {
       return true;
     }
 
-    let rejection: string | undefined;
-    if (reviewed.verdict !== undefined) {
-      const text = renderVerdict(reviewed.verdict);
-      await store.writeVerdict(spec.id, state.sessions, text);
-      await store.appendJournal(spec.id, state.sessions, text);
-      if (reviewed.verdict.decision === "changes") rejection = summariseVerdict(reviewed.verdict);
-    }
+    const rejection =
+      reviewed.verdict?.decision === "changes" ? summariseVerdict(reviewed.verdict) : undefined;
 
     // Materialisation validates too — cycles, missing acceptance criteria, unknown
     // capabilities — and a plan the council liked can still be unbuildable. Both refusals
-    // come back the same way, so the agent has one thing to react to.
+    // come back the same way, so the agent has one thing to react to. Pure, so it is above
+    // the unit: nothing it does touches the checkout.
     const cut = rejection === undefined
       ? materialise(plan, {
           parent: spec.id,
@@ -2099,58 +2119,79 @@ export class Supervisor {
       usage: addUsage(state.usage, reviewed.usage),
       review: { rounds, last: cut.kind === "rejected" ? "changes" : "pass" },
     };
-    await store.writeState(next);
 
-    if (cut.kind === "rejected") {
+    // A whole plan's worth of writes as ONE unit — see `unit`, and this is the largest one
+    // in the loop: a verdict, a journal entry, the brainstorm's own state, and then a
+    // `state.json` and a `spec.md` PER CHILD TASK. Split across two commits by a sibling
+    // slot's `git add -A tasks`, half a plan would land in a commit belonging to another
+    // task, and the wave that half describes would be claimable with no spec to read.
+    const outcome = await this.unit(async () => {
+      if (reviewed.verdict !== undefined) {
+        const text = renderVerdict(reviewed.verdict);
+        await store.writeVerdict(spec.id, state.sessions, text);
+        await store.appendJournal(spec.id, state.sessions, text);
+      }
+
+      await store.writeState(next);
+
+      if (cut.kind === "rejected") {
+        await store.appendJournal(
+          spec.id,
+          state.sessions,
+          `**The plan was not accepted:**\n\n${cut.reason}`,
+        );
+
+        if (rounds >= config.limits.maxReviewRounds) {
+          await this.park(lease, spec, next, `the plan was rejected ${rounds} times`);
+          return "parked" as const;
+        }
+
+        await this.transition(lease, next, "ready");
+        await this.push(lease, `chore(${spec.id}): plan sent back`);
+        return "sent-back" as const;
+      }
+
+      for (const child of cut.tasks) {
+        // ORDER IS LOAD-BEARING, exactly as at intake: state first, spec last. `hasTask`
+        // keys on `spec.md`, so a crash between the two leaves a task the claim loop skips
+        // and the next pass can recreate cleanly.
+        await store.writeState({
+          id: child.spec.id,
+          status: "ready",
+          phase: "planning",
+          requires: child.spec.requires,
+          sessions: 0,
+          limits: { maxSessions: config.limits.maxSessionsPerTask },
+          usage: EMPTY_USAGE,
+          progress: { lastProgressSession: 0, noProgressStreak: 0 },
+          plan: child.plan,
+          ...(next.chat === undefined ? {} : { chat: next.chat }),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        await store.writeSpec(child.spec);
+      }
+
       await store.appendJournal(
         spec.id,
         state.sessions,
-        `**The plan was not accepted:**\n\n${cut.reason}`,
+        [
+          `**Plan accepted: ${plan.title}**`,
+          "",
+          ...cut.tasks.map((c) => `- \`${c.spec.id}\` — wave ${c.plan.wave}`),
+        ].join("\n"),
       );
+      await this.transition(lease, next, "done");
+      await this.push(lease, `chore(${spec.id}): plan cut into ${cut.tasks.length} task(s)`);
+      return "cut" as const;
+    });
 
-      if (rounds >= config.limits.maxReviewRounds) {
-        await this.park(lease, spec, next, `the plan was rejected ${rounds} times`);
-        return true;
-      }
-
-      await this.transition(lease, next, "ready");
-      await this.push(lease, `chore(${spec.id}): plan sent back`);
-      await this.notifyTask(next, { kind: "verdict", task: spec.id, summary: cut.reason });
+    if (outcome === "parked") return true;
+    if (outcome === "sent-back") {
+      await this.notifyTask(next, { kind: "verdict", task: spec.id, summary: rejection ?? "" });
       return false;
     }
-
-    for (const child of cut.tasks) {
-      // ORDER IS LOAD-BEARING, exactly as at intake: state first, spec last. `hasTask`
-      // keys on `spec.md`, so a crash between the two leaves a task the claim loop skips
-      // and the next pass can recreate cleanly.
-      await store.writeState({
-        id: child.spec.id,
-        status: "ready",
-        phase: "planning",
-        requires: child.spec.requires,
-        sessions: 0,
-        limits: { maxSessions: config.limits.maxSessionsPerTask },
-        usage: EMPTY_USAGE,
-        progress: { lastProgressSession: 0, noProgressStreak: 0 },
-        plan: child.plan,
-        ...(next.chat === undefined ? {} : { chat: next.chat }),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
-      await store.writeSpec(child.spec);
-    }
-
-    await store.appendJournal(
-      spec.id,
-      state.sessions,
-      [
-        `**Plan accepted: ${plan.title}**`,
-        "",
-        ...cut.tasks.map((c) => `- \`${c.spec.id}\` — wave ${c.plan.wave}`),
-      ].join("\n"),
-    );
-    await this.transition(lease, next, "done");
-    await this.push(lease, `chore(${spec.id}): plan cut into ${cut.tasks.length} task(s)`);
+    if (cut.kind === "rejected") return false;
 
     logger.info("plan.materialised", {
       task: spec.id,
@@ -2201,9 +2242,6 @@ export class Supervisor {
     const text = renderVerdict(verdict);
     const rounds = (state.review?.rounds ?? 0) + (verdict.decision === "changes" ? 1 : 0);
 
-    await store.writeVerdict(spec.id, state.sessions, text);
-    await store.appendJournal(spec.id, state.sessions, text);
-
     const next: TaskState = {
       ...state,
       // The council's own tokens belong to the task that convened it, or a reviewed
@@ -2211,32 +2249,50 @@ export class Supervisor {
       usage: addUsage(state.usage, usage),
       review: { rounds, last: verdict.decision },
     };
-    await store.writeState(next);
-    metrics.council.inc({ task: spec.id, decision: verdict.decision });
 
-    if (verdict.decision === "pass") {
-      await this.push(lease, `chore(${spec.id}): review council passed`);
-      return { state: next, decision: "pass" };
-    }
+    // The verdict, the journal entry, the state and whichever push follows, as one unit —
+    // see `unit`. The council REVIEW is deliberately above it: that takes minutes (§5.1
+    // records 207s), and holding the state checkout across one would stop every other slot
+    // writing and stop housekeeping pulling for the whole of it.
+    //
+    // `park` below is itself a unit and nests harmlessly: `StateStore.exclusive` recognises
+    // the async context already holding the lock, so the inner acquisition runs immediately
+    // rather than deadlocking on this one.
+    const stalled = await this.unit(async () => {
+      await store.writeVerdict(spec.id, state.sessions, text);
+      await store.appendJournal(spec.id, state.sessions, text);
+      await store.writeState(next);
+      metrics.council.inc({ task: spec.id, decision: verdict.decision });
 
-    if (rounds >= config.limits.maxReviewRounds) {
-      // The council and the agent are not converging. Parking beats a fourth attempt:
-      // from outside, a task trading itself back and forth looks identical to one that
-      // is working.
-      logger.warn("council.stalled", { task: spec.id, rounds });
-      await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
-        kind: "review-stalled",
-        task: spec.id,
-        rounds,
-        summary: summariseVerdict(verdict),
-        ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
-        canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
-      });
-      return { state: next, decision: "stalled" };
-    }
+      if (verdict.decision === "pass") {
+        await this.push(lease, `chore(${spec.id}): review council passed`);
+        return false;
+      }
 
-    await this.transition(lease, next, "ready");
-    await this.push(lease, `chore(${spec.id}): review council requested changes`);
+      if (rounds >= config.limits.maxReviewRounds) {
+        // The council and the agent are not converging. Parking beats a fourth attempt:
+        // from outside, a task trading itself back and forth looks identical to one that
+        // is working.
+        logger.warn("council.stalled", { task: spec.id, rounds });
+        await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
+          kind: "review-stalled",
+          task: spec.id,
+          rounds,
+          summary: summariseVerdict(verdict),
+          ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
+          canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
+        });
+        return true;
+      }
+
+      await this.transition(lease, next, "ready");
+      await this.push(lease, `chore(${spec.id}): review council requested changes`);
+      return false;
+    });
+
+    if (verdict.decision === "pass") return { state: next, decision: "pass" };
+    if (stalled) return { state: next, decision: "stalled" };
+
     await this.notifyTask(next, {
       kind: "verdict",
       task: spec.id,
@@ -2288,13 +2344,22 @@ export class Supervisor {
       const { revision } = await maintainer.revise(spec, state, siblings);
       if (revision === undefined) return;
 
-      const changed = await this.applyRevision(membership.parent, records, revision, open);
+      // The revision rewrites a `state.json` PER SIBLING and then commits, so it is one
+      // unit — see `unit`. A partial one is worse than none: waves are recomputed across
+      // the whole graph (`relayer`), so half of them landing in a sibling slot's commit
+      // leaves the plan describing a schedule nobody proposed. The maintainer's own model
+      // call stays above it.
+      const changed = await this.unit(async () => {
+        const applied = await this.applyRevision(membership.parent, records, revision, open);
+        if (applied === 0) return 0;
+        await this.push(lease, `chore(${membership.parent}): plan graph revised`);
+        return applied;
+      });
       if (changed === 0) {
         logger.info("plan.unchanged", { plan: membership.parent, note: revision.note });
         return;
       }
 
-      await this.push(lease, `chore(${membership.parent}): plan graph revised`);
       await this.notifyTask(state, {
         kind: "plan-revised",
         task: membership.parent,
@@ -2506,19 +2571,6 @@ export class Supervisor {
 
     // A session that got a token back happened; one that did not, did not.
     const counts = origin === "session" && spent.outputTokens > 0;
-    if (counts) {
-      await store.appendJournal(
-        spec.id,
-        state.sessions + 1,
-        [
-          `**Interrupted:** ${outage.detail}`,
-          "",
-          "The model provider stopped answering mid-session. Nothing about this task " +
-            "caused it and nothing here is a verdict on the work; the next session " +
-            "picks up from the branch as usual.",
-        ].join("\n"),
-      );
-    }
 
     const released: TaskState = {
       ...state,
@@ -2526,11 +2578,33 @@ export class Supervisor {
       usage: addUsage(state.usage, spent),
     };
 
-    // ALWAYS pushed, even when nothing else changed. Only `ready` is claimable, and a
-    // task last pushed as `running` — which is every task past its first session — would
-    // otherwise be stranded there by an outage no human is going to hear about in time.
-    await this.transition(lease, released, "ready");
-    await this.push(lease, `chore(${spec.id}): released — the provider stopped answering`);
+    // One unit, and here it matters more than anywhere else: the fan-out sends every other
+    // in-flight task down this same path within milliseconds, so this is the one write
+    // sequence N slots are GUARANTEED to attempt simultaneously rather than merely likely
+    // to. Without the unit, four tasks released by one spend limit would produce one commit
+    // carrying four `state.json` files under one task's message, and three tasks whose
+    // release was never recorded — left `running`, which no human hears about.
+    await this.unit(async () => {
+      if (counts) {
+        await store.appendJournal(
+          spec.id,
+          state.sessions + 1,
+          [
+            `**Interrupted:** ${outage.detail}`,
+            "",
+            "The model provider stopped answering mid-session. Nothing about this task " +
+              "caused it and nothing here is a verdict on the work; the next session " +
+              "picks up from the branch as usual.",
+          ].join("\n"),
+        );
+      }
+
+      // ALWAYS pushed, even when nothing else changed. Only `ready` is claimable, and a
+      // task last pushed as `running` — which is every task past its first session — would
+      // otherwise be stranded there by an outage no human is going to hear about in time.
+      await this.transition(lease, released, "ready");
+      await this.push(lease, `chore(${spec.id}): released — the provider stopped answering`);
+    });
 
     // Once per incident. The runner re-checks on a back-off, and a message per attempt
     // would be this failure mode wearing a different hat.
@@ -2649,9 +2723,14 @@ export class Supervisor {
   ): Promise<void> {
     const { store, logger } = this.deps;
     logger.warn("task.parked", { task: spec.id, sessions: state.sessions, reason });
-    await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
-    await this.transition(lease, state, "parked");
-    await this.push(lease, `chore(${spec.id}): parked`);
+    // Journal, state and commit as one unit — see `unit`. The tracker and the notification
+    // stay outside it: both are views of what git already says, and holding the state
+    // checkout across a Discord round trip would stall every other slot's writes.
+    await this.unit(async () => {
+      await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
+      await this.transition(lease, state, "parked");
+      await this.push(lease, `chore(${spec.id}): parked`);
+    });
     await this.mirror(spec, { kind: "parked", reason });
     await this.notify(notification ?? { kind: "parked", task: spec.id, reason });
   }
@@ -2883,23 +2962,29 @@ export class Supervisor {
     });
 
     const now = new Date().toISOString();
-    // Same load-bearing order as intake: state first, spec last, because `hasTask` keys
-    // on `spec.md` (§14).
-    await store.writeState({
-      id,
-      status: "ready",
-      phase: "planning",
-      requires: [],
-      sessions: 0,
-      limits: { maxSessions: config.limits.maxSessionsPerTask },
-      usage: EMPTY_USAGE,
-      progress: { lastProgressSession: 0, noProgressStreak: 0 },
-      chat: { threadId: request.threadId },
-      createdAt: now,
-      updatedAt: now,
+    // One unit — see `unit`. Housekeeping runs on a single thread of control, so this used
+    // to have only the work loop's ONE session to race; with N slots it has N, and a state
+    // written here with its spec swept into a session's commit is a task the claim loop
+    // skips forever (`hasTask` keys on `spec.md`).
+    await this.unit(async () => {
+      // Same load-bearing order as intake: state first, spec last, because `hasTask` keys
+      // on `spec.md` (§14).
+      await store.writeState({
+        id,
+        status: "ready",
+        phase: "planning",
+        requires: [],
+        sessions: 0,
+        limits: { maxSessions: config.limits.maxSessionsPerTask },
+        usage: EMPTY_USAGE,
+        progress: { lastProgressSession: 0, noProgressStreak: 0 },
+        chat: { threadId: request.threadId },
+        createdAt: now,
+        updatedAt: now,
+      });
+      await store.writeSpec(spec);
+      await store.commitAndPush(`chore(${id}): brainstorm started`, "origin", config.stateRepo.branch);
     });
-    await store.writeSpec(spec);
-    await store.commitAndPush(`chore(${id}): brainstorm started`, "origin", config.stateRepo.branch);
 
     logger.info("brainstorm.created", {
       task: id,
@@ -2923,25 +3008,30 @@ export class Supervisor {
       return { kind: "not-waiting", status: state.status };
     }
 
-    await store.writeAnswer(request.task, pending.index, request.text);
-    await store.appendJournal(
-      request.task,
-      state.sessions,
-      `**Answer from the operator:**\n\n${request.text}`,
-    );
-    await store.writeState({
-      ...state,
-      status: "ready",
-      // The streak that made the task park is not the next session's fault, and a
-      // task resumed at the limit parks again on the very next claim without ever
-      // running. Answering IS the progress.
-      progress: { ...state.progress, noProgressStreak: 0 },
+    // One unit — see `unit`. The answer FILE is the record of the answer (§4.1), and a
+    // sibling slot's commit sweeping it up while this one commits nothing is how an answer
+    // reported `applied` and was never readable by the session it was written for.
+    await this.unit(async () => {
+      await store.writeAnswer(request.task, pending.index, request.text);
+      await store.appendJournal(
+        request.task,
+        state.sessions,
+        `**Answer from the operator:**\n\n${request.text}`,
+      );
+      await store.writeState({
+        ...state,
+        status: "ready",
+        // The streak that made the task park is not the next session's fault, and a
+        // task resumed at the limit parks again on the very next claim without ever
+        // running. Answering IS the progress.
+        progress: { ...state.progress, noProgressStreak: 0 },
+      });
+      await store.commitAndPush(
+        `chore(${request.task}): answered question ${pending.index}`,
+        "origin",
+        config.stateRepo.branch,
+      );
     });
-    await store.commitAndPush(
-      `chore(${request.task}): answered question ${pending.index}`,
-      "origin",
-      config.stateRepo.branch,
-    );
 
     logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
     return { kind: "applied", index: pending.index };
@@ -2979,9 +3069,11 @@ export class Supervisor {
 
     try {
       const handle = heldLease(lease);
-      await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
-      await this.transition(handle, state, "parked");
-      await this.push(handle, `chore(${request.task}): parked from chat`);
+      await this.unit(async () => {
+        await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
+        await this.transition(handle, state, "parked");
+        await this.push(handle, `chore(${request.task}): parked from chat`);
+      });
       logger.info("task.cancelled", { task: request.task, previous: state.status });
 
       // After the push, never before: the thread's last word must describe what git
@@ -3056,15 +3148,17 @@ export class Supervisor {
 
     try {
       const handle = heldLease(lease);
-      await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
-      // `lastProgressSession` is history and stays put; only the streak is forgiven, so
-      // the journal can still show how long the task has actually been stalled.
-      await this.transition(
-        handle,
-        { ...state, progress: { ...state.progress, noProgressStreak: 0 } },
-        "ready",
-      );
-      await this.push(handle, `chore(${request.task}): resumed from chat`);
+      await this.unit(async () => {
+        await store.appendJournal(request.task, state.sessions, "**Resumed:** from chat.");
+        // `lastProgressSession` is history and stays put; only the streak is forgiven, so
+        // the journal can still show how long the task has actually been stalled.
+        await this.transition(
+          handle,
+          { ...state, progress: { ...state.progress, noProgressStreak: 0 } },
+          "ready",
+        );
+        await this.push(handle, `chore(${request.task}): resumed from chat`);
+      });
       logger.info("task.resumed", {
         task: request.task,
         sessions: state.sessions,
@@ -3137,9 +3231,11 @@ export class Supervisor {
       // it parked would invite a human to pick up something already shipped.
       const handle = heldLease(lease);
       try {
-        await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
-        await this.transition(handle, state, "done");
-        await this.push(handle, `chore(${request.task}): merged from chat`);
+        await this.unit(async () => {
+          await store.appendJournal(request.task, state.sessions, "**Merged** from chat.");
+          await this.transition(handle, state, "done");
+          await this.push(handle, `chore(${request.task}): merged from chat`);
+        });
       } catch (error) {
         // The merge already happened; failing to record it is worth a log, not a retry.
         logger.warn("merge.unrecorded", { task: request.task, ...errorFields(error) });
@@ -3270,6 +3366,48 @@ export class Supervisor {
     await this.deps.store.writeState(next);
     this.deps.metrics.taskStatus.set({ task: state.id, status }, 1);
     return next;
+  }
+
+  /**
+   * Run `body` — a write-then-push unit — with the state checkout to this slot alone.
+   *
+   * **This is what N slots made mandatory, and `StateStore.exclusively` was kept for it.**
+   * That method's own docstring says so: "Nothing in the supervisor calls this yet… the cost
+   * of that route is attribution (another writer's commit may carry these files) rather than
+   * durability. This exists for a caller that cannot accept even that cost." A runner with
+   * one slot could accept it, because the only other writer was housekeeping, whose writes
+   * belong to a DIFFERENT task and land in a commit whose message is at worst imprecise.
+   *
+   * At N slots it stops being about tidiness. Two sessions ending within a millisecond of
+   * each other each write a journal shard, a `handoff.md` and a `state.json`, and then each
+   * commits; without the hold, whichever gets there first stages the other's half-written
+   * files under its own message and the second finds a clean tree and commits nothing.
+   * `Serial` does not prevent it: every individual git call is properly ordered, and the
+   * damage happens in the interval between one writer's last `writeFile` and its own
+   * `git add`, which it had handed to whoever asked next. Not hypothetical —
+   * `loop.test.ts`'s "two slots writing state at once" reproduced it on the first run, with
+   * `chore(CONC-WRITE-A): session 1` carrying six files across two tasks.
+   *
+   * **This is one of TWO halves and neither is sufficient.** The other is
+   * `StateStore.pending`: staging is now scoped to the paths a writer actually wrote,
+   * because `transition("running")` deliberately leaves a `state.json` uncommitted for the
+   * whole of a session, so at any instant every other in-flight task has one sitting in
+   * this tree — a window no lock can close, since it has been open for minutes. This hold
+   * stops a concurrent writer entering; that scoping stops an already-written file being
+   * swept up.
+   *
+   * The unit is therefore the whole of a logical operation, from its first write to its
+   * push, and never any wider. In particular it must NOT span a session: the model call
+   * takes minutes and holding the state checkout across one would stop every other slot
+   * writing and stop housekeeping pulling.
+   *
+   * Re-entrant within one async context by construction (`StateStore.exclusive` keys on
+   * `AsyncLocalStorage`), so a unit nested inside a unit — `applyOutcome` calling `park`,
+   * `convene` calling `releaseAfterOutage` — runs immediately on the hold it already has
+   * rather than deadlocking on it.
+   */
+  private unit<T>(body: () => Promise<T>): Promise<T> {
+    return this.deps.store.exclusively(() => body());
   }
 
   /**

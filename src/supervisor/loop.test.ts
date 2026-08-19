@@ -3533,3 +3533,591 @@ test("the survey publishes thread bindings for a bot that is not in this process
     "a done task's thread must not stay bound",
   );
 });
+
+/**
+ * ============================================================================
+ * N concurrent tasks per runner (DESIGN.md §6.4)
+ * ============================================================================
+ *
+ * Every test above this line describes a runner at `concurrency: 1` and still passes
+ * unchanged, which is the point: the default did not move. What follows exercises the
+ * scheduler at N > 1, and each case is aimed at one specific way a slot could reach into
+ * another one's business.
+ */
+
+/** The shared config with `concurrency` raised. Nothing else differs. */
+const withSlots = (slots: number): RunnerConfig => ({ ...config, concurrency: slots });
+
+/** The dependencies every test here supplies identically, so a case shows only its subject. */
+const inertDeps = (): Pick<SupervisorDeps, "verifier" | "progress" | "notifier" | "logger" | "toolchain"> => ({
+  verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+  progress: {
+    probe: () =>
+      Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+  },
+  notifier: new NullNotifier(),
+  logger: SILENT_LOGGER,
+  toolchain: TEST_TOOLCHAIN,
+});
+
+const newLeases = (): LeaseManager =>
+  new LeaseManager({
+    git: stateGit,
+    remote: "origin",
+    runner: asRunnerId(config.runnerId),
+    staleAfterSeconds: config.lease.staleAfterSeconds,
+  });
+
+/**
+ * A session that hangs until something releases it, with the keepalive a real hang has.
+ *
+ * `keepalive` is load-bearing for the reason the `/cancel` test above spells out at length:
+ * every timer the supervisor arms for the duration of a session is unref'd, so a promise
+ * that holds nothing lets node drain the event loop mid-session and end the test with
+ * "Promise resolution is still pending". A real hung session holds a child process. This
+ * holds an interval, and `stop()` must be called from `t.after` as well as on release — a
+ * live interval outliving a FAILING assertion is what turns a failed test into a hung
+ * suite.
+ */
+const hangingSessions = (): {
+  readonly runner: SessionRunner;
+  /** Task ids whose session has started, in order. */
+  readonly started: TaskId[];
+  /** Finish one task's session with `outcome`. */
+  readonly finish: (task: TaskId, outcome: SessionOutcome) => void;
+  /** Whose signal has aborted. */
+  readonly aborted: Set<TaskId>;
+  readonly stop: () => void;
+} => {
+  const started: TaskId[] = [];
+  const aborted = new Set<TaskId>();
+  const settle = new Map<TaskId, (outcome: SessionOutcome) => void>();
+  let keepalive: NodeJS.Timeout | undefined;
+
+  const runner: SessionRunner = {
+    run: (spec, _state, signal) =>
+      new Promise<SessionOutcome>((resolve) => {
+        started.push(spec.id);
+        keepalive ??= setInterval(() => {}, 1_000);
+        settle.set(spec.id, resolve);
+        signal.addEventListener("abort", () => {
+          aborted.add(spec.id);
+          settle.delete(spec.id);
+          resolve({
+            reason: "interrupted",
+            usage: EMPTY_USAGE,
+            contextTokens: 0,
+            summary: "stopped from outside",
+          });
+        });
+      }),
+  };
+
+  return {
+    runner,
+    started,
+    aborted,
+    finish: (task, outcome) => settle.get(task)?.(outcome),
+    stop: () => {
+      if (keepalive !== undefined) clearInterval(keepalive);
+      keepalive = undefined;
+    },
+  };
+};
+
+/** Poll until `predicate` holds, or give up. Returns whether it held. */
+const until = async (predicate: () => boolean, budgetMs = 30_000): Promise<boolean> => {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(25);
+  }
+  return predicate();
+};
+
+test("two tasks are claimed and worked at the same time", async (t) => {
+  // The whole feature, in its simplest form. Both sessions must be IN FLIGHT together —
+  // asserted on the two `run` calls overlapping, not on both tasks eventually finishing,
+  // which a strictly sequential runner also satisfies.
+  const A = asTaskId("CONC-BOTH-A");
+  const B = asTaskId("CONC-BOTH-B");
+  await seedTask(A);
+  await seedTask(B);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const bothStarted = await until(
+    () => sessions.started.includes(A) && sessions.started.includes(B),
+  );
+
+  // Neither has been allowed to finish, so both `run` calls are still outstanding at this
+  // instant — which is what "at the same time" means here.
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(bothStarted, `both tasks must be in flight together, saw ${sessions.started.join(",")}`);
+
+  await retire(A);
+  await retire(B);
+});
+
+test("concurrency is a cap: a third task is not claimed while two are running", async (t) => {
+  // The bound, from the other side. Without it `claimUpTo` would be a rename of
+  // `claimNext` with a loop round it, and the operator's number would mean nothing.
+  const A = asTaskId("CONC-CAP-A");
+  const B = asTaskId("CONC-CAP-B");
+  const C = asTaskId("CONC-CAP-C");
+  await seedTask(A);
+  await seedTask(B);
+  await seedTask(C);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  await until(() => sessions.started.length >= 2);
+  // Several more polls at `pollSeconds: 1`. A runner that was going to claim a third has
+  // had every opportunity to; a run that came back with two after three seconds did not
+  // simply fail to get round to it.
+  await sleep(3_000);
+
+  const started = [...sessions.started];
+  const scraped = metrics.registry.render();
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.equal(started.length, 2, `two slots, two sessions — saw ${started.join(",")}`);
+
+  // The gauges say the same thing the behaviour does, because the operator reads the
+  // gauges. `slots_free` at 0 with `tasks_in_flight` at 2 is a saturated runner, and it
+  // is also how `concurrency: 2` is legible from a scrape.
+  assert.match(scraped, /caterpillar_tasks_in_flight\{runner="test-runner"\} 2/);
+  assert.match(scraped, /caterpillar_slots_free\{runner="test-runner"\} 0/);
+  // And the third task was seen and walked past, rather than never being noticed. This is
+  // the series that distinguishes a saturated fleet from an idle one — they look identical
+  // from every other metric, because in both cases nothing new starts.
+  assert.match(
+    scraped,
+    /caterpillar_claims_rejected_full_total\{runner="test-runner"\} [1-9]/,
+    `a claimable task walked past for want of a slot must be counted: ${scraped}`,
+  );
+
+  await retire(A);
+  await retire(B);
+  await retire(C);
+});
+
+test("one task failing does not disturb the other", async (t) => {
+  // The containment property, and the reason `startSlot` exists. `workOnce` used to
+  // `await workTask` on its own stack, so a throw unwound the POLL — which was harmless
+  // with one task and is not with two: the pass that would have cleaned up and re-claimed
+  // for the sibling is the pass that just died.
+  const DOOMED = asTaskId("CONC-FAIL-DOOMED");
+  const HEALTHY = asTaskId("CONC-FAIL-HEALTHY");
+  await seedTask(DOOMED);
+  await seedTask(HEALTHY);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  // One task's session throws outright — the shape of a mirror clone that cannot
+  // authenticate, which is what `parkFailed` was written for. The other hangs.
+  const runner: SessionRunner = {
+    run: (spec, state, signal) =>
+      spec.id === DOOMED
+        ? Promise.reject(new Error("mirror clone failed: Repository not found"))
+        : sessions.runner.run(spec, state, signal),
+  };
+
+  const store = new StateStore(statePath, stateGit);
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store,
+    leases: newLeases(),
+    runner,
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // The doomed task must reach `parked` ON THE REMOTE, which is the only evidence its
+  // failure was handled rather than swallowed...
+  let parked = false;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !parked) {
+    parked = (await pushedState(DOOMED))?.status === "parked";
+    await sleep(50);
+  }
+
+  // ...and the healthy task's session must still be running at that instant. Nothing has
+  // been allowed to finish it, so if the failure had unwound the loop the session would
+  // have been abandoned with it.
+  const healthyStarted = sessions.started.includes(HEALTHY);
+  const healthyAborted = sessions.aborted.has(HEALTHY);
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(parked, "the failing task must be parked on the remote, as it always was");
+  assert.ok(healthyStarted, "the healthy task must have been claimed and started");
+  assert.equal(
+    healthyAborted,
+    false,
+    "one task's failure must not abort the other's session",
+  );
+
+  await retire(HEALTHY);
+});
+
+test("a lost lease drops that task and only that task", async (t) => {
+  // Per-slot heartbeats, asserted on the blast radius. A `LeaseLostError` for A means
+  // another runner owns A; it is evidence about nothing else, and B's lease may be
+  // perfectly healthy. One shared heartbeat could not tell those apart.
+  //
+  // The lease is stolen the way another runner would steal it: by force-pushing the ref
+  // out from under this one, so the renewal's CAS fails against the genuine article.
+  const STOLEN = asTaskId("CONC-LEASE-STOLEN");
+  const KEPT = asTaskId("CONC-LEASE-KEPT");
+  await seedTask(STOLEN);
+  await seedTask(KEPT);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const reaped: TaskId[] = [];
+  const worktrees: WorktreeReaper = {
+    removeTaskWorktrees: (task) => {
+      reaped.push(task);
+      return Promise.resolve({ worktrees: 1, bytes: 0, tasks: [task] } satisfies ReapResult);
+    },
+    reapStaleWorktrees: () =>
+      Promise.resolve({ worktrees: 0, bytes: 0, tasks: [] } satisfies ReapResult),
+  };
+
+  const deactivated: TaskId[] = [];
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    // A heartbeat that actually fires, unlike the file's default hour. This test is about
+    // what a renewal failure does, so the renewal has to happen.
+    config: { ...withSlots(2), lease: { heartbeatSeconds: 1, staleAfterSeconds: 300 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+    worktrees,
+    credentials: {
+      deactivate: (task) => {
+        deactivated.push(task);
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  await until(() => sessions.started.includes(STOLEN) && sessions.started.includes(KEPT));
+
+  // Another runner takes the lease. An empty tree commit onto the ref is exactly what
+  // `LeaseManager.casRef` writes, so the renewal below meets an oid it does not own.
+  const emptyTree = await stateGit.run("hash-object", "-t", "tree", "/dev/null");
+  const thief = await stateGit.run("commit-tree", emptyTree, "-m", "lease stolen by another runner");
+  await stateGit.run("push", "--force", "origin", `${thief}:${leaseRef(STOLEN)}`);
+
+  const stolenAborted = await until(() => sessions.aborted.has(STOLEN));
+  // Long enough for several more heartbeat intervals: if the loss had been read as a
+  // statement about the runner, this is when the other session would have gone too.
+  await sleep(2_500);
+  const keptAborted = sessions.aborted.has(KEPT);
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(stolenAborted, "the session whose lease was stolen must be aborted");
+  assert.equal(keptAborted, false, "a lease lost for one task must not touch the other");
+  assert.deepEqual(
+    deactivated,
+    [STOLEN],
+    "only the stolen task's credential is revoked — the other lease was never in question",
+  );
+  assert.equal(
+    reaped.includes(KEPT),
+    false,
+    "the surviving task's checkout must not be reaped from another task's lease loss",
+  );
+
+  await retire(STOLEN);
+  await retire(KEPT);
+});
+
+test("a cancel stops exactly one of two running sessions", async (t) => {
+  // The sharpest of the three fields slots replaced. A single `cancelInFlight` on the
+  // supervisor would hold whichever session installed itself LAST, so cancelling A would
+  // stop B and leave A running — with the human told their cancel had worked. And
+  // `request.task === this.inFlightTask` would have answered "not mine" for every session
+  // but one, sending the cancel to `applyPark`, which fails its CAS against the task's own
+  // live lease and replies "not-parkable: running" about a task this very process is
+  // working.
+  const TARGET = asTaskId("CONC-CANCEL-TARGET");
+  const BYSTANDER = asTaskId("CONC-CANCEL-BYSTANDER");
+  await seedTask(TARGET);
+  await seedTask(BYSTANDER);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store,
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  await until(() => sessions.started.includes(TARGET) && sessions.started.includes(BYSTANDER));
+
+  const outcome = await inbox.submit({ kind: "park", task: TARGET });
+
+  const targetAborted = await until(() => sessions.aborted.has(TARGET));
+  // The park lands a turn boundary later. Waiting for it also gives the bystander every
+  // chance to have been aborted by mistake.
+  let parked = false;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !parked) {
+    parked = (await store.tryReadState(TARGET))?.status === "parked";
+    await sleep(50);
+  }
+  const bystanderAborted = sessions.aborted.has(BYSTANDER);
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.equal(
+    outcome.kind,
+    "cancelling",
+    "a cancel for one of several running tasks must be accepted, not refused as `running`",
+  );
+  assert.ok(targetAborted, "the named session must be aborted");
+  assert.equal(bystanderAborted, false, "a cancel names ONE task and must reach only it");
+  assert.ok(parked, "the cancelled task must end up parked, not left claimable");
+
+  await retire(BYSTANDER);
+});
+
+test("a provider outage releases every in-flight task, not just the one that met it", async (t) => {
+  // `releaseAfterOutage` was written for one slot, where "stop claiming" and "let go of
+  // what you hold" were the same sentence. With N slots they are not: without the fan-out
+  // the other N-1 sessions keep spending requests against an endpoint that has already
+  // refused one, each meeting the wall separately — N journal entries, N cooldown records
+  // extending the back-off geometrically, and the stampede the cooldown exists to prevent
+  // arriving one task at a time.
+  const MET = asTaskId("CONC-OUTAGE-MET");
+  const OTHER = asTaskId("CONC-OUTAGE-OTHER");
+  await seedTask(MET, { sessions: 1 });
+  await seedTask(OTHER, { sessions: 1 });
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const notifications: string[] = [];
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+    notifier: {
+      notify: (notification) => {
+        notifications.push(notification.kind);
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  await until(() => sessions.started.includes(MET) && sessions.started.includes(OTHER));
+
+  // One session meets the wall. The other is still hanging and knows nothing about it.
+  sessions.finish(MET, {
+    reason: "provider-unavailable",
+    usage: EMPTY_USAGE,
+    contextTokens: 0,
+    error: '429 {"type":"error","error":{"type":"rate_limit_error"}}',
+    outage: { kind: "exhausted", status: 429, detail: "monthly spend limit" },
+    summary: "the model provider stopped answering",
+  });
+
+  const otherAborted = await until(() => sessions.aborted.has(OTHER));
+
+  // Both must reach `ready` on the REMOTE. An outage is not the task's fault, and only
+  // `ready` is claimable — a task left `running` here is one no human hears about.
+  let bothReady = false;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && !bothReady) {
+    bothReady =
+      (await pushedState(MET))?.status === "ready" && (await pushedState(OTHER))?.status === "ready";
+    await sleep(50);
+  }
+
+  // Several more polls: the cooldown has to stop the runner re-claiming either of them.
+  const startedBefore = sessions.started.length;
+  await sleep(2_500);
+  const startedAfter = sessions.started.length;
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(otherAborted, "an outage must reach every in-flight session, not only its own");
+  assert.ok(bothReady, "both tasks must be released to `ready`, so neither is stranded");
+  assert.equal(
+    startedAfter,
+    startedBefore,
+    "the cooldown must stop the runner re-claiming what the outage released",
+  );
+  // One incident, one message. The fan-out sends the second task through the same release
+  // path within seconds, and `entry.first` is what keeps that from being a second alert.
+  assert.deepEqual(
+    notifications.filter((kind) => kind === "provider-unavailable"),
+    ["provider-unavailable"],
+    "four tasks meeting one spend limit is one incident, not four",
+  );
+
+  await retire(MET);
+  await retire(OTHER);
+});
+
+test("two slots writing state at once commit their own content, not each other's", async (t) => {
+  // The state repo is ONE working copy and N slots write it (DESIGN.md §6.4). `Serial`
+  // covers that, and the existing "two concurrent store writes are serialised" test pins
+  // the mutex directly — this one pins the property from the SUPERVISOR's side, because
+  // that is where the two writers actually come from now: two sessions ending within
+  // milliseconds of each other, each running `recordSession` -> `transition` -> `push`.
+  //
+  // Asserted on the COMMITTED CONTENT, not on the absence of an error. Only the milder of
+  // the two failures throws: `index.lock` is loud, and `git add -A` staging the other
+  // writer's half-written `state.json` into this writer's commit is silent. So "nothing
+  // blew up" is exactly the assertion that would pass while the real damage happened —
+  // each commit must carry its own task's session count and NOT the other's.
+  const A = asTaskId("CONC-WRITE-A");
+  const B = asTaskId("CONC-WRITE-B");
+  await seedTask(A);
+  await seedTask(B);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  await until(() => sessions.started.includes(A) && sessions.started.includes(B));
+
+  // Both sessions end in the SAME TICK, which is the case the mutex has to get right and
+  // the one a sequential runner could never produce. Each hands back a `handoff`, so both
+  // go down `recordSession`: a journal shard, a `state.json` with `sessions: 1`, and a
+  // commit-and-push under its own lease.
+  const handoff = (task: TaskId): SessionOutcome => ({
+    reason: "handoff",
+    usage: { inputTokens: 100, outputTokens: 200, costUsd: 0.5 },
+    contextTokens: 1_000,
+    summary: `${task} handed off`,
+  });
+  sessions.finish(A, handoff(A));
+  sessions.finish(B, handoff(B));
+
+  // Wait for BOTH to be visible on the remote, which is the only evidence a push landed.
+  let both = false;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline && !both) {
+    both =
+      (await pushedState(A))?.sessions === 1 && (await pushedState(B))?.sessions === 1;
+    await sleep(50);
+  }
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  const pushedA = await pushedState(A);
+  const pushedB = await pushedState(B);
+  assert.ok(both, `both writers must land on the remote; A=${pushedA?.sessions} B=${pushedB?.sessions}`);
+
+  // Each task's own accounting, and only its own. A mixed commit shows up here as a
+  // doubled session count or doubled tokens on one task and none on the other.
+  for (const [task, pushed] of [[A, pushedA], [B, pushedB]] as const) {
+    assert.equal(pushed?.sessions, 1, `${task} must record exactly its own one session`);
+    assert.equal(pushed?.usage.outputTokens, 200, `${task} must carry only its own tokens`);
+  }
+
+  // And each COMMIT must name one task and carry only that task's files. This is the
+  // assertion that fails when the git calls are serialised but the write-then-commit unit
+  // is not: whichever writer commits first sweeps up both journals under its own message,
+  // and the second commits nothing.
+  const log = await new Git(origin).run("log", "-4", "--name-only", "--format=%H%x00%s");
+  for (const entry of log.split(/\n(?=[0-9a-f]{40}\x00)/)) {
+    const [header, ...paths] = entry.split("\n");
+    const subject = (header ?? "").split("\0")[1] ?? "";
+    const owner = subject.includes(A) ? A : subject.includes(B) ? B : undefined;
+    if (owner === undefined) continue;
+    const stranger = owner === A ? B : A;
+    assert.ok(
+      !paths.some((path) => path.includes(stranger)),
+      `${subject} carries ${stranger}'s files:\n${entry}`,
+    );
+  }
+
+  await retire(A);
+  await retire(B);
+});
