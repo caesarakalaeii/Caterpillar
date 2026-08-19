@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskStatus } from "../domain/task.ts";
 import { TaskSnapshot, type TaskSummary } from "../supervisor/snapshot.ts";
-import { describeList } from "./replies.ts";
+import { describeList, describeTask } from "./replies.ts";
 
 const at = (id: string, status: TaskStatus, updatedAt: string): TaskSummary => ({
   id: asTaskId(id),
@@ -161,4 +161,72 @@ test("tasks updated in the same millisecond keep a stable order", () => {
     snapshot.all().map((task) => task.id),
     ["P-1", "P-2", "P-3"],
   );
+});
+
+/**
+ * `/task` and the question it could not answer.
+ *
+ * A brainstorm the council kept sending back showed as `ready`, then `ready`, then
+ * `parked`, and nothing in Discord ever said a review had happened — the verdicts were
+ * files in a repo, and the snapshot this reply is served from carried no trace of them.
+ */
+test("a task the council sent back says how often, why, and whose move it is", () => {
+  const rendered = describeTask(asTaskId("BS-153"), {
+    ...at("BS-153", "ready", "2026-08-19T09:00:00.000Z"),
+    review: {
+      rounds: 3,
+      last: "changes",
+      reason: "**Feasibility** — task 2 declares no command that exercises the new endpoint.",
+    },
+  });
+
+  assert.match(rendered, /3 rounds/);
+  assert.match(rendered, /last sent back/);
+  assert.match(rendered, /exercises the new endpoint/);
+  // `ready` is the agent's move, and saying so is the half a count of rounds leaves out:
+  // a reader who cannot tell whether they are expected to act assumes they are not.
+  assert.match(rendered, /goes back to the agent by itself/);
+});
+
+test("a parked task names the commands that unpark it", () => {
+  const rendered = describeTask(asTaskId("BS-153"), {
+    ...at("BS-153", "parked", "2026-08-19T09:00:00.000Z"),
+    review: { rounds: 3, last: "changes", reason: "**Decomposition** — five tasks are one task." },
+  });
+
+  assert.match(rendered, /will not be picked up again on its own/);
+  assert.match(rendered, /\/resume BS-153/);
+  // No PR on a brainstorm, so no merge is offered: a command that cannot work is worse
+  // than no suggestion at all.
+  assert.doesNotMatch(rendered, /\/merge/);
+});
+
+test("a parked task WITH a pull request offers the merge as well", () => {
+  const rendered = describeTask(asTaskId("T-9"), {
+    ...at("T-9", "parked", "2026-08-19T09:00:00.000Z"),
+    prUrl: "https://github.com/acme/app/pull/4",
+    review: { rounds: 3, last: "changes", reason: "**Correctness** — off by one." },
+  });
+
+  assert.match(rendered, /\/merge T-9/);
+  assert.match(rendered, /\/resume T-9/);
+});
+
+test("a task no council has looked at says nothing about reviews", () => {
+  // The reply is read at a glance. A "0 rounds, no verdict recorded" line on every task
+  // that has never been reviewed is noise on the four fields that are always true.
+  const rendered = describeTask(asTaskId("T-1"), at("T-1", "running", "2026-08-19T09:00:00.000Z"));
+
+  assert.doesNotMatch(rendered, /Review council/);
+  assert.match(rendered, /\*\*T-1\*\* — `running`/);
+});
+
+test("a task the council passed does not keep quoting an answered objection", () => {
+  const rendered = describeTask(asTaskId("T-2"), {
+    ...at("T-2", "done", "2026-08-19T09:00:00.000Z"),
+    review: { rounds: 2, last: "pass" },
+  });
+
+  assert.match(rendered, /2 rounds, last passed/);
+  assert.doesNotMatch(rendered, /sent back/);
 });

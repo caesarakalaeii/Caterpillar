@@ -681,10 +681,22 @@ export const taskPage = (detail: TaskDetail): Html => {
     }
 
     ${
-      detail.verdicts.length === 0
+      // The reason on its own is enough to render this section. A plan refused by
+      // MATERIALISATION — a dependency cycle, a child with no acceptance criteria — never
+      // convened a council, so it has no verdict file and this section used to disappear
+      // entirely on exactly the rejections that had a mechanical, fixable cause.
+      detail.verdicts.length === 0 && state.review?.reason === undefined
         ? raw("")
         : html`<section>
             <h2>Review council</h2>
+            ${
+              state.review?.reason === undefined
+                ? raw("")
+                : html`<div class="panel" data-status="awaiting-human">
+                    <h3>why it was last sent back — after ${state.review.rounds} round(s)</h3>
+                    <div class="prose">${state.review.reason}</div>
+                  </div>`
+            }
             ${detail.verdicts.map(
               (verdict) => html`<details>
                 <summary>verdict ${verdict.index}</summary>

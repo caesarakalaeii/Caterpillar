@@ -134,6 +134,43 @@ export const describeList = (
   return take([header, "", ...lines, ...footer].join("\n"), CONTENT_LIMIT);
 };
 
+/**
+ * The review half of `/task`, and the reason this reply grew past six fields.
+ *
+ * A task the council keeps sending back showed as `ready`, then `ready`, then `parked`,
+ * with nothing anywhere in Discord saying a review had happened at all — let alone what it
+ * objected to or what a human could do about it. `rounds` answers how often, `reason`
+ * answers why, and the last line answers whose move it is, because a count and a critique
+ * still leave a reader guessing whether they are expected to act.
+ */
+const reviewLines = (task: TaskSummary): readonly string[] => {
+  const review = task.review;
+  if (review === undefined || review.rounds === 0) return [];
+
+  const rounds = `${review.rounds} round${review.rounds === 1 ? "" : "s"}`;
+  const outcome =
+    review.last === "pass"
+      ? "passed"
+      : review.last === "changes"
+        ? "sent back"
+        : "no verdict recorded";
+
+  return [
+    "",
+    `**Review council:** ${rounds}, last ${outcome}.`,
+    ...(review.reason === undefined ? [] : [review.reason]),
+    "",
+    // Keyed on status, not on the task's kind, because the summary does not carry the kind
+    // and guessing it from the id prefix would be wrong for exactly the tasks a plan cut.
+    task.status === "parked"
+      ? `It will not be picked up again on its own. Say what to change — in its thread, or ` +
+        `\`/answer ${task.id} <what to change>\` — then \`/resume ${task.id}\`` +
+        (task.prUrl === undefined ? "." : `, or \`/merge ${task.id}\` to take the PR as it stands.`)
+      : `It goes back to the agent by itself. To steer it, say what to change in its thread ` +
+        `before the next session starts.`,
+  ];
+};
+
 export const describeTask = (id: TaskId, task: TaskSummary | undefined): string => {
   if (task === undefined) {
     return `No task **${id}** in the state repo. It may not have been ingested yet.`;
@@ -147,6 +184,7 @@ export const describeTask = (id: TaskId, task: TaskSummary | undefined): string 
       `Cost: $${task.costUsd.toFixed(2)}`,
       ...(task.prUrl === undefined ? [] : [`PR: ${task.prUrl}`]),
       `Updated: ${task.updatedAt}`,
+      ...reviewLines(task),
     ].join("\n"),
     CONTENT_LIMIT,
   );

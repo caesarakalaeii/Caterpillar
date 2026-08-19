@@ -12,7 +12,7 @@
  * authoritative, exactly as the tracker and Discord are (README invariant 6). Nothing is
  * ever written from it.
  */
-import type { TaskId, TaskPhase, TaskState, TaskStatus } from "../domain/task.ts";
+import type { ReviewRecord, TaskId, TaskPhase, TaskState, TaskStatus } from "../domain/task.ts";
 
 export interface TaskSummary {
   readonly id: TaskId;
@@ -21,6 +21,15 @@ export interface TaskSummary {
   readonly sessions: number;
   readonly costUsd: number;
   readonly prUrl?: string;
+  /**
+   * The review council's history, when it has one (§12.1, §14.3).
+   *
+   * Carried so `/task` can answer why something keeps being sent back. It is the only
+   * question about a task whose answer lived exclusively in files — the verdicts under
+   * `reviews/` — and the snapshot exists precisely because reading files is what a Discord
+   * interaction has no time to do.
+   */
+  readonly review?: ReviewRecord;
   readonly updatedAt: string;
 }
 
@@ -31,6 +40,7 @@ export const summarise = (state: TaskState): TaskSummary => ({
   sessions: state.sessions,
   costUsd: state.usage.costUsd,
   ...(state.pr === undefined ? {} : { prUrl: state.pr.url }),
+  ...(state.review === undefined ? {} : { review: state.review }),
   updatedAt: state.updatedAt,
 });
 

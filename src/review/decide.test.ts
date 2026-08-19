@@ -7,7 +7,13 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decide, renderVerdict, summariseVerdict, type ReviewerVerdict } from "./decide.ts";
+import {
+  decide,
+  explainVerdict,
+  renderVerdict,
+  summariseVerdict,
+  type ReviewerVerdict,
+} from "./decide.ts";
 
 const verdict = (over: Partial<ReviewerVerdict> = {}): ReviewerVerdict => ({
   lens: "correctness",
@@ -121,4 +127,64 @@ test("the one-line summary names who blocked", () => {
 
   assert.equal(summariseVerdict(blocked), "blocked by fit, design");
   assert.match(summariseVerdict(decide([verdict()])), /passed 1 lens/);
+});
+
+test("the one-line summary of an all-abstained council is not `blocked by` nothing", () => {
+  // `decide` sends this back with zero blockers by construction, so the join over the
+  // blocker list produced a sentence that stopped after "by" — in the one outcome where
+  // the reader most needs to be told that no review happened.
+  const nobody = decide([
+    verdict({ lens: "correctness", abstained: true, decision: "changes" }),
+    verdict({ lens: "design", abstained: true, decision: "changes" }),
+  ]);
+
+  assert.equal(nobody.blockers.length, 0);
+  assert.doesNotMatch(summariseVerdict(nobody), /blocked by\s*$/);
+  assert.match(summariseVerdict(nobody), /no reviewer completed a review \(2 abstained\)/);
+  assert.match(explainVerdict(nobody), /abstention is not an approval/);
+});
+
+test("the explanation says what was objected to, not only who objected", () => {
+  // The whole point: this is what Discord shows. `blocked by feasibility` named a lens and
+  // gave the human nothing to act on, and the reasons were in a repo they had to clone.
+  const blocked = decide([
+    verdict({
+      lens: "feasibility",
+      title: "Feasibility",
+      decision: "changes",
+      blocking: true,
+      summary: "Task 3 cannot be verified by the command it declares.",
+      findings: [{ where: "task 3", what: "`npm test` does not exercise the new endpoint" }],
+    }),
+    verdict({ lens: "design" }),
+  ]);
+
+  const text = explainVerdict(blocked);
+  assert.match(text, /Feasibility/);
+  assert.match(text, /cannot be verified by the command it declares/);
+  assert.match(text, /does not exercise the new endpoint/);
+  // The lenses that passed are absent: this is the actionable half, and a reader acting on
+  // it does not need the two opinions that asked for nothing.
+  assert.doesNotMatch(text, /design/);
+});
+
+test("the explanation bounds its findings and says how many it dropped", () => {
+  // Bounded before Discord's limit gets involved, so what survives is whole findings
+  // rather than a sentence cut mid-word — and a dropped tail is stated, never implied.
+  const many = decide([
+    verdict({
+      lens: "decomposition",
+      title: "Decomposition",
+      decision: "changes",
+      blocking: true,
+      summary: "Five tasks are one task.",
+      findings: [1, 2, 3, 4, 5].map((n) => ({ where: `task ${n}`, what: `overlaps task ${n + 1}` })),
+    }),
+  ]);
+
+  const text = explainVerdict(many);
+  assert.match(text, /task 1/);
+  assert.match(text, /task 3/);
+  assert.match(text, /…and 2 more, in the full verdict\./);
+  assert.doesNotMatch(text, /overlaps task 5/);
 });

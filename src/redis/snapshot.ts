@@ -20,7 +20,7 @@
  * the awaiting-human-first ranking and the cap of 25 are Discord's rules, not this
  * layer's, and duplicating them here is how they would drift.
  */
-import type { TaskId, TaskStatus } from "../domain/task.ts";
+import type { ReviewRecord, TaskId, TaskStatus } from "../domain/task.ts";
 import type { Logger } from "../obs/log.ts";
 import { TaskSnapshot, type TaskSummary } from "../supervisor/snapshot.ts";
 import type { RedisClient } from "./client.ts";
@@ -231,7 +231,7 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
   if (value === null || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
 
-  const { id, status, phase, sessions, costUsd, prUrl, updatedAt } = raw;
+  const { id, status, phase, sessions, costUsd, prUrl, review, updatedAt } = raw;
   if (
     typeof id !== "string" ||
     typeof status !== "string" ||
@@ -243,6 +243,8 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
     return undefined;
   }
 
+  const parsedReview = parseReview(review);
+
   return {
     id: id as TaskId,
     status: status as TaskStatus,
@@ -250,6 +252,35 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
     sessions,
     costUsd,
     ...(typeof prUrl === "string" ? { prUrl } : {}),
+    ...(parsedReview === undefined ? {} : { review: parsedReview }),
     updatedAt,
+  };
+};
+
+/**
+ * The review record, rebuilt field by field like everything else here.
+ *
+ * This function is why `/task` says why a task keeps being sent back on a FLEET and not
+ * only on a single runner. Every field of a summary is reconstructed explicitly, so a field
+ * this misses is dropped in silence — and with Redis configured the process answering
+ * `/task` is the standalone bot, which has no state repo and knows only what it reads from
+ * this key. The failure mode is the worst kind: correct in a one-replica dev run, and
+ * quietly back to `rounds`-and-nothing in production.
+ *
+ * A malformed record yields undefined rather than dropping the whole task: the review
+ * history is the least important thing a summary carries, and losing the task from an
+ * autocomplete list to save it would be the wrong trade.
+ */
+const parseReview = (value: unknown): ReviewRecord | undefined => {
+  if (value === null || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+
+  const { rounds, last, reason } = raw;
+  if (typeof rounds !== "number") return undefined;
+
+  return {
+    rounds,
+    ...(last === "pass" || last === "changes" ? { last } : {}),
+    ...(typeof reason === "string" ? { reason } : {}),
   };
 };

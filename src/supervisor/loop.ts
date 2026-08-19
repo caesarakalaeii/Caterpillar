@@ -24,6 +24,7 @@ import {
   EMPTY_USAGE,
   isClaimable,
   isTerminal,
+  recordedReason,
   repoSlug,
   type ProposedPlan,
   type RepoRef,
@@ -71,7 +72,7 @@ import type { ThreadBindingWriter } from "../redis/threads.ts";
 import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
-import { renderVerdict, summariseVerdict } from "../review/decide.ts";
+import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
@@ -2187,8 +2188,16 @@ export class Supervisor {
       return true;
     }
 
+    // Both halves of the story: `summary` names who objected, `detail` says to what. They
+    // are carried separately all the way to Discord because they survive differently — a
+    // long verdict is truncated to fit a message and the one-liner never is.
     const rejection =
-      reviewed.verdict?.decision === "changes" ? summariseVerdict(reviewed.verdict) : undefined;
+      reviewed.verdict?.decision === "changes"
+        ? {
+            summary: summariseVerdict(reviewed.verdict),
+            detail: explainVerdict(reviewed.verdict),
+          }
+        : undefined;
 
     // Materialisation validates too — cycles, missing acceptance criteria, unknown
     // capabilities — and a plan the council liked can still be unbuildable. Both refusals
@@ -2203,13 +2212,33 @@ export class Supervisor {
           // successor a credential for any repo it named (§9.1).
           scope: this.workspaceScope(spec.workspace),
         })
-      : ({ kind: "rejected", reason: rejection } as const);
+      : ({ kind: "rejected", reason: rejection.detail } as const);
+
+    // A materialisation refusal has no council behind it to summarise, and its `reason` is
+    // already a full sentence naming the offending child. So the headline states the
+    // category and the reason itself carries the specifics — the alternative was a header
+    // that repeated the body verbatim.
+    const headline = rejection?.summary ?? "the plan cannot be built as proposed";
+
+    // Narrowed HERE rather than at the notification below. The unit returns an outcome
+    // string, so `outcome === "sent-back"` implies a rejected cut without TypeScript being
+    // able to see it — which is how the notification came to send `rejection ?? ""` and
+    // post an empty message for every plan refused by materialisation.
+    const objections = cut.kind === "rejected" ? cut.reason : undefined;
 
     const rounds = (state.review?.rounds ?? 0) + (cut.kind === "rejected" ? 1 : 0);
     const next: TaskState = {
       ...state,
       usage: addUsage(state.usage, reviewed.usage),
-      review: { rounds, last: cut.kind === "rejected" ? "changes" : "pass" },
+      review: {
+        rounds,
+        last: cut.kind === "rejected" ? "changes" : "pass",
+        // The reason lands in `state.json` and so in the snapshot, which is the only copy
+        // `/task` can reach: the verdict file needs a clone and the journal needs a clone
+        // (§snapshot). Cleared on acceptance so a passing task does not keep quoting the
+        // objection it has already answered.
+        ...(cut.kind === "rejected" ? { reason: recordedReason(cut.reason) } : {}),
+      },
     };
 
     // A whole plan's worth of writes as ONE unit — see `unit`, and this is the largest one
@@ -2234,7 +2263,19 @@ export class Supervisor {
         );
 
         if (rounds >= config.limits.maxReviewRounds) {
-          await this.park(lease, spec, next, `the plan was rejected ${rounds} times`);
+          logger.warn("plan.stalled", { task: spec.id, rounds, summary: headline });
+          // The headline, not the objections: `park` puts its reason in a log field, a
+          // tracker comment and a journal entry, and the journal already has the objections
+          // in full from the append above. The notification is where the detail belongs —
+          // hence the override, which is also what keeps a brainstorm from being offered a
+          // Merge button for a pull request it never opened.
+          await this.park(
+            lease,
+            spec,
+            next,
+            `the plan was sent back ${rounds} times — ${headline}`,
+            { kind: "plan-stalled", task: spec.id, rounds, summary: headline, detail: cut.reason },
+          );
           return "parked" as const;
         }
 
@@ -2280,7 +2321,12 @@ export class Supervisor {
 
     if (outcome === "parked") return true;
     if (outcome === "sent-back") {
-      await this.notifyTask(next, { kind: "verdict", task: spec.id, summary: rejection ?? "" });
+      await this.notifyTask(next, {
+        kind: "verdict",
+        task: spec.id,
+        summary: headline,
+        detail: objections ?? headline,
+      });
       return false;
     }
     if (cut.kind === "rejected") return false;
@@ -2334,12 +2380,20 @@ export class Supervisor {
     const text = renderVerdict(verdict);
     const rounds = (state.review?.rounds ?? 0) + (verdict.decision === "changes" ? 1 : 0);
 
+    const summary = summariseVerdict(verdict);
+    const detail = explainVerdict(verdict);
+
     const next: TaskState = {
       ...state,
       // The council's own tokens belong to the task that convened it, or a reviewed
       // task looks cheaper than it was and the cost of reviewing is invisible.
       usage: addUsage(state.usage, usage),
-      review: { rounds, last: verdict.decision },
+      review: {
+        rounds,
+        last: verdict.decision,
+        // See `applyPlan`: the objections have to be in state to be reachable from `/task`.
+        ...(verdict.decision === "changes" ? { reason: recordedReason(detail) } : {}),
+      },
     };
 
     // The verdict, the journal entry, the state and whichever push follows, as one unit —
@@ -2365,15 +2419,25 @@ export class Supervisor {
         // The council and the agent are not converging. Parking beats a fourth attempt:
         // from outside, a task trading itself back and forth looks identical to one that
         // is working.
-        logger.warn("council.stalled", { task: spec.id, rounds });
-        await this.park(lease, spec, next, `review council requested changes ${rounds} times`, {
-          kind: "review-stalled",
-          task: spec.id,
-          rounds,
-          summary: summariseVerdict(verdict),
-          ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
-          canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
-        });
+        logger.warn("council.stalled", { task: spec.id, rounds, summary });
+        // One line, for the same reason as `applyPlan`'s park: the verdict is already in
+        // the journal in full, and `park`'s reason is also a log field and a tracker
+        // comment. The objections travel on the notification instead.
+        await this.park(
+          lease,
+          spec,
+          next,
+          `review council requested changes ${rounds} times — ${summary}`,
+          {
+            kind: "review-stalled",
+            task: spec.id,
+            rounds,
+            summary,
+            detail,
+            ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
+            canMerge: this.deps.reviewers?.get(spec.workspace) !== undefined,
+          },
+        );
         return true;
       }
 
@@ -2388,7 +2452,8 @@ export class Supervisor {
     await this.notifyTask(next, {
       kind: "verdict",
       task: spec.id,
-      summary: summariseVerdict(verdict),
+      summary,
+      detail,
       ...(next.pr === undefined ? {} : { prUrl: next.pr.url }),
     });
     return { state: next, decision: "changes" };
