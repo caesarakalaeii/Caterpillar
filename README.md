@@ -145,6 +145,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/exec.ts` | The agent's shell with a per-command ceiling — the hang detector (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
+| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against (§12.2). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
@@ -152,8 +153,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/intake/spec.ts` | Tracker item → `TaskSpec`. Pure, no IO (§14). |
 | `src/intake/ingest.ts` | Idempotent tracker → state-repo ingestion (§14). |
 | `src/supervisor/verifier.ts` | Independent completion gates (§12). |
-| `src/review/lenses.ts` | The council's three reviewer prompts (§12.1). |
-| `src/review/decide.ts` | Three verdicts → one decision. Pure, no IO (§12.1). |
+| `src/review/lenses.ts` | The council's four reviewer prompts (§12.1). |
+| `src/review/decide.ts` | Four verdicts → one decision. Pure, no IO (§12.1). |
+| `src/review/tdd.ts` | Commit order → test-first evidence. Pure, and decides nothing (§12.2). |
 | `src/review/council.ts` | Runs the reviewers in the task's worktree, read-only (§12.1). |
 | `src/plan/brainstorm.ts` | `/brainstorm` → a brainstorm task. Pure, no IO (§14.3). |
 | `src/plan/materialize.ts` | Plan → child tasks, waves and cycle detection. Pure (§14.3). |
@@ -219,7 +221,7 @@ awkward, the change is probably wrong.
    are committed to git, so a token in `argv` is a token in git history.
 2. **The agent cannot declare itself done.** `done` only *claims* completion; the
    supervisor independently runs the acceptance criteria and checks CI, and then a review
-   council of three reviewers reads the change itself (§12.1). Any one blocking objection
+   council of four reviewers reads the change itself (§12.1). Any one blocking objection
    sends it back, and an abstention is never an approval. Nothing merges as the identity
    that opened the PR: GitHub will not let a pull request's author approve it, and that
    refusal is the only thing making branch protection a real gate — so the council
@@ -303,6 +305,16 @@ awkward, the change is probably wrong.
     throttled warn line; nothing there may throw into the poll loop. `redis.enabled`
     defaults to false, and with it off the runner is byte-for-byte what it has always been
     (§21).
+15. **The author and the reviewer are given the same standards, word for word.** Code
+    health, test-first and how to write a commit message live in `src/agent/standards.ts`
+    and are spliced into both the implementation prompt and the lenses that grade it — a
+    test asserts each standard has exactly one owning lens and that no lens grades against
+    text the author was never handed. Test-first is checked from the **commit order**,
+    because a change written test-first and one with the tests appended produce identical
+    trees, so `git diff` cannot tell them apart and only `git log` can. The supervisor
+    reads that order and states it; `src/review/tdd.ts` reaches no verdict, and the one
+    lens that does is told the carve-out — documentation, comments, formatting and pure
+    config have no behaviour to test (§12.2).
 
 ## The web view
 
