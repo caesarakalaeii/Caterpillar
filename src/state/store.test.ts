@@ -434,7 +434,7 @@ test("pull removes untracked task directories a failed push left behind", async 
   // `reset --hard` reverts tracked files and leaves untracked ones. `applyPlan` writes
   // every child's spec BEFORE pushing, so a rejected push left the children on disk —
   // and `listTasks` enumerates the filesystem, so the runner claimed and worked five
-  // tasks that existed nowhere in git. That is the HANDOFF.md:469 incident.
+  // tasks that existed nowhere in git (`docs/lessons.md`).
   const { store, root } = await sharedStateRepo();
 
   await mkdir(join(root, "tasks", "PHANTOM-01"), { recursive: true });

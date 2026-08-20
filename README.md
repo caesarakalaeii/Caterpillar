@@ -7,10 +7,18 @@ restarts, and machine boundaries.
 there are chosen deliberately, several against the obvious default, and the reasons are
 not recoverable from the code.
 
-**Picking up mid-stream: [`HANDOFF.md`](HANDOFF.md)** — current status, live credential
-IDs, environment quirks, and the traps already paid for.
+**Traps already paid for: [`docs/lessons.md`](docs/lessons.md)** — the debugging this
+project has already done, encoded in code and tests. Read it before "simplifying" anything
+that looks redundant.
 
-**Status: deployed, running, and proven end to end** in the `caterpillar` namespace since
+Operational state for a running deployment — credential ids, cluster topology, what is
+live — deliberately lives with that deployment's manifests, not here.
+
+Licensed **AGPL-3.0-or-later** — see [`LICENSE`](LICENSE). It runs as a network service,
+which is the case the AGPL exists for: if you run a modified Caterpillar where others can
+reach it, they are entitled to your changes.
+
+**Status: deployed, running, and proven end to end** in a `caterpillar` namespace since
 2026-08-13 — leasing, sessions, handoff, verification, both forges, and both trackers.
 The first in-cluster task took a spec from the state repo through two sessions and a
 context handoff to a merged pull request, with the supervisor's own §12 gates — not the
@@ -22,7 +30,7 @@ could not work around.
 Work reaches it three ways: label a tracker item `agent` and intake renders a spec (§14);
 run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and then cut
 into wave-tagged tasks (§14.3); or commit a `tasks/<id>/spec.md` into the state repo by
-hand for full control over the acceptance criteria. See `HANDOFF.md`.
+hand for full control over the acceptance criteria.
 
 To hand a GitHub issue or Vikunja task to the agent, label it `agent` and put an `agent`
 block in the body — `acceptance` is required, since a task with no machine-checkable
@@ -524,7 +532,7 @@ unable to reach into a heap it is not in.
 ```json
 "redis": {
   "enabled": true,
-  "url": "redis://redis-ha.all-chat.svc.cluster.local:6379",
+  "url": "redis://redis-ha.redis.svc.cluster.local:6379",
   "secretRef": "caterpillar-redis",
   "commandTimeoutMs": 1000,
   "keyPrefix": "caterpillar:"
@@ -785,7 +793,7 @@ a passing task is `done` with its PR open for you to merge (§12.1).
 ## Verifying a Codeberg token
 
 ```bash
-CODEBERG_TOKEN=... npm run verify:forgejo -- --repo ElectricBoogaloo/eb-api
+CODEBERG_TOKEN=... npm run verify:forgejo -- --repo Acme/acme-api
 ```
 
 Confirms the token reaches the repo, that out-of-scope repos are refused, and that the
@@ -947,13 +955,13 @@ names which pull requests already landed.
 
 **The `repo:` box autocompletes** from the repos the runner can actually reach, so the name
 is picked rather than typed — and the ranking is deliberately forgiving: typing `allchat`
-offers `caesarakalaeii/all-chat`. With several repos in the box, a suggestion keeps the ones
+offers `acme/all-chat`. With several repos in the box, a suggestion keeps the ones
 already there.
 
 A repo the App cannot reach is still refused **before the task exists**, for the times
 somebody types past the suggestions, and the refusal names the near miss:
-`repo:caesarakalaeii/allchat` answers *"not one of the 65 repositories this workspace's
-GitHub App can see — did you mean `caesarakalaeii/all-chat`?"* rather than opening a thread
+`repo:acme/allchat` answers *"not one of the 65 repositories this workspace's
+GitHub App can see — did you mean `acme/all-chat`?"* rather than opening a thread
 that spends a session and parks on a git exit code (§9.1.1). Retype it and run the command
 again; nothing was created.
 
@@ -1052,5 +1060,28 @@ The bot must have been invited with the `applications.commands` scope. An invite
 with `scope=bot` alone joins the guild and registers nothing, and the failure is a 403
 that reads like a bad token — logged as `commands.failed`, and it stops nothing else.
 
-Deployed via `caesar-deployment` at `apps/workloads/caterpillar`. `HANDOFF.md` has the
-live topology, the credential rules, and an unresolved security note.
+Deployed from a separate manifests repo. The live topology, the credential rules and the
+operational notes live there with the manifests, because they describe one deployment
+rather than the software.
+
+---
+
+## Licence
+
+Copyright (C) 2026 Caterpillar contributors.
+
+This program is free software: you can redistribute it and/or modify it under the terms of
+the GNU Affero General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along with this
+program. If not, see <https://www.gnu.org/licenses/>.
+
+**Why AGPL and not MIT.** This supervisor is run, not shipped — the only way anyone
+encounters it is as a service reachable over a network. A permissive licence would let a
+hosted fork take the work and return nothing, and §13 is the clause that closes exactly
+that gap. Using it, self-hosting it, and modifying it privately are all unrestricted.

@@ -1548,8 +1548,8 @@ export class StateStore {
    *
    * The state branch is ONE shared resource. Leases are per task, so they say nothing
    * about this: two runners finishing different tasks push to the same branch, and so
-   * does a human hand-committing a spec (§14.4), which HANDOFF.md documents as a
-   * supported workflow. `Git.run` throws on any non-zero exit, so a non-fast-forward
+   * does a human hand-committing a spec (§14.4), which is a supported workflow.
+   * `Git.run` throws on any non-zero exit, so a non-fast-forward
    * rejection used to propagate out of `recordSession` into `parkFailed`, which pushes
    * too and was rejected identically — costing a session's journal, its usage
    * accounting, and leaving the task stranded.
@@ -1654,7 +1654,7 @@ export class StateStore {
    * untracked ones — left the task directories of a rejected `applyPlan` on disk.
    * `listTasks` enumerates the filesystem, so those became tasks the runner claimed and
    * worked while they existed nowhere in git. That happened: five of them, and the money
-   * spent on them is in HANDOFF.md.
+   * spent on them was real (`docs/lessons.md`).
    *
    * **It declines outright while the working tree holds uncommitted state**, and returns
    * `"skipped"` to say so. That is the second half of the invariant in the class docstring,
