@@ -2626,6 +2626,49 @@ the digest summariser covers the daily post to Discord and the state repo. A str
 over the output was considered and rejected: it would be a denylist of the phrasings
 somebody already thought of, and the model has more.
 
+#### And the agent cannot supply one of its own
+
+Git config is advice. `WorktreeManager.configureShared` writes `user.name` and `user.email`
+into every checkout on every create and reuse, and that was not enough, because an agent
+that decides a git command needs an author can overrule it from the command line. One did:
+
+```
+git -c user.name=Caterpillar -c user.email=caterpillar@users.noreply.github.com \
+    merge --no-edit 79715d93
+```
+
+Unprompted — no git error to react to, on a merge it was otherwise right to make, in a
+worktree whose config was correct the whole time. The name came from its own system prompt
+("**You are Caterpillar**") and the address was invented to match. It is the exact form
+this section was written after, so GitHub resolved it to the account holding the login
+`caterpillar` and a stranger became the author of a merge commit in a repository they have
+never seen. `load.ts` could not catch it: the address never passed through config.
+
+So the identity is also stamped into the ENVIRONMENT — `GIT_AUTHOR_NAME`,
+`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, set by
+`withCommitIdentity` in the toolchain resolver, so all four spawn sites (§8.1) get them
+from one place. Git reads those before ANY config, `-c` included, so the command above now
+produces the configured identity whatever it is handed. They join `RESERVED`, for the same
+reason `HOME` is there: a repo-authored devShell exporting `GIT_AUTHOR_NAME` would
+otherwise rename the fleet for every task on that repo.
+
+The config writes stay. They are what a human reads in the checkout, and what git falls
+back to in a shell the supervisor did not spawn.
+
+**And the VALUE is refused twice, because the value is the thing that matters.** Who typed
+an address is incidental; a bare `<login>@users.noreply.github.com` names a real person
+whatever route it arrived by. The rule lives in `config/identity.ts` and is asked twice:
+by `load.ts`, so a runner told to be a stranger does not start, and by
+`withCommitIdentity`, at the last point before an identity becomes history. The second is
+not the first one twice — a machine runner inherits the operator's own `GIT_AUTHOR_EMAIL`,
+and the loader never sees it.
+
+It is not a sandbox — `--author`, `--reset-author` and `unset` all still exist — and it is
+not meant to be. It is the difference between a mistake a helpful model makes on its own
+and one it has to decide to make. The prompt rule covers the rest, and says why rather than
+only what: an email address is not a label, a forge resolves it to an account, and the last
+one guessed belonged to a real person.
+
 ---
 
 ## 10. Kubernetes

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
+import { promisify } from "node:util";
 import type { ToolchainConfig } from "../config/types.ts";
 import { asTaskId, asWorkspaceName, KNOWN_CAPABILITIES, type TaskSpec } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
@@ -28,6 +30,12 @@ const spec: TaskSpec = {
 /** The shipped defaults, but with a timeout no test should ever reach. */
 const TEST_CONFIG: ToolchainConfig = { ...DEFAULT_TOOLCHAIN_CONFIG, timeoutSeconds: 60 };
 
+/**
+ * The identity every resolver under test commits as. `.invalid` on purpose: a test
+ * fixture that names a real forge address is one copy-paste away from being deployed.
+ */
+const TEST_IDENTITY = { name: "caterpillar", email: "caterpillar@example.invalid" };
+
 const temporaries: string[] = [];
 
 after(async () => {
@@ -38,6 +46,30 @@ const scratch = async (): Promise<string> => {
   const dir = await mkdtemp(join(tmpdir(), "caterpillar-toolchain-"));
   temporaries.push(dir);
   return dir;
+};
+
+const exec = promisify(execFile);
+
+/**
+ * Keep the operator's own git config out of a test that runs git.
+ *
+ * A machine runner inherits `~/.gitconfig` — an identity, `commit.gpgsign`, an
+ * `insteadOf` — and without these two a test asserting who a commit is by would be
+ * measuring the workstation it happens to run on.
+ */
+const HERMETIC_GIT: NodeJS.ProcessEnv = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+};
+
+/** One git command in `cwd`, under exactly the environment a task's shell would get. */
+const git = async (
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  ...args: readonly string[]
+): Promise<string> => {
+  const { stdout } = await exec("git", [...args], { cwd, env });
+  return stdout;
 };
 
 /**
@@ -52,6 +84,7 @@ const resolver = (
     logger: SILENT_LOGGER,
     config: TEST_CONFIG,
     tasksDir,
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: process.env["PATH"] ?? "", ...extra },
   });
 
@@ -75,6 +108,7 @@ test("the resolved environment is a copy, so a caller cannot mutate the base", a
     logger: SILENT_LOGGER,
     config: TEST_CONFIG,
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: base,
   }).resolve(spec, "/tmp/wt");
 
@@ -130,6 +164,7 @@ test("a runner without bash fails loudly instead of falling back to sh", async (
     logger: SILENT_LOGGER,
     config: TEST_CONFIG,
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: "/nonexistent" },
   });
 
@@ -300,6 +335,111 @@ test("a cache entry whose store paths are gone is a miss, not a broken PATH", as
   );
 });
 
+// -------------------------------------------------------------------------- identity
+
+test("every spawned process is told who it commits as", async () => {
+  // Not only the agent's shell: the council's, the plan maintainer's and the gate's come
+  // from the same resolver, and a `wip` commit made by any of them is history too.
+  const resolved = await resolver().resolve(spec, "/tmp/wt");
+
+  assert.equal(resolved.env["GIT_AUTHOR_NAME"], TEST_IDENTITY.name);
+  assert.equal(resolved.env["GIT_AUTHOR_EMAIL"], TEST_IDENTITY.email);
+  assert.equal(resolved.env["GIT_COMMITTER_NAME"], TEST_IDENTITY.name);
+  assert.equal(resolved.env["GIT_COMMITTER_EMAIL"], TEST_IDENTITY.email);
+});
+
+test("a devShell cannot rename the fleet", async () => {
+  // Same reasoning as HOME and the credential helper, one step further: a repo-authored
+  // `mkShell` exporting GIT_AUTHOR_NAME would put a name the operator never configured on
+  // every commit made in that repo, and it would look like the fleet's own doing.
+  const worktree = await scratch();
+  const tasksDir = await scratch();
+  await seedCache(tasksDir, worktree, "{ rename }", {
+    PATH: LIVE_STORE_BIN,
+    GIT_AUTHOR_NAME: "Somebody Else",
+    GIT_COMMITTER_EMAIL: "somebody@else.invalid",
+  });
+
+  const resolved = await resolver({}, tasksDir).resolve(spec, worktree);
+
+  assert.equal(resolved.env["GIT_AUTHOR_NAME"], TEST_IDENTITY.name);
+  assert.equal(resolved.env["GIT_COMMITTER_EMAIL"], TEST_IDENTITY.email);
+});
+
+test("an identity that names a real stranger is refused, not stamped", () => {
+  // The value matters more than who typed it. `load.ts` refuses this shape in the
+  // ConfigMap, and it is checked again HERE because an identity can reach a commit
+  // without passing through the loader — a machine runner's inherited GIT_AUTHOR_EMAIL,
+  // a caller wiring the resolver by hand — and this is the last point before it is
+  // history. Constructing throws, so the runner does not start rather than committing as
+  // the person who holds the login `caterpillar`.
+  assert.throws(
+    () =>
+      new ToolchainResolver({
+        logger: SILENT_LOGGER,
+        config: TEST_CONFIG,
+        tasksDir: "/tmp/caterpillar-tasks",
+        identity: { name: "Caterpillar", email: "caterpillar@users.noreply.github.com" },
+        baseEnv: { PATH: process.env["PATH"] ?? "" },
+      }),
+    /users\.noreply\.github\.com/,
+  );
+});
+
+test("the id-prefixed form of the same domain is the one that is fine", () => {
+  // The rule is about ambiguity, not about the domain: a numeric id names exactly one
+  // account, so the bot's own address must not be caught by the check above.
+  const resolver = new ToolchainResolver({
+    logger: SILENT_LOGGER,
+    config: TEST_CONFIG,
+    tasksDir: "/tmp/caterpillar-tasks",
+    identity: {
+      name: "caterpillar-agent[bot]",
+      email: "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+    },
+    baseEnv: { PATH: process.env["PATH"] ?? "" },
+  });
+
+  assert.ok(resolver instanceof ToolchainResolver);
+});
+
+test("`git -c user.email=` cannot outrank the configured identity", async () => {
+  // The defect, verbatim. A session recovering a reset branch merged main back in with
+  //
+  //   git -c user.name=Caterpillar -c user.email=caterpillar@users.noreply.github.com \
+  //       merge --no-edit <sha>
+  //
+  // unprompted — the name from its own system prompt, the address invented to match. It is
+  // the pre-2017 personal noreply form, so GitHub resolved it to the stranger holding the
+  // login `caterpillar`, who became the author of a merge into a repo they have never seen
+  // (DESIGN.md §9.7). The worktree's git CONFIG was correct throughout; `-c` simply outranks
+  // it. Only the environment does not lose that argument, which is what this pins.
+  const repo = await scratch();
+  const env = { ...(await resolver().resolve(spec, "/tmp/wt")).env, ...HERMETIC_GIT };
+
+  await git(repo, env, "init", "--initial-branch=main", ".");
+  await writeFile(join(repo, "a.txt"), "a\n", "utf8");
+  await git(repo, env, "add", "a.txt");
+  await git(
+    repo,
+    env,
+    "-c",
+    "user.name=Caterpillar",
+    "-c",
+    "user.email=caterpillar@users.noreply.github.com",
+    "commit",
+    "-m",
+    "who wrote this",
+  );
+
+  const who = await git(repo, env, "log", "-1", "--format=%an <%ae>|%cn <%ce>");
+
+  assert.equal(
+    who.trim(),
+    `${TEST_IDENTITY.name} <${TEST_IDENTITY.email}>|${TEST_IDENTITY.name} <${TEST_IDENTITY.email}>`,
+  );
+});
+
 test("a reserved variable the supervisor does not set is removed, not inherited", async () => {
   // The supervisor has no ANTHROPIC_API_KEY, so a devShell exporting one must not be able
   // to introduce it — the credential the agent uses is not the agent's to choose.
@@ -336,6 +476,7 @@ const withNix = async (installed: boolean, exitCode = 0): Promise<ToolchainResol
     logger: SILENT_LOGGER,
     config: TEST_CONFIG,
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: bin },
   });
 };
@@ -411,6 +552,7 @@ const withInspector = (repo: RepoInspector | undefined): ToolchainResolver =>
     logger: SILENT_LOGGER,
     config: TEST_CONFIG,
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: process.env["PATH"] ?? "" },
     ...(repo === undefined ? {} : { repo: () => repo }),
   });
@@ -453,6 +595,7 @@ test("a worktree that HAS the flake is never called stale", async () => {
         logger: SILENT_LOGGER,
         config: TEST_CONFIG,
         tasksDir,
+        identity: TEST_IDENTITY,
         baseEnv: { PATH: process.env["PATH"] ?? "" },
         repo: () => inspector(["flake.nix"]),
       }).resolve(spec, worktree),
@@ -499,6 +642,7 @@ const cached = (
     logger: SILENT_LOGGER,
     config: { ...TEST_CONFIG, ...over },
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: process.env["PATH"] ?? "", ...extra },
   });
 
@@ -570,6 +714,7 @@ test("the quota is on by default, because an unbounded store fills a node", asyn
     logger: SILENT_LOGGER,
     config: DEFAULT_TOOLCHAIN_CONFIG,
     tasksDir: "/tmp/caterpillar-tasks",
+    identity: TEST_IDENTITY,
     baseEnv: { PATH: process.env["PATH"] ?? "" },
   }).resolve(spec, "/tmp/wt");
 

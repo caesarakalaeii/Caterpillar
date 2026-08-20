@@ -152,6 +152,7 @@ const supervisorWith = (
       logger: SILENT_LOGGER,
       config: DEFAULT_TOOLCHAIN_CONFIG,
       tasksDir: join(config.paths.root, "tasks"),
+      identity: config.identity,
     }),
     intake,
     intakeStatus,

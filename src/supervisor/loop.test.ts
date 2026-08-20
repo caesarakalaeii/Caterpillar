@@ -210,6 +210,7 @@ const TEST_TOOLCHAIN = new ToolchainResolver({
   logger: SILENT_LOGGER,
   config: DEFAULT_TOOLCHAIN_CONFIG,
   tasksDir: join(root, "tasks"),
+  identity: config.identity,
 });
 
 /**

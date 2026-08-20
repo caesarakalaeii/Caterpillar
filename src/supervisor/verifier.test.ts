@@ -29,6 +29,12 @@ import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolch
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { AcceptanceVerifier } from "./verifier.ts";
 
+/**
+ * Who the resolved environment commits as. Any address will do here — what the
+ * verifier's tests care about is that the resolver demands one at all (DESIGN.md §9.7).
+ */
+const TEST_IDENTITY = { name: "caterpillar", email: "caterpillar@example.invalid" };
+
 const temporaries: string[] = [];
 
 after(async () => {
@@ -80,6 +86,7 @@ const verifierFor = (worktree: string, baseEnv: NodeJS.ProcessEnv): AcceptanceVe
       logger: SILENT_LOGGER,
       config: DEFAULT_TOOLCHAIN_CONFIG,
       tasksDir: worktree,
+      identity: TEST_IDENTITY,
       baseEnv,
     }),
   });
@@ -173,6 +180,7 @@ const ciVerifier = (worktree: string, bindings: WorkspaceBindings): AcceptanceVe
       logger: SILENT_LOGGER,
       config: DEFAULT_TOOLCHAIN_CONFIG,
       tasksDir: worktree,
+      identity: TEST_IDENTITY,
     }),
   });
 
