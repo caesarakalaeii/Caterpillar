@@ -1,5 +1,5 @@
 /**
- * Turning three opinions into one decision. See DESIGN.md §12.1.
+ * Turning several opinions into one decision. See DESIGN.md §12.1.
  *
  * Pure, and separated from everything that runs a reviewer, because this is the rule the
  * whole council exists to apply and it must be readable in one screen and testable
@@ -52,7 +52,7 @@ export const decide = (verdicts: readonly ReviewerVerdict[]): CouncilVerdict => 
     // An empty council is not unanimous approval. It means nothing reviewed this, which
     // is the one outcome that must never merge silently — and a council where every
     // reviewer abstained is the same council, convened. That second half was missing:
-    // abstentions are excluded from `blockers` by design, so three of them left zero
+    // abstentions are excluded from `blockers` by design, so a full set of them left zero
     // blocking objections and read as a pass. During a provider outage that is every
     // reviewer, which made "the model is unreachable" a way to merge an unread change.
     decision:
