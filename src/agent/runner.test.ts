@@ -283,6 +283,7 @@ const buildRunner = (
       logger: SILENT_LOGGER,
       config: DEFAULT_TOOLCHAIN_CONFIG,
       tasksDir: tasks,
+      identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
     }),
   });
 

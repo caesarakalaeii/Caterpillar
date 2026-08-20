@@ -32,7 +32,8 @@ import { createHash } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Capability, TaskSpec, ToolchainSpec } from "../domain/task.ts";
-import type { ToolchainConfig } from "../config/types.ts";
+import { identityFault } from "../config/identity.ts";
+import type { CommitIdentity, ToolchainConfig } from "../config/types.ts";
 import type { Logger } from "../obs/log.ts";
 
 export interface ResolvedEnv {
@@ -125,6 +126,12 @@ export interface ToolchainResolverOptions {
    */
   readonly repo?: () => RepoInspector | undefined;
   /**
+   * Who the fleet commits as (DESIGN.md §9.7). Required, and required HERE rather than
+   * defaulted, for the same reason the config field has no default: a name for an audit
+   * trail is not something a program may pick.
+   */
+  readonly identity: CommitIdentity;
+  /**
    * The environment to inherit from. Injectable so a test does not have to mutate
    * `process.env`, which leaks across node's in-process test runner.
    */
@@ -149,7 +156,10 @@ export class ToolchainResolver {
     this.logger = options.logger;
     this.config = options.config;
     this.tasksDir = options.tasksDir;
-    this.baseEnv = withNixSettings(options.baseEnv ?? process.env, options.config);
+    this.baseEnv = withCommitIdentity(
+      withNixSettings(options.baseEnv ?? process.env, options.config),
+      options.identity,
+    );
     this.repo = options.repo;
   }
 
@@ -640,6 +650,66 @@ const withNixSettings = (
   };
 };
 
+/**
+ * Stamp the configured identity into the environment, where nothing can talk over it.
+ *
+ * Every checkout already carries it in git config — `WorktreeManager.configureShared`
+ * writes `user.name` and `user.email` on every worktree create and reuse. That was not
+ * enough. Config is advice, and an agent that decides a git command needs an author can
+ * overrule it from the command line. One did:
+ *
+ *   git -c user.name=Caterpillar -c user.email=caterpillar@users.noreply.github.com \
+ *       merge --no-edit 79715d93
+ *
+ * Unprompted, with no git error to react to, on a merge it was otherwise right to make.
+ * The name came from its own system prompt ("You are Caterpillar") and the address was
+ * invented to match — and it is precisely the pre-2017 personal noreply form §9.7 exists
+ * to refuse. GitHub resolved it to the account holding the login `caterpillar`: a
+ * stranger, now the author of a merge commit in a repository they have never seen, on
+ * their contribution graph, with their avatar. The loader cannot catch this one, because
+ * the address never passes through config.
+ *
+ * So the identity moves to the only scope an argument cannot reach. Git reads
+ * `GIT_AUTHOR_*` and `GIT_COMMITTER_*` before ANY config, `-c` included, so the exact
+ * command above now produces the configured identity whatever it is handed. The config
+ * writes stay: they are what a human reads in the checkout, and what git falls back to in
+ * a shell the supervisor did not spawn.
+ *
+ * `RESERVED` re-asserts these after a devShell, for the same reason it holds `HOME` — a
+ * repo-authored `mkShell` that exports `GIT_AUTHOR_NAME` would otherwise rename the fleet
+ * for every task in that repo.
+ *
+ * And the VALUE is checked here, not only where config is parsed. Which address is being
+ * stamped matters more than who typed it: a bare `<login>@users.noreply.github.com` names
+ * a real person whatever route it arrived by, and this is the last point before it becomes
+ * history. Throwing at construction means a runner refuses to start rather than commit as
+ * a stranger — the same answer `load.ts` gives, at the other end of the same rule.
+ *
+ * Not a sandbox: `--author`, `git commit --amend --reset-author` and `unset` are all still
+ * there, and an agent set on forging an author can. It is the difference between a mistake
+ * a helpful model makes on its own and one it has to decide to make. The prompt rule in
+ * `agent/prompt.ts` covers the rest.
+ */
+const withCommitIdentity = (
+  env: NodeJS.ProcessEnv,
+  identity: CommitIdentity,
+): NodeJS.ProcessEnv => {
+  const fault = identityFault(identity.email);
+  if (fault !== undefined) {
+    throw new Error(
+      `refusing to hand every task shell an identity that is not this fleet's: ${fault}`,
+    );
+  }
+
+  return {
+    ...env,
+    GIT_AUTHOR_NAME: identity.name,
+    GIT_AUTHOR_EMAIL: identity.email,
+    GIT_COMMITTER_NAME: identity.name,
+    GIT_COMMITTER_EMAIL: identity.email,
+  };
+};
+
 export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {
   // A release branch, not `nixos-unstable`: an unattended agent that picks up a silent
   // toolchain bump produces a red acceptance run with no diff to explain it.
@@ -703,14 +773,29 @@ const CACHE_VERSION = "v1";
 const PROBE_TIMEOUT_MS = 10_000;
 
 /**
+ * The four variables that decide whose name a commit carries. See `withCommitIdentity`.
+ *
+ * Named separately from `RESERVED` because they are the only entries the supervisor
+ * WRITES rather than merely defends, and a reader of either list should be able to see
+ * which is which.
+ */
+const IDENTITY_VARIABLES: readonly string[] = [
+  "GIT_AUTHOR_NAME",
+  "GIT_AUTHOR_EMAIL",
+  "GIT_COMMITTER_NAME",
+  "GIT_COMMITTER_EMAIL",
+];
+
+/**
  * Variables the supervisor owns, restored after a devShell has had its say.
  *
- * Everything here either points at a credential path or decides where this process reads
- * its own identity from. A repo-authored devShell moving one of them is the difference
- * between a task with a lua interpreter and a task holding the wrong end of the
- * credential helper.
+ * Everything here either points at a credential path, decides where this process reads
+ * its own identity from, or IS that identity. A repo-authored devShell moving one of them
+ * is the difference between a task with a lua interpreter and a task holding the wrong end
+ * of the credential helper.
  */
 const RESERVED: readonly string[] = [
+  ...IDENTITY_VARIABLES,
   "HOME",
   "RUNNER_ID",
   "CONFIG_PATH",

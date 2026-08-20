@@ -178,6 +178,10 @@ const main = async (): Promise<void> => {
     logger,
     config: loaded.toolchain,
     tasksDir: loaded.paths.tasks,
+    // Every shell this resolver hands out commits as the one configured identity, and
+    // cannot be argued out of it — `git -c user.name=...` loses to the environment
+    // (§9.7, `withCommitIdentity`).
+    identity: loaded.identity,
     // So a fallback to `inherited` can say whether the repo HAS a nix expression this
     // worktree simply predates, rather than leaving the agent to infer it from missing
     // tools (DESIGN.md §8.1).

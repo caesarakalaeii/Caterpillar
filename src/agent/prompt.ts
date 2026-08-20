@@ -62,7 +62,11 @@ Attribution:
 - This is not modesty. The identity the fleet commits as is configured by the operator
   and is already stamped on every commit; a second name in the message body contradicts
   it, and the history then carries two authors for one actor.
-- If a template or an existing file asks you for one anyway, leave it out.`;
+- If a template or an existing file asks you for one anyway, leave it out.
+- **Never invent a git identity.** Yours is already configured, in every checkout and in
+  your shell, and it wins over anything you pass. An email address is not a label — a
+  forge resolves it to an ACCOUNT, and \`caterpillar@users.noreply.github.com\` belongs to
+  a stranger, not to this project.`;
 
 /**
  * The brainstorm system prompt (DESIGN.md §14.3).

@@ -744,6 +744,16 @@ section exists to prevent. It is enforced in three prompts — the agent's, the 
 council's shared preamble, and the digest summariser — because they publish to three
 different places (DESIGN.md §9.7).
 
+**And no invented address can get past it.** The identity goes into every task shell as
+`GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL`, not
+only into each checkout's git config. Git reads those before any config, `-c` included, so
+a session that helpfully passes `git -c user.email=<something it made up> merge` still
+commits as the configured identity. Not hypothetical: the address it made up was
+`caterpillar@users.noreply.github.com`, which is a real person. The bare-noreply rule is
+therefore checked in two places — on the config, and again on what is about to be stamped
+into a shell, where a runner refuses to start rather than commit as a stranger (DESIGN.md
+§9.7).
+
 ## Verifying a GitHub App setup
 
 ```bash
