@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import { test } from "node:test";
-import { asTaskId, asWorkspaceName } from "../domain/task.ts";
+import { asTaskId, asWorkspaceName, type TaskSpec } from "../domain/task.ts";
 import { GitHubAppForgeFactory, signAppJwt, summarise } from "./github-app.ts";
 
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -383,4 +383,130 @@ test("a 422 the installation listing cannot explain still says what it can", asy
     forge.credential({ host: "github.com", owner: "acme", name: "all-chat" }),
     /not installed/,
   );
+});
+
+/* ─────────────── open_pr adopts the pull request that already exists ─────────────── */
+
+const REPO = { host: "github.com", owner: "caesarakalaeii", name: "all-chat-extension" } as const;
+/** The task shape `forTask` needs: this one spans two repos, which is how #113 arose. */
+const SPEC = {
+  id: asTaskId("GH-caesarakalaeii-all-chat-543"),
+  workspace: asWorkspaceName("caesar"),
+  goal: "harden reconnect",
+  repos: [{ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }, REPO],
+  requires: [],
+  acceptance: ["true"],
+} as unknown as TaskSpec;
+const REQUEST = {
+  title: "Harden reconnect",
+  body: "…",
+  head: "agent/GH-caesarakalaeii-all-chat-543",
+  base: "main",
+} as const;
+
+/** Token route plus whatever the test wants for the rest. */
+const withToken =
+  (rest: (route: string, init?: RequestInit) => unknown) =>
+  (route: string, init?: RequestInit): unknown => {
+    if (route.endsWith("/access_tokens")) {
+      return { token: "ghs_x", expires_at: new Date(Date.now() + 3_600_000).toISOString() };
+    }
+    return rest(route, init);
+  };
+
+const DUPLICATE = JSON.stringify({
+  message: "Validation Failed",
+  errors: [
+    {
+      resource: "PullRequest",
+      message:
+        "A pull request already exists for caesarakalaeii:agent/GH-caesarakalaeii-all-chat-543.",
+    },
+  ],
+});
+
+test("a second open_pr for the same branch adopts the PR that is already open", async () => {
+  // GitHub answers the second POST with a 422, which is a statement about the world already
+  // being the way the caller wanted. Treating it as a failure made a whole class of situation
+  // unrecoverable from inside a session — a handoff that re-opens, a push whose state write was
+  // lost, or a human who opened it by hand while the task was parked, which is exactly how
+  // all-chat-extension#113 came to exist.
+  const { factory, routes } = github(
+    withToken((route, init) => {
+      if (init?.method === "POST" && route.endsWith("/pulls")) {
+        return new Response(DUPLICATE, { status: 422 });
+      }
+      if (route.includes("/pulls?")) {
+        return [{ number: 113, html_url: "https://github.com/caesarakalaeii/all-chat-extension/pull/113" }];
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const pr = await forge.openPr(REPO, REQUEST);
+
+  assert.deepEqual(pr, {
+    number: 113,
+    url: "https://github.com/caesarakalaeii/all-chat-extension/pull/113",
+  });
+  // Qualified with the owner: an unqualified branch name silently matches nothing on this
+  // endpoint, which would turn the adoption into the original 422 with extra steps.
+  assert.ok(
+    routes.some((r) => r.includes("head=caesarakalaeii%3Aagent%2FGH-caesarakalaeii-all-chat-543")),
+    `the lookup must filter by owner-qualified head — got ${routes.join(", ")}`,
+  );
+});
+
+test("a 422 that is NOT a duplicate still throws, because the agent has to see it", async () => {
+  // An unusable base is the case that produced two confusing failures on
+  // GH-caesarakalaeii-all-chat-543. Swallowing it would hide the one 422 worth reading.
+  const { factory } = github(
+    withToken((route, init) => {
+      if (init?.method === "POST" && route.endsWith("/pulls")) {
+        return new Response(JSON.stringify({ message: "Validation Failed", errors: [{ field: "base" }] }), {
+          status: 422,
+        });
+      }
+      if (route.includes("/pulls?")) return [];
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.openPr(REPO, REQUEST), /422/);
+});
+
+test("a duplicate whose PR cannot be found reports the original 422, not a lookup failure", async () => {
+  // The lookup is best-effort; the error a human reads must still be the one GitHub gave.
+  const { factory } = github(
+    withToken((route, init) => {
+      if (init?.method === "POST" && route.endsWith("/pulls")) {
+        return new Response(DUPLICATE, { status: 422 });
+      }
+      if (route.includes("/pulls?")) return new Response("nope", { status: 500 });
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.openPr(REPO, REQUEST), /already exists/);
+});
+
+test("the ordinary path still opens one PR and looks nothing up", async () => {
+  const { factory, routes } = github(
+    withToken((route, init) => {
+      if (init?.method === "POST" && route.endsWith("/pulls")) {
+        return { number: 7, html_url: "https://github.test/pull/7" };
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  assert.deepEqual(await forge.openPr(REPO, REQUEST), {
+    number: 7,
+    url: "https://github.test/pull/7",
+  });
+  assert.equal(routes.filter((r) => r.includes("/pulls?")).length, 0, "no lookup on the happy path");
 });

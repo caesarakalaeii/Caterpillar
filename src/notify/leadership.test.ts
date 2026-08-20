@@ -23,15 +23,22 @@ const RUNNER = asRunnerId("caterpillar-2");
 /** Records what was asked of the claim, and answers with a script. */
 const claims = (answers: readonly (string | undefined | Error)[]): StealableClaims & {
   readonly asked: { ref: string; held: string | undefined }[];
+  readonly released: { ref: string; oid: string }[];
 } => {
   const asked: { ref: string; held: string | undefined }[] = [];
+  const released: { ref: string; oid: string }[] = [];
   let call = 0;
   return {
     asked,
+    released,
     claimStealable: (ref, _message, held) => {
       asked.push({ ref, held });
       const answer = answers[Math.min(call++, answers.length - 1)];
       return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
+    },
+    releaseRef: (ref, oid) => {
+      released.push({ ref, oid });
+      return oid === "boom" ? Promise.reject(new Error("remote refused")) : Promise.resolve();
     },
   };
 };
@@ -241,4 +248,48 @@ test("start() settles the first attempt before returning", async () => {
   assert.equal(bot.held(), true);
 
   await bot.stop();
+});
+
+test("a holder gives the ref back on the way out, so a rollout costs a poll not a stale window", async () => {
+  // THE deploy defect. A holder that just dies leaves `refs/chat/holder` behind with the commit
+  // time of its last renewal, and `claimStealable` refuses a ref that is not yet stale — so
+  // every replica came up, connected its gateway, and acted on nothing for the remainder of
+  // `lease.staleAfterSeconds`. Silently: a non-holder answers nothing and logs nothing, so a
+  // slash command in the gap shows Discord's own "This interaction failed".
+  //
+  // Observed 2026-08-19: pods restarted 20:03–20:05, the ref went stale at 20:09:58 — exactly
+  // 300s after the dead holder's last renewal — and the bot was deaf in between.
+  const claimer = claims(["oid-1"]);
+  const subject = leadership(claimer);
+  await subject.refresh();
+  assert.equal(subject.held(), true);
+
+  await subject.standDown();
+
+  assert.deepEqual(claimer.released, [{ ref: CHAT_HOLDER_REF, oid: "oid-1" }]);
+  assert.equal(subject.held(), false, "it must stop acting the instant it gives the ref up");
+});
+
+test("a replica that holds nothing deletes nothing", async () => {
+  // It would be deleting the ref its SUCCESSOR is holding — the one case where standing down
+  // is worse than not bothering.
+  const claimer = claims([undefined]);
+  const subject = leadership(claimer);
+  await subject.refresh();
+
+  await subject.standDown();
+
+  assert.deepEqual(claimer.released, []);
+});
+
+test("a stand-down that the remote refuses is not the thing that fails a shutdown", async () => {
+  // The cost of a failed stand-down is exactly the behaviour that existed before it, and
+  // shutdown must not be the path that hangs or throws.
+  const claimer = claims(["boom"]);
+  const subject = leadership(claimer);
+  await subject.refresh();
+
+  await subject.standDown();
+
+  assert.equal(subject.held(), false);
 });

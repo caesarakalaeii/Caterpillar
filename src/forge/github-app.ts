@@ -244,24 +244,81 @@ class GitHubAppForge implements Forge {
     return minted;
   }
 
+  /**
+   * Open a pull request, or ADOPT the one that is already open for this branch.
+   *
+   * GitHub answers a second POST for the same head with a 422 whose body says
+   * `A pull request already exists for <owner>:<head>`. That is a statement about the world
+   * being the way the caller wanted, and treating it as a failure is what made a whole class of
+   * situation unrecoverable from inside a session:
+   *
+   *   - A session opens a PR, hands off, and the next session opens one again from the journal.
+   *   - A push succeeds and the state write that records the PR does not, so the task resumes
+   *     believing it has no PR.
+   *   - A human opened it by hand while the task was parked — which is exactly how
+   *     `all-chat-extension#113` came to exist, and it left the task unable to record its own
+   *     second PR ever again.
+   *
+   * In every one of those the branch, the base and the intent are identical, so the existing PR
+   * is the one the caller is asking for. Finding it makes the call idempotent, which is what a
+   * control-plane verb driven by a model needs to be — an agent that has to distinguish "already
+   * done" from "failed" will sometimes get it wrong, and it costs a whole session when it does.
+   *
+   * Narrow on purpose. Only a 422, only when the branch actually has an open PR against the
+   * requested base, and the lookup is by head+base rather than by title: a DIFFERENT 422 —
+   * an invalid base, a head with no commits, a repo that refuses the fork — still throws, and
+   * those are the ones the agent must see. The title and body are NOT applied to an adopted PR;
+   * rewriting a description a human may have edited is not this call's business.
+   */
   async openPr(repo: RepoRef, request: PrRequest): Promise<PrResult> {
     assertInScope(repo, this.allowed);
 
-    const pr = await this.api<PullRequestResponse>(
-      repo,
-      `/repos/${repo.owner}/${repo.name}/pulls`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          title: request.title,
-          body: request.body,
-          head: request.head,
-          base: request.base,
-        }),
-      },
-    );
+    try {
+      const pr = await this.api<PullRequestResponse>(
+        repo,
+        `/repos/${repo.owner}/${repo.name}/pulls`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            title: request.title,
+            body: request.body,
+            head: request.head,
+            base: request.base,
+          }),
+        },
+      );
 
-    return { number: pr.number, url: pr.html_url };
+      return { number: pr.number, url: pr.html_url };
+    } catch (error) {
+      if (!(error instanceof GitHubApiError) || error.status !== 422) throw error;
+
+      const existing = await this.openPrFor(repo, request);
+      // The 422 was about something else — an unusable base, a head with no commits. The
+      // agent has to see that one, and it is the original error rather than a summary of it.
+      if (existing === undefined) throw error;
+      return existing;
+    }
+  }
+
+  /**
+   * The open pull request for `head` against `base`, if there is one.
+   *
+   * `head` is qualified with the owner because that is what the list endpoint's filter wants,
+   * and an unqualified branch name silently matches nothing. A request that already qualified
+   * it — `owner:branch`, which is what a cross-fork PR needs — is passed through untouched.
+   */
+  private async openPrFor(repo: RepoRef, request: PrRequest): Promise<PrResult | undefined> {
+    const head = request.head.includes(":") ? request.head : `${repo.owner}:${request.head}`;
+    const query = `head=${encodeURIComponent(head)}&base=${encodeURIComponent(request.base)}&state=open`;
+
+    const found = await this.api<readonly PullRequestResponse[]>(
+      repo,
+      `/repos/${repo.owner}/${repo.name}/pulls?${query}`,
+      { method: "GET" },
+    ).catch(() => undefined);
+
+    const pr = found?.[0];
+    return pr === undefined ? undefined : { number: pr.number, url: pr.html_url };
   }
 
   /**

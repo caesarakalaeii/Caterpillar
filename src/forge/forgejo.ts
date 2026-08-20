@@ -213,24 +213,60 @@ class ForgejoForge implements Forge {
     return { username: this.options.username, password: token };
   }
 
+  /**
+   * Open a pull request, or adopt the one already open for this branch.
+   *
+   * The same rule as the GitHub forge, and it has to be the same rule: `open_pr` is one
+   * control-plane verb with one contract, and an agent that had to know which forge it was
+   * talking to in order to know whether "already open" is a failure would be reasoning about
+   * something the tool exists to hide.
+   *
+   * Forgejo answers a duplicate with **409**, not GitHub's 422 — and it is a `Conflict` for this
+   * one reason rather than a family of validation errors, so there is no equivalent of the
+   * narrowing the GitHub path needs. The lookup is still what decides: a conflict with no open
+   * PR for that head rethrows.
+   */
   async openPr(repo: RepoRef, request: PrRequest): Promise<PrResult> {
     assertInScope(repo, this.allowed);
 
-    const pr = await this.api<PullRequestResponse>(
-      repo,
-      `/repos/${repo.owner}/${repo.name}/pulls`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          title: request.title,
-          body: request.body,
-          head: request.head,
-          base: request.base,
-        }),
-      },
-    );
+    try {
+      const pr = await this.api<PullRequestResponse>(
+        repo,
+        `/repos/${repo.owner}/${repo.name}/pulls`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            title: request.title,
+            body: request.body,
+            head: request.head,
+            base: request.base,
+          }),
+        },
+      );
 
-    return { number: pr.number, url: pr.html_url };
+      return { number: pr.number, url: pr.html_url };
+    } catch (error) {
+      if (!(error instanceof ForgejoApiError) || error.status !== 409) throw error;
+
+      const existing = await this.openPrFor(repo, request);
+      if (existing === undefined) throw error;
+      return existing;
+    }
+  }
+
+  /** The open pull request for `head` against `base`, if there is one. Best-effort. */
+  private async openPrFor(repo: RepoRef, request: PrRequest): Promise<PrResult | undefined> {
+    const head = request.head.includes(":") ? request.head : `${repo.owner}:${request.head}`;
+    const query = `head=${encodeURIComponent(head)}&base=${encodeURIComponent(request.base)}&state=open`;
+
+    const found = await this.api<readonly PullRequestResponse[]>(
+      repo,
+      `/repos/${repo.owner}/${repo.name}/pulls?${query}`,
+      { method: "GET" },
+    ).catch(() => undefined);
+
+    const pr = found?.[0];
+    return pr === undefined ? undefined : { number: pr.number, url: pr.html_url };
   }
 
   async checks(repo: RepoRef, ref: string): Promise<CheckStatus> {

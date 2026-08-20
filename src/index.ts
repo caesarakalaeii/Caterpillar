@@ -529,6 +529,11 @@ const main = async (): Promise<void> => {
     stopReceiver();
     await credentials.stop();
     await bridge;
+    // Give the chat claim back before anything else, so the next replica can take it on its
+    // FIRST housekeeping pass instead of waiting out `lease.staleAfterSeconds`. A holder that
+    // just dies leaves the bot deaf for the rest of that window — and silently, because a
+    // non-holder answers nothing and logs nothing (§7). Never throws.
+    await chat.standDown();
     // Leave the display before closing the connection, so a rollout does not show a
     // runner that has already gone for the whole presence TTL. Advisory either way (§21):
     // a runner that dies without departing ages out on its heartbeat score.
