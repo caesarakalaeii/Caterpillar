@@ -1082,3 +1082,71 @@ test("two concurrent checkouts against one mirror do not corrupt it", async () =
     assert.match(await git.run("config", "credential.helper"), new RegExp(task));
   }
 });
+
+test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
+  // Feeds `review/tdd.ts`, whose whole subject is the ORDER — so oldest-first is the
+  // contract, not a detail. `git log` defaults to newest-first, which would invert every
+  // test-first verdict the council reaches while looking entirely plausible.
+  const root = await scratch();
+  const repo = join(root, "work");
+  const plain = new Git(root, HERMETIC);
+  await plain.run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  await writeFile(join(repo, "README.md"), "seed\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed the repository");
+  const base = (await git.run("rev-parse", "HEAD")).trim();
+
+  await writeFile(join(repo, "widget.test.ts"), "assert(false)\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Add a failing test for the widget");
+
+  await mkdir(join(repo, "src"), { recursive: true });
+  await writeFile(join(repo, "src", "widget.ts"), "export const widget = 1\n");
+  await writeFile(join(repo, "widget.test.ts"), "assert(true)\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Make the widget test pass");
+
+  const commits = await manager(root).commitsSince(repo, base);
+
+  assert.deepEqual(
+    commits.map((c) => c.subject),
+    ["Add a failing test for the widget", "Make the widget test pass"],
+  );
+  assert.deepEqual(commits[0]?.files, ["widget.test.ts"]);
+  assert.deepEqual(commits[1]?.files, ["src/widget.ts", "widget.test.ts"]);
+  // Abbreviated, because it is shown to a reviewer next to the `git log` it can run.
+  assert.match(commits[0]?.oid ?? "", /^[0-9a-f]{7,}$/);
+});
+
+test("commitsSince is empty when the branch has added nothing", async () => {
+  const root = await scratch();
+  const repo = join(root, "work");
+  await new Git(root, HERMETIC).run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  await writeFile(join(repo, "f"), "one\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed");
+  const base = (await git.run("rev-parse", "HEAD")).trim();
+
+  assert.deepEqual(await manager(root).commitsSince(repo, base), []);
+});
+
+test("commitsSince answers with nothing rather than throwing on a bad base", async () => {
+  // Reachable: `branchPoint` resolves against the mirror's default branch, and a worktree
+  // whose mirror has been re-pointed can hand over a ref this repository does not carry.
+  // The council must still convene — losing the evidence block is a degradation, losing
+  // the review is an outage.
+  const root = await scratch();
+  const repo = join(root, "work");
+  await new Git(root, HERMETIC).run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  await writeFile(join(repo, "f"), "one\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed");
+
+  assert.deepEqual(await manager(root).commitsSince(repo, "0000000000000000000000000000000000000000"), []);
+});
