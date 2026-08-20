@@ -3027,8 +3027,9 @@ can satisfy both and still be wrong in ways only reading catches: the test that 
 weakened to pass, the error path that swallows, the half of the goal that was quietly not
 implemented.
 
-**Three reviewers, three different lenses** — correctness, design and simplicity,
-acceptance fit — run concurrently in the task's existing worktree. Different rather than
+**Four reviewers, four different lenses** — correctness; design, simplicity and the
+record; test-first discipline; acceptance fit — run concurrently in the task's existing
+worktree. Different rather than
 redundant: three runs of one prompt catch variance, but only a different lens catches a
 failure mode the first one is blind to. Their tool surface is `read`, `bash` and
 `submit_verdict`: no `write`, no `edit`, and none of the implementation agent's control
@@ -3080,6 +3081,64 @@ button.
 Verdicts are written to `tasks/<id>/reviews/NNN-verdict.md`, numbered by session and never
 overwritten, and appended to the journal — the journal is what the next session actually
 reads, so a rejection has to arrive there as instructions rather than as a score.
+
+### 12.2 The standards, and why both sides are given the same words
+
+Everything above grades a change. `agent/standards.ts` is what it is graded *against*, and
+the reason it is a module rather than four paragraphs in a prompt is that **the agent that
+writes the code and the council that reads it are handed the same constants**. Written
+twice they drift, and a drifted standard produces the most demoralising round trip this
+system has: a task sent back over a rule its session was never told, with no way for the
+next session to see what it missed.
+
+The content is Google's engineering practices, distilled into instructions to an agent
+rather than advice to a team — the code review standard, what to look for in a change, and
+the change author's guide to writing a description:
+
+| Constant | Given to the author | Graded by |
+|---|---|---|
+| `CODE_HEALTH_STANDARD` | every implementation and remediation session | the `design` lens |
+| `TEST_FIRST_STANDARD` | the same | the `tests` lens |
+| `WRITING_STANDARD` | the same | the `design` lens |
+| `REVIEW_STANDARD` | **nobody** — see below | every PR lens |
+
+`REVIEW_STANDARD` is the one asymmetry and it is deliberate. Its central sentence is
+Google's — *approve once the change definitely improves the overall health of the codebase,
+even if it is not perfect* — which is permission to let something merge. That is what stops
+a four-lens council being a bottleneck. Handed to the author it reads as permission to ship
+whatever survives a lenient reading, which is the opposite of its purpose, so the bundle
+the author gets (`AUTHOR_STANDARDS`) excludes it and a test asserts that it does.
+
+**Test-first is not optional, and the commit order is the only thing that can prove it.** A
+change written test-first and one with the tests bolted on at the end produce *identical
+trees*. No reviewer reading `git diff` can tell them apart, so a lens asked to grade the
+discipline would be grading the agent's claim about itself. What distinguishes them is the
+order of the commits — which is why the author's prompt asks for the failing test as its own
+commit as a mechanical requirement rather than as a virtue, and why the supervisor reads it
+back:
+
+- `WorktreeManager.commitsSince` logs the branch **oldest first** (`--reverse` is
+  load-bearing; git's default would invert every verdict while still reading as plausible),
+  with the files each commit touched.
+- `review/tdd.ts` classifies each path as test, source, or neither — polyglot, because the
+  fleet is pointed at whatever repo an operator owns and a classifier that only knows
+  `*.test.ts` reports every Go change as untested. It flags source commits with no test in
+  them and none before them.
+- The result goes into the prompt **every** lens receives, as a *Test-first evidence*
+  section. Only `tests` is asked to reach a verdict on it; a correctness reviewer is simply
+  better informed knowing the fix landed three commits before anything exercised it.
+
+That module decides nothing, and must not. It reports order; a docs-only change and a spike
+that was covered before it landed both have legitimate shapes, and only a reader can tell
+which is which. The narrow carve-out — documentation, comments, formatting and pure
+configuration have no behaviour to test — is stated to the author and to the lens in the
+same words, because a rule that produces absurd work is one the next session learns to
+ignore in the cases that matter.
+
+Its cost is a fourth concurrent reviewer on every round of every task, roughly a third more
+review spend. That buys the one defect class both earlier gates are blind to *by
+construction*: a test weakened until the suite goes green passes acceptance and passes CI,
+because the suite is green precisely because the test stopped asking.
 
 ---
 

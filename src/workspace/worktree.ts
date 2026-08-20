@@ -53,6 +53,30 @@ export interface ReapResult {
 
 const EMPTY_REAP: ReapResult = { worktrees: 0, bytes: 0, tasks: [] };
 
+/**
+ * One commit on a task's branch, with the files it touched. See `commitsSince`.
+ *
+ * Consumed by `review/tdd.ts`, which is where what it MEANS lives. This is the read.
+ */
+export interface CommitTouched {
+  /** Abbreviated oid, so it matches the `git log` a reviewer runs by hand. */
+  readonly oid: string;
+  readonly subject: string;
+  /** Repo-relative paths, in git's order. */
+  readonly files: readonly string[];
+}
+
+/**
+ * Separators for the `git log` format in `commitsSince`.
+ *
+ * Neither can occur in git's output for these fields: a commit subject is arbitrary user
+ * text and may contain newlines — the fleet's own prompt asks for multi-paragraph
+ * messages — so a line-oriented parse would hand one commit's files to another. Control
+ * characters are the only thing git will not produce here.
+ */
+const RECORD_SEPARATOR = "\u001e";
+const FIELD_SEPARATOR = "\u0000";
+
 /** Where a task's repos landed. `root` is the agent's working directory. */
 export interface TaskCheckout {
   readonly root: string;
@@ -443,6 +467,55 @@ export class WorktreeManager {
 
     const forkPoint = await this.git.at(worktree).tryRun("merge-base", "HEAD", base);
     return forkPoint.code === 0 ? forkPoint.stdout.trim() : undefined;
+  }
+
+  /**
+   * The commits this branch added since `base`, OLDEST FIRST, with the files each touched.
+   *
+   * Read by the review council, which grades whether the change was written test-first
+   * (`review/tdd.ts`). The order is the entire point — a change written test-first and one
+   * with the tests bolted on afterwards produce identical trees, so the commit sequence is
+   * the only durable evidence of which happened. `git log` is newest-first by default, and
+   * `--reverse` here is therefore load-bearing rather than cosmetic: without it every
+   * verdict inverts while still reading as plausible.
+   *
+   * Merges are excluded. A merge commit's `--name-only` output is empty against its first
+   * parent and confusing against the second; it contributes no authored change to read.
+   *
+   * Never throws. A base this worktree does not carry answers with nothing, so a council
+   * still convenes without its evidence block — losing the evidence is a degradation,
+   * losing the review is an outage.
+   */
+  async commitsSince(worktree: string, base: string): Promise<readonly CommitTouched[]> {
+    const result = await this.git
+      .at(worktree)
+      .tryRun(
+        "log",
+        "--reverse",
+        "--no-merges",
+        "--name-only",
+        "--format=%x1e%h%x00%s%x00",
+        `${base}..HEAD`,
+      );
+    if (result.code !== 0) return [];
+
+    return result.stdout
+      .split(RECORD_SEPARATOR)
+      .slice(1) // Whatever precedes the first record marker: empty, or a stray newline.
+      .flatMap((record) => {
+        const [oid, subject, files] = record.split(FIELD_SEPARATOR);
+        if (oid === undefined || subject === undefined) return [];
+        return [
+          {
+            oid: oid.trim(),
+            subject: subject.trim(),
+            files: (files ?? "")
+              .split("\n")
+              .map((line) => line.trim())
+              .filter((line) => line.length > 0),
+          },
+        ];
+      });
   }
 
   /**

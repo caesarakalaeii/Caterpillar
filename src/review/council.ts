@@ -6,13 +6,13 @@
  * commands exit 0 and that CI is green. The council is the third gate, and the only one
  * that reads the change rather than its outcome.
  *
- * Three reviewers run CONCURRENTLY in the task's existing worktree. They share it, which
+ * The reviewers run CONCURRENTLY in the task's existing worktree. They share it, which
  * is safe because none of them can write: the tool surface is `read`, `bash` and
  * `submit_verdict`, with no `write`, no `edit`, and none of the implementation agent's
  * control verbs. A reviewer cannot open a PR, cannot claim completion, and cannot hand
  * off; its whole output is one typed verdict.
  *
- * Nothing here decides anything. It gathers three verdicts and hands them to `decide`,
+ * Nothing here decides anything. It gathers their verdicts and hands them to `decide`,
  * which is pure and is where the rule actually lives.
  */
 import {
@@ -46,6 +46,7 @@ import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
 import { PLAN_LENSES, PR_LENSES, type Lens } from "./lenses.ts";
+import { renderEvidence, testFirstEvidence, type Commit } from "./tdd.ts";
 import { submitVerdictTool, type VerdictSink } from "./tools.ts";
 
 interface ExecContext {
@@ -76,7 +77,7 @@ export interface CouncilResult {
    *
    * Carried out rather than folded into the verdict because it is not a review outcome
    * at all: the supervisor must back off and convene again later, not record that the
-   * council had reservations. A verdict written from three unreachable reviewers would
+   * council had reservations. A verdict written from unreachable reviewers would
    * be a permanent document about a temporary condition.
    */
   readonly outage?: ProviderOutage;
@@ -108,11 +109,16 @@ export class ReviewCouncil implements Council {
   async review(spec: TaskSpec, state: TaskState): Promise<CouncilResult> {
     const checkout = await this.options.worktrees.ensureTaskCheckout(spec.repos, spec.id);
     const base = await this.options.worktrees.branchPoint(checkout.root);
+    // Only with a base. Without one there is no range to log, and an unbounded `git log`
+    // would present the repository's whole history as this task's commits — which reads
+    // as damning evidence about a change that did not write any of it.
+    const commits =
+      base === undefined ? [] : await this.options.worktrees.commitsSince(checkout.root, base);
 
     return this.convene(
       this.options.lenses ?? PR_LENSES,
       checkout.root,
-      reviewPrompt(spec, state, base),
+      reviewPrompt(spec, state, base, commits),
       spec,
       state,
     );
@@ -145,8 +151,8 @@ export class ReviewCouncil implements Council {
       lenses: lenses.map((l) => l.key).join(","),
     });
 
-    // Resolved once and shared by all three reviewers. They read the same worktree, so
-    // three resolves would be three identical answers — and a reviewer judging the code
+    // Resolved once and shared by every reviewer. They read the same worktree, so a
+    // resolve each would be one identical answer each — and a reviewer judging the code
     // in a different environment from the one that produced it is the failure this
     // module exists to prevent (see `workspace/toolchain.ts`).
     const toolchain = await this.options.toolchain.resolve(spec, worktree);
@@ -181,8 +187,8 @@ export class ReviewCouncil implements Council {
 
     const verdict = decide(results.map((r) => r.verdict));
     const usage = results.reduce<UsageTotals>((total, r) => addUsage(total, r.usage), EMPTY_USAGE);
-    // Any of them is enough: the three reviewers share one account, so one that could
-    // not reach the provider is a statement about all three.
+    // Any of them is enough: the reviewers share one account, so one that could not
+    // reach the provider is a statement about all of them.
     const outage = results.find((r) => r.outage !== undefined)?.outage;
 
     logger.info("council.verdict", {
@@ -250,8 +256,8 @@ export class ReviewCouncil implements Council {
     try {
       const result = await runSession({
         // A reviewer is a session and gets a session's ceiling. Nothing bounded this
-        // before, and three reviewers run concurrently under `Promise.all` — so one
-        // request that never returned held the runner, and the other two with it.
+        // before, and the reviewers run concurrently under `Promise.all` — so one
+        // request that never returned held the runner, and every other lens with it.
         timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
@@ -328,7 +334,7 @@ const abstention = (lens: Lens, reason: string): ReviewerVerdict => ({
 });
 
 /**
- * What every reviewer is told about the change. Identical for all three — the lenses
+ * What every reviewer is told about the change. Identical for all of them — the lenses
  * differ in the system prompt, not in what they are shown, so a finding one makes and
  * another misses is a difference of attention rather than of information.
  */
@@ -336,6 +342,7 @@ export const reviewPrompt = (
   spec: TaskSpec,
   state: TaskState,
   base: string | undefined,
+  commits: readonly Commit[] = [],
 ): string => {
   const diff =
     base === undefined
@@ -351,6 +358,14 @@ export const reviewPrompt = (
     "## The change",
     "",
     `The diff under review is ${diff}.`,
+    "",
+    "## Test-first evidence",
+    "",
+    // Given to every lens, not only to `tests`. It is the cheapest possible statement of
+    // how the change was arrived at, and a correctness reviewer reading "the fix landed
+    // three commits before anything tested it" is better informed for it. Only one lens
+    // is asked to reach a verdict on it.
+    renderEvidence(testFirstEvidence(commits)),
     "",
     "## What the task was asked to do",
     "",

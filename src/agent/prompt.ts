@@ -7,8 +7,14 @@
  *
  * The transcript is NOT replayed. The journal is the source of truth on resume,
  * which is what makes crash recovery cheap and keeps a handoff bounded.
+ *
+ * What "good work" means is NOT here. It is in `standards.ts`, spliced in below, because
+ * the review council is handed the same constants — a standard stated twice is a standard
+ * that drifts, and the round trip it produces rejects a change over a rule its author was
+ * never given (DESIGN.md §12.2).
  */
 import type { TaskKind, TaskSpec, TaskState } from "../domain/task.ts";
+import { AUTHOR_STANDARDS } from "./standards.ts";
 
 export interface PromptParts {
   readonly spec: TaskSpec;
@@ -39,7 +45,7 @@ Because of this, the durable record is what matters, not your memory:
   session precisely what to do first. Be concrete: file paths, command names, the exact
   next step.
 
-Control-plane rules:
+## Control-plane rules
 
 - \`done\` CLAIMS completion; it does not grant it. The supervisor independently runs the
   acceptance criteria and checks CI. Do not claim completion speculatively — a false
@@ -51,7 +57,12 @@ Control-plane rules:
 - You have no credentials. Pushes work through a credential helper and PRs through
   \`open_pr\`. Do not attempt to authenticate to anything yourself.
 
-Attribution:
+${AUTHOR_STANDARDS}
+
+The review council reads your change against exactly the text above — the same words,
+not a paraphrase of them. It is not advice.
+
+## Attribution
 
 - **You are Caterpillar.** That is the only name that belongs on anything you write.
   Not the model you are, not the vendor that trained it, not the harness you resemble.
@@ -109,6 +120,11 @@ Writing the tasks:
   reason, every time, even when it feels repetitive.
 - Every task needs \`acceptance\`: commands that must exit 0. A task without them can
   never be verified as done and the plan will be refused.
+- **The acceptance criteria must be able to fail.** An agent writes the tests for its own
+  task test-first, so \`npm test\` on a suite that does not yet cover the new behaviour
+  passes no matter what that agent does, and the completion gate becomes decorative. Say
+  in the goal what the new tests must prove, so the criteria bite on THIS task rather
+  than on the build. A criterion that only checks that it compiles verifies nothing.
 - \`dependsOn\` is for REAL ordering constraints only — where one task cannot start until
   another has landed. Everything you do not list may run at the same time, on different
   machines. Over-declaring dependencies turns a plan into a queue.
