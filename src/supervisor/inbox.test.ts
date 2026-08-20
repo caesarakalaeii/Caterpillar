@@ -63,7 +63,7 @@ test("the queue can be asked what it holds without consuming it", () => {
     topic: "make the thing faster",
     repos: ["acme/widget"],
     threadId: "1538626232302960801",
-    author: "caesar",
+    author: "operator",
   });
 
   assert.equal(inbox.some((request) => request.kind === "brainstorm"), true);

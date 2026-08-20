@@ -2,7 +2,7 @@
  * Verifies a tree of Kubernetes manifests structurally, with no SOPS in the path.
  *
  *   node src/cli/verify-manifests.ts <dir> [--require Kind/name ...] [--namespace ns] [--quiet]
- *   npm run verify:manifests -- ../caesar-deployment/apps --require ConfigMap/caterpillar
+ *   npm run verify:manifests -- ../deployment/apps --require ConfigMap/caterpillar
  *
  * The manifests this exists for live in a separate private repo where Secrets are
  * SOPS-encrypted and rendered by a ksops generator that needs an age private key. An

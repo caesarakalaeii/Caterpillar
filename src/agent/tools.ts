@@ -171,7 +171,7 @@ export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrR
     const repo = resolveTaskRepo(ctx.repos, params.repo);
     // A refusal the agent can act on, not a throw. It names what IS allowed, because the
     // failure this replaces was a raw 422 from a repository the agent had not asked for —
-    // twice, on `GH-caesarakalaeii-all-chat-543`, and neither told it what the tool could do.
+    // twice, on `GH-acme-all-chat-543`, and neither told it what the tool could do.
     if (repo === undefined) {
       return text(
         `\`${params.repo ?? ""}\` is not one of this task's repos. Open pull requests ` +

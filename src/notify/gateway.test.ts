@@ -87,7 +87,7 @@ const messageCreate = (over: Record<string, unknown> = {}): unknown => ({
   op: 0,
   s: 5,
   t: "MESSAGE_CREATE",
-  d: { channel_id: CHANNEL, content: "!answer SMOKE-1 yes", author: { username: "caesar" }, ...over },
+  d: { channel_id: CHANNEL, content: "!answer SMOKE-1 yes", author: { username: "operator" }, ...over },
 });
 
 /** Runs the gateway until the first socket exists, then hands it back. */

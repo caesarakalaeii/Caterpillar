@@ -1,8 +1,8 @@
 /**
  * Verifies a Vikunja agent API token and its per-route scopes, without printing it.
  *
- *   VIKUNJA_TOKEN=... npm run verify:vikunja
- *   VIKUNJA_TOKEN=... npm run verify:vikunja -- --task 42     # also writes (see below)
+ *   VIKUNJA_TOKEN=... npm run verify:vikunja -- --api-base https://vikunja.example.com/api/v1
+ *   VIKUNJA_TOKEN=... npm run verify:vikunja -- ... --task 42   # also writes (see below)
  *
  * Read-only by default:
  *   1. the token authenticates                        (projects: read)
@@ -24,8 +24,17 @@ import { asTaskId } from "../domain/task.ts";
 import { TrackerScopeError } from "../tracker/types.ts";
 import { VikunjaTracker } from "../tracker/vikunja.ts";
 
-const DEFAULT_API_BASE = "https://tasks.eb.bims.sh/api/v1";
 const TOKEN_ENVS = ["VIKUNJA_TOKEN", "VIKUNJA_API_TOKEN"] as const;
+
+/**
+ * Where the instance is. REQUIRED, with no default, and that is the point.
+ *
+ * Vikunja is self-hosted: there is no vikunja.com every deployment shares, so any
+ * default here would be one operator's hostname wearing the word "default". The old one
+ * was — and a token verified against somebody else's instance either 401s confusingly or,
+ * far worse, succeeds against the wrong data.
+ */
+const API_BASE_ENV = "VIKUNJA_API_BASE";
 
 const main = async (): Promise<void> => {
   const argv = process.argv.slice(2);
@@ -34,7 +43,12 @@ const main = async (): Promise<void> => {
     return index < 0 ? undefined : argv[index + 1];
   };
 
-  const apiBase = arg("--api-base") ?? DEFAULT_API_BASE;
+  const apiBase = arg("--api-base") ?? process.env[API_BASE_ENV];
+  if (apiBase === undefined || apiBase.length === 0) {
+    throw new Error(
+      `pass --api-base <url> or set ${API_BASE_ENV} — e.g. https://vikunja.example.com/api/v1`,
+    );
+  }
   const ingestLabel = arg("--ingest-label") ?? "agent";
   const wipLabel = arg("--wip-label") ?? "agent-wip";
   const needsHumanLabel = arg("--needs-human-label") ?? "needs-human";

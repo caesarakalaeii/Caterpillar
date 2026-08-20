@@ -288,7 +288,7 @@ test("completion marks done last, after the PR link is recorded", async () => {
 
   await tracker(fetch).transition(
     REF,
-    { kind: "completed", prUrl: "https://codeberg.org/EB/eb-api/pulls/12" },
+    { kind: "completed", prUrl: "https://codeberg.org/CONTOSO/acme-api/pulls/12" },
     TASK,
   );
 
@@ -296,7 +296,7 @@ test("completion marks done last, after the PR link is recorded", async () => {
   assert.deepEqual(calls.at(-1)?.body, { done: true });
   assert.match(
     String((calls[0]?.body as { comment: string }).comment),
-    /<a href="https:\/\/codeberg\.org\/EB\/eb-api\/pulls\/12">/,
+    /<a href="https:\/\/codeberg\.org\/CONTOSO\/acme-api\/pulls\/12">/,
   );
 });
 

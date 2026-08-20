@@ -25,9 +25,9 @@ const POLICY = parsePolicy(`
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm run check
       - npm test
@@ -37,9 +37,9 @@ alerts:
       This alert usually means a session wedged on a provider cooldown.
     runbook: https://runbooks.example.invalid/no-progress
   - alertname: CaterpillarBudget
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
     maxOpenTasks: 2
@@ -278,14 +278,14 @@ test("the happy path writes a spec carrying the policy's acceptance commands ver
   assert.ok(spec !== undefined);
   assert.equal(spec.id, "ALERT-a1b2c3d4");
   assert.equal(spec.kind, "remediation");
-  assert.equal(spec.workspace, asWorkspaceName("caesar"));
+  assert.equal(spec.workspace, asWorkspaceName("primary"));
   // VERBATIM. Nothing appended, nothing synthesised: the operator wrote the completion
   // gate, and a receiver that added to it would be writing the gate of a task it created.
   assert.deepEqual([...spec.acceptance], ["npm run check", "npm test"]);
   assert.deepEqual([...spec.requires], ["linux"]);
   assert.deepEqual(
     spec.repos.map((repo) => `${repo.host}/${repo.owner}/${repo.name}`),
-    ["github.com/caesarakalaeii/caterpillar"],
+    ["github.com/acme/caterpillar"],
   );
 
   // State first, spec last (§14.2) — and the state carries the spec's own `requires`, or a

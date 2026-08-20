@@ -11,7 +11,7 @@ export type TaskId = string & { readonly __brand: "TaskId" };
 /** Identity of a single runner process, e.g. `pod-7f3a` or `workstation`. */
 export type RunnerId = string & { readonly __brand: "RunnerId" };
 
-/** Name of a workspace profile, e.g. `caesar` or `electric-boogaloo`. */
+/** Name of a workspace profile, e.g. `primary` or `oss`. */
 export type WorkspaceName = string & { readonly __brand: "WorkspaceName" };
 
 export const asTaskId = (value: string): TaskId => value as TaskId;
@@ -265,7 +265,7 @@ export interface PullRequestRef {
  * unconditionally, the CI gate checked `repos[0]`, and the council merged `repos[0]`. A
  * two-repo task could therefore finish its work and then only ever half-finish.
  *
- * Observed on `GH-caesarakalaeii-all-chat-543`: both halves were built, committed and pushed,
+ * Observed on `GH-acme-all-chat-543`: both halves were built, committed and pushed,
  * and the second PR could not be opened at all — the tool answered 422 from the wrong
  * repository twice, and the session parked on a question a human had to answer by hand.
  */

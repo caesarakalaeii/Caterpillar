@@ -3250,7 +3250,7 @@ export class Supervisor {
     // The last thing a repo name is checked against, and the only one that involves the
     // forge: can this workspace's credential reach it at all (§9.1.1)? Everything above is
     // shape and configuration, and a name that satisfies both can still be a repo that does
-    // not exist — `caesarakalaeii/allchat` for `all-chat` parsed, resolved, became a task,
+    // not exist — `acme/allchat` for `all-chat` parsed, resolved, became a task,
     // was claimed, and died in `git clone --mirror` a session later.
     //
     // After the idempotency check, not before: a repeated `/brainstorm` in a thread that

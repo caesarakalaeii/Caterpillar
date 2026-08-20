@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Long-running autonomous coding agent supervisor. See DESIGN.md.",
+  "license": "AGPL-3.0-or-later",
   "engines": {
     "node": ">=22.18"
   },

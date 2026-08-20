@@ -1924,7 +1924,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
     topic: "make the thing faster",
     repos: ["acme/widget"],
     threadId: "1538626232302960801",
-    author: "caesar",
+    author: "operator",
   });
 
   const held = sessions;
@@ -1974,7 +1974,7 @@ const workspace = (name: string, host: string, owner: string) => ({
 
 const TWO_WORKSPACES: Partial<RunnerConfig> = {
   workspaces: new Map(
-    [workspace("caesar", "github.com", "acme"), workspace("boogaloo", "codeberg.org", "eb")].map(
+    [workspace("primary", "github.com", "acme"), workspace("secondary", "codeberg.org", "contoso")].map(
       (profile) => [profile.name, profile],
     ),
   ),
@@ -1989,7 +1989,7 @@ test("a brainstorm over several repos in one workspace carries all of them", asy
       topic: "split the client out of the server",
       repos: ["acme/widget", "acme/api", "acme/widget"],
       threadId: "1538626232302960802",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
   );
@@ -2006,7 +2006,7 @@ test("a brainstorm over several repos in one workspace carries all of them", asy
     ],
     "both repos, in the order typed, and the duplicate collapsed",
   );
-  assert.equal(spec.workspace, "caesar");
+  assert.equal(spec.workspace, "primary");
   assert.match(spec.goal, /acme\/api/, "the agent is told what it may read");
 
   await retire(BRAINSTORM);
@@ -2022,19 +2022,19 @@ test("a brainstorm that spans two workspaces is refused, and says which went whe
     {
       kind: "brainstorm",
       topic: "port the client to the other forge",
-      repos: ["acme/widget", "codeberg.org/eb/api"],
+      repos: ["acme/widget", "codeberg.org/contoso/api"],
       threadId: "1538626232302960803",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
   );
 
   assert.equal(outcome.kind, "refused");
   const reason = outcome.kind === "refused" ? outcome.reason : "";
-  assert.match(reason, /caesar/);
-  assert.match(reason, /boogaloo/);
+  assert.match(reason, /primary/);
+  assert.match(reason, /secondary/);
   assert.match(reason, /acme\/widget/);
-  assert.match(reason, /codeberg\.org\/eb\/api/);
+  assert.match(reason, /codeberg\.org\/contoso\/api/);
 
   assert.equal(
     await store.hasTask(asTaskId("BS-1538626232302960803")),
@@ -2052,7 +2052,7 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
       topic: "read someone else's code",
       repos: ["acme/widget", "stranger/thing"],
       threadId: "1538626232302960804",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
   );
@@ -2064,7 +2064,7 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
 /**
  * A repo nobody can reach is refused at the door (DESIGN.md §9.1).
  *
- * 2026-08-18: `/brainstorm caesarakalaeii/allchat` — for a repo called `all-chat` — was
+ * 2026-08-18: `/brainstorm acme/allchat` — for a repo called `all-chat` — was
  * accepted, claimed, and spent its session reaching `git clone --mirror`, where the App's
  * 422 became `fatal: could not read Username`. The name was one dash out and nothing on
  * the way in had asked the only question that would have caught it.
@@ -2072,7 +2072,7 @@ test("a brainstorm naming a repo no workspace owns is refused, not guessed at", 
 const reachStub = (unreachable: readonly string[]): Partial<SupervisorDeps> => ({
   forges: new Map([
     [
-      asWorkspaceName("caesar"),
+      asWorkspaceName("primary"),
       {
         unreachable: (repos: readonly RepoRef[]) =>
           Promise.resolve(
@@ -2097,7 +2097,7 @@ test("a brainstorm naming a repo the credential cannot reach is refused with the
       topic: "refine the widget",
       repos: ["acme/widgit"],
       threadId: "1539331435477860432",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
     reachStub(["acme/widgit"]),
@@ -2125,7 +2125,7 @@ test("a reachable brainstorm is unaffected by the check", async () => {
       topic: "refine the widget",
       repos: ["acme/widget"],
       threadId: "1539331435477860433",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
     reachStub(["acme/widgit"]),
@@ -2147,13 +2147,13 @@ test("a forge that cannot answer lets the brainstorm through rather than refusin
       topic: "refine the widget",
       repos: ["acme/widget"],
       threadId: "1539331435477860434",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
     {
       forges: new Map([
         [
-          asWorkspaceName("caesar"),
+          asWorkspaceName("primary"),
           { unreachable: () => Promise.reject(new Error("GitHub /installation/repositories failed with 500")) },
         ],
       ]),
@@ -2176,7 +2176,7 @@ test("a brainstorm with no repos at all is refused by the loop too", async () =>
       topic: "read nothing",
       repos: [],
       threadId: "1538626232302960806",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
   );
@@ -2194,7 +2194,7 @@ test("a brainstorm with an unparseable repo is refused by name", async () => {
       topic: "read the code",
       repos: ["acme/widget", "widget"],
       threadId: "1538626232302960805",
-      author: "caesar",
+      author: "operator",
     },
     TWO_WORKSPACES,
   );

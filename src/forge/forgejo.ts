@@ -39,7 +39,7 @@ export interface ForgejoOptions {
   /**
    * Tokens covering every repo under an owner, keyed by owner.
    *
-   * This is the normal unit for Codeberg: an ecosystem like ElectricBoogaloo is worked
+   * This is the normal unit for Codeberg: an ecosystem like Acme is worked
    * as one workspace plus sibling clones, so essentially no task touches a single repo
    * and a per-repo token would have to be assembled per task anyway.
    */

@@ -1,7 +1,8 @@
 # Caterpillar — Design
 
 A long-running autonomous coding agent that survives context exhaustion, pod restarts,
-and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment`.
+and machine boundaries. Deployed to a k3s cluster from a separate manifests repo, which
+this document refers to throughout as `deployment`.
 
 **Status:** design agreed, not yet implemented.
 
@@ -37,7 +38,7 @@ and machine boundaries. Runs on the k3s cluster managed by `../caesar-deployment
 | Autonomy | Push branches, open/update PRs. **No merging. No cluster writes.** |
 | Human channel | **Discord** — questions, parks, terminal outcomes only |
 | Metrics | **Prometheus/Grafana** for everything else |
-| Workspaces | Per-ecosystem profiles (`caesar`, `electric-boogaloo`) — forge, tracker, creds |
+| Workspaces | Per-ecosystem profiles (`primary`, `oss`) — forge, tracker, creds |
 | Task intake | GitHub issues / Vikunja tasks labelled `agent`, Discord command, hand-committed spec |
 | Stop conditions | Max sessions per task + no-progress detector |
 | Done | Machine-checkable acceptance criteria **and** PR open with CI green |
@@ -91,7 +92,7 @@ The npm scope already moved `@mariozechner/*` → `@earendil-works/*`; pin exact
 │    outbound: questions, parks, outcomes                    │
 │    inbound:  !answer → commits answer to state repo        │
 │                                                            │
-│  redis (HA, in namespace all-chat)   ← §21                 │
+│  redis (HA, its own namespace)       ← §21                 │
 │    the EPHEMERAL plane, and only it:                       │
 │    chat inbox, task snapshot,                              │
 │    presence, cancel signals.                               │
@@ -126,30 +127,32 @@ no Redis is a supported deployment and is what the dedicated machine above actua
 
 ### 3.1 Workspaces
 
-Work is not one ecosystem. `caesar` and `electric-boogaloo` differ in forge, task tracker,
-and cluster, so a **workspace profile** is a first-class config object and every task
-declares which one it belongs to.
+Work is not one ecosystem. The deployment this was built for runs two that differ in forge,
+task tracker and cluster, so a **workspace profile** is a first-class config object and
+every task declares which one it belongs to.
 
-| | `caesar` | `electric-boogaloo` |
+The shape, with two profiles named `primary` and `oss` for illustration — the names are
+arbitrary and mean only what an operator's config says they mean:
+
+| | `primary` | `oss` |
 |---|---|---|
-| Forge | GitHub (`sipgate`, personal) | Codeberg — `ElectricBoogaloo` org |
+| Forge | GitHub | Codeberg (any Forgejo host) |
 | Forge credential | GitHub App, minted per task | repo-scoped Forgejo token |
-| Task tracker | GitHub issues | **Vikunja** — `tasks.eb.bims.sh` |
-| Cluster | k3s via `caesar-deployment` | EB cluster (`cluster` repo) |
-| Local prior art | — | `../electric-boogaloo-workspace` |
+| Task tracker | GitHub issues | **Vikunja**, self-hosted |
+| Cluster | k3s via a manifests repo | a second cluster |
 
 ```jsonc
 // workspaces.json — supervisor config, no secrets
 {
-  "electric-boogaloo": {
-    "forge":   { "type": "forgejo", "host": "codeberg.org", "org": "ElectricBoogaloo" },
-    "tracker": { "type": "vikunja", "base": "https://tasks.eb.bims.sh/api/v1" },
-    "secretRef": "caterpillar-eb"        // SOPS secret with the tokens
+  "oss": {
+    "forge":   { "type": "forgejo", "host": "codeberg.org", "org": "acme" },
+    "tracker": { "type": "vikunja", "base": "https://vikunja.example.com/api/v1" },
+    "secretRef": "caterpillar-oss"       // SOPS secret with the tokens
   }
 }
 ```
 
-`spec.md` carries `workspace: electric-boogaloo`. The supervisor resolves forge and tracker
+`spec.md` carries `workspace: oss`. The supervisor resolves forge and tracker
 credentials from the profile; **a task in one workspace can never obtain another
 workspace's credentials.** This is the same containment property as §9.1, one level up.
 
@@ -1879,7 +1882,7 @@ inside the binaries, so moving it invalidates every binary-cache substitution an
 builds from source.
 
 In the cluster a volume is mounted at `/nix`, seeded from the image's own closure by an
-initContainer (`caesar-deployment`, `apps/workloads/caterpillar`). Without it every deploy
+initContainer (`deployment`, `apps/workloads/caterpillar`). Without it every deploy
 throws the store away, and since keel rolls the workload on every push to `main`, a task
 needing a dotnet SDK would re-download over a gigabyte each time. Nothing in this repo
 changes for any of it — which is the point, because a machine runner and a local
@@ -2028,8 +2031,8 @@ No admin, no workflow.
 > that is where a token actually leaves the supervisor. Only the last two are the
 > boundary; the first two exist so the failure is legible.
 
-With both layers, `TASK-123` cannot touch `caesar-deployment` unless its spec says so
-**and** `caesar-deployment` is on the workspace's forge and is not the state repo.
+With both layers, `TASK-123` cannot touch `deployment` unless its spec says so
+**and** `deployment` is on the workspace's forge and is not the state repo.
 
 > **Correction — "no merging" is not a token property.** GitHub has no separate merge
 > scope: `PUT /pulls/{n}/merge` is authorised by `pull_requests: write`, the same
@@ -2070,7 +2073,7 @@ possible moment.
 
 ```
 BS-1539331435477860432 parked — session failed: git clone --mirror
-  https://github.com/caesarakalaeii/allchat.git failed (128):
+  https://github.com/acme/allchat.git failed (128):
   caterpillar-cred: GitHub /app/installations/153385932/access_tokens failed with 422:
     the App is not installed on one of the requested repositories
   fatal: could not read Username for '…': terminal prompts disabled
@@ -2091,8 +2094,8 @@ it as one sent the operator to the App's settings page for what was a dash.
 
 The question is therefore asked from the other side: **`GET /installation/repositories`**
 returns the list, so the difference can be computed here, and a list makes the useful
-sentence possible — *"`caesarakalaeii/allchat` is not one of the 65 repositories this
-workspace's GitHub App can see. Did you mean `caesarakalaeii/all-chat`?"* Near misses are
+sentence possible — *"`acme/allchat` is not one of the 65 repositories this
+workspace's GitHub App can see. Did you mean `acme/all-chat`?"* Near misses are
 ranked by a squashed comparison first (`-`, `_`, `.` and case are what people retype
 wrong: `AllChat`, `all_chat`, `allchat` are all one edit from nothing) and then by bounded
 edit distance. `ForgeFactory` answers it — one per workspace, which is the unit a
@@ -2285,7 +2288,7 @@ past v15.0, so **repository-scoped access tokens are available**:
 `POST /users/{u}/tokens` requires basic auth — so on-demand minting would mean storing the
 account password, which is strictly worse than storing a scoped token.
 
-**And per-repo scoping does not fit the actual workflow.** `electric-boogaloo` is worked
+**And per-repo scoping does not fit the actual workflow.** `oss` is worked
 as *one workspace repo with the others cloned inside it* — it is a single ecosystem, and
 essentially no task touches only one repo. A per-repo token would have to be reassembled
 for every task, for no benefit. So:
@@ -2295,8 +2298,8 @@ for every task, for no benefit. So:
   checked before the owner-wide token.
 - Stored SOPS-encrypted as `tokens.json`:
   ```jsonc
-  { "owners": { "ElectricBoogaloo": "<token>" },
-    "repos":  { "ElectricBoogaloo/sensitive": "<narrower token>" } }
+  { "owners": { "Acme": "<token>" },
+    "repos":  { "Acme/sensitive": "<narrower token>" } }
   ```
 - **Rotation is a scheduled chore, not a free property** — calendar or CronJob, and alert
   if a token predates the rotation window.
@@ -2330,12 +2333,12 @@ committed into the workspace even in a repo that has not thought to ignore it.
 > worktree-private directory, and git reads `info/exclude` only from the common one. The
 > pattern therefore applies to every worktree of that mirror, which is the intent.
 
-> Prior art: `../electric-boogaloo-workspace/scripts/cb-api.sh` solves this for a *shell*
-> agent — it sources `.env` in-process and feeds the header through a process-substituted
-> `--config` file so the token never reaches `argv`/`ps`. The supervisor does not need that
-> trick, because a TypeScript HTTP client sets the header directly and argv is never
-> involved. The *principle* is the same and already encoded in §9.2: the agent never holds
-> the token. Do not ship `cb-api.sh` into the agent's toolset — expose `open_pr()` instead.
+> Prior art: a shell predecessor solved this for a *shell* agent — it sourced `.env`
+> in-process and fed the header through a process-substituted `--config` file, so the
+> token never reached `argv`/`ps`. The supervisor does not need that trick, because a
+> TypeScript HTTP client sets the header directly and argv is never involved. The
+> *principle* is the same and already encoded in §9.2: the agent never holds the token.
+> Do not ship a forge-API script into the agent's toolset — expose `open_pr()` instead.
 
 #### The checkout was plural and the completion path was not
 
@@ -2349,7 +2352,7 @@ defaulted to `spec.repos[0]`:
 - **The council merged `repos[0]`.** The rest stayed open with nothing saying so.
 
 So a two-repo task could do all of its work and then only ever half-finish, and the first
-failure hid the second two. `GH-caesarakalaeii-all-chat-543` is the record: both halves built,
+failure hid the second two. `GH-acme-all-chat-543` is the record: both halves built,
 committed, pushed and verified — 22 acceptance commands exiting 0 — and the second pull request
 could not be opened at all. The agent called `open_pr` twice and got a 422 from the wrong
 repository twice (once matching the PR it had already opened on the *primary* repo, once
@@ -2397,7 +2400,7 @@ not merge.
 
 ### 9.5 Task tracker credential (Vikunja)
 
-Everything in `electric-boogaloo` is tracked in Vikunja at `https://tasks.eb.bims.sh`
+Everything in `oss` is tracked in Vikunja at `https://vikunja.example.com`
 (cluster ns `vikunja`, Authelia-OIDC for humans). Agents authenticate with a personal
 **API token**, `Authorization: Bearer`.
 
@@ -2456,9 +2459,9 @@ mark a task done — for the same reason it cannot self-declare success in §12:
 determined by acceptance criteria and CI, verified independently. Granting the agent
 `tasks: update` on the `done` field would route around that gate.
 
-> Prior art: `../electric-boogaloo-workspace/scripts/vikunja.py` — same discipline as
-> `cb-api.sh`, token read in-process from `.env`, header-only, never argv. In the cluster
-> the `.env` becomes a SOPS secret; the discipline is unchanged.
+> Prior art: a python predecessor — same discipline as the shell one above: token read
+> in-process from `.env`, header-only, never argv. In the cluster the `.env` becomes a
+> SOPS secret; the discipline is unchanged.
 
 ### 9.6 LLM credential
 
@@ -2560,7 +2563,7 @@ credential. Its value is not "easy provider swap" (pi-ai already gives that) but
 The modes are not exclusive at runtime: pi resolves *a stored credential owns the
 provider; ambient env is consulted only when nothing is stored*, so a subscription runner
 can keep an API key in its environment as an automatic fallback. The cluster deliberately
-does not — there is no Anthropic key anywhere in `caesar-deployment`.
+does not — there is no Anthropic key anywhere in `deployment`.
 
 Swapping to a private provider later remains a config change.
 
@@ -2673,7 +2676,7 @@ one guessed belonged to a real person.
 
 ## 10. Kubernetes
 
-Deployed via ArgoCD from `caesar-deployment`, following the existing conventions:
+Deployed via ArgoCD from `deployment`, following the existing conventions:
 
 - `apps/workloads/caterpillar/` — manifests + `kustomization.yaml`
 - `argocd/apps/caterpillar.yaml` — Application, sync wave 4
@@ -2709,7 +2712,7 @@ ever booting, which is the opposite of what a fleet is for.
 
 ### The bot is a second Deployment, and deliberately a small one
 
-Splitting the bot out (§7) costs one manifest in `caesar-deployment` and no second image:
+Splitting the bot out (§7) costs one manifest in `deployment` and no second image:
 `dist/` is copied whole, so the entrypoint is already there.
 
 ```yaml
@@ -3080,8 +3083,8 @@ leave the supervisor, because Kubernetes RBAC cannot express "keys but not value
 
 Five paths, all converging on a `spec.md`:
 
-1. **GitHub issue** labelled `agent` → ingester renders a spec. (`caesar`)
-2. **Vikunja task** labelled `agent` → ingester renders a spec. (`electric-boogaloo`)
+1. **GitHub issue** labelled `agent` → ingester renders a spec. (`primary`)
+2. **Vikunja task** labelled `agent` → ingester renders a spec. (`oss`)
 3. **Discord** `/brainstorm` → refine into a plan → child tasks (§14.3). Fastest, works
    from a phone, and the only path that produces acceptance criteria by asking for them.
 4. **Hand-committed** `tasks/TASK-x/spec.md` (most control over acceptance criteria).
@@ -3378,7 +3381,7 @@ an issue", about a fleet that had worked an issue across five sessions and opene
 Three things changed, and each of them is the smallest one that answers the question.
 
 **The refusal record grew the fields a page needs.** `{digest, reason, at}` could not be
-rendered as anything but text: `GH-caesarakalaeii-all-chat-724` does not say where the owner
+rendered as anything but text: `GH-acme-all-chat-724` does not say where the owner
 ends and the repo begins, so nothing could link to the item being refused. `url`, `title`
 and `workspace` are now written too, and all three are **optional** on read. That is not
 tidiness: the digest is the suppression key, a record whose *shape* changed must not read as
@@ -4028,9 +4031,9 @@ a fix for it is verified**. That statement is a file in the **state repo**:
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress        # required, exact match on the alert label
-    workspace: caesar                       # required, a known workspace
+    workspace: primary                       # required, a known workspace
     repos:                                  # required, >= 1, host/owner/name
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:                             # required, >= 1 command (§12)
       - npm run check
       - npm test
@@ -4157,7 +4160,7 @@ not a reason to lower the bar; it is a reason to have the diagnosis written down
 
 ## 21. The ephemeral plane, and why the leases are not on it
 
-There is now an HA Redis in the cluster's `all-chat` namespace. That is a genuinely useful
+There is now an HA Redis in the cluster. That is a genuinely useful
 thing to have, and the reason it exists here at all is one specific need: the Discord bot
 is becoming its own process, and a bot in a different pod from the supervisor cannot reach
 into the supervisor's heap. `ChatInbox` and `TaskSnapshot` were in-process objects because

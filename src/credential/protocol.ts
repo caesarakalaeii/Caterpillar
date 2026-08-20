@@ -13,7 +13,7 @@
 export interface CredentialRequest {
   readonly protocol?: string;
   readonly host?: string;
-  /** e.g. `caesarakalaeii/Caterpillar.git` — requires credential.useHttpPath=true. */
+  /** e.g. `acme/widget.git` — requires credential.useHttpPath=true. */
   readonly path?: string;
   readonly username?: string;
 }

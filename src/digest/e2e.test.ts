@@ -60,7 +60,7 @@ const state = (): TaskState => ({
 
 const SPEC = [
   "---",
-  "workspace: caesar",
+  "workspace: primary",
   "repos:",
   "  - github.com/acme/widget",
   "acceptance:",

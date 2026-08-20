@@ -1,7 +1,7 @@
 /**
  * Verifies a Forgejo/Codeberg repository-scoped token, without printing it.
  *
- *   CODEBERG_TOKEN=... npm run verify:forgejo -- --repo ElectricBoogaloo/eb-api
+ *   CODEBERG_TOKEN=... npm run verify:forgejo -- --repo acme/widget
  *
  * Checks:
  *   1. the token authenticates against the repo

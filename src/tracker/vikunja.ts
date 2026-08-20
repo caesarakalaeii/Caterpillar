@@ -1,5 +1,5 @@
 /**
- * Vikunja tracker for the `electric-boogaloo` workspace. See DESIGN.md §9.5.
+ * Vikunja tracker, for a workspace whose tracker is a self-hosted Vikunja. See DESIGN.md §9.5.
  *
  * Auth: personal API token, `Authorization: Bearer`. Token scopes are per ROUTE,
  * ticked at creation in Settings → API Tokens. Grant the agent token exactly:
@@ -21,9 +21,9 @@
  *     a `**bold**` note renders as literal asterisks. Everything written here is
  *     escaped and wrapped in `<p>`; everything read back is stripped to text.
  *
- * Prior art: `../electric-boogaloo-workspace/scripts/vikunja.py`, whose routes were
- * proven against the live instance. Same discipline: token read in-process, sent as a
- * header, never on argv, never logged.
+ * Routes were proven against a live instance by a shell/python predecessor before being
+ * written here. Same discipline: token read in-process, sent as a header, never on argv,
+ * never logged.
  */
 import type { TaskId, TrackerRef } from "../domain/task.ts";
 import {
@@ -37,7 +37,7 @@ import {
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export interface VikunjaOptions {
-  /** e.g. `https://tasks.eb.bims.sh/api/v1` */
+  /** e.g. `https://vikunja.example.com/api/v1` */
   readonly apiBase: string;
   /** Resolved from the mounted SOPS secret. Header-only, never argv. */
   readonly token: string;

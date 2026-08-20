@@ -4,12 +4,12 @@ import { formatAnswer, parseInvocation, parseRepoPath, parseRequest } from "./pr
 
 test("parses git's key=value block and ignores unknown keys", () => {
   const request = parseRequest(
-    ["protocol=https", "host=github.com", "path=caesarakalaeii/Caterpillar.git", "wildcard=x", ""].join("\n"),
+    ["protocol=https", "host=github.com", "path=acme/Caterpillar.git", "wildcard=x", ""].join("\n"),
   );
   assert.deepEqual(request, {
     protocol: "https",
     host: "github.com",
-    path: "caesarakalaeii/Caterpillar.git",
+    path: "acme/Caterpillar.git",
   });
 });
 
@@ -24,13 +24,13 @@ test("formats the answer git expects, terminated by a blank line", () => {
 });
 
 test("extracts owner and name from a repo path", () => {
-  assert.deepEqual(parseRepoPath("caesarakalaeii/Caterpillar.git"), {
-    owner: "caesarakalaeii",
+  assert.deepEqual(parseRepoPath("acme/Caterpillar.git"), {
+    owner: "acme",
     name: "Caterpillar",
   });
-  assert.deepEqual(parseRepoPath("ElectricBoogaloo/eb-api"), {
-    owner: "ElectricBoogaloo",
-    name: "eb-api",
+  assert.deepEqual(parseRepoPath("Acme/acme-api"), {
+    owner: "Acme",
+    name: "acme-api",
   });
 });
 

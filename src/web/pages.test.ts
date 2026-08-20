@@ -174,7 +174,7 @@ test("the intake page escapes an alert annotation that tries to be markup", asyn
           reason: hostile,
           title: `<img src=x onerror="alert(1)">`,
           url: "javascript:alert(1)",
-          workspace: "caesar",
+          workspace: "primary",
           at: "2026-08-18T06:50:29.000Z",
         },
       ],
@@ -221,7 +221,7 @@ test("the intake page says whether anything is listening for an alert at all", a
       policy: [
         {
           alertname: "CaterpillarContextOverrun",
-          workspace: asWorkspaceName("caesar"),
+          workspace: asWorkspaceName("primary"),
           repos: [{ host: "github.com", owner: "acme", name: "widget" }],
           acceptance: ["npm test"],
           requires: ["linux"],

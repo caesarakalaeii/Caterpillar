@@ -326,7 +326,7 @@ test("controlTools is unchanged by any of this", () => {
 
 test("open_pr opens against a NAMED repo, not always the primary one", async () => {
   // THE defect. `open_pr` posted to `spec.repos[0]` unconditionally and took no repo argument,
-  // so on `GH-caesarakalaeii-all-chat-543` the extension half was built, committed and pushed
+  // so on `GH-acme-all-chat-543` the extension half was built, committed and pushed
   // and then had nowhere to go: two attempts, two 422s from the wrong repository, and a session
   // that parked on a question a human had to answer by opening the PR themselves.
   const { ctx, forge, control } = harness();

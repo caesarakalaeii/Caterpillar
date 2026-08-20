@@ -5,7 +5,7 @@ import { stripHtml } from "../tracker/vikunja.ts";
 import type { TrackerItem } from "../tracker/types.ts";
 import { renderSpec, taskIdFor } from "./spec.ts";
 
-const WORKSPACE = asWorkspaceName("caesar");
+const WORKSPACE = asWorkspaceName("primary");
 const SELF: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
 const SCOPE = {
   host: "github.com",

@@ -17,7 +17,7 @@ const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
 
 const options = {
   parent: PARENT,
-  workspace: asWorkspaceName("caesar"),
+  workspace: asWorkspaceName("primary"),
   defaultRepos: [REPO],
   scope: { host: "github.com", stateRepo: { host: "github.com", owner: "acme", name: "state" } },
 };
@@ -131,13 +131,13 @@ test("a task inherits the brainstorm's repos when it names none", () => {
 
 test("a task may name its own repos, qualified or not, within the workspace's forge", () => {
   const result = materialise(
-    plan([{ ...task("a"), repos: ["other/thing", "github.com/eb/api"] }]),
+    plan([{ ...task("a"), repos: ["other/thing", "github.com/contoso/api"] }]),
     options,
   );
   assert.equal(result.kind, "plan");
   assert.deepEqual(result.kind === "plan" ? result.tasks[0]?.spec.repos : [], [
     { host: "github.com", owner: "other", name: "thing" },
-    { host: "github.com", owner: "eb", name: "api" },
+    { host: "github.com", owner: "contoso", name: "api" },
   ]);
 });
 
@@ -147,7 +147,7 @@ test("a child naming a repo on another forge is refused", () => {
   // review decomposition, not scope. This assertion used to run the other way round,
   // which meant a session could choose its successor's credential scope.
   const result = materialise(
-    plan([{ ...task("a"), repos: ["codeberg.org/eb/api"] }]),
+    plan([{ ...task("a"), repos: ["codeberg.org/contoso/api"] }]),
     options,
   );
   assert.equal(result.kind, "rejected");

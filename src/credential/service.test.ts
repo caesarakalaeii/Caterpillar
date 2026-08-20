@@ -21,9 +21,9 @@ import { CredentialService, taskSocketPath, type ActiveCredential } from "./serv
 
 const HELPER = fileURLToPath(new URL("../cli/credential-helper.ts", import.meta.url));
 
-const REPO: RepoRef = { host: "github.com", owner: "caesarakalaeii", name: "Caterpillar" };
-const OTHER_REPO: RepoRef = { host: "github.com", owner: "caesarakalaeii", name: "Sisyphus" };
-const STATE_REPO: RepoRef = { host: "github.com", owner: "caesarakalaeii", name: "caterpillar-state" };
+const REPO: RepoRef = { host: "github.com", owner: "acme", name: "Caterpillar" };
+const OTHER_REPO: RepoRef = { host: "github.com", owner: "acme", name: "Sisyphus" };
+const STATE_REPO: RepoRef = { host: "github.com", owner: "acme", name: "caterpillar-state" };
 const SCOPE = { host: "github.com", stateRepo: STATE_REPO };
 
 const TASK = asTaskId("T-1");
@@ -121,7 +121,7 @@ test("serves a credential for a repo in the active task's scope", async () => {
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n",
   );
 
   assert.equal(output, "username=x-access-token\npassword=fake-forge-token\n\n");
@@ -142,11 +142,11 @@ test("two concurrent tasks are served their own credentials, not each other's", 
   const [a, b] = await Promise.all([
     runHelper(
       socketFor(TASK),
-      "protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+      "protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n",
     ),
     runHelper(
       socketFor(OTHER_TASK),
-      "protocol=https\nhost=github.com\npath=caesarakalaeii/Sisyphus.git\n\n",
+      "protocol=https\nhost=github.com\npath=acme/Sisyphus.git\n\n",
     ),
   ]);
 
@@ -167,7 +167,7 @@ test("a task is not served another task's repo, even on its own socket", async (
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Sisyphus.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Sisyphus.git\n\n",
   );
 
   assert.equal(output, "");
@@ -188,11 +188,11 @@ test("clearing one task leaves the other served", async () => {
 
   const refused = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n",
   );
   const served = await runHelper(
     socketFor(OTHER_TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Sisyphus.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Sisyphus.git\n\n",
   );
 
   assert.equal(refused, "");
@@ -230,7 +230,7 @@ test("a leftover socket from a previous process does not block a restart", async
   const lease = await restarted.activate(TASK, { forge, repos: [REPO], scope: SCOPE });
   const output = await runHelper(
     lease.socketPath,
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n",
   );
 
   assert.match(output, /^password=fake-forge-token$/m);
@@ -244,7 +244,7 @@ test("refuses a repo outside the active task's scope", async () => {
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/some-other-repo.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/some-other-repo.git\n\n",
   );
 
   // Silence means "no credential"; git then reports a normal auth failure.
@@ -257,7 +257,7 @@ test("refuses when the named task has no active credential", async () => {
   // silent, which is the same answer git gets from a refusal.
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n",
   );
 
   assert.equal(output, "");
@@ -302,7 +302,7 @@ test("real git gets a usable credential out of the helper", async () => {
     });
     child.on("error", reject);
     child.on("close", () => resolve(stdout));
-    child.stdin.end("protocol=https\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n");
+    child.stdin.end("protocol=https\nhost=github.com\npath=acme/Caterpillar.git\n\n");
   });
 
   assert.match(output, /^username=x-access-token$/m);
@@ -326,18 +326,18 @@ test("refuses a host the workspace does not own, even when the task declared it"
   // The attack this exists to stop: `spec.repos` is free text from an issue body, and
   // the clone URL is built from `repo.host`. Matching the request against the task's
   // own declared list is a tautology — the attacker wrote the list. A runner that
-  // clones `evil.example.com/caesarakalaeii/Caterpillar` with the helper attached gets
+  // clones `evil.example.com/acme/Caterpillar` with the helper attached gets
   // a 401 back, and the helper must NOT answer it.
   //
   // This is also the ORDER assertion: the hostile repo IS in the task's `repos` list, so
   // the only thing that can refuse it is `assertWorkspaceScope` running first.
-  const hostile: RepoRef = { host: "evil.example.com", owner: "caesarakalaeii", name: "Caterpillar" };
+  const hostile: RepoRef = { host: "evil.example.com", owner: "acme", name: "Caterpillar" };
   const forge = new FakeForge([REPO, hostile]);
   await activate(TASK, { forge, repos: [REPO, hostile], scope: SCOPE });
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=evil.example.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=https\nhost=evil.example.com\npath=acme/Caterpillar.git\n\n",
   );
 
   assert.equal(output, "");
@@ -353,7 +353,7 @@ test("refuses a repo inside the workspace scope but outside the task's repos", a
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/Sisyphus.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/Sisyphus.git\n\n",
   );
 
   assert.equal(output, "");
@@ -369,7 +369,7 @@ test("refuses the supervisor's own state repo", async () => {
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=github.com\npath=caesarakalaeii/caterpillar-state.git\n\n",
+    "protocol=https\nhost=github.com\npath=acme/caterpillar-state.git\n\n",
   );
 
   assert.equal(output, "");
@@ -379,13 +379,13 @@ test("refuses the supervisor's own state repo", async () => {
 test("refuses the state repo under a different casing", async () => {
   // GitHub resolves `Caterpillar-State` and `caterpillar-state` to the same repo, so a
   // case-sensitive comparison is not an exclusion at all.
-  const disguised: RepoRef = { host: "GitHub.com", owner: "CaesarAkalaeii", name: "Caterpillar-State" };
+  const disguised: RepoRef = { host: "GitHub.com", owner: "Acme", name: "Caterpillar-State" };
   const forge = new FakeForge([REPO, disguised]);
   await activate(TASK, { forge, repos: [REPO, disguised], scope: SCOPE });
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=https\nhost=GitHub.com\npath=CaesarAkalaeii/Caterpillar-State.git\n\n",
+    "protocol=https\nhost=GitHub.com\npath=Acme/Caterpillar-State.git\n\n",
   );
 
   assert.equal(output, "");
@@ -401,7 +401,7 @@ test("refuses a plaintext http request for an in-scope repo", async () => {
 
   const output = await runHelper(
     socketFor(TASK),
-    "protocol=http\nhost=github.com\npath=caesarakalaeii/Caterpillar.git\n\n",
+    "protocol=http\nhost=github.com\npath=acme/Caterpillar.git\n\n",
   );
 
   assert.equal(output, "");

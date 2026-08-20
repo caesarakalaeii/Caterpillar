@@ -6,7 +6,7 @@ that way; this file says how to turn it on, how to test each half by hand, and �
 you are probably here for — [how to turn it off in a hurry](#turning-it-off-in-a-hurry).
 
 Nothing here is specific to one cluster except the names: namespace `caterpillar`, the
-StatefulSet `caterpillar`, Loki in `monitoring`, manifests in `caesar-deployment`.
+StatefulSet `caterpillar`, Loki in `monitoring`, manifests in `deployment`.
 
 ---
 
@@ -35,7 +35,7 @@ flight. Cancel those by hand (`kubectl exec` into the runner is not needed; edit
 `tasks/<id>/state.json` in the state repo to a terminal status, or delete the task
 directory).
 
-**All of it, now.** In `caesar-deployment`, set `remediation.enabled: false` in the
+**All of it, now.** In `deployment`, set `remediation.enabled: false` in the
 supervisor ConfigMap and let Argo sync; or, faster than a git round trip:
 
 ```bash
@@ -93,7 +93,7 @@ for an alert nobody listed in `alerts/policy.yaml`.
 Do these in order. Each step is verifiable before the next, and doing them out of order
 produces failures that look like the previous step's.
 
-### 1. RBAC and the Service port (`caesar-deployment`)
+### 1. RBAC and the Service port (`deployment`)
 
 The supervisor's ServiceAccount needs read verbs on the kinds `cluster_describe` reads plus
 `events`, in each allowlisted namespace. `npm run verify:cluster-read` prints the exact list;
@@ -317,9 +317,9 @@ alerts:
   # before the handoff threshold fired, which is a defect in the threshold arithmetic in
   # src/agent/limits.ts — code this repo owns and whose tests would show a fix.
   - alertname: CaterpillarContextOverrun
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm run check
       - npm test
@@ -337,9 +337,9 @@ alerts:
   # Three consecutive sessions with no commit, no newly passing acceptance command and no
   # journal step (§11.1) — a task going in circles. Often the task, sometimes the detector.
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm run check
       - npm test
@@ -351,7 +351,7 @@ alerts:
       not observe, or a fork-point baseline that makes the first commit invisible
       (src/supervisor/progress.ts and src/supervisor/probe.ts). Only the second one is a
       code change.
-    runbook: https://github.com/caesarakalaeii/caterpillar/blob/main/docs/remediation-runbook.md
+    runbook: https://github.com/acme/caterpillar/blob/main/docs/remediation-runbook.md
     maxOpenTasks: 1
 ```
 

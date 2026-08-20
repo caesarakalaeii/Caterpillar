@@ -3,7 +3,7 @@
  * the minted token.
  *
  *   npm run verify:github-issues -- --pem <key.pem> --app-id <id> --installation <id>
- *   npm run verify:github-issues -- ... --issue caesarakalaeii/widget#7   # also writes
+ *   npm run verify:github-issues -- ... --issue acme/widget#7   # also writes
  *
  * Read-only by default:
  *   1. an installation token mints with issues:write + metadata:read only

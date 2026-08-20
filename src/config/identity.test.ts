@@ -37,7 +37,7 @@ const BASE = {
     maxTokens: 32000,
   },
   workspaces: {
-    caesar: {
+    primary: {
       forge: { kind: "github", host: "github.com", owner: "acme", apiBase: "https://api.github.com" },
       secretRef: "caterpillar-github-app",
     },
@@ -108,9 +108,9 @@ test("the id-prefixed noreply form is accepted for a bot and for a person", asyn
   assert.equal(bot.identity.email, "316492202+caterpillar-agent[bot]@users.noreply.github.com");
 
   const person = await load({
-    identity: { name: "Caesar", email: "82340152+caesarakalaeii@users.noreply.github.com" },
+    identity: { name: "Acme Bot", email: "82340152+acme@users.noreply.github.com" },
   });
-  assert.equal(person.identity.email, "82340152+caesarakalaeii@users.noreply.github.com");
+  assert.equal(person.identity.email, "82340152+acme@users.noreply.github.com");
 });
 
 test("the rule is about github's noreply domain, not about plus addressing", async () => {

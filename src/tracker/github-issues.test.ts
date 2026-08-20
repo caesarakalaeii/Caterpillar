@@ -10,7 +10,7 @@ import {
 } from "./github-issues.ts";
 
 const API_BASE = "https://api.github.test";
-const OWNER = "caesarakalaeii";
+const OWNER = "acme";
 const TASK = asTaskId("TASK-7");
 const REF: TrackerRef = { kind: "github-issues", id: "42", container: `${OWNER}/widget` };
 
@@ -94,7 +94,7 @@ test("intake enumerates the installation instead of using the search API", async
   assert.ok(!paths(calls).some((p) => p.includes("search")));
   assert.deepEqual(paths(calls), [
     "GET installation/repositories?per_page=100&page=1",
-    "GET repos/caesarakalaeii/widget/issues?state=open&labels=agent&per_page=100&page=1",
+    "GET repos/acme/widget/issues?state=open&labels=agent&per_page=100&page=1",
   ]);
 });
 
@@ -116,7 +116,7 @@ test("pull requests are dropped from intake — every PR is also an issue", asyn
   assert.deepEqual(items[0]?.ref, {
     kind: "github-issues",
     id: "42",
-    container: "caesarakalaeii/widget",
+    container: "acme/widget",
   });
   assert.equal(items[0]?.title, "Real issue");
   assert.equal(items[0]?.url, "https://gh/42");
@@ -177,7 +177,7 @@ test("archived repos and other owners are never queried", async () => {
 
   assert.deepEqual(
     paths(calls).filter((p) => p.includes("/issues")),
-    ["GET repos/caesarakalaeii/widget/issues?state=open&labels=agent&per_page=100&page=1"],
+    ["GET repos/acme/widget/issues?state=open&labels=agent&per_page=100&page=1"],
   );
 });
 
@@ -219,7 +219,7 @@ test("comments are markdown, posted verbatim", async () => {
   const { fetch, calls } = stub(() => null);
   await tracker(fetch).comment(REF, "**bold** and a https://example.com link");
 
-  assert.deepEqual(paths(calls), ["POST repos/caesarakalaeii/widget/issues/42/comments"]);
+  assert.deepEqual(paths(calls), ["POST repos/acme/widget/issues/42/comments"]);
   assert.deepEqual(calls[0]?.body, { body: "**bold** and a https://example.com link" });
 });
 
@@ -234,9 +234,9 @@ test("claiming comments, applies wip, and stops advertising needs-human", async 
   assert.deepEqual(
     paths(calls).filter((p) => !p.includes("/labels?")),
     [
-      "POST repos/caesarakalaeii/widget/issues/42/comments",
-      "POST repos/caesarakalaeii/widget/issues/42/labels",
-      "DELETE repos/caesarakalaeii/widget/issues/42/labels/needs-human",
+      "POST repos/acme/widget/issues/42/comments",
+      "POST repos/acme/widget/issues/42/labels",
+      "DELETE repos/acme/widget/issues/42/labels/needs-human",
     ],
   );
   assert.deepEqual(calls.at(-2)?.body, { labels: ["agent-wip"] });
@@ -255,7 +255,7 @@ test("a label GitHub would have silently created is refused instead", async () =
   );
 
   // The comment still landed, so the human sees what happened.
-  assert.ok(paths(calls).includes("POST repos/caesarakalaeii/widget/issues/42/comments"));
+  assert.ok(paths(calls).includes("POST repos/acme/widget/issues/42/comments"));
   assert.ok(!paths(calls).some((p) => p.startsWith("POST") && p.endsWith("/labels")));
 });
 
@@ -275,8 +275,8 @@ test("parking removes the wip label and leaves the issue open", async () => {
   assert.deepEqual(
     paths(calls).filter((p) => !p.includes("/labels?")),
     [
-      "POST repos/caesarakalaeii/widget/issues/42/comments",
-      "DELETE repos/caesarakalaeii/widget/issues/42/labels/agent-wip",
+      "POST repos/acme/widget/issues/42/comments",
+      "DELETE repos/acme/widget/issues/42/labels/agent-wip",
     ],
   );
   assert.ok(!paths(calls).some((p) => p.startsWith("PATCH")));
@@ -295,11 +295,11 @@ test("completion closes the issue last, after the prose and the label", async ()
   assert.deepEqual(
     paths(calls).filter((p) => !p.includes("/labels?")),
     [
-      "POST repos/caesarakalaeii/widget/issues/42/comments",
-      "DELETE repos/caesarakalaeii/widget/issues/42/labels/agent-wip",
+      "POST repos/acme/widget/issues/42/comments",
+      "DELETE repos/acme/widget/issues/42/labels/agent-wip",
       // A done task is waiting on nobody, whatever it asked along the way.
-      "DELETE repos/caesarakalaeii/widget/issues/42/labels/needs-human",
-      "PATCH repos/caesarakalaeii/widget/issues/42",
+      "DELETE repos/acme/widget/issues/42/labels/needs-human",
+      "PATCH repos/acme/widget/issues/42",
     ],
   );
   assert.deepEqual(calls.at(-1)?.body, { state: "closed", state_reason: "completed" });

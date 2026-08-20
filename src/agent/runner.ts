@@ -248,7 +248,7 @@ export class AgentSessionRunner {
 
       // The last line is not decoration. `open_pr` defaults to the primary repo, so an agent
       // that does not know a sibling PR is a thing it can ask for will finish the work, push the
-      // branch, and then have nowhere to put it — which is what `GH-caesarakalaeii-all-chat-543`
+      // branch, and then have nowhere to put it — which is what `GH-acme-all-chat-543`
       // did before the tool grew a `repo` argument, and it cost a park and a hand-opened PR.
       const layout =
         checkout.siblings.size === 0
