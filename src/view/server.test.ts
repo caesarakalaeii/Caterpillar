@@ -162,9 +162,9 @@ test("the viewer forwards the identity the proxy vouched for, and fails closed w
   assert.equal(anonymous.status, 401);
   assert.equal(runner.seen.length, 0, "an unauthenticated request never reaches a runner");
 
-  const vouched = await fetch(`${url}/`, { headers: { "remote-user": "caesar" } });
+  const vouched = await fetch(`${url}/`, { headers: { "remote-user": "operator" } });
   assert.equal(vouched.status, 200);
-  assert.deepEqual(runner.seen, [{ path: "/api/fleet", user: "caesar" }]);
+  assert.deepEqual(runner.seen, [{ path: "/api/fleet", user: "operator" }]);
   assert.match(await vouched.text(), /Fix the widget/);
 });
 

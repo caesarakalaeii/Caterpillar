@@ -45,7 +45,7 @@ const BASE = {
     maxTokens: 32000,
   },
   workspaces: {
-    caesar: {
+    primary: {
       forge: {
         kind: "github",
         host: "github.com",

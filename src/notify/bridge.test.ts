@@ -591,7 +591,7 @@ test("the repo box is completed from the workspaces' repos, not from task ids", 
   // still being typed, so the name that parked a task cannot be committed to at all.
   const { bridge, calls } = harness({
     repos: {
-      reachable: () => Promise.resolve(["caesarakalaeii/Caterpillar", "caesarakalaeii/all-chat"]),
+      reachable: () => Promise.resolve(["acme/Caterpillar", "acme/all-chat"]),
     },
   });
 
@@ -607,7 +607,7 @@ test("the repo box is completed from the workspaces' repos, not from task ids", 
   const data = ack.body["data"] as { readonly choices: readonly { readonly value: string }[] };
   assert.deepEqual(
     data.choices.map((choice) => choice.value),
-    ["caesarakalaeii/all-chat"],
+    ["acme/all-chat"],
   );
 });
 

@@ -22,8 +22,8 @@
  *   time-series — of which we want one; ioredis is a single package with six small
  *   transitive dependencies and its own type declarations. It also does the two things
  *   this plane actually needs without extra code: an offline command queue with a
- *   bounded retry strategy, and a `Cluster`/Sentinel constructor for the HA deployment in
- *   `all-chat`. Pinned exactly, like every other dependency here (`.npmrc` sets
+ *   bounded retry strategy, and a `Cluster`/Sentinel constructor for an HA deployment.
+ *   Pinned exactly, like every other dependency here (`.npmrc` sets
  *   `save-exact`).
  *
  * NOTHING here logs a value. Keys are identifiers and safe to log; payloads may quote a

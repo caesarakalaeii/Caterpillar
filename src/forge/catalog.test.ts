@@ -8,11 +8,11 @@ test("every workspace's repos are offered, once each, in order", async () => {
     logger: SILENT_LOGGER,
     catalogs: [
       { reachable: () => Promise.resolve(["acme/widget", "acme/api"]) },
-      { reachable: () => Promise.resolve(["eb/eb-api", "acme/widget"]) },
+      { reachable: () => Promise.resolve(["contoso/acme-api", "acme/widget"]) },
     ],
   });
 
-  assert.deepEqual(await catalog.reachable(), ["acme/widget", "acme/api", "eb/eb-api"]);
+  assert.deepEqual(await catalog.reachable(), ["acme/widget", "acme/api", "contoso/acme-api"]);
 });
 
 test("one forge failing does not empty the box for the others", async () => {
@@ -22,11 +22,11 @@ test("one forge failing does not empty the box for the others", async () => {
     logger: SILENT_LOGGER,
     catalogs: [
       { reachable: () => Promise.reject(new Error("GitHub 500")) },
-      { reachable: () => Promise.resolve(["eb/eb-api"]) },
+      { reachable: () => Promise.resolve(["contoso/acme-api"]) },
     ],
   });
 
-  assert.deepEqual(await catalog.reachable(), ["eb/eb-api"]);
+  assert.deepEqual(await catalog.reachable(), ["contoso/acme-api"]);
 });
 
 test("a forge that never answers loses its place, not the whole suggestion", async () => {

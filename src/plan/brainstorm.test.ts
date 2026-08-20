@@ -20,7 +20,7 @@ import {
 
 const WIDGET = { host: "github.com", owner: "acme", name: "widget" } as const;
 const API = { host: "github.com", owner: "acme", name: "api" } as const;
-const EB = { host: "codeberg.org", owner: "eb", name: "api" } as const;
+const CONTOSO = { host: "codeberg.org", owner: "contoso", name: "api" } as const;
 
 const profile = (name: string, host: string, owner: string): WorkspaceProfile => ({
   name: asWorkspaceName(name),
@@ -42,33 +42,33 @@ test("a brainstorm's id is its thread, and is a usable task id", () => {
 });
 
 test("a workspace is matched on host and owner", () => {
-  const caesar = profile("caesar", "github.com", "acme");
-  const boogaloo = profile("electric-boogaloo", "codeberg.org", "eb");
+  const primary = profile("primary", "github.com", "acme");
+  const ossProfile = profile("oss", "codeberg.org", "contoso");
 
   assert.equal(
-    resolveWorkspace(workspaces(caesar, boogaloo), {
+    resolveWorkspace(workspaces(primary, ossProfile), {
       host: "codeberg.org",
-      owner: "eb",
+      owner: "contoso",
       name: "api",
     })?.name,
-    "electric-boogaloo",
+    "oss",
   );
 });
 
 test("a single configured workspace needs no matching", () => {
   // With one there is nothing to disambiguate, and refusing would make the common setup
   // the awkward one.
-  const only = profile("caesar", "github.com", "acme");
+  const only = profile("primary", "github.com", "acme");
   assert.equal(
     resolveWorkspace(workspaces(only), { host: "github.com", owner: "someone-else", name: "x" })
       ?.name,
-    "caesar",
+    "primary",
   );
 });
 
 test("an unowned repo across several workspaces is refused rather than guessed", () => {
-  const a = profile("caesar", "github.com", "acme");
-  const b = profile("electric-boogaloo", "codeberg.org", "eb");
+  const a = profile("primary", "github.com", "acme");
+  const b = profile("oss", "codeberg.org", "contoso");
 
   assert.equal(
     resolveWorkspace(workspaces(a, b), { host: "github.com", owner: "stranger", name: "x" }),
@@ -82,9 +82,9 @@ test("a repo is accepted qualified or not", () => {
     owner: "acme",
     name: "widget",
   });
-  assert.deepEqual(parseRepo("codeberg.org/eb/api"), {
+  assert.deepEqual(parseRepo("codeberg.org/contoso/api"), {
     host: "codeberg.org",
-    owner: "eb",
+    owner: "contoso",
     name: "api",
   });
   assert.equal(parseRepo("widget"), undefined);
@@ -95,7 +95,7 @@ test("a brainstorm spec declares no acceptance criteria, and says it is one", ()
   // and `kind` is what tells every other path that.
   const spec = brainstormSpec({
     id: brainstormId("42"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     topic: "Make intake accept a Linear issue",
     repos: [{ host: "github.com", owner: "acme", name: "widget" }],
     author: "operator",
@@ -113,19 +113,19 @@ test("a brainstorm spec carries every repo it was given, in order", () => {
   // working directory (§9.4.1), and plan children inherit the whole list unchanged.
   const spec = brainstormSpec({
     id: brainstormId("42"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     topic: "Split the client out of the server",
-    repos: [WIDGET, API, EB],
+    repos: [WIDGET, API, CONTOSO],
     author: "operator",
   });
 
-  assert.deepEqual(spec.repos, [WIDGET, API, EB]);
+  assert.deepEqual(spec.repos, [WIDGET, API, CONTOSO]);
 });
 
 test("the same repo named twice is one repo", () => {
   const spec = brainstormSpec({
     id: brainstormId("42"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     topic: "Split the client out of the server",
     repos: [WIDGET, API, WIDGET, { ...API }],
     author: "operator",
@@ -140,18 +140,18 @@ test("the goal names every repo the brainstorm may read", () => {
   // about is a repo it will not open, which is the whole payoff of the list going missing.
   const spec = brainstormSpec({
     id: brainstormId("42"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     topic: "Split the client out of the server",
-    repos: [WIDGET, EB],
+    repos: [WIDGET, CONTOSO],
     author: "operator",
   });
 
   assert.match(spec.goal, /acme\/widget/);
-  assert.match(spec.goal, /codeberg\.org\/eb\/api/, "a non-GitHub repo stays qualified");
+  assert.match(spec.goal, /codeberg\.org\/contoso\/api/, "a non-GitHub repo stays qualified");
   assert.match(spec.goal, /repos\/<name>/, "and it must be told where the siblings are");
 });
 
 test("a repo is named the way a human typed it", () => {
   assert.equal(qualifiedSlug(WIDGET), "acme/widget");
-  assert.equal(qualifiedSlug(EB), "codeberg.org/eb/api");
+  assert.equal(qualifiedSlug(CONTOSO), "codeberg.org/contoso/api");
 });

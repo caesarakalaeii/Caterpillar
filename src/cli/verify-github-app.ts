@@ -2,7 +2,7 @@
  * Verifies a GitHub App setup end to end, without ever printing a token.
  *
  *   npm run verify:github-app -- --pem ./caterpillar.private-key.pem \
- *     --app-id 123456 --repo caesarakalaeii/Caterpillar
+ *     --app-id 123456 --repo acme/widget
  *
  * Checks, in order:
  *   1. the PEM signs a valid App JWT

@@ -39,7 +39,7 @@ const storeAt = async (): Promise<{ subject: StateStore; root: string }> => {
 
 const SPEC: TaskSpec = {
   id: asTaskId("GH-acme-widget-12"),
-  workspace: asWorkspaceName("caesar"),
+  workspace: asWorkspaceName("primary"),
   // `readSpec` normalises the default rather than leaving it undefined, so exactly one
   // place decides what a spec without a `kind` is. `writeSpec` omits it again, which is
   // what keeps a hand-written spec free of a field nobody needs to know about.
@@ -184,14 +184,14 @@ test("the optional fields a page needs round-trip, and the digest keeps its mean
     reason: "no `agent` block",
     url: "https://github.com/acme/widget/issues/96",
     title: "the widget drops frames",
-    workspace: "caesar",
+    workspace: "primary",
   });
 
   const record = await subject.readIntakeRejection(id);
   assert.equal(record?.digest, "deadbeef");
   assert.equal(record?.url, "https://github.com/acme/widget/issues/96");
   assert.equal(record?.title, "the widget drops frames");
-  assert.equal(record?.workspace, "caesar");
+  assert.equal(record?.workspace, "primary");
 });
 
 test("listIntakeRejections reads an old-shape record beside a new-shape one", async () => {
@@ -213,7 +213,7 @@ test("listIntakeRejections reads an old-shape record beside a new-shape one", as
     reason: "no `agent` block",
     url: "https://github.com/acme/widget/issues/2",
     title: "a second item",
-    workspace: "caesar",
+    workspace: "primary",
   });
 
   // Neither of these is a task and neither is a rejection: a directory listing is whatever
@@ -577,7 +577,7 @@ test("a remediation spec with no acceptance commands is refused", async () => {
     join(subject.taskDir(task), "spec.md"),
     [
       "---",
-      "workspace: caesar",
+      "workspace: primary",
       "kind: remediation",
       "repos:",
       "  - github.com/acme/widget",
@@ -603,7 +603,7 @@ test("a remediation spec with no acceptance commands is refused", async () => {
   await mkdir(join(subject.taskDir(brainstorm)), { recursive: true });
   await writeFile(
     join(subject.taskDir(brainstorm), "spec.md"),
-    ["---", "workspace: caesar", "kind: brainstorm", "repos:", "  - github.com/acme/widget", "---", "", "# an idea", ""].join("\n"),
+    ["---", "workspace: primary", "kind: brainstorm", "repos:", "  - github.com/acme/widget", "---", "", "# an idea", ""].join("\n"),
     "utf8",
   );
   assert.deepEqual((await subject.readSpec(brainstorm)).acceptance, []);
@@ -630,7 +630,7 @@ test("readAlertPolicy parses an operator-authored policy, and still throws on a 
       "version: 1",
       "alerts:",
       "  - alertname: CaterpillarNoProgress",
-      "    workspace: caesar",
+      "    workspace: primary",
       "    repos:",
       "      - github.com/acme/widget",
       "    acceptance:",

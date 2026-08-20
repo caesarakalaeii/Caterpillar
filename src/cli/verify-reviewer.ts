@@ -2,7 +2,7 @@
  * Verifies the REVIEWER App — the second identity that approves and merges (§12.1).
  *
  *   npm run verify:reviewer -- --pem ./caterpillar-reviewer.private-key.pem \
- *     --app-id 654321 --repo caesarakalaeii/Caterpillar
+ *     --app-id 654321 --repo acme/widget
  *
  * Checks, in order:
  *   1. the PEM signs a valid App JWT and GitHub reports the App identity

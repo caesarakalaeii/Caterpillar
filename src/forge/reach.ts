@@ -16,7 +16,7 @@
  * naming the repo at fault.
  *
  * The most common cause is not a missing installation at all: it is a NAME. Someone types
- * `caesarakalaeii/allchat` for a repo called `all-chat`, and GitHub answers the mint with
+ * `acme/allchat` for a repo called `all-chat`, and GitHub answers the mint with
  * the same 422 for a repo that does not exist as for one the App cannot see — so the mint
  * cannot tell the operator which of the two it is, and the useful reply ("did you mean
  * all-chat?") needs the installation's repo list rather than the mint's refusal.
@@ -138,8 +138,8 @@ const editBudget = (name: string): number => Math.max(1, Math.min(3, Math.floor(
  * Ranked rather than first-match, and the ranking is the part that matters:
  *
  *   1. the same slug once squashed — `acme/AllChat` for `acme/all-chat`
- *   2. the same NAME once squashed, under a different owner — `caesar/all-chat` for
- *      `caesarakalaeii/all-chat`, because an owner shorthand is as common as a typo and
+ *   2. the same NAME once squashed, under a different owner — `acme/all-chat` for
+ *      `acmecorp/all-chat`, because an owner shorthand is as common as a typo and
  *      refusing without the suggestion sends the human to an installation page that was
  *      never the problem
  *   3. a name within `editBudget` edits — `widgot` for `widget`
@@ -214,7 +214,7 @@ const MAX_CHOICES = 25;
  *
  * Forgiving in exactly the way the incident was. Ranked:
  *
- *   1. the slug starts with the query — the ordinary case, `caesarakalaeii/all` narrowing
+ *   1. the slug starts with the query — the ordinary case, `acme/all` narrowing
  *   2. the query appears in it — `chat` finding `all-chat` without the owner
  *   3. the SQUASHED query appears in the squashed slug — this is the one that matters:
  *      `allchat` finds `all-chat` while it is still being typed, so the name that caused

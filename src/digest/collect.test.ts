@@ -48,7 +48,7 @@ const state = (overrides: Partial<TaskState> & Pick<TaskState, "id">): TaskState
 const SPEC = (goal: string): string =>
   [
     "---",
-    "workspace: caesar",
+    "workspace: primary",
     "repos:",
     "  - github.com/acme/widget",
     "acceptance:",

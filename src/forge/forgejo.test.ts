@@ -4,11 +4,11 @@ import { asTaskId, asWorkspaceName, type RepoRef, type TaskSpec } from "../domai
 import { ForgejoForgeFactory, MissingRepoTokenError, summariseCombinedStatus } from "./forgejo.ts";
 import { RepoOffWorkspaceError, RepoOutOfScopeError } from "./types.ts";
 
-const REPO: RepoRef = { host: "codeberg.org", owner: "ElectricBoogaloo", name: "eb-api" };
+const REPO: RepoRef = { host: "codeberg.org", owner: "Acme", name: "acme-api" };
 
 const spec = (repos: readonly RepoRef[]): TaskSpec => ({
   id: asTaskId("TASK-1"),
-  workspace: asWorkspaceName("electric-boogaloo"),
+  workspace: asWorkspaceName("oss"),
   goal: "g",
   repos,
   requires: [],
@@ -32,7 +32,7 @@ const factory = (
 test("serves the owner-wide token for a declared repo", async () => {
   // Owner-wide is the normal unit on Codeberg: these ecosystems are worked as one
   // workspace plus sibling clones, so essentially no task touches a single repo.
-  const forge = await factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO]));
+  const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));
   const credential = await forge.credential(REPO);
 
   assert.equal(credential.username, "bot");
@@ -44,7 +44,7 @@ test("serves the owner-wide token for a declared repo", async () => {
 test("a repo outside the task's spec is refused before any request", async () => {
   // The spec, not the token, is the scope boundary on Forgejo — the token cannot be
   // narrowed at use time because there is no mint step.
-  const forge = await factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO]));
+  const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));
   await assert.rejects(
     () => forge.credential({ ...REPO, name: "other" }),
     RepoOutOfScopeError,
@@ -58,7 +58,7 @@ test("a repo on another host is refused when the task is built, not when it is u
   const hostile: RepoRef = { ...REPO, host: "evil.example.com" };
 
   await assert.rejects(
-    () => factory([["ElectricBoogaloo", "tok"]]).forTask(spec([REPO, hostile])),
+    () => factory([["Acme", "tok"]]).forTask(spec([REPO, hostile])),
     RepoOffWorkspaceError,
   );
 });
@@ -72,16 +72,16 @@ test("a per-repo token overrides the owner-wide one", async () => {
   // Lets a sensitive repo carry a tighter credential without changing how the rest of
   // the ecosystem is reached.
   const forge = await factory(
-    [["ElectricBoogaloo", "broad"]],
-    [["ElectricBoogaloo/eb-api", "narrow"]],
+    [["Acme", "broad"]],
+    [["Acme/acme-api", "narrow"]],
   ).forTask(spec([REPO]));
 
   assert.equal((await forge.credential(REPO)).password, "narrow");
 
-  const sibling = { ...REPO, name: "eb-admin" };
+  const sibling = { ...REPO, name: "acme-admin" };
   const multi = await factory(
-    [["ElectricBoogaloo", "broad"]],
-    [["ElectricBoogaloo/eb-api", "narrow"]],
+    [["Acme", "broad"]],
+    [["Acme/acme-api", "narrow"]],
   ).forTask(spec([REPO, sibling]));
   assert.equal((await multi.credential(sibling)).password, "broad");
 });
@@ -181,7 +181,7 @@ const reachable = (
   );
 
 test("a repo with no configured token is unreachable, and says which secret to edit", async () => {
-  const unreachable = await reachable([["ElectricBoogaloo", "tok"]], () => {
+  const unreachable = await reachable([["Acme", "tok"]], () => {
     throw new Error("no request should be made for a repo with no token");
   }).unreachable([{ host: "codeberg.org", owner: "stranger", name: "thing" }]);
 
@@ -191,8 +191,8 @@ test("a repo with no configured token is unreachable, and says which secret to e
 });
 
 test("a repo the token cannot see is unreachable; one it can is not", async () => {
-  const factory = reachable([["ElectricBoogaloo", "tok"]], (route) =>
-    route === "/repos/ElectricBoogaloo/eb-api"
+  const factory = reachable([["Acme", "tok"]], (route) =>
+    route === "/repos/Acme/acme-api"
       ? new Response("{}", { status: 200 })
       : new Response("Not Found", { status: 404 }),
   );
@@ -200,16 +200,16 @@ test("a repo the token cannot see is unreachable; one it can is not", async () =
   assert.deepEqual(await factory.unreachable([REPO]), []);
 
   const unreachable = await factory.unreachable([
-    { host: "codeberg.org", owner: "ElectricBoogaloo", name: "eb-apy" },
+    { host: "codeberg.org", owner: "Acme", name: "acme-apy" },
   ]);
   assert.equal(unreachable.length, 1);
-  assert.match(unreachable[0]?.reason ?? "", /eb-apy/);
+  assert.match(unreachable[0]?.reason ?? "", /acme-apy/);
 });
 
 test("a forge that cannot answer THROWS rather than calling a repo unreachable", async () => {
   // Every caller fails open on a throw: a 500 from Codeberg is not evidence that a repo
   // was deleted, and turning it into one would park a task over a blip.
-  const factory = reachable([["ElectricBoogaloo", "tok"]], () => new Response("", { status: 500 }));
+  const factory = reachable([["Acme", "tok"]], () => new Response("", { status: 500 }));
   await assert.rejects(factory.unreachable([REPO]), /500/);
 });
 
@@ -218,14 +218,14 @@ test("the state repo is refused at the door, not at the mint", async () => {
     {
       apiBase: "https://codeberg.org/api/v1",
       username: "bot",
-      tokensByOwner: new Map([["caesar", "tok"]]),
+      tokensByOwner: new Map([["acme", "tok"]]),
       fetch: () => Promise.reject(new Error("no request should be needed")),
     },
-    { host: "codeberg.org", stateRepo: { host: "codeberg.org", owner: "caesar", name: "state" } },
+    { host: "codeberg.org", stateRepo: { host: "codeberg.org", owner: "acme", name: "state" } },
   );
 
   const unreachable = await factory.unreachable([
-    { host: "codeberg.org", owner: "caesar", name: "state" },
+    { host: "codeberg.org", owner: "acme", name: "state" },
   ]);
   assert.equal(unreachable.length, 1);
   assert.match(unreachable[0]?.reason ?? "", /state repo/);
@@ -234,15 +234,15 @@ test("the state repo is refused at the door, not at the mint", async () => {
 test("the catalogue is what the tokens can enumerate, narrowed to owners we hold", async () => {
   // A bot account can be a collaborator on repos this workspace holds no token for.
   // Suggesting one offers work that cannot be cloned.
-  const factory = reachable([["ElectricBoogaloo", "tok"]], (route) =>
+  const factory = reachable([["Acme", "tok"]], (route) =>
     route.startsWith("/user/repos")
       ? new Response(
           JSON.stringify(
             route.includes("page=1")
               ? [
-                  { full_name: "ElectricBoogaloo/eb-api" },
+                  { full_name: "Acme/acme-api" },
                   { full_name: "SomeoneElse/not-ours" },
-                  { full_name: "ElectricBoogaloo/eb-web" },
+                  { full_name: "Acme/acme-web" },
                 ]
               : [],
           ),
@@ -252,8 +252,8 @@ test("the catalogue is what the tokens can enumerate, narrowed to owners we hold
   );
 
   assert.deepEqual(await factory.reachable(), [
-    "ElectricBoogaloo/eb-api",
-    "ElectricBoogaloo/eb-web",
+    "Acme/acme-api",
+    "Acme/acme-web",
   ]);
 });
 
@@ -264,12 +264,12 @@ test("a token that may not list falls back to the repos it was configured for", 
     {
       apiBase: "https://codeberg.org/api/v1",
       username: "bot",
-      tokensByOwner: new Map([["ElectricBoogaloo", "tok"]]),
-      tokensByRepo: new Map([["ElectricBoogaloo/eb-api", "narrow"]]),
+      tokensByOwner: new Map([["Acme", "tok"]]),
+      tokensByRepo: new Map([["Acme/acme-api", "narrow"]]),
       fetch: () => Promise.resolve(new Response("Forbidden", { status: 403 })),
     },
     { host: "codeberg.org" },
   );
 
-  assert.deepEqual(await factory.reachable(), ["ElectricBoogaloo/eb-api"]);
+  assert.deepEqual(await factory.reachable(), ["Acme/acme-api"]);
 });

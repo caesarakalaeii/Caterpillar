@@ -28,9 +28,9 @@ const VALID = `
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm run check
       - npm test
@@ -40,10 +40,10 @@ alerts:
     runbook: https://runbooks.example.invalid/no-progress
     maxOpenTasks: 2
   - alertname: CaterpillarPodCrashLooping
-    workspace: caesar
+    workspace: primary
     repos:
-      - codeberg.org/caesar/deployment
-      - github.com/caesarakalaeii/caterpillar
+      - codeberg.org/acme/deployment
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
     requires:
@@ -86,12 +86,12 @@ test("a valid multi-entry document parses into normalised entries", () => {
   ];
 
   assert.equal(first.alertname, "CaterpillarNoProgress");
-  assert.equal(first.workspace, "caesar");
+  assert.equal(first.workspace, "primary");
   // Repo refs come back as `RepoRef`, not strings: everything downstream — the token
   // scope, the worktree layout — works in refs, and parsing here is what stops a
   // malformed ref reaching the point where it becomes a clone URL.
   assert.deepEqual(first.repos, [
-    { host: "github.com", owner: "caesarakalaeii", name: "caterpillar" },
+    { host: "github.com", owner: "acme", name: "caterpillar" },
   ]);
   assert.deepEqual(first.acceptance, ["npm run check", "npm test"]);
   assert.deepEqual(first.requires, []);
@@ -119,9 +119,9 @@ test("an entry with no `acceptance` key is refused, naming the field", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
 `,
     /CaterpillarNoProgress/,
     /`acceptance`/,
@@ -136,9 +136,9 @@ test("an entry with an empty `acceptance` list is refused too", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance: []
 `,
     /CaterpillarNoProgress/,
@@ -159,9 +159,9 @@ test("a misspelled key fails loudly instead of producing an entry with no criter
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptence:
       - npm test
 `,
@@ -194,9 +194,9 @@ test("an unknown capability is refused, listing the ones that exist", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
     requires:
@@ -222,15 +222,15 @@ test("a duplicate alertname is refused rather than resolved last-wins", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/other
+      - github.com/acme/other
     acceptance:
       - npm run check
 `,
@@ -259,9 +259,9 @@ test("a malformed repo ref is refused before it can become a clone URL", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - "https://github.com/caesarakalaeii/caterpillar.git"
+      - "https://github.com/acme/caterpillar.git"
     acceptance:
       - npm test
 `,
@@ -277,7 +277,7 @@ test("an entry with no repos at all is refused", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos: []
     acceptance:
       - npm test
@@ -296,9 +296,9 @@ test("an unquoted command YAML read as a mapping is refused, not dropped", () =>
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
       - foo: bar
@@ -315,9 +315,9 @@ test("an entry broken before it has an alertname is located by index", () => {
     `
 version: 1
 alerts:
-  - workspace: caesar
+  - workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
 `,
@@ -331,9 +331,9 @@ test("`maxOpenTasks` must be a positive integer", () => {
 version: 1
 alerts:
   - alertname: CaterpillarNoProgress
-    workspace: caesar
+    workspace: primary
     repos:
-      - github.com/caesarakalaeii/caterpillar
+      - github.com/acme/caterpillar
     acceptance:
       - npm test
     maxOpenTasks: ${value}
@@ -364,7 +364,7 @@ test("an empty or absent-alerts document is an empty policy, not an error", () =
 test("lookupPolicy misses cleanly on an alert nobody opted in", () => {
   const policy = parsePolicy(VALID);
 
-  assert.equal(lookupPolicy(policy, "CaterpillarNoProgress")?.workspace, "caesar");
+  assert.equal(lookupPolicy(policy, "CaterpillarNoProgress")?.workspace, "primary");
   // Undefined, not a throw and not a default entry: an unlisted alert is simply not
   // handled, and the receiver's answer to it is "nothing to do" rather than an error.
   assert.equal(lookupPolicy(policy, "SomeOtherThingFiring"), undefined);

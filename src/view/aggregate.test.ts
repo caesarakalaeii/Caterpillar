@@ -223,12 +223,12 @@ test("the identity the proxy vouched for is forwarded on every fan-out request",
 
   await aggregatorWith(fetcherFor(answers, { seen })).fleet({
     path: "/api/fleet",
-    user: "caesar",
+    user: "operator",
   });
 
   assert.equal(seen.length, 4);
   for (const headers of seen) {
-    assert.equal(headers.get("remote-user"), "caesar", "every replica, not just the first");
+    assert.equal(headers.get("remote-user"), "operator", "every replica, not just the first");
   }
 
   // And an anonymous request forwards nothing at all: inventing an identity would be this

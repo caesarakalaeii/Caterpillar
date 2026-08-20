@@ -25,7 +25,7 @@ const store = async (): Promise<StateStore> => {
 
 const spec = (id: string, goal: string): TaskSpec => ({
   id: asTaskId(id),
-  workspace: asWorkspaceName("caesar"),
+  workspace: asWorkspaceName("primary"),
   kind: "implement",
   goal,
   repos: [{ host: "github.com", owner: "acme", name: "widget" }],
@@ -87,9 +87,9 @@ const CONFIG: RunnerConfig = {
   },
   workspaces: new Map([
     [
-      asWorkspaceName("caesar"),
+      asWorkspaceName("primary"),
       {
-        name: asWorkspaceName("caesar"),
+        name: asWorkspaceName("primary"),
         forge: { kind: "github", host: "github.com", owner: "acme", apiBase: "https://api.github.com" },
         tracker: { kind: "github-issues", apiBase: "https://api.github.com", ingestLabel: "agent" },
         secretRef: "caterpillar-github-app",
@@ -457,7 +457,7 @@ test("intakeView gathers the four things that explain a pickup that did not happ
     reason: "no `agent` block",
     url: "https://github.com/acme/widget/issues/724",
     title: "please fix the widget",
-    workspace: "caesar",
+    workspace: "primary",
   });
   await subject.writeAlertRefusal("aa01", {
     fingerprint: "aa01",

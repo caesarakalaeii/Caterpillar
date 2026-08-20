@@ -1,5 +1,5 @@
 /**
- * GitHub Issues tracker for the `caesar` workspace. See DESIGN.md §9.5, §14.
+ * GitHub Issues tracker, for a workspace whose forge is GitHub. See DESIGN.md §9.5, §14.
  *
  * Auth: the workspace's existing GitHub App, minted installation-wide with
  * `issues: write` and `metadata: read` and nothing else — see `trackerTokenSource`.

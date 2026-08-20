@@ -11,7 +11,12 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE: caesarakalaeii/caterpillar
+  # Derived, never spelled out: a fork must publish to ITS OWN namespace or the build
+  # fails at push with a permission error that names a registry path the forker has
+  # never heard of. `github.repository` is `owner/name`, which is exactly the GHCR
+  # path, and `docker/metadata-action` lowercases it — GHCR rejects an uppercase
+  # component, and the repo name here has one.
+  IMAGE: ${{ github.repository }}
 
 jobs:
   check:

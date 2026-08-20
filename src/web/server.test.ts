@@ -70,9 +70,9 @@ const config = (over: Partial<RunnerConfig["web"]> = {}): RunnerConfig => ({
   },
   workspaces: new Map([
     [
-      asWorkspaceName("caesar"),
+      asWorkspaceName("primary"),
       {
-        name: asWorkspaceName("caesar"),
+        name: asWorkspaceName("primary"),
         forge: { kind: "github", host: "github.com", owner: "acme", apiBase: "https://api.github.com" },
         secretRef: "caterpillar-github-app",
       },
@@ -127,7 +127,7 @@ const state = (id: string, over: Partial<TaskState> = {}): TaskState => ({
 
 const spec = (id: string, goal: string): TaskSpec => ({
   id: asTaskId(id),
-  workspace: asWorkspaceName("caesar"),
+  workspace: asWorkspaceName("primary"),
   kind: "implement",
   goal,
   repos: [{ host: "github.com", owner: "acme", name: "widget" }],
@@ -390,9 +390,9 @@ test("with requireForwardedUser, a request that did not come through the proxy i
   const bare = await fetch(`${harness.url}/`);
   assert.equal(bare.status, 401);
 
-  const proxied = await fetch(`${harness.url}/`, { headers: { "remote-user": "caesar" } });
+  const proxied = await fetch(`${harness.url}/`, { headers: { "remote-user": "operator" } });
   assert.equal(proxied.status, 200);
-  assert.match(await proxied.text(), /caesar/, "the page names who it thinks you are");
+  assert.match(await proxied.text(), /operator/, "the page names who it thinks you are");
 });
 
 test("healthz answers even when a forwarded user is required, or the probe fails", async () => {
@@ -501,7 +501,7 @@ test("/intake renders the refusals nobody could see, and /api/intake says the sa
     reason: "no `agent` block",
     url: "https://github.com/acme/widget/issues/724",
     title: "please fix the widget",
-    workspace: "caesar",
+    workspace: "primary",
   });
 
   const response = await fetch(`${harness.url}/intake`);
@@ -559,6 +559,6 @@ test("/intake is refused a write and refused an unauthenticated request, like ev
   const anonymous = await fetch(`${harness.url}/intake`);
   assert.equal(anonymous.status, 401);
 
-  const vouched = await fetch(`${harness.url}/intake`, { headers: { "remote-user": "caesar" } });
+  const vouched = await fetch(`${harness.url}/intake`, { headers: { "remote-user": "operator" } });
   assert.equal(vouched.status, 200);
 });

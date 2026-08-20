@@ -165,13 +165,13 @@ test("a response without total_count is trusted as complete", () => {
  * Reachability (DESIGN.md §9.1).
  *
  * The 422 these cover cost a real brainstorm its whole session: `/brainstorm
- * caesarakalaeii/allchat` for a repo called `all-chat` reached `git clone --mirror`
+ * acme/allchat` for a repo called `all-chat` reached `git clone --mirror`
  * before anything noticed, and the message named the installation rather than the repo.
  */
 const REPO_LIST = [
-  "caesarakalaeii/Caterpillar",
-  "caesarakalaeii/all-chat",
-  "caesarakalaeii/all-chat-extension",
+  "acme/Caterpillar",
+  "acme/all-chat",
+  "acme/all-chat-extension",
 ];
 
 const github = (
@@ -215,13 +215,13 @@ test("a repo the App cannot see is named, and the near miss is offered", async (
   const { factory } = github(installationServer(REPO_LIST));
 
   const unreachable = await factory.unreachable([
-    { host: "github.com", owner: "caesarakalaeii", name: "allchat" },
+    { host: "github.com", owner: "acme", name: "allchat" },
   ]);
 
   assert.equal(unreachable.length, 1);
   const reason = unreachable[0]?.reason ?? "";
-  assert.match(reason, /caesarakalaeii\/allchat/, "the refusal must name the repo asked for");
-  assert.match(reason, /caesarakalaeii\/all-chat/, "and the one the App can actually see");
+  assert.match(reason, /acme\/allchat/, "the refusal must name the repo asked for");
+  assert.match(reason, /acme\/all-chat/, "and the one the App can actually see");
   assert.match(reason, /installed/, "and say what to do about it if the name was right");
 });
 
@@ -230,8 +230,8 @@ test("repos the App can see are not reported, and one listing serves them all", 
 
   assert.deepEqual(
     await factory.unreachable([
-      { host: "github.com", owner: "caesarakalaeii", name: "Caterpillar" },
-      { host: "github.com", owner: "caesarakalaeii", name: "all-chat" },
+      { host: "github.com", owner: "acme", name: "Caterpillar" },
+      { host: "github.com", owner: "acme", name: "all-chat" },
     ]),
     [],
   );
@@ -239,7 +239,7 @@ test("repos the App can see are not reported, and one listing serves them all", 
   // Twice over, to prove the TTL cache holds: intake and the claim loop both ask, and a
   // request per repo per pass against a 5000/hour installation budget is what §14.2 is
   // already rationing.
-  await factory.unreachable([{ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }]);
+  await factory.unreachable([{ host: "github.com", owner: "acme", name: "all-chat" }]);
 
   const listings = routes.filter((route) => route.includes("/installation/repositories"));
   assert.equal(listings.length, 1, `one listing, not ${listings.length}: ${routes.join(", ")}`);
@@ -249,11 +249,11 @@ test("a miss is confirmed against a FRESH listing before it becomes a refusal", 
   // The cache is five minutes wide, and a repo created a minute ago is not in it. Refusing
   // on a stale absence would tell a human their brand-new repo does not exist — so a miss
   // costs one re-read, which the hit path never pays.
-  let installed: readonly string[] = ["caesarakalaeii/Caterpillar"];
+  let installed: readonly string[] = ["acme/Caterpillar"];
   const { factory, routes } = github((route) => installationServer(installed)(route));
 
   const first = await factory.unreachable([
-    { host: "github.com", owner: "caesarakalaeii", name: "brand-new" },
+    { host: "github.com", owner: "acme", name: "brand-new" },
   ]);
   assert.equal(first.length, 1, "genuinely absent, on two readings");
   assert.equal(
@@ -263,9 +263,9 @@ test("a miss is confirmed against a FRESH listing before it becomes a refusal", 
   );
 
   // The App is installed on it a moment later. No waiting out the TTL.
-  installed = ["caesarakalaeii/Caterpillar", "caesarakalaeii/brand-new"];
+  installed = ["acme/Caterpillar", "acme/brand-new"];
   assert.deepEqual(
-    await factory.unreachable([{ host: "github.com", owner: "caesarakalaeii", name: "brand-new" }]),
+    await factory.unreachable([{ host: "github.com", owner: "acme", name: "brand-new" }]),
     [],
   );
 });
@@ -278,7 +278,7 @@ test("a repo on another forge is refused as off-workspace, not as uninstalled", 
   const { factory, routes } = github(installationServer(REPO_LIST));
 
   const unreachable = await factory.unreachable([
-    { host: "codeberg.org", owner: "eb", name: "eb-api" },
+    { host: "codeberg.org", owner: "contoso", name: "acme-api" },
   ]);
 
   assert.equal(unreachable.length, 1);
@@ -298,7 +298,7 @@ test("an installation whose repo list cannot be read THROWS rather than refusing
   });
 
   await assert.rejects(
-    factory.unreachable([{ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }]),
+    factory.unreachable([{ host: "github.com", owner: "acme", name: "all-chat" }]),
     /500/,
   );
 });
@@ -311,11 +311,11 @@ test("a listing truncated by the page cap throws rather than inventing an absenc
       return { token: "ghs_metadata", expires_at: new Date(Date.now() + 3_600_000).toISOString() };
     }
     // Claims far more repos than it ever returns, so the loop runs out of pages.
-    return { total_count: 5000, repositories: [{ full_name: "caesarakalaeii/all-chat" }] };
+    return { total_count: 5000, repositories: [{ full_name: "acme/all-chat" }] };
   });
 
   await assert.rejects(
-    factory.unreachable([{ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }]),
+    factory.unreachable([{ host: "github.com", owner: "acme", name: "all-chat" }]),
     /repositor/,
   );
 });
@@ -343,15 +343,15 @@ test("a 422 from the mint names the repo at fault, not just the installation", a
 
   const forge = await factory.forTask({
     id: asTaskId("BS-1539331435477860432"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     goal: "g",
-    repos: [{ host: "github.com", owner: "caesarakalaeii", name: "allchat" }],
+    repos: [{ host: "github.com", owner: "acme", name: "allchat" }],
     requires: [],
     acceptance: [],
   });
 
   await assert.rejects(
-    forge.credential({ host: "github.com", owner: "caesarakalaeii", name: "allchat" }),
+    forge.credential({ host: "github.com", owner: "acme", name: "allchat" }),
     (error: Error) => {
       assert.match(error.message, /allchat/, "the 422 must name the repo it was asked for");
       assert.match(error.message, /all-chat/, "and the near miss that explains it");
@@ -372,15 +372,15 @@ test("a 422 the installation listing cannot explain still says what it can", asy
 
   const forge = await factory.forTask({
     id: asTaskId("TASK-422"),
-    workspace: asWorkspaceName("caesar"),
+    workspace: asWorkspaceName("primary"),
     goal: "g",
-    repos: [{ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }],
+    repos: [{ host: "github.com", owner: "acme", name: "all-chat" }],
     requires: [],
     acceptance: [],
   });
 
   await assert.rejects(
-    forge.credential({ host: "github.com", owner: "caesarakalaeii", name: "all-chat" }),
+    forge.credential({ host: "github.com", owner: "acme", name: "all-chat" }),
     /not installed/,
   );
 });

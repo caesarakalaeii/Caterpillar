@@ -86,7 +86,7 @@ export interface AlertRefusal {
  * shape widens and never narrows.
  *
  * `url`, `title` and `workspace` are here because the task id cannot be turned back into
- * any of them: `GH-caesarakalaeii-all-chat-724` does not say where the owner ends and the
+ * any of them: `GH-acme-all-chat-724` does not say where the owner ends and the
  * repo begins, so a page keyed on these records could otherwise show a reason and no link
  * to the thing being refused.
  */

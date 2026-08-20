@@ -27,7 +27,7 @@ import { StateStore } from "../state/store.ts";
 import type { Tracker, TrackerItem, TrackerTransition } from "../tracker/types.ts";
 import { Ingester, intakeDue, intakeRef } from "./ingest.ts";
 
-const WORKSPACE = asWorkspaceName("caesar");
+const WORKSPACE = asWorkspaceName("primary");
 const roots: string[] = [];
 
 after(async () => {
@@ -294,7 +294,7 @@ test("an unreachable tracker does not stop another workspace's intake", async ()
   const subject = ingesterFor(
     store,
     new Map([
-      [asWorkspaceName("electric-boogaloo"), broken],
+      [asWorkspaceName("oss"), broken],
       [WORKSPACE, working],
     ]),
   );
@@ -331,7 +331,7 @@ test("a tracker that cannot be listed is counted, not silently dropped", async (
   const { store } = await stateRepo();
   const subject = ingesterFor(
     store,
-    new Map([[asWorkspaceName("electric-boogaloo"), new FakeTracker([], true)]]),
+    new Map([[asWorkspaceName("oss"), new FakeTracker([], true)]]),
   );
 
   assert.deepEqual(await subject.ingest("origin", "main"), {
@@ -428,7 +428,7 @@ test("a refusal record carries what a page needs to link to the item", async () 
   const record = await store.readIntakeRejection(asTaskId("GH-acme-widget-12"));
   assert.equal(record?.url, "https://github.com/acme/widget/issues/12");
   assert.equal(record?.title, "Fix the widget");
-  assert.equal(record?.workspace, "caesar");
+  assert.equal(record?.workspace, "primary");
 });
 
 test("adding the page's fields does not re-comment on an item already refused", async () => {
@@ -476,14 +476,14 @@ test("every decision reaches the observer, so Grafana can count them", async () 
   });
 
   await subject.ingest("origin", "main");
-  assert.deepEqual(observed.sort(), ["caesar:created", "caesar:rejected"]);
+  assert.deepEqual(observed.sort(), ["primary:created", "primary:rejected"]);
   assert.deepEqual(items, [2]);
 
   // The second pass is the normal case: the created task is skipped and the refused one is
   // suppressed, and `skipped` must be its own outcome rather than folded into either.
   observed.length = 0;
   await subject.ingest("origin", "main");
-  assert.deepEqual(observed, ["caesar:skipped", "caesar:skipped"]);
+  assert.deepEqual(observed, ["primary:skipped", "primary:skipped"]);
   assert.deepEqual(items, [2, 2], "the gauge is published even when nothing changes");
 });
 

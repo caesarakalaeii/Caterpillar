@@ -4,9 +4,9 @@ import { parseStateRepoUrl, tokenGitEnv } from "./credential.ts";
 import { Git } from "./git.ts";
 
 test("a state repo URL parses into a repo ref", () => {
-  assert.deepEqual(parseStateRepoUrl("https://github.com/caesarakalaeii/caterpillar-state.git"), {
+  assert.deepEqual(parseStateRepoUrl("https://github.com/acme/caterpillar-state.git"), {
     host: "github.com",
-    owner: "caesarakalaeii",
+    owner: "acme",
     name: "caterpillar-state",
   });
   assert.deepEqual(parseStateRepoUrl("https://github.com/o/n"), {
@@ -20,7 +20,7 @@ test("an ssh state repo URL is refused", () => {
   // The token authenticates as an HTTP header. Over ssh git would ignore it and fall
   // back to whatever key the host has — on a machine runner, the operator's own.
   assert.throws(
-    () => parseStateRepoUrl("git@github.com:caesarakalaeii/caterpillar-state.git"),
+    () => parseStateRepoUrl("git@github.com:acme/caterpillar-state.git"),
     /must be https/,
   );
 });

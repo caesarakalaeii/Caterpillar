@@ -217,12 +217,12 @@ test("/brainstorm takes several repos, separated by commas or by spaces", () => 
 });
 
 test("/brainstorm keeps a fully qualified repo qualified", () => {
-  assert.deepEqual(parseInteraction(brainstorm("port it", "acme/widget, codeberg.org/eb/api")), {
+  assert.deepEqual(parseInteraction(brainstorm("port it", "acme/widget, codeberg.org/contoso/api")), {
     kind: "run",
     command: {
       kind: "brainstorm",
       topic: "port it",
-      repos: ["acme/widget", "codeberg.org/eb/api"],
+      repos: ["acme/widget", "codeberg.org/contoso/api"],
     },
   });
 });

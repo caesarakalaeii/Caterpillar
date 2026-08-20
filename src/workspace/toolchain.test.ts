@@ -709,7 +709,7 @@ test("the store quota reaches nix as min-free/max-free, in bytes", async () => {
 
 test("the quota is on by default, because an unbounded store fills a node", async () => {
   // Deliberately unlike the caches, which default to empty. A workstation runner filling
-  // a laptop's disk is the same failure as a replica filling caesar2, with a shorter fuse.
+  // a laptop's disk is the same failure as a replica filling a cluster node, with a shorter fuse.
   const resolved = await new ToolchainResolver({
     logger: SILENT_LOGGER,
     config: DEFAULT_TOOLCHAIN_CONFIG,
