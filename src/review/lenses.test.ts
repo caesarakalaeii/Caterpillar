@@ -16,7 +16,7 @@ import {
   TEST_FIRST_STANDARD,
   WRITING_STANDARD,
 } from "../agent/standards.ts";
-import { PLAN_LENSES, PR_LENSES } from "./lenses.ts";
+import { PLAN_LENSES, PR_LENSES, SABOTAGE_LENS, prLenses } from "./lenses.ts";
 
 test("every reviewer is told when not to block", () => {
   // The council's expensive failure is not a missed bug, it is three reviewers sending a
@@ -76,6 +76,61 @@ test("every lens is told to finish with submit_verdict", () => {
   for (const lens of [...PR_LENSES, ...PLAN_LENSES]) {
     assert.match(lens.prompt, /submit_verdict/, lens.key);
   }
+});
+
+test("the sabotage lens is convened only when the diff touches source", () => {
+  // A documentation-only diff has nothing to break, and convening a reviewer that can
+  // only abstain costs a concurrent session and a copy of the checkout.
+  assert.deepEqual(
+    prLenses(true).map((l) => l.key),
+    ["correctness", "design", "tests", "fit", "sabotage"],
+  );
+  assert.deepEqual(
+    prLenses(false).map((l) => l.key),
+    ["correctness", "design", "tests", "fit"],
+  );
+});
+
+test("the sabotage lens is not a standing member of the council", () => {
+  // `PR_LENSES` is what every other caller convenes. Adding it there would put a
+  // writable copy of the checkout behind every documentation change.
+  assert.ok(!PR_LENSES.includes(SABOTAGE_LENS));
+});
+
+test("the sabotage lens went through the shared factory", () => {
+  // Hand-rolling its preamble would drop the blocking bar and the abstention rule that
+  // every other reviewer is held to.
+  assert.ok(SABOTAGE_LENS.prompt.includes(REVIEW_STANDARD));
+  assert.match(SABOTAGE_LENS.prompt, /submit_verdict/);
+});
+
+test("no reviewer is told how many reviewers there are", () => {
+  // The count was baked into the preamble as "four". A fifth lens makes it false for
+  // every reviewer, and a reviewer that has miscounted its peers misjudges its own scope.
+  for (const lens of [...PR_LENSES, ...PLAN_LENSES, SABOTAGE_LENS]) {
+    assert.ok(!lens.prompt.includes("one of four independent reviewers"), lens.key);
+  }
+});
+
+test("the sabotage lens overrides the shared instruction not to re-run the suite", () => {
+  // It inherits `SHARED`, which forbids exactly the thing it exists to do. Without an
+  // explicit override the reviewer obeys the preamble and abstains every time.
+  assert.ok(
+    SABOTAGE_LENS.prompt.includes("do not run the test suite\nagain to confirm it"),
+    "the shared instruction is no longer inherited; update the override phrase too",
+  );
+  assert.ok(SABOTAGE_LENS.prompt.includes("does not apply to this lens"));
+  assert.ok(SABOTAGE_LENS.prompt.includes("re-running it is the entire method"));
+  assert.ok(SABOTAGE_LENS.prompt.includes("whether it FAILS when it should"));
+});
+
+test("the sabotage lens blocks on a sabotage the suite misses, and abstains otherwise", () => {
+  assert.ok(SABOTAGE_LENS.prompt.includes("a test that does not test"));
+  assert.ok(SABOTAGE_LENS.prompt.includes("could not complete the review"));
+  assert.ok(
+    SABOTAGE_LENS.prompt.includes("not a defect in the change"),
+    "an unrunnable copy must not be reported as a fault in the diff",
+  );
 });
 
 test("a plan reviewer is not handed the code-health standard", () => {
