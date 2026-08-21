@@ -6,18 +6,26 @@
  * commands exit 0 and that CI is green. The council is the third gate, and the only one
  * that reads the change rather than its outcome.
  *
- * The reviewers run CONCURRENTLY in the task's existing worktree. They share it, which
- * is safe because none of them can write: the tool surface is `read`, `bash` and
+ * The read-only reviewers run CONCURRENTLY in the task's existing worktree. They share it,
+ * which is safe because none of them can write: their tool surface is `read`, `bash` and
  * `submit_verdict`, with no `write`, no `edit`, and none of the implementation agent's
  * control verbs. A reviewer cannot open a PR, cannot claim completion, and cannot hand
  * off; its whole output is one typed verdict.
  *
+ * The `sabotage` lens is the exception, and the only one: it breaks the changed source on
+ * purpose to find out whether the tests notice, so it gets `write` and `edit` — in a
+ * PRIVATE copy of the checkout, never in the shared one. `reviewerPlan` below is where
+ * that distinction is decided, and it is pure so that it can be tested without a session.
+ *
  * Nothing here decides anything. It gathers their verdicts and hands them to `decide`,
  * which is pure and is where the rule actually lives.
  */
+import { join } from "node:path";
 import {
   createBashTool,
+  createEditTool,
   createReadTool,
+  createWriteTool,
   NodeExecutionEnv,
   type AgentHarnessTool,
   type AgentTool,
@@ -45,7 +53,13 @@ import type { WorktreeManager } from "../workspace/worktree.ts";
 import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
-import { PLAN_LENSES, PR_LENSES, type Lens } from "./lenses.ts";
+import { PLAN_LENSES, prLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
+import {
+  prepareSabotageCopy,
+  SabotageExecutionEnv,
+  type PrepareOptions,
+  type PrepareResult,
+} from "./sabotage.ts";
 import { renderEvidence, testFirstEvidence, type Commit } from "./tdd.ts";
 import { submitVerdictTool, type VerdictSink } from "./tools.ts";
 
@@ -67,6 +81,114 @@ const bindTool = <TParameters extends TSchema, TDetails>(
   ): Promise<AgentToolResult<TDetails>> =>
     tool.execute(toolCallId, params, signal, onUpdate, context),
 });
+
+export interface ReviewerPlanInput {
+  readonly lensKey: string;
+  /** The shared, read-only task checkout. Every reviewer but `sabotage` works here. */
+  readonly worktree: string;
+  /** The private copy, when one was prepared. Only `sabotage` may be pointed at it. */
+  readonly sabotageCopy?: string;
+  /** `limits.sabotageMaxCommands`. Applied to the sabotage reviewer only. */
+  readonly maxCommands: number;
+}
+
+export interface ReviewerPlan {
+  readonly cwd: string;
+  /** pi's own tool names, in the order the tools are built. */
+  readonly toolNames: readonly string[];
+  /** Set only for the sabotage reviewer, whose loop is otherwise unbounded. */
+  readonly maxCommands?: number;
+}
+
+/** What every reviewer gets, and what only the sabotage reviewer gets on top. */
+const READ_ONLY_TOOLS = ["read", "bash", "submit_verdict"] as const;
+const SABOTAGE_TOOLS = ["read", "bash", "write", "edit", "submit_verdict"] as const;
+
+/**
+ * Where a reviewer works and what it may do there. Pure, and exported to be tested.
+ *
+ * All of it is one decision — read-only in the shared worktree, or writable in a private
+ * copy — and it is extracted rather than inlined into `runReviewer` because `runReviewer`
+ * needs a provider, a toolchain and a session to reach, and the decision needs none of
+ * those. A test of this function is a test of the rule; a test of `runReviewer` against a
+ * hand-built fake session would mostly be a test of the fake.
+ *
+ * Throws for a sabotage reviewer with no copy. That is the one outcome that must be
+ * impossible: `write` and `edit` in the shared worktree reach the checkout the other four
+ * reviewers are reading concurrently, and would rewrite the very diff they are grading.
+ * `runReviewer` turns the throw into an abstention, which is the honest reading — the lens
+ * did not review anything.
+ */
+export const reviewerPlan = (input: ReviewerPlanInput): ReviewerPlan => {
+  if (input.lensKey !== SABOTAGE_LENS.key) {
+    return { cwd: input.worktree, toolNames: READ_ONLY_TOOLS };
+  }
+
+  if (input.sabotageCopy === undefined) {
+    throw new Error(
+      "refusing to run the sabotage reviewer: no private copy was prepared, and it must " +
+        "never be given write access to the shared worktree",
+    );
+  }
+
+  return {
+    cwd: input.sabotageCopy,
+    toolNames: SABOTAGE_TOOLS,
+    maxCommands: input.maxCommands,
+  };
+};
+
+/**
+ * A round with the sabotage lens dropped, and the abstention that says why.
+ *
+ * A copy that could not be made is not a defect in the change under review, so it must not
+ * fail the council — and it must not silently vanish either, or a review round with four
+ * lenses would be indistinguishable from one with five. The lens leaves the round and its
+ * reason is recorded as an abstention, which `decide` already counts separately from an
+ * approval.
+ */
+export const sabotageAbstentionFor = (
+  lenses: readonly Lens[],
+  reason: string,
+): { readonly lenses: readonly Lens[]; readonly verdicts: readonly ReviewerVerdict[] } => {
+  const dropped = lenses.filter((lens) => lens.key === SABOTAGE_LENS.key);
+
+  return {
+    lenses: lenses.filter((lens) => lens.key !== SABOTAGE_LENS.key),
+    verdicts: dropped.map((lens) => abstention(lens, reason)),
+  };
+};
+
+/**
+ * Run `body` with a sabotage copy prepared, and remove the copy whatever happens.
+ *
+ * The try/finally is here, in a function of its own, because that is what makes the
+ * guarantee testable: `convene` needs a provider and five concurrent sessions to reach,
+ * and "the copy is removed even when a reviewer throws" is the property least likely to be
+ * exercised by a passing run and most expensive to get wrong — a leaked copy is a whole
+ * second checkout of the task, per review round, on a volume up to four replicas share.
+ *
+ * `body` is handed the same discriminated shape `prepare` returned, minus `cleanup`, so it
+ * cannot forget the refused case and cannot remove the copy out from under this `finally`.
+ */
+export type SabotageCopy =
+  | { readonly ok: true; readonly path: string }
+  | { readonly ok: false; readonly reason: string };
+
+export const withSabotageCopy = async <T>(
+  prepare: (options: PrepareOptions) => Promise<PrepareResult>,
+  options: PrepareOptions,
+  body: (copy: SabotageCopy) => Promise<T>,
+): Promise<T> => {
+  const prepared = await prepare(options);
+  if (!prepared.ok) return body({ ok: false, reason: prepared.reason });
+
+  try {
+    return await body({ ok: true, path: prepared.path });
+  } finally {
+    await prepared.cleanup();
+  }
+};
 
 export interface CouncilResult {
   readonly verdict: CouncilVerdict;
@@ -97,6 +219,16 @@ export interface ReviewCouncilOptions {
   readonly toolchain: ToolchainResolver;
   /** Overridable so a future plan council can supply its own (DESIGN.md §12.1). */
   readonly lenses?: readonly Lens[];
+  /**
+   * How the sabotage reviewer's private copy is made. Defaults to the real thing.
+   *
+   * A seam, not a feature: `prepareSabotageCopy` shells out to `cp -a` on a whole checkout
+   * and rewrites git pointer files, so a test of what the council does with its ANSWER —
+   * drop the lens on a refusal, remove the copy on a throw — cannot afford to call it. This
+   * repo does not use module mocking and `npm test` does not enable it, so the substitution
+   * has to be a constructor argument.
+   */
+  readonly prepareSabotage?: typeof prepareSabotageCopy;
 }
 
 export class ReviewCouncil implements Council {
@@ -116,7 +248,9 @@ export class ReviewCouncil implements Council {
       base === undefined ? [] : await this.options.worktrees.commitsSince(checkout.root, base);
 
     return this.convene(
-      this.options.lenses ?? PR_LENSES,
+      // `touchesSource` is the "is there anything to break" question, already answered here
+      // for the evidence block the prompt carries.
+      this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
       checkout.root,
       reviewPrompt(spec, state, base, commits),
       spec,
@@ -139,6 +273,55 @@ export class ReviewCouncil implements Council {
   private async convene(
     lenses: readonly Lens[],
     worktree: string,
+    prompt: string,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<CouncilResult> {
+    // The sabotage lens needs somewhere to write before any reviewer starts, and there is
+    // exactly one copy for the round. A refusal drops the lens rather than failing the
+    // council, and `withSabotageCopy` removes the copy whichever way the round ends.
+    if (!lenses.some((lens) => lens.key === SABOTAGE_LENS.key)) {
+      return this.round(lenses, [], worktree, undefined, prompt, spec, state);
+    }
+
+    const prepare = this.options.prepareSabotage ?? prepareSabotageCopy;
+    return withSabotageCopy(
+      prepare,
+      {
+        checkoutRoot: worktree,
+        taskDir: join(this.options.config.paths.tasks, spec.id),
+        // NOT `config.toolchain.minFreeGb`: that is the nix store's GC threshold, where 0
+        // is a documented off switch, and reusing it would disable this floor on every
+        // runner with store collection turned off.
+        minFreeGb: this.options.config.limits.sabotageMinFreeGb,
+        logger: this.options.logger,
+        task: spec.id,
+      },
+      async (copy) => {
+        if (!copy.ok) {
+          const round = sabotageAbstentionFor(lenses, copy.reason);
+          return this.round(
+            round.lenses,
+            round.verdicts,
+            worktree,
+            undefined,
+            prompt,
+            spec,
+            state,
+          );
+        }
+        return this.round(lenses, [], worktree, copy.path, prompt, spec, state);
+      },
+    );
+  }
+
+  /** One convened round, with the sabotage copy (if any) already prepared. */
+  private async round(
+    lenses: readonly Lens[],
+    /** Verdicts for lenses that never ran, merged in before `decide`. */
+    dropped: readonly ReviewerVerdict[],
+    worktree: string,
+    sabotageCopy: string | undefined,
     prompt: string,
     spec: TaskSpec,
     state: TaskState,
@@ -178,14 +361,22 @@ export class ReviewCouncil implements Council {
     try {
       results = await Promise.all(
         lenses.map((lens) =>
-          this.runReviewer(lens, worktree, prompt, spec, toolchain, deadline.signal),
+          this.runReviewer(
+            lens,
+            worktree,
+            sabotageCopy,
+            prompt,
+            spec,
+            toolchain,
+            deadline.signal,
+          ),
         ),
       );
     } finally {
       clearTimeout(timer);
     }
 
-    const verdict = decide(results.map((r) => r.verdict));
+    const verdict = decide([...dropped, ...results.map((r) => r.verdict)]);
     const usage = results.reduce<UsageTotals>((total, r) => addUsage(total, r.usage), EMPTY_USAGE);
     // Any of them is enough: the reviewers share one account, so one that could not
     // reach the provider is a statement about all of them.
@@ -214,6 +405,8 @@ export class ReviewCouncil implements Council {
   private async runReviewer(
     lens: Lens,
     worktree: string,
+    /** The sabotage reviewer's private copy, when the round has one. */
+    sabotageCopy: string | undefined,
     prompt: string,
     spec: TaskSpec,
     toolchain: ResolvedEnv,
@@ -237,23 +430,46 @@ export class ReviewCouncil implements Council {
     // A reviewer is told the suite has already passed and not to run it again; it ran it
     // anyway, which is the whole argument for the ceiling living here rather than in a
     // prompt.
-    const execContext: ExecContext = {
-      env: new BoundedExecutionEnv({
-        cwd: worktree,
+    try {
+      // Everything that differs between the read-only lenses and the sabotage one, decided
+      // in one pure place. It throws for a sabotage reviewer with no copy, and inside this
+      // `try` that becomes an abstention rather than a council failure.
+      const plan = reviewerPlan({
+        lensKey: lens.key,
+        worktree,
+        ...(sabotageCopy === undefined ? {} : { sabotageCopy }),
+        maxCommands: config.limits.sabotageMaxCommands,
+      });
+      const envOptions = {
+        cwd: plan.cwd,
         shellPath: toolchain.shell,
         shellEnv: toolchain.env,
         timeoutSeconds: config.limits.commandTimeoutSeconds,
         logger,
         task: spec.id,
-      }),
-    };
-    const tools: AgentTool[] = [
-      bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
-      bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,
-      submitVerdictTool(sink, control) as AgentTool,
-    ];
+      };
+      const execContext: ExecContext = {
+        env:
+          plan.maxCommands === undefined
+            ? new BoundedExecutionEnv(envOptions)
+            : new SabotageExecutionEnv({ ...envOptions, maxCommands: plan.maxCommands }),
+      };
+      // Selected by `plan.toolNames`, in the order the plan lists them, so the tools the
+      // plan says a lens gets and the tools it actually holds cannot drift apart — which is
+      // what makes testing the plan worth anything.
+      const writable = plan.toolNames.includes("write");
+      const tools: AgentTool[] = [
+        bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
+        bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,
+        ...(writable
+          ? [
+              bindTool(createWriteTool<ExecContext>(), execContext) as AgentTool,
+              bindTool(createEditTool<ExecContext>(), execContext) as AgentTool,
+            ]
+          : []),
+        submitVerdictTool(sink, control) as AgentTool,
+      ];
 
-    try {
       const result = await runSession({
         // A reviewer is a session and gets a session's ceiling. Nothing bounded this
         // before, and the reviewers run concurrently under `Promise.all` — so one
@@ -261,7 +477,9 @@ export class ReviewCouncil implements Council {
         timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${lens.prompt}\n\nYour working directory is ${worktree}.`,
+        // `plan.cwd`, not `worktree`: a sabotage reviewer told the shared path would `cd`
+        // out of its copy and edit the checkout the other four are reading.
+        systemPrompt: `${lens.prompt}\n\nYour working directory is ${plan.cwd}.`,
         initialPrompt: prompt,
         tools,
         budget: new ContextBudget({
