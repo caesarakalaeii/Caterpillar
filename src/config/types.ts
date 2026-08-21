@@ -114,6 +114,32 @@ export interface LimitsConfig {
    * only the gate was protected.
    */
   readonly commandTimeoutSeconds: number;
+  /**
+   * Shell commands the sabotage reviewer may run in total (DESIGN.md §12.1).
+   *
+   * `commandTimeoutSeconds` above bounds one command; nothing bounds how MANY. This
+   * reviewer's whole job is breaking the changed source and running the acceptance suite
+   * again to see whether the tests notice, so it is the one reviewer that loops, and
+   * without a cap it can spend the entire `maxSessionSeconds` doing it.
+   *
+   * Defaults to 40: enough for a handful of sabotage-and-rerun cycles plus the reading and
+   * `git` work around them, and far short of a suite run in a loop.
+   */
+  readonly sabotageMaxCommands: number;
+  /**
+   * Free disk, in GiB, that must remain on the filesystem holding the work root before a
+   * sabotage copy of the task's checkout is attempted.
+   *
+   * The reviewer needs a private copy so the breakage it introduces never reaches the
+   * branch — and a checkout with `node_modules` is hundreds of megabytes, on a volume up to
+   * four replicas share. Below this floor the copy is skipped rather than allowed to fill
+   * the volume out from under every other task on the host.
+   *
+   * Defaults to 5, roughly ten times a large checkout, so the copy is refused while there
+   * is still room for the sessions already running. 0 is a legitimate "no floor" for a dev
+   * machine with one replica and nothing to fill.
+   */
+  readonly sabotageMinFreeGb: number;
 }
 
 export interface StateRepoConfig {
