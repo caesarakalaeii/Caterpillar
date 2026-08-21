@@ -2973,6 +2973,13 @@ both produced a session that could only fail:
   in-slot wait resolves it and a fresh session cannot: the session is not the thing that
   was missing, time was.
 
+  Why that window is minutes rather than seconds, for anyone later tuning
+  `limits.ciSettleSeconds`: `.github/workflows/build-and-push.yml` triggers on `push` to
+  `'**'`, and its `build` job is skipped only for `pull_request` events. A push to an
+  agent branch therefore runs the two `check` matrix legs *and* a buildx image build and
+  registry push, and the image build dominates the wall time. The budget has to cover the
+  slowest check on the branch, not the length of the test suite.
+
   **Known residual, deliberately left:** the release carries no not-before, and
   `isClaimable` accepts `ready` immediately, so an idle runner re-claims the task on the
   very next poll. CI that stays pending *longer than the whole settle budget* therefore
