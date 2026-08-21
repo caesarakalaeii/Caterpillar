@@ -3111,13 +3111,47 @@ rejection read `failing: check (22), check (26), check (26), check (22)` — fou
 two broken jobs, which invites the reader to hunt for a difference between them. There is
 none; they are the same two jobs reported twice.
 
+**A fifth, found while trying to explain the fourth's own red CI: the acceptance command
+could not fail.** `npm test` ran `node --test --test-force-exit`, and force-exit tears the
+process down as soon as the root test settles, discarding the results of tests still
+reporting from other files. The numbering closes over the gap and `fail` stays 0, so this
+suite reported 1425, 1428, 1440 or its true 1441 tests run to run — always losing the tail
+of `src/cluster/preflight.test.ts` from the *middle* of the stream — and exited 0 every
+time. A test that never ran was indistinguishable from a test that passed.
+
+The journal had already noticed the symptom twice and filed it as cosmetic: "`npm test`
+registers 1421 or 1431 tests run to run … harmless to the gate". It was not harmless and it
+was not the reporter. `npm test` is an acceptance command (§12), so it is one of the three
+things that decide whether a task is done; a gate that cannot fail certifies nothing, and a
+session whose work is waved through by it is a session whose defect surfaces later, to
+someone with less context.
+
+Force-exit is gone. It was added as a hang backstop — a hung test once held CI open for
+twenty minutes — so removing it required the hang to still be caught, and `--test-timeout`
+alone catches it: a leaked-handle test is reported `cancelled` and the run exits 1, checked
+on node 22 against three deliberately hanging files including the original incident's exact
+shape. Force-exit turned out to be the weaker of the two, not the stronger: with stdout
+piped it reported that same hanging file as a **pass with exit 0**. The suite is now
+deterministic, at unchanged speed. `--test-concurrency=1` also stabilised it, and was
+rejected — 47% more wall time to narrow a race rather than remove it.
+
+Belt and braces, in `src/testing/run-report.ts`: the run is judged against a known test
+count, so a result lost for some other reason — a file that fails to load registers nothing
+at all — cannot read as a pass either. The floor is a hand-maintained constant rather than
+a high-water mark on disk, because a self-updating floor ratchets down the first time a run
+truncates, which is exactly the failure it is there to catch. Note that a timed-out test
+reports `cancelled`, not `fail`, so a check that only reads `fail` would miss the hang.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
 these and parked the work later instead of sooner. The fourth adds a corollary about the
 evidence rather than the limit: **a gate that rejects work must say what it saw.** A
 verdict the next session cannot act on spends a session to rediscover it, and three of
-those park the task.
+those park the task. The fifth adds its converse: **a gate that accepts work must have been
+able to reject it.** A green that cannot go red is not evidence, and a number in a summary
+that nobody has checked against a known total is not either — twice it was seen varying and
+twice it was called harmless.
 
 **The `ask_human` exemption above is not an exception to that rule, and it matters that it
 is not.** The rule forbids making the detector less sensitive to hide a defect upstream of
