@@ -2984,6 +2984,30 @@ what the last session did rather than on what was committed, and it is the omiss
 not the ambient variable — that stranded `BS-…-07`. The `NODE_ENV` strip is still right,
 and is kept, but it is a fix for the *next* repo rather than an account of this one.
 
+**A third one, found while verifying the fixes for the first two, and it is a lesson about
+evidence rather than about code.** The branch carrying them had `check (26)` go red, so the
+completion claim was rejected and another session started — on a branch whose acceptance
+commands passed. Three sessions went looking for a defect in node 26. There was none.
+
+The red was a **flaky test added by the first fix**, and the matrix leg was a coin toss:
+the same test took `check (22)` red on the next commit, with a green run in between. It
+asserted on a state that is transient by design — a task released back to `ready` is
+re-claimed on the very next iteration, so the window is one `claimNext` wide and an
+observer polling every 100ms steps straight over it. It now waits for the *commit* the
+release pushes instead: history only grows, so the assertion can be late without being
+wrong.
+
+Two rules come out of it, and the second is the expensive one:
+
+- **A red check on one matrix leg that reproduces on neither locally is evidence of a
+  race, not of a version.** Nothing version-specific can produce a green run on the same
+  leg two commits later. Reading it as "node 26 is broken" cost a session that could not
+  execute the failing leg at all and therefore could not have concluded anything.
+- **Assert on what is durable, not on what is momentary.** A test that watches for a
+  transient state is a test that fails on whichever machine is busiest, and it will be
+  read as a defect in the code under review — which is precisely the "session with
+  nothing to do" this whole section is about, manufactured by the fix for it.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
