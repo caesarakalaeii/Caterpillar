@@ -1554,6 +1554,92 @@ test("/resume clears the no-progress streak, or the task parks again without run
   );
 });
 
+test("a session that stops to ask a human does not report a no-progress streak", async () => {
+  // CaterpillarTaskThrashing, fingerprint 76f2ff229fea37b1, 2026-08-21.
+  //
+  // BS-1540279100223127564-01's session 3 was a completion claim the verifier rejected
+  // (streak 1). Session 4 read the rejection, worked out that its acceptance list ran
+  // the WHOLE frontend's lint while the task owned only a slice of the errors, and asked
+  // a human — which is the correct move and the only one available. The probe scored it
+  // no-progress, the streak reached 2, and the alert fired against a task that had been
+  // sitting in `awaiting-human` with nothing running for hours.
+  //
+  // Both halves are asserted, because either one alone still fires the alert: the STATE
+  // must not carry the streak, and the GAUGE Prometheus scrapes must agree with it.
+  // `metrics.noProgress.set` in `recordSession` was the gauge's only writer, so a task
+  // that stopped running kept reporting its last streak until the pod restarted.
+  const ASKED = asTaskId("ASK-1");
+  await seedTask(ASKED, {
+    status: "ready",
+    sessions: 3,
+    progress: { lastProgressSession: 2, noProgressStreak: 1 },
+  });
+
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "ask-human",
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "The acceptance list lints the whole app. Whose errors are mine?",
+          summary: "the acceptance list cannot be satisfied from inside this task's scope",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    // No commit: the session spent itself reading and reasoning, exactly as session 4 did.
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // `awaiting-human` is durable — nothing reclaims it without a human — so unlike the
+  // transient `ready` this can be waited for without racing the loop.
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(ASKED);
+    if (state?.status === "awaiting-human") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "awaiting-human", "the question must have been filed");
+  assert.equal(settled?.sessions, 4, "the session still counts against the session budget");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    1,
+    "asking a human is neither progress nor a stall — the streak must be left where it was",
+  );
+  assert.match(
+    metrics.render(),
+    /caterpillar_no_progress_streak\{[^}]*task="ASK-1"[^}]*\} 1/,
+    "the scraped gauge must agree with the state, or the alert fires on a number nothing holds",
+  );
+});
+
 test("a git failure in the poll loop is logged and retried, not fatal", async () => {
   // `store.pull`, `applyChatRequests`, `maybeIngest`, `survey` and `claimNext` all sat
   // OUTSIDE any try — only `workTask` was wrapped. `Git.run` throws on every non-zero
