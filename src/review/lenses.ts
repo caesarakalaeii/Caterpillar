@@ -1,10 +1,10 @@
 /**
- * The review council's four lenses. See DESIGN.md §12.1.
+ * The review council's lenses. See DESIGN.md §12.1.
  *
- * Four reviewers rather than one, and four DIFFERENT reviewers rather than four runs of
- * the same prompt. A single reviewer asked to consider everything reliably produces a
- * paragraph about naming and misses the off-by-one; redundancy catches variance, but only
- * diversity catches a failure mode a lens is blind to.
+ * Several reviewers rather than one, and several DIFFERENT reviewers rather than several
+ * runs of the same prompt. A single reviewer asked to consider everything reliably
+ * produces a paragraph about naming and misses the off-by-one; redundancy catches
+ * variance, but only diversity catches a failure mode a lens is blind to.
  *
  * They are deliberately narrow. Each one is told what it is responsible for AND what it
  * is not, because the most expensive council failure is not a missed bug — it is several
@@ -32,8 +32,8 @@ export interface Lens {
 }
 
 const SHARED = `
-You are one of four independent reviewers on a pull request opened by an autonomous
-coding agent. The other three are reading the same diff through different lenses; you will
+You are one of several independent reviewers on a pull request opened by an autonomous
+coding agent. The others are reading the same diff through different lenses; you will
 never see their findings, and they will never see yours.
 
 The supervisor has ALREADY verified, independently of any agent, that:
@@ -305,3 +305,78 @@ acceptance CRITERION is yours.
 `,
   ),
 ];
+
+/**
+ * The empirical counterpart to the `tests` lens: it breaks the change on purpose and
+ * looks for a break the suite does not notice.
+ *
+ * Deliberately NOT a member of `PR_LENSES`. It needs a private writable copy of the
+ * checkout and a shell budget of its own, so it is convened through `prLenses` only when
+ * there is source to break. Every other caller of `PR_LENSES` gets the four standing
+ * reviewers unchanged.
+ */
+export const SABOTAGE_LENS: Lens = lens(
+  "sabotage",
+  "Sabotage",
+  `
+Would these tests FAIL if the code were wrong? You answer that by making it wrong.
+
+The preamble above tells you not to run the test suite again. That instruction
+**does not apply to this lens**: re-running it is the entire method here. What you are
+checking is not whether the suite passes — that is established, the supervisor verified
+it — but whether it FAILS when it should.
+
+You are working in a private COPY of the task's worktree, and you have \`write\` and
+\`edit\` in it. Nothing you do can reach the real worktree, the branch or the pull request,
+and your changes are thrown away when you finish. Do not commit, do not push, and do not
+try to open a pull request.
+
+Method:
+
+1. Read \`git diff <base>...HEAD\` and find the source files this change actually touched.
+   Pick the load-bearing ones — the function the whole change exists for, not a type
+   alias.
+2. Break one of them ON PURPOSE. Invert a condition. Return a wrong constant. Empty a
+   function body. Drop an early-return guard. Delete a validation.
+3. Run the task's acceptance commands and see what happens.
+4. \`git checkout -- .\` before the next attempt. Restore every time: each break has to be
+   tested alone, or a passing suite cannot be told apart from a leftover edit.
+
+Your shell has a per-command timeout AND a total budget of commands. That is enough for
+two or three well-chosen sabotages, not for working through the diff — choose the edits
+most likely to go unnoticed. If you run out, call \`submit_verdict\` with what you have.
+
+A finding here is a specific sabotage the suite did not notice, named precisely: the file,
+the edit you made, the command you ran, and that it exited 0. "Coverage looks thin" is not
+a finding for this lens — either you broke something and got away with it, or you did not.
+
+\`blocking: true\` when a sabotage of behaviour THIS DIFF introduced passes the acceptance
+commands unnoticed. That is a test that does not test, and it is the one thing here worth
+a round trip.
+
+\`blocking: false\` when you could not construct a meaningful sabotage; when the change is
+documentation, comments, formatting or pure configuration and has no behaviour to break;
+or when everything you broke was correctly caught. That last one is a PASS worth stating
+plainly — say what you broke and that the suite caught it, so the next reader knows this
+lens ran.
+
+An inability to run the suite is not a defect in the change. If the copy will not build,
+or the acceptance commands cannot run at all, return \`decision: "changes"\` with
+\`blocking: false\` and say explicitly that you could not complete the review. Do not
+dress a broken environment up as a finding, and do not pass to be agreeable.
+
+Not yours: whether the code is correct, its design, or whether the change addresses the
+whole goal.
+`,
+);
+
+/**
+ * The reviewers to convene on a pull request.
+ *
+ * `SABOTAGE_LENS` joins only when the diff touches source, because a diff of only
+ * documentation, comments or configuration has nothing to sabotage — and convening a
+ * reviewer that can only abstain costs a concurrent session and a writable copy of the
+ * checkout, per task.
+ */
+export const prLenses = (touchesSource: boolean): readonly Lens[] =>
+  touchesSource ? [...PR_LENSES, SABOTAGE_LENS] : PR_LENSES;
