@@ -2972,6 +2972,17 @@ both produced a session that could only fail:
   pending verdict and the green one was 3–7 minutes in every case, which is why a bounded
   in-slot wait resolves it and a fresh session cannot: the session is not the thing that
   was missing, time was.
+
+  **Known residual, deliberately left:** the release carries no not-before, and
+  `isClaimable` accepts `ready` immediately, so an idle runner re-claims the task on the
+  very next poll. CI that stays pending *longer than the whole settle budget* therefore
+  still spends a session per claim cycle, and three such cycles still park the task —
+  `BS-…-07`'s exact shape, roughly twenty minutes slower each time round. The observed
+  gaps were 3–7 minutes against a 20-minute budget, so this is not the case that fired;
+  fixing it properly means giving a released task an earliest-claim time, which is a
+  change to the claim/release cycle rather than to this gate, and it is not made here.
+  Anyone who sees a task park with green CI and an `awaiting CI` commit in its history
+  should start with that.
 - **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
   image sets it (correctly — that image installed with `--omit=dev`), but it is
   process-wide and every agent session and acceptance command is a child of the

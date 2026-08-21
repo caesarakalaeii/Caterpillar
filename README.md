@@ -331,7 +331,9 @@ awkward, the change is probably wrong.
     a queue — three times, each session truthfully scored no-progress. Pending is now its
     own answer: the gate waits it out in the same session slot
     (`limits.ciSettleSeconds`, bounded) and otherwise releases the task *without* running
-    a session. Separately, the supervisor image's own `NODE_ENV=production` was inherited
+    a session — though a release carries no earliest-claim time, so CI pending for longer
+    than the whole budget still costs a session per cycle (§11.1 records why that residual
+    is left). Separately, the supervisor image's own `NODE_ENV=production` was inherited
     by every acceptance command, so `npm ci` skipped devDependencies and `npm run check`
     died with `tsc: command not found` — an acceptance list no agent could satisfy from
     inside the repo. `ToolchainResolver` strips that one value at the single point every
