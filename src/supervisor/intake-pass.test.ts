@@ -72,6 +72,8 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
     maxReviewRounds: 3,
     maxSessionSeconds: 3600,
     commandTimeoutSeconds: 900,
+    sabotageMaxCommands: 40,
+    sabotageMinFreeGb: 5,
   },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
