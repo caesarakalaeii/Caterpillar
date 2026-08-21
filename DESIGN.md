@@ -3076,10 +3076,48 @@ Two rules come out of it, and the second is the expensive one:
   read as a defect in the code under review — which is precisely the "session with
   nothing to do" this whole section is about, manufactured by the fix for it.
 
+**A fourth, and it is the one that made the third expensive: the gate said a job was red
+and never said why.** `summarise` in `github-app.ts` read three fields of a check-run —
+`status`, `conclusion`, `name` — so a rejection was `CI is red — failing: check (26)` and
+nothing more. That is the whole of what the next session gets to act on, and it cannot get
+more on its own: the agent holds no forge credential (§9.2), the image has no `gh` or
+`curl`, the unauthenticated API 404s on a private repo, and the App has no `actions: read`
+by deliberate choice. So the only moves left are to re-prove the tree green or to change
+code blind, and both produce a session with no commit — the detector then scores that
+honestly, and the opacity has manufactured the streak.
+
+It is recorded three times over. `ALERT-6155db6ffb83deff` spent session 2 proving one tree
+green five ways against a leg the machine cannot execute ("Node 26 is not available on this
+machine") and session 7 concluding "the red is unexplained from here";
+`BS-1539163866305658891-07` records "four sessions were burned on blind changes to a
+GitGuardian issue that turned out to be dashboard triage". The rule above — a red leg that
+reproduces nowhere is a race, not a version — is the correct reading, and none of those
+sessions could reach it, because the message they were handed contained no information to
+read either way.
+
+GitHub was returning the answer all along, in the same response the names come from:
+`output.title`/`output.summary` and `html_url` per check-run, under the `checks: read`
+permission the App already holds. Those are now declared and used — title before summary
+(for an Actions job the title is the one-line verdict; the summary can run to pages), first
+line only, name alone where a run offers neither. The job log itself is still out of reach
+and stays that way: fetching it needs `actions: read`, and "no admin, no workflows" is a
+stated property of this App rather than an oversight. A link a human can follow is the
+honest substitute, and quoting it in an `ask_human` is the right move for a red leg the
+container cannot run.
+
+The same change deduplicates by job name. `push: ['**']` and `pull_request` both trigger
+the workflow, so every job has two check-runs at one sha: `ALERT-76f2ff229fea37b1`'s own
+rejection read `failing: check (22), check (26), check (26), check (22)` — four entries for
+two broken jobs, which invites the reader to hunt for a difference between them. There is
+none; they are the same two jobs reported twice.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
-these and parked the work later instead of sooner.
+these and parked the work later instead of sooner. The fourth adds a corollary about the
+evidence rather than the limit: **a gate that rejects work must say what it saw.** A
+verdict the next session cannot act on spends a session to rediscover it, and three of
+those park the task.
 
 **The `ask_human` exemption above is not an exception to that rule, and it matters that it
 is not.** The rule forbids making the detector less sensitive to hide a defect upstream of
