@@ -2927,6 +2927,44 @@ the thing that finally stopped the spend-limit retry storm on 2026-08-15, by par
 task — which is the right mechanism reaching the wrong conclusion about the wrong actor,
 and exactly the kind of evidence that makes a park unreadable.
 
+**A session that ended in `ask_human` is neutral: neither progress nor a stall.** It is
+the one exit reason that is, and the reason is the charter above — the question is whether
+the *agent* is going in circles, and an agent that established it needs a decision only a
+human can make is not. §7 says it plainly: "Nothing is running while you think."
+
+§7 half-conceded this already, by clearing the streak when an **answer** arrives, on the
+grounds that `awaiting-human` is only ever reached from a session that produced no commit.
+That fixes the park and not the reading. Between the question and the answer — which is
+hours, because the whole point is that a human is asleep or busy — the task carries a
+streak it did not earn, and `caterpillar_no_progress_streak` reports it. That is how
+`BS-1540279100223127564-01` fired `CaterpillarTaskThrashing` on 2026-08-21: session 3 was
+a completion claim the verifier rejected and scored a stall honestly (streak 1); session 4
+read the rejection, worked out that its acceptance list runs the whole frontend's lint
+while the task owns only a slice of the reported errors, and asked. Streak 2, alert firing,
+and nothing running on the task for the next four hours. A task waiting **too long** on a
+human is a real problem and §11 already gives it its own alert (`awaiting-human > 24h`),
+which is about a human rather than about the code.
+
+Neutral rather than forgiving, deliberately. Clearing the streak here would hand an agent
+a way to reset the detector on demand — stall, ask anything, get answered, stall again —
+so a streak earned by other sessions survives an `ask_human` untouched. Evidence still
+wins over the exit reason: a session that commits real work and *then* discovers it needs
+a decision moved the task forward, and is scored as progress. `handoff` is deliberately
+not exempt: it is how most sessions end and says nothing about what was achieved, so
+exempting it would blind the detector to the exact failure it exists for.
+
+**The gauge is a claim about right now, and nothing expires it.** `recordSession` was the
+only writer of `caterpillar_no_progress_streak{task=...}`, while three other sites forgive
+the streak in state (an answer, guidance, a resume) and a parked or finished task stops
+having sessions at all. So the series reported a number the state no longer held for as
+long as the pod lived — `BS-1540252370968117339-04` reached streak 2 and then merged its
+PR, and went on reporting 2. Since this is an **alerting** rule, a stale sample is not
+cosmetic: it pages somebody about work that is over. Every forgiveness now publishes, and
+`transition` **removes** the series when a task reaches a terminal status — the state keeps
+the streak, because it is the record of why the task parked, but the gauge stops claiming
+there is a session to measure. Removed rather than zeroed: 0 is a real reading, meaning a
+task that is making progress.
+
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
 exists — the point the task branch forked from. Both halves are load-bearing:
@@ -3042,6 +3080,20 @@ The rule all of them share: **when a task parks for no progress, suspect the ses
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
 these and parked the work later instead of sooner.
+
+**The `ask_human` exemption above is not an exception to that rule, and it matters that it
+is not.** The rule forbids making the detector less sensitive to hide a defect upstream of
+it; the exemption says a particular kind of session was never evidence of circling in the
+first place, which is a statement about what the metric *means*. The test is whether the
+change loses information: raising the limit to 4 would have let every defect in this
+section through, whereas nothing that an `ask_human` session could tell you about a
+thrashing agent is lost — the task is parked on a human either way, and §11's
+`awaiting-human > 24h` is the alert that says so. The upstream defect in
+`BS-1540279100223127564-01`'s case is still real and still unfixed by any of this: **an
+acceptance list that grades the whole repository cannot be satisfied by a task that owns
+part of it**, and a wave of sibling tasks cut from one plan will each be handed the same
+repo-wide `lint` gate. That belongs to §14's plan materialisation, not here, and the
+symptom to look for is a task whose acceptance output names files it never touched.
 
 ### 11.2 The Discord webhook
 

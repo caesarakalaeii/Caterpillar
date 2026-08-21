@@ -41,7 +41,7 @@ test("progress resets the streak and advances the high-water mark", () => {
     committed: true,
     acceptanceImproved: false,
     stepCompleted: false,
-  });
+  }, "handoff");
   assert.deepEqual(record, { lastProgressSession: 5, noProgressStreak: 0 });
 });
 
@@ -50,7 +50,7 @@ test("no progress increments the streak but preserves the high-water mark", () =
     committed: false,
     acceptanceImproved: false,
     stepCompleted: false,
-  });
+  }, "handoff");
   // lastProgressSession stays at 2 so the journal can show how long it has stalled,
   // not merely that it is stalled now.
   assert.deepEqual(record, { lastProgressSession: 2, noProgressStreak: 2 });
