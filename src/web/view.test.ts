@@ -72,7 +72,15 @@ const CONFIG: RunnerConfig = {
   usage: { intervalHours: 1, deadlineSeconds: 120 },
   lease: { heartbeatSeconds: 60, staleAfterSeconds: 300 },
   handoff: { thresholdFraction: 0.7 },
-  limits: { maxSessionsPerTask: 20, noProgressLimit: 3, maxReviewRounds: 3, maxSessionSeconds: 14_400, commandTimeoutSeconds: 900 },
+  limits: {
+    maxSessionsPerTask: 20,
+    noProgressLimit: 3,
+    maxReviewRounds: 3,
+    maxSessionSeconds: 14_400,
+    commandTimeoutSeconds: 900,
+    sabotageMaxCommands: 40,
+    sabotageMinFreeGb: 5,
+  },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
   llm: {

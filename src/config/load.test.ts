@@ -443,3 +443,56 @@ test("a misspelled mode fails the boot rather than quietly connecting twice", as
   await assert.rejects(() => load({ bot: { mode: "" } }), ConfigError);
   await assert.rejects(() => load({ bot: { port: "9091" } }), ConfigError);
 });
+
+/**
+ * The sabotage reviewer's two budgets in `limits` (DESIGN.md §12.1).
+ *
+ * Both exist to bound a reviewer that copies a checkout and then runs a test suite over
+ * and over. The defaults are the whole setting for every operator who never writes them
+ * down, so they are asserted exactly rather than "is a number": an undefined leaking
+ * through the parse would satisfy a looser assertion and hand the reviewer no budget at
+ * all.
+ */
+test("a config that says nothing about sabotage budgets takes the documented defaults", async () => {
+  const config = await load({});
+
+  assert.equal(config.limits.sabotageMaxCommands, 40);
+  assert.equal(config.limits.sabotageMinFreeGb, 5);
+});
+
+test("both sabotage budgets can be set", async () => {
+  const config = await load({ limits: { sabotageMaxCommands: 12, sabotageMinFreeGb: 25 } });
+
+  assert.equal(config.limits.sabotageMaxCommands, 12);
+  assert.equal(config.limits.sabotageMinFreeGb, 25);
+});
+
+test("a command budget that cannot run a single command is refused", async () => {
+  // A reviewer convened with a budget of zero can only abstain, which spends a fifth
+  // session on every task and reports nothing. Refused at boot instead.
+  const names = async (over: Record<string, unknown>): Promise<void> => {
+    await assert.rejects(
+      () => load(over),
+      (error: unknown) =>
+        error instanceof ConfigError && /limits\.sabotageMaxCommands/.test(error.message),
+    );
+  };
+
+  await names({ limits: { sabotageMaxCommands: 0 } });
+  await names({ limits: { sabotageMaxCommands: -1 } });
+  // Half a command is a typo, not a budget.
+  await names({ limits: { sabotageMaxCommands: 2.5 } });
+});
+
+test("a negative disk floor is refused, but zero is a legitimate no-floor", async () => {
+  await assert.rejects(
+    () => load({ limits: { sabotageMinFreeGb: -1 } }),
+    (error: unknown) =>
+      error instanceof ConfigError && /limits\.sabotageMinFreeGb/.test(error.message),
+  );
+
+  // Unlike `toolchain.minFreeGb`, 0 means "copy regardless" — the right answer on a dev
+  // machine with one replica and no volume to fill.
+  const config = await load({ limits: { sabotageMinFreeGb: 0 } });
+  assert.equal(config.limits.sabotageMinFreeGb, 0);
+});

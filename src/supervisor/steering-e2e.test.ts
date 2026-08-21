@@ -155,6 +155,8 @@ const world = async (tasks: readonly TaskState[]): Promise<World> => {
         maxReviewRounds: 3,
         maxSessionSeconds: 3600,
         commandTimeoutSeconds: 900,
+        sabotageMaxCommands: 40,
+        sabotageMinFreeGb: 5,
       },
       log: { level: "info" },
       intake: { intervalSeconds: 300 },

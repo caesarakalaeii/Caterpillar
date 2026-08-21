@@ -63,6 +63,8 @@ interface RawConfig {
     readonly maxReviewRounds?: unknown;
     readonly maxSessionSeconds?: unknown;
     readonly commandTimeoutSeconds?: unknown;
+    readonly sabotageMaxCommands?: unknown;
+    readonly sabotageMinFreeGb?: unknown;
   };
   readonly toolchain?: {
     readonly nixpkgs?: unknown;
@@ -509,6 +511,32 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     throw new ConfigError("concurrency must be a whole number of at least 1");
   }
 
+  // Hoisted out of the `limits` block below so they can be validated before they are used.
+  // Both are refused rather than clamped, for the same reason `concurrency` is: the only
+  // reading of either is "a budget", so a number that is not one is a typo, and correcting
+  // it silently leaves an operator believing they set something they did not.
+  const sabotageMaxCommands = num(
+    raw.limits?.sabotageMaxCommands,
+    "limits.sabotageMaxCommands",
+    40,
+  );
+  if (!Number.isInteger(sabotageMaxCommands) || sabotageMaxCommands < 1) {
+    throw new ConfigError(
+      `limits.sabotageMaxCommands (${sabotageMaxCommands}) must be a whole number of at ` +
+        `least 1 — a sabotage reviewer that cannot run a command can only abstain, and it ` +
+        `would do so once per task with a full session spent on it`,
+    );
+  }
+
+  // 0 is allowed here, unlike `toolchain.minFreeGb`: it is the honest "copy regardless" for
+  // a single-replica machine with no shared volume to fill.
+  const sabotageMinFreeGb = num(raw.limits?.sabotageMinFreeGb, "limits.sabotageMinFreeGb", 5);
+  if (sabotageMinFreeGb < 0) {
+    throw new ConfigError(
+      `limits.sabotageMinFreeGb (${sabotageMinFreeGb}) cannot be negative`,
+    );
+  }
+
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
@@ -601,6 +629,8 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         "limits.commandTimeoutSeconds",
         15 * 60,
       ),
+      sabotageMaxCommands,
+      sabotageMinFreeGb,
     },
     llm: llmConfig(llm),
     workspaces,
