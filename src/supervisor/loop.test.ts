@@ -4747,3 +4747,86 @@ test("CI that has not finished releases the task instead of spending a session o
   // spin sessions against a CI queue, which is what `settled.sessions` pins down.
   assert.ok(sessions >= 1, "the session that made the claim must have run");
 });
+
+test("the pending-CI release commits its own files, not a sibling slot's", async (t) => {
+  // The release above writes a journal shard, transitions state and pushes. That trio is a
+  // unit for the reason `Supervisor.unit` documents: `StateStore.stageCommitPush` stages the
+  // whole writable tree when no hold is held, and `transition("running")` deliberately leaves
+  // an uncommitted `state.json` for EVERY in-flight task for the whole of its session. So an
+  // unwrapped release commits a running sibling's state under `chore(<id>): awaiting CI`, and
+  // that sibling's own commit later finds a clean tree and records nothing.
+  //
+  // Asserted on the committed FILE LIST, like "two slots writing state at once": the damage is
+  // silent. Nothing throws, both pushes succeed, and the state that reaches the remote is even
+  // correct — what is wrong is which commit carries it, and only `--name-only` shows that.
+  const WAITING = asTaskId("CONC-CI-WAIT");
+  const RUNNING = asTaskId("CONC-CI-RUN");
+  await seedTask(WAITING, { pr: { number: 13, url: "https://example.invalid/pr/13" } });
+  await seedTask(RUNNING);
+
+  // The sibling hangs, which is precisely the production shape: it is mid-session, so its
+  // `state.json` has been written and left uncommitted. A finished sibling would commit its
+  // own files and prove nothing.
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const claiming = new Set<TaskId>();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: (spec, state, signal) => {
+        // Only the waiting task claims completion; the other one hangs, holding its slot.
+        if (spec.id !== WAITING) return sessions.runner.run(spec, state, signal);
+        claiming.add(spec.id);
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Wait for the sibling to be genuinely mid-session before reading the release, so its
+  // uncommitted `state.json` is actually in the tree at the moment the release commits.
+  await until(() => sessions.started.includes(RUNNING));
+  const released = await waitForCommit(`chore(${WAITING}): awaiting CI`, 30_000);
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(released !== undefined, "the pending gate never released the task");
+
+  const named = await new Git(origin).run("show", "--name-only", "--format=", released);
+  const paths = named.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  assert.ok(paths.length > 0, "the release commit must carry the files it wrote");
+  assert.deepEqual(
+    paths.filter((path) => path.includes(RUNNING)),
+    [],
+    `the release swept up ${RUNNING}'s in-flight state:\n${paths.join("\n")}`,
+  );
+
+  await retire(WAITING);
+  await retire(RUNNING);
+});
