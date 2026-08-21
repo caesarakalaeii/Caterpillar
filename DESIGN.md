@@ -3027,13 +3027,39 @@ can satisfy both and still be wrong in ways only reading catches: the test that 
 weakened to pass, the error path that swallows, the half of the goal that was quietly not
 implemented.
 
-**Four reviewers, four different lenses** — correctness; design, simplicity and the
-record; test-first discipline; acceptance fit — run concurrently in the task's existing
-worktree. Different rather than
-redundant: three runs of one prompt catch variance, but only a different lens catches a
-failure mode the first one is blind to. Their tool surface is `read`, `bash` and
-`submit_verdict`: no `write`, no `edit`, and none of the implementation agent's control
-verbs. A reviewer cannot open a PR, claim completion, ask a human, or hand off.
+**Four read-only reviewers, four different lenses** — correctness; design, simplicity and
+the record; test-first discipline; acceptance fit — run concurrently in the task's existing
+worktree, joined by a fifth, `sabotage`, when there is source to break. Different rather
+than redundant: three runs of one prompt catch variance, but only a different lens catches a
+failure mode the first one is blind to. The four read-only lenses share the worktree safely
+because their tool surface is `read`, `bash` and `submit_verdict`: no `write`, no `edit`,
+and none of the implementation agent's control verbs. `sabotage` is the one reviewer that
+can write, and it writes only in a copy of its own — see below. No reviewer of either kind
+can open a PR, claim completion, ask a human, or hand off.
+
+**The fifth reviewer breaks the code on purpose.** Reasoning about test quality does not
+settle it: a reviewer reading a diff can say the coverage looks thin, and that is an opinion
+about a test suite rather than a fact about one. So this lens inverts a condition, empties a
+function body or drops a guard, runs the task's acceptance commands, and reports what got
+through. Either a sabotage of behaviour this diff introduced passed unnoticed — a test that
+does not test, worth a round trip — or it did not, which is a pass worth stating plainly.
+
+It is convened only when the diff touched source (`prLenses` in `review/lenses.ts`, off
+`review/tdd.ts`'s `touchesSource`): a documentation or configuration change has nothing to
+break, and a reviewer that can only abstain still costs a concurrent session and a copy of
+the checkout. It works in a **private copy** of the checkout, a sibling directory under
+`<taskDir>/.caterpillar/sabotage` — beside rather than inside, so the copy never appears in
+the original's `git status`, and made a checkout by rewriting git's pointer files rather
+than by `git worktree add`, so the shared mirror is only ever read. The other four
+reviewers' worktree, the branch and the pull request are therefore untouched by anything it
+does, and the copy is removed whichever way the round ends, including a throw out of the
+concurrent stage. Three bounds hold it: a total **command cap** (`limits.sabotageMaxCommands`,
+default 40 — this is the one lens whose loop is naturally unbounded, and exhausting the
+budget fails the command with an instruction to submit what it has rather than throwing away
+the verdict it had formed), the same **per-command timeout** every other shell here gets,
+and a **disk floor** (`limits.sabotageMinFreeGb`, default 5) below which the copy is refused.
+A refusal drops the lens from the round and records an abstention carrying the reason; it
+never fails the council, and it never falls back to the shared worktree.
 
 **Any blocking objection sends the work back.** Not a majority. Two reviewers who did not
 look at the thing a third found are not evidence against it. The cost of that rule is paid
@@ -3105,7 +3131,7 @@ the change author's guide to writing a description:
 `REVIEW_STANDARD` is the one asymmetry and it is deliberate. Its central sentence is
 Google's — *approve once the change definitely improves the overall health of the codebase,
 even if it is not perfect* — which is permission to let something merge. That is what stops
-a four-lens council being a bottleneck. Handed to the author it reads as permission to ship
+a multi-lens council being a bottleneck. Handed to the author it reads as permission to ship
 whatever survives a lenient reading, which is the opposite of its purpose, so the bundle
 the author gets (`AUTHOR_STANDARDS`) excludes it and a test asserts that it does.
 
