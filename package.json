@@ -17,7 +17,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
-    "test": "node --test --test-timeout=180000 --test-force-exit 'src/**/*.test.ts'",
+    "test": "node src/cli/run-tests.ts",
     "start": "node src/index.ts",
     "start:view": "node src/cli/view.ts",
     "verify:github-app": "node src/cli/verify-github-app.ts",
