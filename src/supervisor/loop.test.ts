@@ -1640,6 +1640,88 @@ test("a session that stops to ask a human does not report a no-progress streak",
   );
 });
 
+test("a task that reaches a terminal status stops reporting a no-progress streak", async () => {
+  // `caterpillar_no_progress_streak{task="..."}` takes its label from the world, and
+  // `Metric` expires nothing — its own `clear()` docstring names this failure: a sample
+  // "would otherwise keep reporting the size it had when it last made the cut, forever".
+  //
+  // Tasks end. A task that parked or finished never gets another `set`, so its last
+  // streak is immortal and `caterpillar_no_progress_streak >= 2` keeps firing about work
+  // that is over. BS-1540252370968117339-04 reached streak 2 and then went `done`, so its
+  // series stayed at 2 for the life of the pod — a warning about a merged pull request.
+  //
+  // Driven through a park rather than a `done` because parking needs no forge: the point
+  // is the terminal status, and `transition` is the one funnel every status change takes.
+  const ENDED = asTaskId("ENDED-1");
+  await seedTask(ENDED, {
+    status: "ready",
+    sessions: 3,
+    progress: { lastProgressSession: 1, noProgressStreak: 2 },
+  });
+
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // The third stalled session in a row, which is what `noProgressLimit: 3` parks on.
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "handoff",
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          summary: "still going in circles",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(ENDED);
+    if (state?.status === "parked") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "parked", "three stalled sessions must park the task");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    3,
+    "the streak is history and stays in the state — it is why the task parked",
+  );
+  // The STATE keeps the streak; the gauge does not, because the gauge is a claim about
+  // right now and there is no longer a session to make it about.
+  assert.doesNotMatch(
+    metrics.render(),
+    /caterpillar_no_progress_streak\{[^}]*task="ENDED-1"/,
+    "a parked task must stop reporting a streak, or it alerts forever about settled work",
+  );
+});
+
 test("a git failure in the poll loop is logged and retried, not fatal", async () => {
   // `store.pull`, `applyChatRequests`, `maybeIngest`, `survey` and `claimNext` all sat
   // OUTSIDE any try — only `workTask` was wrapped. `Git.run` throws on every non-zero
