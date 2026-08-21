@@ -269,7 +269,7 @@ export type { ForgeFactory };
  * same repo in the same image that morning and passed, because its list begins
  * `npm ci --ignore-scripts`. The difference was never visible from the failure text.
  *
- * This only annotates \u2014 it never changes the verdict. A 127 is still a failure, because
+ * This only annotates — it never changes the verdict. A 127 is still a failure, because
  * a command that cannot run has not passed. The point is to aim the next session at the
  * acceptance list instead of at the source, and the note is deliberately conditional on
  * both signals (an exit code that means "not found", and a list with no install step) so
@@ -290,7 +290,7 @@ const missingInstallNote = (acceptance: readonly string[], failures: CommandResu
     "it). The list is then graded against whatever a previous session left in the " +
     "worktree, so it can pass once and fail later on an unchanged commit. Before " +
     "treating this as a code defect, check whether the acceptance criteria are missing " +
-    "their install step \u2014 that is a change to the task's spec, not to the repository."
+    "their install step — that is a change to the task's spec, not to the repository."
   );
 };
 

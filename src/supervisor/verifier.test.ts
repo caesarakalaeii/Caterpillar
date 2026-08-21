@@ -183,6 +183,7 @@ test("the acceptance shell does not source a login profile", async () => {
   assert.equal(result.detail, NO_PR);
 });
 
+/* ───────────────────────────── gate 2: CI, per repo ───────────────────────────── */
 
 const PRIMARY: RepoRef = { host: "github.com", owner: "o", name: "r" };
 const SIBLING: RepoRef = { host: "github.com", owner: "o", name: "r-extension" };

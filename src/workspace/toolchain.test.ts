@@ -743,7 +743,7 @@ test("minFreeGb 0 switches the quota off without switching the caches off", asyn
  * `tsc: command not found` (exit 127) — an acceptance list the container cannot satisfy,
  * which no agent can fix from inside the repo.
  *
- * This repo also pins `include=dev` in its own `.npmrc`, which is the right fix for a repo
+ * This repo also clears `omit` in its own `.npmrc`, which is the right fix for a repo
  * that knows about the problem. This is the fix for the repos that do not: the fleet runs
  * acceptance commands for containers that never heard of this supervisor.
  */

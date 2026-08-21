@@ -725,8 +725,10 @@ const withCommitIdentity = (
  * unsatisfiable inside the container, which is not something an agent can fix from inside
  * the worktree.
  *
- * This repo defends itself in its own `.npmrc` (`include=dev`), and that is the right
- * place for a repo to state what its own install needs. But `.npmrc` only protects the
+ * This repo defends itself in its own `.npmrc` (`omit=`, deliberately not `include=dev`,
+ * which would outrank the Dockerfile's `npm ci --omit=dev` and ship typescript into the
+ * runtime image), and that is the right place for a repo to state what its own install
+ * needs. But `.npmrc` only protects the
  * repo that carries it, and the fleet runs acceptance commands for repos that have never
  * heard of this supervisor. The variable is the runner's accident rather than the repo's
  * intent, so it is dropped here, at the one point every task environment is built.
