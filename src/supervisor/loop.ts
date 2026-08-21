@@ -2167,15 +2167,21 @@ export class Supervisor {
           // Coming back through a later poll costs nothing and lets the runner do real
           // work in between.
           logger.info("task.awaiting-ci", { task: spec.id, session: state.sessions });
-          await store.appendJournal(
-            spec.id,
-            state.sessions,
-            `**Completion claim not yet decided — CI is still running.** Acceptance ` +
-              `commands passed. No action is needed: the task was released and will be ` +
-              `re-checked when CI reports.\n\n${result.detail}`,
-          );
-          await this.transition(lease, state, "ready");
-          await this.push(lease, `chore(${spec.id}): awaiting CI`);
+          // One unit, like every other write-then-push in this switch. Without the hold
+          // this commit stages the whole writable tree, which at N slots means a sibling
+          // session's deliberately-uncommitted `state.json` lands under this task's
+          // message and that sibling's own commit finds nothing to record.
+          await this.unit(async () => {
+            await store.appendJournal(
+              spec.id,
+              state.sessions,
+              `**Completion claim not yet decided — CI is still running.** Acceptance ` +
+                `commands passed. No action is needed: the task was released and will be ` +
+                `re-checked when CI reports.\n\n${result.detail}`,
+            );
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): awaiting CI`);
+          });
           return true;
         }
         if (!result.passed) {
