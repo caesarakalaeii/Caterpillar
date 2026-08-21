@@ -2960,6 +2960,18 @@ both produced a session that could only fail:
   and past that budget the task is *released without a session* rather than rejected. The
   wait is bounded on purpose: a check that never settles is a real problem an agent
   should be told about, not a reason to pin the runner forever.
+
+  This is not one task's bad luck. On 2026-08-21 the fleet logs show the same pending
+  rejection **seven** times between 07:41 and 13:58, across two repos and four runners,
+  every one of them on work whose acceptance commands had already passed:
+  `BS-…052-01/02/03/04`, `BS-…609-01/02`, and the branch carrying this very fix. In each
+  case the next session was started 2–4 seconds after the rejection, ran for 2–15
+  minutes, committed nothing because there was nothing to commit, and was honestly scored
+  no-progress. `BS-…052-04` went round twice and reached streak 2 — one cycle short of a
+  park — before the same commit passed at 08:42 with 7 checks green. The gap between the
+  pending verdict and the green one was 3–7 minutes in every case, which is why a bounded
+  in-slot wait resolves it and a fresh session cannot: the session is not the thing that
+  was missing, time was.
 - **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
   image sets it (correctly — that image installed with `--omit=dev`), but it is
   process-wide and every agent session and acceptance command is a child of the
