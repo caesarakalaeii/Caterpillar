@@ -323,6 +323,22 @@ awkward, the change is probably wrong.
     reads that order and states it; `src/review/tdd.ts` reaches no verdict, and the one
     lens that does is told the carve-out — documentation, comments, formatting and pure
     config have no behaviour to test (§12.2).
+16. **A session that cannot possibly succeed must not be started, and the environment the
+    gate grades in must be one the acceptance list can satisfy.** Both halves come from a
+    single park: `BS-…-07` hit the no-progress limit with a green branch and an open PR.
+    A CI run that had not *finished* was returned as a failed gate, so the supervisor
+    journalled a rejected claim and spent a fresh session on a task whose only blocker was
+    a queue — three times, each session truthfully scored no-progress. Pending is now its
+    own answer: the gate waits it out in the same session slot
+    (`limits.ciSettleSeconds`, bounded) and otherwise releases the task *without* running
+    a session — though a release carries no earliest-claim time, so CI pending for longer
+    than the whole budget still costs a session per cycle (§11.1 records why that residual
+    is left). Separately, the supervisor image's own `NODE_ENV=production` was inherited
+    by every acceptance command, so `npm ci` skipped devDependencies and `npm run check`
+    died with `tsc: command not found` — an acceptance list no agent could satisfy from
+    inside the repo. `ToolchainResolver` strips that one value at the single point every
+    task environment is built. Neither was a defect in the detector, and raising its
+    threshold would have hidden both (§11.1).
 
 ## The web view
 

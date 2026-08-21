@@ -391,7 +391,15 @@ const main = async (): Promise<void> => {
     // name that can delete: it owns the one moment a worktree is safe to remove (§2).
     worktrees,
     usage,
-    verifier: new AcceptanceVerifier({ worktrees, bindings, toolchain }),
+    verifier: new AcceptanceVerifier({
+      worktrees,
+      bindings,
+      toolchain,
+      ci: {
+        settleMs: config.limits.ciSettleSeconds * 1000,
+        pollMs: config.limits.ciPollSeconds * 1000,
+      },
+    }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
     council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),

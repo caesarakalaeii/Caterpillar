@@ -157,7 +157,7 @@ export class ToolchainResolver {
     this.config = options.config;
     this.tasksDir = options.tasksDir;
     this.baseEnv = withCommitIdentity(
-      withNixSettings(options.baseEnv ?? process.env, options.config),
+      withNixSettings(withoutProductionNodeEnv(options.baseEnv ?? process.env), options.config),
       options.identity,
     );
     this.repo = options.repo;
@@ -708,6 +708,41 @@ const withCommitIdentity = (
     GIT_COMMITTER_NAME: identity.name,
     GIT_COMMITTER_EMAIL: identity.email,
   };
+};
+
+/**
+ * Drop `NODE_ENV=production` on the way into a task's environment.
+ *
+ * The supervisor's own image sets it (Dockerfile: `ENV NODE_ENV=production`), correctly
+ * — the runtime image installed its dependencies with `--omit=dev` and should behave as
+ * production. But that variable is process-wide, and every agent session and every
+ * acceptance command is a CHILD of the supervisor, so all of them inherited it.
+ *
+ * npm honours `NODE_ENV=production` by omitting devDependencies. A task whose acceptance
+ * list begins `npm ci` therefore installs no devDependencies at all, and the very next
+ * command — `npm run check`, which runs `tsc` — dies with `tsc: command not found` and
+ * exit 127. Nothing in the repo is wrong when that happens: the acceptance list is simply
+ * unsatisfiable inside the container, which is not something an agent can fix from inside
+ * the worktree.
+ *
+ * This repo defends itself in its own `.npmrc` (`omit=`, deliberately not `include=dev`,
+ * which would outrank the Dockerfile's `npm ci --omit=dev` and ship typescript into the
+ * runtime image), and that is the right place for a repo to state what its own install
+ * needs. But `.npmrc` only protects the
+ * repo that carries it, and the fleet runs acceptance commands for repos that have never
+ * heard of this supervisor. The variable is the runner's accident rather than the repo's
+ * intent, so it is dropped here, at the one point every task environment is built.
+ *
+ * The supervisor's own `node_modules` are already installed and unaffected by this; what
+ * is stripped here is only what the TASK's commands see. A repo that genuinely wants a
+ * production install can still say so explicitly in its acceptance command
+ * (`npm ci --omit=dev`), which is a statement about that repo rather than an accident of
+ * where the runner happens to be running.
+ */
+const withoutProductionNodeEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  if (env["NODE_ENV"] !== "production") return env;
+  const { NODE_ENV: _dropped, ...rest } = env;
+  return rest;
 };
 
 export const DEFAULT_TOOLCHAIN_CONFIG: ToolchainConfig = {

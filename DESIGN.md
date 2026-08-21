@@ -2944,6 +2944,105 @@ because the probe runs after the session's credential lease is closed, and the c
 service then refuses to answer for that task by design (§9.2) — anything touching the
 network fails.
 
+**The detector measures sessions; it cannot tell you whether the session should have
+run.** `BS-…-07` parked on 2026-08-18 with a streak of 3, and the probe was right about
+every one of those sessions — none committed anything. The defects were upstream, and
+both produced a session that could only fail:
+
+- **A pending CI run was reported as a failed gate.** `verifier.ts` returned
+  `passed: false` for a check that had not finished, which is indistinguishable from red
+  CI at the call site. The supervisor journalled a REJECTED completion claim, sent the
+  task back to `ready`, and started a fresh session — against a branch nobody was going
+  to change, whose acceptance commands had already passed. Three of those in a row parked
+  finished work behind an open PR. A pending run now carries `pending: true`, the gate
+  waits it out in the same session slot (`limits.ciSettleSeconds`, default 20 minutes,
+  polling every `limits.ciPollSeconds`) the way `ProviderCooldown` waits out a provider,
+  and past that budget the task is *released without a session* rather than rejected. The
+  wait is bounded on purpose: a check that never settles is a real problem an agent
+  should be told about, not a reason to pin the runner forever.
+
+  This is not one task's bad luck. On 2026-08-21 the fleet logs show the same pending
+  rejection **seven** times between 07:41 and 13:58, across two repos and four runners,
+  every one of them on work whose acceptance commands had already passed:
+  `BS-…052-01/02/03/04`, `BS-…609-01/02`, and the branch carrying this very fix. In each
+  case the next session was started 2–4 seconds after the rejection, ran for 2–15
+  minutes, committed nothing because there was nothing to commit, and was honestly scored
+  no-progress. `BS-…052-04` went round twice and reached streak 2 — one cycle short of a
+  park — before the same commit passed at 08:42 with 7 checks green. The gap between the
+  pending verdict and the green one was 3–7 minutes in every case, which is why a bounded
+  in-slot wait resolves it and a fresh session cannot: the session is not the thing that
+  was missing, time was.
+
+  Why that window is minutes rather than seconds, for anyone later tuning
+  `limits.ciSettleSeconds`: `.github/workflows/build-and-push.yml` triggers on `push` to
+  `'**'`, and its `build` job is skipped only for `pull_request` events. A push to an
+  agent branch therefore runs the two `check` matrix legs *and* a buildx image build and
+  registry push, and the image build dominates the wall time. The budget has to cover the
+  slowest check on the branch, not the length of the test suite.
+
+  **Known residual, deliberately left:** the release carries no not-before, and
+  `isClaimable` accepts `ready` immediately, so an idle runner re-claims the task on the
+  very next poll. CI that stays pending *longer than the whole settle budget* therefore
+  still spends a session per claim cycle, and three such cycles still park the task —
+  `BS-…-07`'s exact shape, roughly twenty minutes slower each time round. The observed
+  gaps were 3–7 minutes against a 20-minute budget, so this is not the case that fired;
+  fixing it properly means giving a released task an earliest-claim time, which is a
+  change to the claim/release cycle rather than to this gate, and it is not made here.
+  Anyone who sees a task park with green CI and an `awaiting CI` commit in its history
+  should start with that.
+- **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
+  image sets it (correctly — that image installed with `--omit=dev`), but it is
+  process-wide and every agent session and acceptance command is a child of the
+  supervisor. npm honours it by skipping devDependencies, so a task whose acceptance list
+  begins `npm ci` installs no `typescript` and the next command dies with
+  `tsc: command not found`, exit 127. Nothing in the repo is wrong when that happens and
+  no agent can fix it from inside the worktree: the acceptance list is unsatisfiable
+  inside the container. `ToolchainResolver` now strips exactly that value on the way in —
+  a repo that genuinely wants a production install still says so in its own acceptance
+  command.
+
+**A caution about the second one, because the record nearly recorded it wrongly.** It is
+tempting to read `BS-…-07`'s exit-127 as proof of the `NODE_ENV` defect. It is not.
+That task's acceptance list is `npm run check` and `npm test` with **no `npm ci` at all**,
+so the gate never ran an install and never had devDependencies stripped from under it; it
+type-checked against whatever `node_modules` the previous session happened to leave in the
+worktree. `GH-…-60` ran the same three commands on the same repo in the same image at
+11:45 the same morning and passed, because its list *does* begin `npm ci --ignore-scripts`.
+The two facts only fit together one way: **an acceptance list that omits its install step
+is not reproducible.** It grades the worktree's leftover state, so it passes or fails on
+what the last session did rather than on what was committed, and it is the omission —
+not the ambient variable — that stranded `BS-…-07`. The `NODE_ENV` strip is still right,
+and is kept, but it is a fix for the *next* repo rather than an account of this one.
+
+**A third one, found while verifying the fixes for the first two, and it is a lesson about
+evidence rather than about code.** The branch carrying them had `check (26)` go red, so the
+completion claim was rejected and another session started — on a branch whose acceptance
+commands passed. Three sessions went looking for a defect in node 26. There was none.
+
+The red was a **flaky test added by the first fix**, and the matrix leg was a coin toss:
+the same test took `check (22)` red on the next commit, with a green run in between. It
+asserted on a state that is transient by design — a task released back to `ready` is
+re-claimed on the very next iteration, so the window is one `claimNext` wide and an
+observer polling every 100ms steps straight over it. It now waits for the *commit* the
+release pushes instead: history only grows, so the assertion can be late without being
+wrong.
+
+Two rules come out of it, and the second is the expensive one:
+
+- **A red check on one matrix leg that reproduces on neither locally is evidence of a
+  race, not of a version.** Nothing version-specific can produce a green run on the same
+  leg two commits later. Reading it as "node 26 is broken" cost a session that could not
+  execute the failing leg at all and therefore could not have concluded anything.
+- **Assert on what is durable, not on what is momentary.** A test that watches for a
+  transient state is a test that fails on whichever machine is busiest, and it will be
+  read as a defect in the code under review — which is precisely the "session with
+  nothing to do" this whole section is about, manufactured by the fix for it.
+
+The rule all of them share: **when a task parks for no progress, suspect the sessions
+before the detector** — and check what the acceptance list actually runs before believing
+a story about why it failed. Widening the streak limit here would have hidden every one of
+these and parked the work later instead of sooner.
+
 ### 11.2 The Discord webhook
 
 **Amended when the notifier stopped being a stub.** §10 lists a `discord-bridge`

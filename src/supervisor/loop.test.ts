@@ -158,6 +158,8 @@ const config: RunnerConfig = {
     commandTimeoutSeconds: 900,
     sabotageMaxCommands: 40,
     sabotageMinFreeGb: 5,
+    ciSettleSeconds: 1200,
+    ciPollSeconds: 30,
   },
   log: { level: "info" },
   intake: { intervalSeconds: 300 },
@@ -255,6 +257,81 @@ const pushedJournal = async (task: TaskId): Promise<string> => {
   for (const name of names) {
     const shard = await git.tryRun("show", `main:${name}`);
     if (shard.code === 0) bodies.push(shard.stdout);
+  }
+  return bodies.join("\n");
+};
+
+/**
+ * The FIRST commit on the remote's `main` whose subject is exactly `subject`, waiting up
+ * to `timeoutMs` for one to appear.
+ *
+ * For anything the supervisor only passes THROUGH, wait on the commit rather than on the
+ * live state. `run()` sleeps only on its idle branch, so a task released back to `ready`
+ * is re-claimed on the very next iteration: the released state exists for as long as one
+ * `claimNext` takes, and an observer polling every 100ms — three git subprocesses per
+ * turn — can step straight over the window. History only ever grows, so a test that
+ * waits for a commit can be late without being wrong.
+ *
+ * Oldest match, not newest: when the cycle repeats, only the first one is the release
+ * being asserted about.
+ */
+const waitForCommit = async (subject: string, timeoutMs: number): Promise<string | undefined> => {
+  const git = new Git(origin);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await git.tryRun(
+      "rev-list",
+      "--reverse",
+      "--fixed-strings",
+      `--grep=${subject}`,
+      "main",
+    );
+    const first = found.stdout.split("\n").map((line) => line.trim()).find((line) => line !== "");
+    if (found.code === 0 && first !== undefined) return first;
+    await sleep(100);
+  }
+  return undefined;
+};
+
+/** A blob as of one commit, or `undefined` if that path did not exist there. */
+const blobAt = async (commit: string, path: string): Promise<string | undefined> => {
+  const shown = await new Git(origin).tryRun("show", `${commit}:${path}`);
+  return shown.code === 0 ? shown.stdout : undefined;
+};
+
+/** A task's state as of one commit. See `waitForCommit` for why the commit is the subject. */
+const stateAt = async (commit: string, task: TaskId): Promise<TaskState | undefined> => {
+  const shown = await blobAt(commit, `tasks/${task}/state.json`);
+  return shown === undefined ? undefined : (JSON.parse(shown) as TaskState);
+};
+
+/**
+ * A task's journal as of one commit, every shard concatenated — `pushedJournal` against a
+ * commit instead of `main`.
+ *
+ * A directory listing rather than a guessed filename: a shard is named for its session,
+ * its timestamp AND the runner that wrote it (`journalShardName`), so there is no path a
+ * test can spell ahead of time. Guessing one is how the assertion this replaces came to
+ * be dead — it read `journal/001.md`, which never exists, and skipped itself on the
+ * `code === 0` that was therefore never true.
+ */
+const journalAt = async (commit: string, task: TaskId): Promise<string> => {
+  const git = new Git(origin);
+  const listed = await git.tryRun(
+    "ls-tree",
+    "-r",
+    "--name-only",
+    commit,
+    `tasks/${task}/journal/`,
+  );
+  if (listed.code !== 0) return "";
+
+  const names = listed.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "").sort();
+
+  const bodies: string[] = [];
+  for (const name of names) {
+    const shard = await blobAt(commit, name);
+    if (shard !== undefined) bodies.push(shard);
   }
   return bodies.join("\n");
 };
@@ -4556,4 +4633,200 @@ test("a merge that fails halfway names what DID land", async () => {
   const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
   assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
   assert.match(reason, /half-landed/);
+});
+
+test("CI that has not finished releases the task instead of spending a session on it", async () => {
+  // The BS-...-07 regression, at the loop level.
+  //
+  // A pending CI run is not a rejected completion claim: gate 1 has passed, the branch
+  // will not change while nobody is working on it, and there is nothing an agent could
+  // do. Treating it as a rejection sent the task back to `ready` and started a fresh
+  // session, which could only wait — so it committed nothing and §11.1 scored it
+  // no-progress, truthfully. Three of those parked finished work behind an open PR.
+  //
+  // The fix is to stop starting those sessions, NOT to stop counting them: the detector
+  // was right about every session it was shown.
+  const WAITING = asTaskId("SMOKE-CI-1");
+  await seedTask(WAITING, { pr: { number: 12, url: "https://example.invalid/pr/12" } });
+
+  let sessions = 0;
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () => {
+        sessions += 1;
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    // Still running after the verifier's own bounded wait.
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+    },
+    // The honest probe for a session that only waited: nothing happened.
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.reject(new Error("the council must not run on a pending gate")),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // The release, as the artifact it leaves behind rather than as a state to catch in
+  // flight. Watching for `ready` + no lease could not work: the gate releases the task
+  // and the next iteration re-claims it immediately, so the window is one `claimNext`
+  // wide and the observer holds no lock on it. That is what went red here — the same
+  // tree passed on one CI matrix leg and timed out on the other, twice, on whichever
+  // leg lost the coin toss, while every local run happened to land inside the window.
+  const released = await waitForCommit(`chore(${WAITING}): awaiting CI`, 30_000);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    released !== undefined,
+    "the pending gate never released the task: no `awaiting CI` commit was pushed",
+  );
+
+  // Read AT that commit. By now the runner has re-claimed the task — it had nothing else
+  // to do — and `main` has moved on, which is the gate working as designed, not a
+  // failure. What is under test is the state the release itself pushed.
+  const settled = await stateAt(released, WAITING);
+  assert.equal(settled?.status, "ready", "a task waiting on CI stays claimable");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    1,
+    "the session that DID run is still scored honestly — the fix is not to fudge the count",
+  );
+  // The promise stated the way loop.ts states it: the release happens INSTEAD of a second
+  // session inside the same claim. Read at the release, not at the abort, because a LATER
+  // poll re-claiming is expected ("coming back through a later poll costs nothing") — the
+  // old `sessions === 1` on the live counter asserted a stopped clock, and failed 5 runs
+  // out of 5 the moment this test was run on its own.
+  assert.equal(
+    settled?.sessions,
+    1,
+    "the release must come after the FIRST session, not after a second one spent waiting",
+  );
+
+  // The journal must not call this a rejection: it is what the next session reads, and
+  // "REJECTED" would send an agent looking for a defect that does not exist. Asserted
+  // unconditionally — the pending path always writes an entry, so an absent one is a
+  // failure rather than a reason to skip the check, which is what the old `if` made it.
+  const journal = await journalAt(released, WAITING);
+  assert.match(journal, /Session 1 —/, "the pending gate wrote no journal entry");
+  assert.match(journal, /CI is still running/);
+  assert.doesNotMatch(journal, /REJECTED/);
+
+  // Not `=== 1`: see above. The point is that the gate did not hold the slot open and
+  // spin sessions against a CI queue, which is what `settled.sessions` pins down.
+  assert.ok(sessions >= 1, "the session that made the claim must have run");
+});
+
+test("the pending-CI release commits its own files, not a sibling slot's", async (t) => {
+  // The release above writes a journal shard, transitions state and pushes. That trio is a
+  // unit for the reason `Supervisor.unit` documents: `StateStore.stageCommitPush` stages the
+  // whole writable tree when no hold is held, and `transition("running")` deliberately leaves
+  // an uncommitted `state.json` for EVERY in-flight task for the whole of its session. So an
+  // unwrapped release commits a running sibling's state under `chore(<id>): awaiting CI`, and
+  // that sibling's own commit later finds a clean tree and records nothing.
+  //
+  // Asserted on the committed FILE LIST, like "two slots writing state at once": the damage is
+  // silent. Nothing throws, both pushes succeed, and the state that reaches the remote is even
+  // correct — what is wrong is which commit carries it, and only `--name-only` shows that.
+  const WAITING = asTaskId("CONC-CI-WAIT");
+  const RUNNING = asTaskId("CONC-CI-RUN");
+  await seedTask(WAITING, { pr: { number: 13, url: "https://example.invalid/pr/13" } });
+  await seedTask(RUNNING);
+
+  // The sibling hangs, which is precisely the production shape: it is mid-session, so its
+  // `state.json` has been written and left uncommitted. A finished sibling would commit its
+  // own files and prove nothing.
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const claiming = new Set<TaskId>();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: withSlots(2),
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: (spec, state, signal) => {
+        // Only the waiting task claims completion; the other one hangs, holding its slot.
+        if (spec.id !== WAITING) return sessions.runner.run(spec, state, signal);
+        claiming.add(spec.id);
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Wait for the sibling to be genuinely mid-session before reading the release, so its
+  // uncommitted `state.json` is actually in the tree at the moment the release commits.
+  await until(() => sessions.started.includes(RUNNING));
+  const released = await waitForCommit(`chore(${WAITING}): awaiting CI`, 30_000);
+
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  assert.ok(released !== undefined, "the pending gate never released the task");
+
+  const named = await new Git(origin).run("show", "--name-only", "--format=", released);
+  const paths = named.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  assert.ok(paths.length > 0, "the release commit must carry the files it wrote");
+  assert.deepEqual(
+    paths.filter((path) => path.includes(RUNNING)),
+    [],
+    `the release swept up ${RUNNING}'s in-flight state:\n${paths.join("\n")}`,
+  );
+
+  await retire(WAITING);
+  await retire(RUNNING);
 });

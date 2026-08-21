@@ -150,7 +150,13 @@ export interface Verifier {
   verify(
     spec: TaskSpec,
     state: TaskState,
-  ): Promise<{ readonly passed: boolean; readonly detail: string; readonly prUrl?: string }>;
+  ): Promise<{
+    readonly passed: boolean;
+    readonly detail: string;
+    readonly prUrl?: string;
+    /** Set when CI has not finished, which is not the same as a failed gate. */
+    readonly pending?: boolean;
+  }>;
 }
 
 export interface ProgressProbe {
@@ -2146,8 +2152,38 @@ export class Supervisor {
           task: spec.id,
           session: state.sessions,
           passed: result.passed,
+          pending: result.pending === true,
           detail: result.detail,
         });
+        if (result.pending === true) {
+          // NOT a rejection, and deliberately not journalled as one. The verifier already
+          // waited out `limits.ciSettleSeconds` and CI is still running, so there is
+          // still nothing an agent could usefully do: the acceptance commands pass and
+          // the branch will not change while nobody is working on it.
+          //
+          // Release the task WITHOUT starting another session on it. Spending one here
+          // is what parked BS-...-07 — three sessions that could only wait, each
+          // truthfully scored no-progress by §11.1, on work that was already finished.
+          // Coming back through a later poll costs nothing and lets the runner do real
+          // work in between.
+          logger.info("task.awaiting-ci", { task: spec.id, session: state.sessions });
+          // One unit, like every other write-then-push in this switch. Without the hold
+          // this commit stages the whole writable tree, which at N slots means a sibling
+          // session's deliberately-uncommitted `state.json` lands under this task's
+          // message and that sibling's own commit finds nothing to record.
+          await this.unit(async () => {
+            await store.appendJournal(
+              spec.id,
+              state.sessions,
+              `**Completion claim not yet decided — CI is still running.** Acceptance ` +
+                `commands passed. No action is needed: the task was released and will be ` +
+                `re-checked when CI reports.\n\n${result.detail}`,
+            );
+            await this.transition(lease, state, "ready");
+            await this.push(lease, `chore(${spec.id}): awaiting CI`);
+          });
+          return true;
+        }
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.
