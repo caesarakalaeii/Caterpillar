@@ -484,6 +484,26 @@ test("a command budget that cannot run a single command is refused", async () =>
   await names({ limits: { sabotageMaxCommands: 2.5 } });
 });
 
+test("a CI poll interval of zero is refused", async () => {
+  // `awaitChecks` sleeps `Math.min(pollMs, remaining)` between polls, so a zero interval
+  // is not a fast poll but no poll at all: two GitHub API calls per iteration, uninterrupted,
+  // for the whole of `ciSettleSeconds` — twenty minutes at the default. Refused at boot,
+  // like the two sabotage budgets beside it.
+  //
+  // `ciSettleSeconds: 0` needs no such guard: a zero budget skips the wait, which is a
+  // coherent way to say "never wait on CI".
+  const names = async (over: Record<string, unknown>): Promise<void> => {
+    await assert.rejects(
+      () => load(over),
+      (error: unknown) =>
+        error instanceof ConfigError && /limits\.ciPollSeconds/.test(error.message),
+    );
+  };
+
+  await names({ limits: { ciPollSeconds: 0 } });
+  await names({ limits: { ciPollSeconds: -5 } });
+});
+
 test("a negative disk floor is refused, but zero is a legitimate no-floor", async () => {
   await assert.rejects(
     () => load({ limits: { sabotageMinFreeGb: -1 } }),
