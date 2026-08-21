@@ -17,7 +17,15 @@ import {
   type TaskState,
 } from "../domain/task.ts";
 import type { Commit } from "./tdd.ts";
-import { planPrompt, reviewPrompt } from "./council.ts";
+import { prLenses, SABOTAGE_LENS } from "./lenses.ts";
+import type { PrepareOptions, PrepareResult } from "./sabotage.ts";
+import {
+  planPrompt,
+  reviewerPlan,
+  reviewPrompt,
+  sabotageAbstentionFor,
+  withSabotageCopy,
+} from "./council.ts";
 
 const SPEC: TaskSpec = {
   id: asTaskId("TASK-1"),
@@ -96,4 +104,126 @@ test("a plan reviewer gets no test-first evidence, because nothing has been writ
 
   assert.doesNotMatch(prompt, /Test-first evidence/);
   assert.match(prompt, /Refuse empty repos/);
+});
+
+const WORKTREE = "/work/tasks/TASK-1/widget";
+const COPY = "/work/tasks/TASK-1/.caterpillar/sabotage";
+
+test("a read-only lens reviews the shared worktree with no writable tool and no budget", () => {
+  const plan = reviewerPlan({
+    lensKey: "correctness",
+    worktree: WORKTREE,
+    sabotageCopy: COPY,
+    maxCommands: 40,
+  });
+
+  assert.equal(plan.cwd, WORKTREE);
+  assert.deepEqual(plan.toolNames, ["read", "bash", "submit_verdict"]);
+  assert.equal(plan.maxCommands, undefined);
+});
+
+test("the sabotage lens reviews its own copy, with write and edit and a command budget", () => {
+  const plan = reviewerPlan({
+    lensKey: SABOTAGE_LENS.key,
+    worktree: WORKTREE,
+    sabotageCopy: COPY,
+    maxCommands: 12,
+  });
+
+  assert.equal(plan.cwd, COPY);
+  assert.deepEqual(plan.toolNames, ["read", "bash", "write", "edit", "submit_verdict"]);
+  assert.equal(plan.maxCommands, 12);
+});
+
+test("a sabotage reviewer with no copy is refused rather than pointed at the worktree", () => {
+  // The one outcome that must be impossible: `write` and `edit` in the worktree the other
+  // four reviewers are reading concurrently. A throw here fails the lens, which the
+  // council records as an abstention; silently falling back would corrupt the review.
+  assert.throws(
+    () => reviewerPlan({ lensKey: SABOTAGE_LENS.key, worktree: WORKTREE, maxCommands: 40 }),
+    /sabotage/i,
+  );
+});
+
+test("no lens but sabotage is ever given a writable tool, copy or no copy", () => {
+  for (const lens of prLenses(true)) {
+    const plan = reviewerPlan({
+      lensKey: lens.key,
+      worktree: WORKTREE,
+      sabotageCopy: COPY,
+      maxCommands: 40,
+    });
+    if (lens.key === SABOTAGE_LENS.key) continue;
+
+    assert.ok(!plan.toolNames.includes("write"), `${lens.key} was given write`);
+    assert.ok(!plan.toolNames.includes("edit"), `${lens.key} was given edit`);
+  }
+});
+
+test("a refused copy drops the sabotage lens and records why, instead of failing the council", () => {
+  const round = sabotageAbstentionFor(prLenses(true), "no disk");
+
+  assert.ok(!round.lenses.some((l) => l.key === SABOTAGE_LENS.key));
+  assert.deepEqual(
+    round.lenses.map((l) => l.key),
+    prLenses(false).map((l) => l.key),
+  );
+  assert.equal(round.verdicts.length, 1);
+  const [verdict] = round.verdicts;
+  assert.equal(verdict?.lens, SABOTAGE_LENS.key);
+  assert.equal(verdict?.abstained, true);
+  assert.match(verdict?.summary ?? "", /no disk/);
+});
+
+const prepareOptions = (): PrepareOptions => ({
+  checkoutRoot: WORKTREE,
+  taskDir: "/work/tasks/TASK-1",
+  minFreeGb: 5,
+  logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+  task: "TASK-1",
+});
+
+test("the copy is removed even when the reviewers throw", async () => {
+  // The guarantee worth pinning: a throw out of `Promise.all` must not leave a whole
+  // second checkout of the task on disk.
+  let cleaned = false;
+  const prepare = async (): Promise<PrepareResult> => ({
+    ok: true,
+    path: COPY,
+    cleanup: async () => {
+      cleaned = true;
+    },
+  });
+
+  await assert.rejects(
+    withSabotageCopy(prepare, prepareOptions(), async () => {
+      throw new Error("a reviewer died");
+    }),
+    /a reviewer died/,
+  );
+  assert.equal(cleaned, true);
+});
+
+test("a body that succeeds is handed the copy and still gets it cleaned up", async () => {
+  let cleaned = false;
+  const prepare = async (): Promise<PrepareResult> => ({
+    ok: true,
+    path: COPY,
+    cleanup: async () => {
+      cleaned = true;
+    },
+  });
+
+  const seen = await withSabotageCopy(prepare, prepareOptions(), async (copy) => copy);
+
+  assert.deepEqual(seen, { ok: true, path: COPY });
+  assert.equal(cleaned, true);
+});
+
+test("a refusal reaches the body as a reason and needs no cleanup", async () => {
+  const prepare = async (): Promise<PrepareResult> => ({ ok: false, reason: "no disk" });
+
+  const seen = await withSabotageCopy(prepare, prepareOptions(), async (copy) => copy);
+
+  assert.deepEqual(seen, { ok: false, reason: "no disk" });
 });
