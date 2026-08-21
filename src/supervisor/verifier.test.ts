@@ -379,6 +379,33 @@ test("waiting for CI is bounded — a run that never settles still reports pendi
   assert.equal(clock, 5_000);
 });
 
+test("the last poll waits out the budget, not a whole interval past it", async () => {
+  // The budget is not a multiple of the interval, which is the only case where the
+  // deadline clamp binds. Without `Math.min(pollMs, remaining)` the second sleep runs a
+  // full 2s from 1.5s and the wait ends at 3.5s — 40% past a budget an operator set.
+  // The existing bounded-wait test cannot see this: 5_000/1_000 divides exactly.
+  const worktree = await scratch();
+  const { bindings } = forgeAnswering(["pending"]);
+  let clock = 0;
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings,
+    ci: {
+      settleMs: 2_500,
+      pollMs: 2_000,
+      now: () => clock,
+      sleep: (ms: number) => {
+        clock += ms;
+        return Promise.resolve();
+      },
+    },
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.pending, true);
+  assert.equal(clock, 2_500, "the wait must stop at the deadline, not at the next poll");
+});
+
 test("a failing acceptance command is never blamed on CI", async () => {
   // Gate 1 short-circuits, so a red acceptance run must not consult the forge at all —
   // otherwise a broken build would wait out the CI budget before reporting itself.
@@ -437,6 +464,20 @@ test("an ordinary failure is not annotated", async () => {
 
   assert.equal(result.passed, false);
   assert.doesNotMatch(result.detail, /installs dependencies/);
+});
+
+test("a silent exit 127 is annotated on the code alone", async () => {
+  // The predicate has two arms and the text arm carries every other test here, because a
+  // real missing binary prints "command not found". This pins the exit-code arm: a wrapper
+  // that swallows stderr, or a shell whose message is localised, still exits 127 and still
+  // means the same thing. Without the `code === 127` arm the note silently stops appearing.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(specWith(["exit 127"]), state);
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /no acceptance command installs dependencies/);
 });
 
 test("a not-found failure still fails the gate", async () => {
