@@ -53,6 +53,14 @@ import {
   parsePolicy,
   type AlertPolicy,
 } from "../remediation/policy.ts";
+import {
+  isScheduleId,
+  parseSchedule,
+  ScheduleParseError,
+  SCHEDULE_TASK_PREFIX,
+  type Schedule,
+} from "../schedule/definition.ts";
+import { isOccurrenceId } from "../schedule/occurrence.ts";
 
 /**
  * What the supervisor remembers about one firing alert (DESIGN.md §20).
@@ -72,6 +80,41 @@ export interface AlertRefusal {
   readonly task?: TaskId;
   /** Stamped by the writer, for an operator wondering how long this has been so. */
   readonly at?: string;
+}
+
+/** What became of one occurrence of one schedule. */
+export type ScheduleOutcome = "fired" | "skipped" | "refused";
+
+/**
+ * The ledger entry for one occurrence (DESIGN.md §22).
+ *
+ * Written for a FIRED occurrence as well as a skipped one, and that is what makes the
+ * skipped ones legible: "the precheck said no" and "nothing is polling this schedule" are
+ * the same silence otherwise, and the first is the normal case for a schedule whose whole
+ * job is to notice something occasionally.
+ *
+ * Durable and pushed rather than in memory, for the reason §14.2 gives about Keel rolling
+ * the pod on every push to main: an in-memory note of "already handled 09:00" is emptied
+ * by a deploy, and the claim ref is the only thing that then stops a second task.
+ */
+export interface ScheduleRecord {
+  readonly schedule: string;
+  /** `YYYY-MM-DDTHHMMZ`, as `occurrenceId` renders it. */
+  readonly occurrence: string;
+  readonly outcome: ScheduleOutcome;
+  /** The task this occurrence produced, when it produced one. */
+  readonly task?: TaskId;
+  /** Why it was skipped or refused — a precheck's exit code, a parse error. Human-facing. */
+  readonly detail?: string;
+  /** Stamped by the writer. */
+  readonly at?: string;
+}
+
+/** Every schedule that parsed, and the ones that did not, from one pass over the tree. */
+export interface ScheduleListing {
+  readonly schedules: readonly Schedule[];
+  /** One entry per file that could not be read as a schedule. Shown on `/intake`. */
+  readonly errors: readonly { readonly schedule: string; readonly message: string }[];
 }
 
 /**
@@ -257,7 +300,7 @@ const journalShardName = (session: number, at: Date, runner: string): string => 
  * the two lists answer different questions — this one is "what may this commit carry", that
  * one is "what may a refresh destroy".
  */
-const WRITABLE_TREE: readonly string[] = ["tasks", "intake", "digests", "alerts"];
+const WRITABLE_TREE: readonly string[] = ["tasks", "intake", "digests", "alerts", "schedules"];
 
 /** What `pull` moved aside, and where it put it. */
 export interface SalvagedCommits {
@@ -1021,6 +1064,146 @@ export class StateStore {
     return out;
   }
 
+  /**
+   * Every schedule in the state repo, and every file that failed to be one (§22).
+   *
+   * BOTH, in one answer, because they are needed together: the housekeeping pass fires the
+   * ones that parsed and the intake pass shows the ones that did not. A method that threw
+   * on the first bad file would stop a fleet's scheduled work over one typo, which is the
+   * failure the per-file layout exists to prevent.
+   *
+   * A missing `schedules/` is an empty listing rather than an error — the poll loop calls
+   * this every pass and most state repos have never heard of schedules (`readAlertPolicy`'s
+   * reasoning, §20).
+   *
+   * READ ONLY. There is no `writeSchedule`, for the reason there is no `writeAlertPolicy`:
+   * a schedule is authored and committed by a human, which is what keeps "what work happens
+   * unattended" outside the fleet's own reach. The only thing under `schedules/` the
+   * supervisor writes is the occurrence ledger.
+   */
+  async listSchedules(): Promise<ScheduleListing> {
+    const dir = join(this.root, "schedules");
+    if (!existsSync(dir)) return { schedules: [], errors: [] };
+
+    const schedules: Schedule[] = [];
+    const errors: { schedule: string; message: string }[] = [];
+
+    for (const name of (await readdir(dir)).sort()) {
+      // `.yaml` only. An operator's `README.md` beside their schedules is notes, not a
+      // malformed schedule, and reporting it as one would make the errors list unreadable.
+      if (!name.endsWith(".yaml")) continue;
+      const id = name.slice(0, -".yaml".length);
+
+      try {
+        // The id comes from a DIRECTORY LISTING, so it is validated before it is used: it
+        // becomes a task id and a git ref component, and nothing here wrote the file name.
+        if (!isScheduleId(id)) {
+          throw new ScheduleParseError(
+            id,
+            `'${id}' is not a schedule identifier — the file name becomes a task id and a ` +
+              `git ref component, so it must be letters, digits, \`-\` and \`_\` only`,
+          );
+        }
+        schedules.push(parseSchedule(id, await readFile(join(dir, name), "utf8")));
+      } catch (error) {
+        errors.push({
+          schedule: id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return { schedules, errors };
+  }
+
+  private scheduleRecordPath(schedule: string, occurrence: string): string {
+    return join(this.root, "schedules", "occurrences", `${schedule}-${occurrence}.json`);
+  }
+
+  /** What became of one occurrence, or nothing if this runner has never settled it. */
+  async readScheduleRecord(
+    schedule: string,
+    occurrence: string,
+  ): Promise<ScheduleRecord | undefined> {
+    if (!isScheduleId(schedule) || !isOccurrenceId(occurrence)) return undefined;
+    const path = this.scheduleRecordPath(schedule, occurrence);
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(await readFile(path, "utf8")) as ScheduleRecord;
+  }
+
+  async writeScheduleRecord(
+    schedule: string,
+    occurrence: string,
+    record: ScheduleRecord,
+  ): Promise<void> {
+    return this.write("schedules/occurrences", async () => {
+      // Both halves become a file name, and neither is written by this class: the schedule
+      // id is read off a directory listing and the occurrence is computed from a document
+      // an operator wrote. `..` is a legal directory name that resolves out of `schedules/`.
+      if (!isScheduleId(schedule) || !isOccurrenceId(occurrence)) {
+        throw new Error(
+          `'${schedule}' / '${occurrence}' cannot be filed as a schedule occurrence`,
+        );
+      }
+      await mkdir(join(this.root, "schedules", "occurrences"), { recursive: true });
+      await writeFile(
+        this.scheduleRecordPath(schedule, occurrence),
+        `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+        "utf8",
+      );
+    });
+  }
+
+  /**
+   * The whole occurrence ledger, oldest file name first, for the `/intake` page.
+   *
+   * Defensive in `listAlertRefusals`'s way: one unreadable record must not cost the whole
+   * listing, because a page that renders nothing looks exactly like a fleet that has never
+   * fired a schedule.
+   */
+  async listScheduleRecords(): Promise<readonly ScheduleRecord[]> {
+    const dir = join(this.root, "schedules", "occurrences");
+    if (!existsSync(dir)) return [];
+
+    const out: ScheduleRecord[] = [];
+    for (const name of (await readdir(dir)).sort()) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        out.push(JSON.parse(await readFile(join(dir, name), "utf8")) as ScheduleRecord);
+      } catch {
+        continue;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * How many tasks this schedule has open right now (§22).
+   *
+   * "Open" is `!isTerminal(status)` — the supervisor's one notion of task status, and
+   * deliberately not a second one invented here. A `parked` task counts as closed, exactly
+   * as it does for an alert (§20): it is waiting on a human, and the next occurrence is the
+   * nudge that should be allowed to open fresh work rather than be suppressed by a task
+   * nobody is working on.
+   *
+   * Counted from the TASK TREE rather than from the ledger, because a schedule's task ids
+   * carry the schedule's name (`SCHED-<schedule>-<occurrence>`) and a task deleted by hand
+   * should free its slot rather than wedge the schedule forever. The alert path has to join
+   * through its ledger only because a fingerprint is a hash and does not carry its name.
+   */
+  async countOpenScheduleTasks(schedule: string): Promise<number> {
+    if (!isScheduleId(schedule)) return 0;
+    const prefix = `${SCHEDULE_TASK_PREFIX}${schedule}-`;
+
+    let open = 0;
+    for (const task of await this.listTasks()) {
+      if (!task.startsWith(prefix)) continue;
+      const state = await this.tryReadState(task).catch(() => undefined);
+      if (state !== undefined && !isTerminal(state.status)) open += 1;
+    }
+    return open;
+  }
+
   async readState(task: TaskId): Promise<TaskState> {
     const raw = await readFile(join(this.taskDir(task), "state.json"), "utf8");
     return JSON.parse(raw) as TaskState;
@@ -1760,7 +1943,12 @@ export class StateStore {
     // while existing nowhere in git, so no other runner agrees and no operator can see
     // why the notification stopped (§20). `policy.yaml` is tracked, so the sweep cannot
     // touch it.
-    for (const path of ["tasks", "intake", "alerts"]) {
+    //
+    // `schedules/` is swept on the same terms and for the same reason (§22): an occurrence
+    // record whose commit never landed says "this occurrence is settled" on one runner and
+    // nowhere else, so the ledger a human reads disagrees with the ledger that stopped the
+    // work. The operator's `schedules/*.yaml` are tracked, so the sweep cannot touch them.
+    for (const path of ["tasks", "intake", "alerts", "schedules"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }
     return true;

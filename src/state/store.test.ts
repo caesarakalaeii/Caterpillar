@@ -1581,3 +1581,49 @@ test("open tasks are counted per schedule using the one notion of terminal", asy
   assert.equal(await subject.countOpenScheduleTasks("stale-branches"), 1);
   assert.equal(await subject.countOpenScheduleTasks("nothing-here"), 0);
 });
+
+test("commitAndPush stages occurrence records, and pull sweeps unpushed ones", async () => {
+  // The alert rule (§20) applied to the schedule ledger. Without `schedules` in the
+  // `git add` list a record is written locally and never pushed, so a deploy loses the
+  // fleet's account of what fired. Without it in the `git clean` list a record whose
+  // commit never landed says "settled" on this runner and nowhere else — and the operator
+  // reading `/intake` on another runner sees an occurrence that never happened.
+  const { store: subject, bare, other, root } = await sharedStateRepo();
+
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "precheck exited 1",
+  });
+  await subject.commitAndPush("chore(schedules): record an occurrence", "origin", "main");
+
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^schedules\/occurrences\/deps-audit-2026-08-17T0700Z\.json$/m);
+
+  // Force the reset path with a record on disk that reached no commit. The other clone
+  // has to move main first, or nothing needs resetting.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  const orphan = join(root, "schedules", "occurrences", "deps-audit-2026-08-18T0700Z.json");
+  // Written PAST the store, like the alert case: going through `writeScheduleRecord`
+  // would mark the tree dirty and the pull would correctly decline.
+  await writeFile(
+    orphan,
+    '{"schedule":"deps-audit","occurrence":"2026-08-18T0700Z","outcome":"fired"}\n',
+    "utf8",
+  );
+
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.equal(
+    existsSync(orphan),
+    false,
+    "an unpushed occurrence record must not outlive the branch it was written on",
+  );
+  assert.ok(
+    existsSync(join(root, "schedules", "occurrences", "deps-audit-2026-08-17T0700Z.json")),
+    "the pushed one is tracked, so the sweep leaves it alone",
+  );
+});
