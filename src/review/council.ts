@@ -54,7 +54,7 @@ import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
 import { PLAN_LENSES, prLenses, repoLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
-import { readRepoStandards, repoCheckoutsOf } from "../agent/standards.ts";
+import { readRepoStandards, repoCheckoutsOf, type RepoStandard } from "../agent/standards.ts";
 import {
   prepareSabotageCopy,
   SabotageExecutionEnv,
@@ -138,6 +138,24 @@ export const reviewerPlan = (input: ReviewerPlanInput): ReviewerPlan => {
     maxCommands: input.maxCommands,
   };
 };
+
+/**
+ * The reviewers to convene on a pull request, with the repos' own standards spliced in.
+ *
+ * Pure and exported for the same reason `reviewerPlan` is: `review()` needs a provider, a
+ * worktree and five concurrent sessions to reach, and this is the decision that has to be
+ * right — drop `standards` at the call site and every review still runs, still passes, and
+ * silently stops grading the rules a repository shipped (§12.2).
+ *
+ * `configured` is `options.lenses`, the seam a caller convenes its own council through. It
+ * goes through the splice too: a custom lens set must not become a way to grade against
+ * less than the author was handed.
+ */
+export const reviewLenses = (
+  configured: readonly Lens[] | undefined,
+  touchesSource: boolean,
+  standards: readonly RepoStandard[],
+): readonly Lens[] => repoLenses(configured ?? prLenses(touchesSource), standards);
 
 /**
  * A round with the sabotage lens dropped, and the abstention that says why.
@@ -250,14 +268,14 @@ export class ReviewCouncil implements Council {
 
     // The declared repos' own standards, read from the SAME checkout the session used, so
     // the reviewers grade against the same text its author was handed (DESIGN.md §12.2).
-    // `repoLenses` routes each section to the one lens its heading names.
     const repoStandards = await readRepoStandards(repoCheckoutsOf(spec.repos, checkout));
 
     return this.convene(
       // `touchesSource` is the "is there anything to break" question, already answered here
       // for the evidence block the prompt carries.
-      repoLenses(
-        this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
+      reviewLenses(
+        this.options.lenses,
+        testFirstEvidence(commits).touchesSource,
         repoStandards,
       ),
       checkout.root,
