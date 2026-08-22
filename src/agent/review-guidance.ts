@@ -148,7 +148,8 @@ export const renderReviewGuidance = (
   for (const [pull, group] of byPullRequest(open)) {
     lines.push("", `### ${pull}`, "");
     for (const comment of group) {
-      lines.push(`- **${comment.author}** ${where(comment)}${comment.url === undefined ? "" : ` ([link](${comment.url}))`}`);
+      const link = comment.url === undefined ? "" : ` ([link](${comment.url}))`;
+      lines.push(`- **${comment.author}** ${where(comment)}${link}`);
       // Indented as a block quote so a multi-line comment cannot be mistaken for the
       // surrounding prompt — a reviewer's own markdown headings would otherwise read as
       // sections of the prompt itself.
