@@ -20,6 +20,7 @@
  * Nothing here decides anything. It gathers their verdicts and hands them to `decide`,
  * which is pure and is where the rule actually lives.
  */
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   createBashTool,
@@ -39,6 +40,7 @@ import {
   EMPTY_USAGE,
   type ProposedPlan,
   type ProviderOutage,
+  type TaskId,
   type TaskSpec,
   type TaskState,
   type UsageTotals,
@@ -190,6 +192,80 @@ export const withSabotageCopy = async <T>(
   }
 };
 
+/**
+ * The artifact side of the state repo, and nothing else. `StateStore` satisfies it
+ * structurally, the same way `RepoInspector` in `workspace/toolchain.ts` does — the council
+ * has no business with the state repo's mutex or its git, and a test of what it stages
+ * should not need a clone to say so.
+ */
+export interface ArtifactSource {
+  listArtifacts(task: TaskId): Promise<readonly string[]>;
+  readArtifact(task: TaskId, name: string): Promise<Buffer | undefined>;
+}
+
+/** One staged file: what it was published as, and where a reviewer will find it. */
+export interface StagedEvidence {
+  readonly name: string;
+  readonly path: string;
+}
+
+/**
+ * Where a task's evidence is staged for a review round.
+ *
+ * Beside the checkout, never inside it. `runner.ts` stages upstream artifacts under
+ * `artifacts-in/` for exactly this reason: a file in the worktree is a file in
+ * `git status`, and the sabotage reviewer runs the acceptance suite in its own copy of that
+ * checkout — so evidence inside it would show up as an uncommitted change in both, to five
+ * reviewers grading a diff.
+ *
+ * A function rather than a constant so the one path lives in one place: `convene` builds it
+ * and the test asserts on it, and a second literal is a second thing to keep in step.
+ */
+export const evidenceRoot = (taskDir: string): string => join(taskDir, "evidence-in");
+
+/**
+ * Copy this task's artifacts where the reviewers can read them (DESIGN.md §12.1).
+ *
+ * The mirror of `runner.ts`'s upstream staging, with two differences that matter.
+ *
+ * It is the task's OWN artifacts, not its blockers'. Along a `blockedBy` edge an artifact
+ * is input to the next task's work (§17); here it is evidence about the change under
+ * review, and the change under review is this task's.
+ *
+ * The files are written read-only. Four of the five reviewers hold no writable tool, but
+ * the sabotage lens holds `write` and `edit`, and the five run concurrently under one
+ * `Promise.all` — so a reviewer that edited the screenshot it was shown would change what
+ * the others are looking at, mid-round. Read-only on disk is the cheap way to say that the
+ * evidence is not a thing anyone here may revise.
+ *
+ * The directory is REPLACED, not added to. The council convenes again after a send-back and
+ * the second round's evidence is about the second round's diff; round one's screenshot
+ * still sitting there would be offered as evidence about a change that has moved on. A task
+ * with nothing to show gets no directory at all, because an empty one is a claim.
+ */
+export const stageEvidence = async (
+  artifacts: ArtifactSource,
+  task: TaskId,
+  root: string,
+): Promise<readonly StagedEvidence[]> => {
+  const names = await artifacts.listArtifacts(task);
+  await rm(root, { recursive: true, force: true });
+  if (names.length === 0) return [];
+
+  await mkdir(root, { recursive: true });
+  const staged: StagedEvidence[] = [];
+
+  for (const name of names) {
+    const contents = await artifacts.readArtifact(task, name);
+    if (contents === undefined) continue;
+    const path = join(root, name);
+    await writeFile(path, contents, { mode: 0o444 });
+    staged.push({ name, path });
+  }
+
+  return staged;
+};
+
 export interface CouncilResult {
   readonly verdict: CouncilVerdict;
   /** Tokens and cost the council itself spent. Added to the task's totals. */
@@ -229,6 +305,14 @@ export interface ReviewCouncilOptions {
    * has to be a constructor argument.
    */
   readonly prepareSabotage?: typeof prepareSabotageCopy;
+  /**
+   * Where the task's artifacts come from, so the reviewers can be shown them (§12.1).
+   *
+   * Optional: without it the council reviews exactly as it did before, on the diff alone.
+   * That keeps a runner assembled without a state repo working, and it keeps the eight
+   * existing prompt tests testing the prompt rather than a store.
+   */
+  readonly artifacts?: ArtifactSource;
 }
 
 export class ReviewCouncil implements Council {
@@ -247,14 +331,37 @@ export class ReviewCouncil implements Council {
     const commits =
       base === undefined ? [] : await this.options.worktrees.commitsSince(checkout.root, base);
 
+    // Whatever the acceptance gate left behind, where the reviewers can read it. Never a
+    // reason to fail the council: a review of the diff alone is what every round did until
+    // now, and losing that over an unreadable file would trade a weaker review for none.
+    const evidence = await this.gateEvidenceFor(spec).catch((error: unknown) => {
+      this.options.logger.warn("council.evidence-failed", {
+        task: spec.id,
+        ...errorFields(error),
+      });
+      return [];
+    });
+
     return this.convene(
       // `touchesSource` is the "is there anything to break" question, already answered here
       // for the evidence block the prompt carries.
       this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
       checkout.root,
-      reviewPrompt(spec, state, base, commits),
+      reviewPrompt(spec, state, base, commits, evidence),
       spec,
       state,
+    );
+  }
+
+  /** This task's artifacts, staged read-only beside the checkout. See `stageEvidence`. */
+  private gateEvidenceFor(spec: TaskSpec): Promise<readonly StagedEvidence[]> {
+    const artifacts = this.options.artifacts;
+    if (artifacts === undefined) return Promise.resolve([]);
+
+    return stageEvidence(
+      artifacts,
+      spec.id,
+      evidenceRoot(join(this.options.config.paths.tasks, spec.id)),
     );
   }
 
@@ -561,6 +668,7 @@ export const reviewPrompt = (
   state: TaskState,
   base: string | undefined,
   commits: readonly Commit[] = [],
+  evidence: readonly StagedEvidence[] = [],
 ): string => {
   const diff =
     base === undefined
@@ -593,8 +701,36 @@ export const reviewPrompt = (
     "",
     ...spec.acceptance.map((command) => `- \`${command}\``),
     "",
+    ...evidenceSection(evidence),
     "Review the diff through your lens, then call `submit_verdict`.",
   ].join("\n");
+};
+
+/**
+ * What the reviewers are told about the files the gate left behind.
+ *
+ * Omitted entirely when there are none. "Evidence: none" would be carried by every task
+ * that renders nothing, and it reads as a finding about the change rather than as a fact
+ * about the pipeline — which is how a reviewer talks itself into a blocker.
+ *
+ * The paths are named because that is the whole difference between an artifact being
+ * STORED and it being evidence: a reviewer told "there are screenshots" and not where has
+ * been told nothing it can act on. What to do with a path is left to the lens — `read`
+ * handles text and `bash` handles the rest, and neither needed a new tool.
+ */
+const evidenceSection = (evidence: readonly StagedEvidence[]): readonly string[] => {
+  if (evidence.length === 0) return [];
+
+  return [
+    "## Evidence the acceptance gate produced",
+    "",
+    "These are the files the gate wrote while it ran — a screenshot, a trace, a report.",
+    "They are read-only, they are outside the checkout, and they are not part of the diff.",
+    "Read them where the change renders something a diff cannot show.",
+    "",
+    ...evidence.map((entry) => `- \`${entry.path}\``),
+    "",
+  ];
 };
 
 /**

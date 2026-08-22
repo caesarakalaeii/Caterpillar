@@ -407,7 +407,9 @@ const main = async (): Promise<void> => {
     }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
-    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
+    // `artifacts: store` is what lets the reviewers see what the gate rendered, not just
+    // what the diff says (§12.1). Read-only, staged beside the checkout.
+    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain, artifacts: store }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
     // The workspaces' forge factories, for the one question the loop asks of them: can this
