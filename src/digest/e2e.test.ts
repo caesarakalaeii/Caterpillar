@@ -44,6 +44,36 @@ const identify = async (git: Git): Promise<void> => {
   await git.run("config", "user.name", "test");
 };
 
+/** The fleet's configured commit identity (§9.7), as this deployment's would be. */
+const FLEET_EMAIL = "316492202+caterpillar-agent[bot]@users.noreply.github.com";
+/** The address it committed as before the App was reinstalled. Read-only, never written. */
+const RETIRED_FLEET_EMAIL = "11111111+old-agent[bot]@users.noreply.github.com";
+
+/**
+ * The same repo, with one commit stamped as a particular author at a particular moment.
+ *
+ * Committer dates, because that is what the digest's window filters on, and both author and
+ * committer set, because git will otherwise take the committer from the checkout's config
+ * and every commit here would be attributed to the same person.
+ */
+const commitAs = async (
+  repo: Git,
+  author: { email: string; name: string; at: string },
+  message: string,
+): Promise<void> => {
+  await repo.run("add", "-A");
+  await repo
+    .withEnv({
+      GIT_AUTHOR_NAME: author.name,
+      GIT_AUTHOR_EMAIL: author.email,
+      GIT_AUTHOR_DATE: author.at,
+      GIT_COMMITTER_NAME: author.name,
+      GIT_COMMITTER_EMAIL: author.email,
+      GIT_COMMITTER_DATE: author.at,
+    })
+    .run("commit", "-m", message);
+};
+
 const state = (): TaskState => ({
   id: TASK,
   status: "done",
@@ -131,18 +161,43 @@ const world = async (): Promise<World> => {
   await setup.run("init", "--quiet", "--initial-branch=main", upstream);
   const app = new Git(upstream);
   await identify(app);
+
+  // Before the window: the base the task branched from.
   await writeFile(join(upstream, "commands.ts"), "export const resume = () => 1;\n", "utf8");
-  await app.run("add", "-A");
-  await app.run("commit", "-m", "base");
-  await app.run("checkout", "--quiet", "-b", `agent/${TASK}`);
+  await commitAs(
+    app,
+    { email: "dev@example.invalid", name: "A Person", at: "2026-08-14T10:00:00Z" },
+    "base",
+  );
+
+  // Inside the window, on main: a person's commit, and one from the fleet's RETIRED
+  // address. Both must be attributed correctly by a digest published on the 16th.
+  await writeFile(join(upstream, "docs.md"), "# Widget\n", "utf8");
+  await commitAs(
+    app,
+    { email: "dev@example.invalid", name: "A Person", at: "2026-08-16T08:00:00Z" },
+    "docs: describe the widget",
+  );
+  await writeFile(join(upstream, "legacy.ts"), "export const old = 1;\n", "utf8");
+  await commitAs(
+    app,
+    { email: RETIRED_FLEET_EMAIL, name: "old-agent[bot]", at: "2026-08-16T08:30:00Z" },
+    "chore: work from before the app was reinstalled",
+  );
+
+  // Inside the window, on the task branch: the fleet's current address.
+  await app.run("checkout", "--quiet", "-b", `agent/${TASK}`, "main");
   await writeFile(
     join(upstream, "commands.ts"),
     "export const resume = () => 1;\nexport const clearStreak = () => 0;\n",
     "utf8",
   );
   await writeFile(join(upstream, "commands.test.ts"), "// covers the streak\n", "utf8");
-  await app.run("add", "-A");
-  await app.run("commit", "-m", "fix(notify): /resume clears the no-progress streak");
+  await commitAs(
+    app,
+    { email: FLEET_EMAIL, name: "caterpillar-agent[bot]", at: "2026-08-16T14:00:00Z" },
+    "fix(notify): /resume clears the no-progress streak",
+  );
   await app.run("checkout", "--quiet", "main");
 
   return {
@@ -165,6 +220,17 @@ const world = async (): Promise<World> => {
       );
 
       const notifications: Notification[] = [];
+      const mirrors = new MirrorChangeReader(
+        new WorktreeManager({
+          git,
+          mirrorsDir,
+          tasksDir: join(root, `${id}-tasks`),
+          helperPath: "/nonexistent/helper",
+          socketDir: "/nonexistent/socket",
+          identity: { name: "test", email: "test@example.invalid" },
+        }),
+      );
+
       return {
         notifications,
         digest: new DailyDigest({
@@ -185,16 +251,11 @@ const world = async (): Promise<World> => {
           boundary: BOUNDARY,
           runner: id,
           branch: "main",
-          changes: new MirrorChangeReader(
-            new WorktreeManager({
-              git,
-              mirrorsDir,
-              tasksDir: join(root, `${id}-tasks`),
-              helperPath: "/nonexistent/helper",
-              socketDir: "/nonexistent/socket",
-              identity: { name: "test", email: "test@example.invalid" },
-            }),
-          ),
+          changes: mirrors,
+          authorship: mirrors,
+          // Current address first, then the one this deployment retired: a window that
+          // straddles a change of identity must not read the old half as a person's work.
+          identity: { emails: [FLEET_EMAIL, RETIRED_FLEET_EMAIL] },
         }),
       };
     },
@@ -326,4 +387,24 @@ test("a push the remote refuses hands the day back rather than losing it", async
   await rm(hook);
   await runner.digest.maybePublish(EVENING);
   assert.ok(await onOrigin(scene.origin, "digests/2026-08-15.md"));
+});
+
+test("the published digest splits authorship using real commit identities", async () => {
+  // The one thing no fake can check: that the addresses git actually records match the
+  // ones config carries. The mirror here holds a person's commit, a commit under the
+  // fleet's current address and one under the address it retired — and only the person's
+  // may end up on the human side of the split.
+  const scene = await world();
+  const runner = await scene.runner("pod-a");
+
+  await runner.digest.maybePublish(EVENING);
+  await runner.digest.maybePublish(EVENING);
+
+  const published = (await onOrigin(scene.origin, "digests/2026-08-16.md")) ?? "";
+
+  assert.match(published, /## Authorship/);
+  // Two fleet commits (+3 lines) against one human commit (+1 line) in `acme/widget`.
+  assert.match(published, /acme\/widget[^\n]*3 commits \(2 fleet, 1 human\)/);
+  assert.match(published, /75%/, "3 of 4 lines, and the retired address is on the fleet's side");
+  assert.match(published, /nothing to compare/i, "the 15th had no commits in this repo");
 });
