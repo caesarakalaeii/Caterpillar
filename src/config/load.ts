@@ -28,6 +28,7 @@ import type {
   BotConfig,
   RemediationConfig,
   RunnerConfig,
+  ScheduleConfig,
   WebConfig,
   WorkspaceProfile,
 } from "./types.ts";
@@ -94,6 +95,7 @@ interface RawConfig {
   readonly intake?: { readonly intervalSeconds?: unknown };
   readonly web?: Record<string, unknown>;
   readonly digest?: Record<string, unknown>;
+  readonly schedule?: Record<string, unknown>;
   readonly cluster?: Record<string, unknown>;
   readonly remediation?: Record<string, unknown>;
   readonly redis?: Record<string, unknown>;
@@ -378,6 +380,17 @@ const webConfig = (web: Record<string, unknown>): WebConfig => ({
     "web.forwardedUserHeader",
     "remote-user",
   ).toLowerCase(),
+});
+
+/**
+ * Validate the `schedule` block (DESIGN.md §22).
+ *
+ * One field, and nothing to validate but its type — everything else about a schedule is in
+ * the state repo, where a malformed one is refused on the intake pass and shown on
+ * `/intake` rather than discovered at 09:00 by a runner with nothing useful to do.
+ */
+const scheduleConfig = (schedule: Record<string, unknown>): ScheduleConfig => ({
+  enabled: bool(schedule["enabled"], "schedule.enabled", false),
 });
 
 /**
@@ -667,6 +680,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     },
     web: webConfig(raw.web ?? {}),
     digest: digestConfig(raw.digest ?? {}),
+    schedule: scheduleConfig(raw.schedule ?? {}),
     cluster: clusterConfig(raw.cluster ?? {}),
     remediation: remediationConfig(raw.remediation ?? {}),
     redis: redisConfig(raw.redis ?? {}),

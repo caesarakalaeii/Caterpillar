@@ -113,6 +113,7 @@ const CONFIG: RunnerConfig = {
   housekeepingSeconds: 30,
   secretsDir: "/etc/caterpillar/secrets",
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  schedule: { enabled: false },
   cluster: {
     enabled: false,
     namespaces: [],

@@ -96,6 +96,7 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
   housekeepingSeconds: 1,
   secretsDir: join(root, "secrets"),
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  schedule: { enabled: false },
   cluster: {
     enabled: false,
     namespaces: [],

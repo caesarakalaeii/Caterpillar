@@ -430,6 +430,24 @@ export interface DigestConfig {
 }
 
 /**
+ * Scheduled work (DESIGN.md §22).
+ *
+ * ONE switch, and everything else about a schedule lives in the state repo. That is the
+ * point of the split: which schedules exist, when they fire, in which zone and with which
+ * acceptance commands is operator-authored, reviewable and revertable in the repo the
+ * supervisor already polls, and adding one must not be a redeploy. What this process gets
+ * to decide is only whether it participates at all.
+ *
+ * `enabled` defaults to FALSE, like the digest's and the web view's, and for the digest's
+ * reason: firing an occurrence writes tasks into the shared state repo, and a runner
+ * someone started on a workstation must not begin doing that because it was upgraded. The
+ * claim protocol (§22) makes a second firing runner harmless, not welcome.
+ */
+export interface ScheduleConfig {
+  readonly enabled: boolean;
+}
+
+/**
  * Supervisor-mediated cluster reads (DESIGN.md §20).
  *
  * Two switches, and they are not the same switch. `enabled` says this runner may perform
@@ -513,6 +531,7 @@ export interface RunnerConfig {
   readonly intake: IntakeConfig;
   readonly web: WebConfig;
   readonly digest: DigestConfig;
+  readonly schedule: ScheduleConfig;
   readonly cluster: ClusterConfig;
   readonly remediation: RemediationConfig;
   /** The ephemeral cross-process plane (DESIGN.md §21). Off by default. */
