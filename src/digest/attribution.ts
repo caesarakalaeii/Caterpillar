@@ -153,28 +153,23 @@ const split = (
     side.lines += commit.insertions + commit.deletions;
   }
 
+  const commitShare = share(fleet.commits, human.commits);
+  const lineShare = share(fleet.lines, human.lines);
+
+  // Spread rather than assigned, because `exactOptionalPropertyTypes` distinguishes an
+  // absent share from one present and undefined — and every reader of this type relies on
+  // that distinction to tell "nothing happened" from "the fleet wrote none of it".
   return {
     fleet,
     human,
-    ...shareOf("fleetCommitShare", fleet.commits, human.commits),
-    ...shareOf("fleetLineShare", fleet.lines, human.lines),
+    ...(commitShare === undefined ? {} : { fleetCommitShare: commitShare }),
+    ...(lineShare === undefined ? {} : { fleetLineShare: lineShare }),
   };
 };
 
-/**
- * `fleet / (fleet + human)`, or nothing when the denominator is zero.
- *
- * Keyed, so the caller spreads it: an absent share must be ABSENT rather than present and
- * zero, and returning `number | undefined` would put the decision at every call site.
- */
-const shareOf = <Key extends string>(
-  key: Key,
-  fleet: number,
-  human: number,
-): Partial<Record<Key, number>> => {
-  const whole = fleet + human;
-  return whole === 0 ? {} : ({ [key]: fleet / whole } as Record<Key, number>);
-};
+/** `fleet / (fleet + human)`, or nothing when the denominator is zero. */
+const share = (fleet: number, human: number): number | undefined =>
+  fleet + human === 0 ? undefined : fleet / (fleet + human);
 
 /**
  * Busiest first: the repo where most happened is the one a reader wants at the top, and a
