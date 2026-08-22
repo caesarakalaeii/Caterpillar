@@ -109,9 +109,9 @@ export interface Forge {
    * Every review comment on a pull request, resolved and outdated ones included
    * (DESIGN.md §7.3).
    *
-   * Included rather than filtered because a caller that is told only about the live ones
-   * cannot say how many were dealt with, and "three threads, all resolved" is what tells
-   * the agent a review happened at all. `agent/review-guidance.ts` decides what is quoted.
+   * Included rather than filtered because a caller told only about the live ones cannot say
+   * how many were dealt with, and "two of these five are still open" changes what the two
+   * mean. `agent/review-guidance.ts` decides what is quoted and what is only counted.
    *
    * A forge that cannot be reached must not fail the task, so callers log and continue —
    * see `AgentSessionRunner.reviewGuidance`. This method still throws, because swallowing

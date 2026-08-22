@@ -443,9 +443,9 @@ class GitHubAppForge implements Forge {
    * exposes it nowhere but `pullRequest.reviewThreads`. Without the flag every comment a
    * human had already accepted would come back as an open instruction on every session.
    *
-   * Resolved and outdated threads are returned rather than filtered. Only the caller can
-   * say "three threads, all resolved", and that sentence is what tells a session a review
-   * happened at all — an empty list cannot.
+   * Resolved and outdated threads are returned rather than filtered: the caller states how
+   * many of a review are already answered beside the ones that are not, and a list it had
+   * pre-filtered could not say. Deciding what is quoted is `agent/review-guidance.ts`'s job.
    */
   async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
     assertInScope(repo, this.allowed);

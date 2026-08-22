@@ -317,8 +317,8 @@ class ForgejoForge implements Forge {
    * carries per-line comments, one request each. Reading only the second drops every
    * objection that is not about a particular line.
    *
-   * Resolved comments are returned rather than filtered, as on GitHub: only the caller can
-   * say "three threads, all resolved", and an empty list cannot.
+   * Resolved comments are returned rather than filtered, as on GitHub: the caller states how
+   * many of a review are already answered beside the ones that are not.
    */
   async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
     assertInScope(repo, this.allowed);
