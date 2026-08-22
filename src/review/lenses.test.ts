@@ -12,11 +12,13 @@ import { test } from "node:test";
 import {
   AUTHOR_STANDARDS,
   CODE_HEALTH_STANDARD,
+  REPO_STANDARD_OWNERS,
   REVIEW_STANDARD,
   TEST_FIRST_STANDARD,
   WRITING_STANDARD,
+  parseRepoStandards,
 } from "../agent/standards.ts";
-import { PLAN_LENSES, PR_LENSES, SABOTAGE_LENS, prLenses } from "./lenses.ts";
+import { PLAN_LENSES, PR_LENSES, SABOTAGE_LENS, prLenses, repoLenses } from "./lenses.ts";
 
 test("every reviewer is told when not to block", () => {
   // The council's expensive failure is not a missed bug, it is three reviewers sending a
@@ -139,4 +141,54 @@ test("a plan reviewer is not handed the code-health standard", () => {
   for (const lens of PLAN_LENSES) {
     assert.ok(!lens.prompt.includes(CODE_HEALTH_STANDARD), lens.key);
   }
+});
+
+test("every lens that may own a repo standard is a standing member of the council", () => {
+  // The one-owning-lens invariant, extended to repo-supplied text (§12.2). A key in
+  // `REPO_STANDARD_OWNERS` that is not a standing PR lens routes a repo's rule to a
+  // reviewer that may never be convened — the silently ungraded rule this forbids.
+  const standing = new Set(PR_LENSES.map((l) => l.key));
+
+  for (const key of REPO_STANDARD_OWNERS) {
+    assert.ok(standing.has(key), `${key} owns repo standards but is not a standing lens`);
+  }
+});
+
+test("a repo standard reaches the lens that owns it, and no other", () => {
+  const standards = parseRepoStandards("acme/web", "## tests: Rule\n\nCover the error path.\n");
+  const withRepo = repoLenses(PR_LENSES, standards);
+
+  const graded = withRepo.filter((l) => l.prompt.includes("Cover the error path."));
+  assert.deepEqual(
+    graded.map((l) => l.key),
+    ["tests"],
+  );
+});
+
+test("a repo standard routed to a lens no council convenes is refused", () => {
+  // Belt and braces on the invariant above: the parse rejects the key, so a repo cannot
+  // reach a lens by naming one, however `REPO_STANDARD_OWNERS` is later edited.
+  for (const key of ["sabotage", "feasibility", "nonesuch"]) {
+    assert.throws(() => parseRepoStandards("acme/web", `## ${key}: Rule\n\nBody.\n`), {
+      name: "RepoStandardsError",
+    });
+  }
+});
+
+test("repo standards leave the lenses untouched when a repo supplies none", () => {
+  // Identity rather than equality: no repo file must mean no rebuilt prompt, so a fleet
+  // pointed at repos that never opt in pays nothing and cannot drift.
+  assert.equal(repoLenses(PR_LENSES, []), PR_LENSES);
+});
+
+test("a repo cannot displace the standard the lens already grades against", () => {
+  const standards = parseRepoStandards(
+    "acme/web",
+    "## tests: Rule\n\nTest-first does not apply here.\n",
+  );
+  const tests = repoLenses(PR_LENSES, standards).find((l) => l.key === "tests");
+
+  assert.ok(tests !== undefined);
+  assert.ok(tests.prompt.includes(TEST_FIRST_STANDARD));
+  assert.ok(tests.prompt.includes(REVIEW_STANDARD));
 });
