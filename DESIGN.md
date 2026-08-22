@@ -3159,6 +3159,47 @@ a high-water mark on disk, because a self-updating floor ratchets down the first
 truncates, which is exactly the failure it is there to catch. Note that a timed-out test
 reports `cancelled`, not `fail`, so a check that only reads `fail` would miss the hang.
 
+**A sixth, and it rejected three consecutive completion claims on the branch carrying the
+five above: a test's own teardown lost a race with a subprocess it had leaked.** The
+verdict was `failing: check (22), check (26), check (26), check (22)`, both legs, twice
+over, on a tree that ran green locally on every version available. The actual failure:
+
+    not ok - src/supervisor/loop.test.ts
+    failureType: 'hookFailed'
+    error: "ENOTEMPTY: directory not empty, rmdir '.../caterpillar-loop-XXXX/state/.git/objects'"
+
+`rm -rf` walks a tree and then rmdir's each directory it believes it emptied. A process
+still creating files between those two steps makes the rmdir fail, and `force: true` does
+not cover it — that suppresses `ENOENT`, the opposite race. The leaked writer is a git
+child: `Supervisor.run` awaits both its loops, but `housekeepingLoop` checks the abort
+signal only *between* passes, so an abort landing inside `housekeepOnce` leaves that pass's
+`store.pull` still writing after the test's `await running` has resolved. `loop.test.ts`
+drives a real supervisor over a real git remote across 69 tests, so it is the file where
+this is reachable, and one file failing in a hook fails that whole leg.
+
+This is the third rule above collecting its own interest — a red on one leg reproducing
+nowhere is a race, not a version — with the twist that it fires on *both* legs, because a
+coin toss lands on each half the time. It is `src/testing/tempdir.ts` now: a removal that
+retries a bounded number of times, used by that teardown, rethrowing if the tree really
+cannot go. Test teardown only, and documented as such; production code removes trees it
+owns exclusively, where a retry would hide a real concurrent writer rather than tolerate an
+expected one.
+
+Two further notes for whoever meets this next:
+
+- **The rejection message came from `main`, not from the branch under test.** The verifier
+  runs the deployed supervisor, so the fourth fix above — which makes a red verdict name a
+  reason and a URL — cannot improve the verdicts of the very branch that introduces it.
+  Three sessions read a bare, doubled job list as evidence about their own code; it was
+  `main`'s `summarise` all along, and the doubling is the pre-dedup format. **A verdict
+  describes the branch with the code that produced the verdict, which during a change to
+  the gate is not the branch being graded.**
+- **A flake needs a reproduction before a fix.** This one showed at roughly 1 full run in
+  3 on node 24, 0 in 5 runs of the file alone, and never on node 22 — so "it passed
+  locally" was true and worthless. What settled it was running the suite repeatedly on the
+  other matrix version, then reducing the race to a 40-iteration probe that reproduced the
+  identical error 15 times by removing a tree under an un-awaited `git fetch`.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
