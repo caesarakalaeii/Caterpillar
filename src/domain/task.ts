@@ -332,7 +332,7 @@ export interface ReviewRecord {
    * rest of the task's life, which is the cap deleted rather than informed.
    *
    * Absent until a human has commented on a pull request, and on state written before this
-   * existed — which `reviewRoundsForgiven` reads as "nothing has been acted on yet".
+   * existed — which `isNewerComment` reads as "nothing has been acted on yet".
    */
   readonly commentSeen?: string;
 }

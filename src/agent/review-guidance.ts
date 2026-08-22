@@ -31,13 +31,11 @@ import type { ReviewComment } from "../forge/types.ts";
 /**
  * Comments a human left that are still open — the ones that are actually an instruction.
  *
- * Exported because the round-count reset asks the same question the renderer does, and the
- * two answers must not be able to disagree: a section the agent was shown but that bought it
- * no round would park the task before it could act on what it had just read.
+ * Shared by the renderer and the watermark rather than each filtering for itself: the two
+ * answers must not be able to disagree, or the agent is shown a section that buys it no
+ * review round and the task parks before it can act on what it just read.
  */
-export const actionableComments = (
-  comments: readonly ReviewComment[],
-): readonly ReviewComment[] =>
+const actionableComments = (comments: readonly ReviewComment[]): readonly ReviewComment[] =>
   comments.filter((c) => !c.fromFleet && !c.resolved && !c.outdated);
 
 /**
@@ -66,39 +64,28 @@ export const newestHumanComment = (
 };
 
 /**
- * Whether these comments should clear the review council's round count (§12.1, §7.3).
+ * Whether a comment should clear the review council's round count (§12.1, §7.3).
  *
  * The cap exists because the agent and the council can trade a task forever with nothing new
- * entering the loop, and a human objection is exactly something new — the same argument
- * §7.3 makes for typed guidance, reaching the same answer for the surface a reviewer is
- * actually looking at.
+ * entering the loop, and a human objection is exactly something new — the same argument §7.3
+ * makes for typed guidance, reaching the same answer for the surface a reviewer is actually
+ * looking at.
  *
- * `seen` is the newest comment a previous session already had forgiven for it. Forgiving
+ * `seen` is the newest comment a previous session was already forgiven a round for. Forgiving
  * without it would delete the cap rather than inform it: one comment would buy a round on
  * every session for the rest of the task's life, and the loop the cap exists to detect would
  * run forever.
+ *
+ * Over timestamps rather than over comments, because that is what the caller has. The
+ * supervisor holds no minting forge — `SupervisorDeps.forges` is narrowed to `RepoReach` on
+ * purpose — so what reaches it is the one timestamp `newestHumanComment` produced, carried
+ * on the session's outcome.
  *
  * A `seen` that does not parse is treated as no watermark at all. State files are written by
  * earlier deploys and edited by hand, and a NaN comparison is false in both directions — so
  * the alternative is quietly never forgiving anything again.
  */
-export const reviewRoundsForgiven = (
-  comments: readonly ReviewComment[],
-  seen: string | undefined,
-): boolean => isNewerComment(newestHumanComment(comments), seen);
-
-/**
- * The same rule stated over timestamps, for the caller that has one rather than a list.
- *
- * The supervisor is that caller: it holds no minting forge (`SupervisorDeps.forges` is
- * narrowed to `RepoReach` on purpose), so what reaches it is the one timestamp the session
- * reported on its outcome. Sharing this rather than re-deriving the comparison there is what
- * keeps "newer than what was already acted on" from being written twice and drifting.
- */
-export const isNewerComment = (
-  comment: string | undefined,
-  seen: string | undefined,
-): boolean => {
+export const isNewerComment = (comment: string | undefined, seen: string | undefined): boolean => {
   if (comment === undefined) return false;
   const seenMs = seen === undefined ? NaN : Date.parse(seen);
   return Number.isNaN(seenMs) || Date.parse(comment) > seenMs;
