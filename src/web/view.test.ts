@@ -519,7 +519,7 @@ test("a policy that will not parse is rendered as a message, not thrown at the p
   assert.deepEqual(view.policy, []);
 });
 
-test("a task says which of the four intake paths produced it", async () => {
+test("a task says which of the intake paths produced it", async () => {
   const subject = await store();
 
   await subject.writeSpec({
@@ -549,6 +549,13 @@ test("a task says which of the four intake paths produced it", async () => {
     reason: "created",
   });
 
+  // A scheduled task carries no `kind` and no `tracker`, which is exactly what a
+  // hand-committed spec looks like — so its id is the only thing that distinguishes them,
+  // and saying "a hand-committed spec" about work nobody committed is a lie a reader has no
+  // way to catch.
+  await subject.writeSpec({ ...spec("SCHED-deps-audit-2026-08-17T0700Z", "# Audit") });
+  await subject.writeState(state("SCHED-deps-audit-2026-08-17T0700Z"));
+
   const view = await fleet({ store: subject, live: new LiveSession(), runnerId: "pod-7f3a" });
   const origins = new Map(view.tasks.map((task) => [task.id, task.origin]));
 
@@ -559,6 +566,11 @@ test("a task says which of the four intake paths produced it", async () => {
     "the item's address is in the goal, because a TrackerRef does not carry one",
   );
   assert.equal(origins.get(asTaskId("HAND-1"))?.kind, "spec");
+
+  const scheduled = origins.get(asTaskId("SCHED-deps-audit-2026-08-17T0700Z"));
+  assert.equal(scheduled?.kind, "schedule");
+  assert.match(scheduled?.label ?? "", /deps-audit/);
+
   assert.equal(origins.get(asTaskId("BS-99"))?.kind, "brainstorm");
 
   const alert = origins.get(asTaskId("ALERT-bb01"));
