@@ -98,6 +98,16 @@ export interface ScheduleRunnerOptions {
 export class ScheduleRunner {
   private readonly options: ScheduleRunnerOptions;
 
+  /**
+   * Whether this runner has settled an occurrence whose push has not landed.
+   *
+   * In memory, and that is the right scope: it exists only to make the NEXT pass call
+   * `commitAndPush` again, and a restarted process reaches the same state through
+   * `StateStore`'s own retry — its `stageCommitPush` pushes on a clean tree precisely
+   * because a rejected push leaves the commit local.
+   */
+  private unpushed = false;
+
   constructor(options: ScheduleRunnerOptions) {
     this.options = options;
   }
@@ -158,15 +168,16 @@ export class ScheduleRunner {
       }
     }
 
-    // Only when something happened. An idle pass is the overwhelmingly common case — this
-    // runs every housekeeping interval and a schedule fires once a day — so logging one
-    // would bury every other line the loop writes. What an idle scheduler looks like is
-    // answered by `/intake` and by `caterpillar_schedule_occurrences_total`, both of which
-    // report the counts this method used to return to a caller that ignored them.
     // Committed once per pass rather than per occurrence: six schedules firing at 09:00
     // should be one push, and the state repo's history should read as scheduling events.
-    if (changed) {
-      logger.info("schedule.pass", { fired, skipped, refused });
+    //
+    // `unpushed` is the second reason to commit, and it is what stops a rejected push from
+    // stranding a task on one runner's disk. `commitAndPush` deliberately pushes even when
+    // the tree is clean, because after a rejection the commit is local and nothing else will
+    // send it — but only a CALL can do that, and an idle pass makes none. So a failure is
+    // remembered until a push succeeds.
+    if (changed || this.unpushed) {
+      if (changed) logger.info("schedule.pass", { fired, skipped, refused });
       try {
         await store.commitAndPush(
           fired > 0
@@ -175,13 +186,14 @@ export class ScheduleRunner {
           "origin",
           this.options.branch,
         );
+        this.unpushed = false;
       } catch (error) {
-        // The tasks are written and their claims are held, so the occurrences ARE settled
-        // on this runner; what failed is publishing the fact. Nothing is rolled back — the
-        // next commit on this checkout carries these files (`WRITABLE_TREE`), and a task
-        // that exists locally and nowhere else is picked up by the next `commitAndPush`
-        // rather than lost. Releasing the claims here would be worse: it would invite a
-        // second runner to create tasks this one has already written.
+        // Nothing is rolled back and no claim is released. The tasks are written and their
+        // claims are held, so the occurrences ARE settled here; what failed is publishing
+        // the fact. Releasing the claims would be worse — it would invite a second runner to
+        // create tasks this one has already written — and the retry above is what makes
+        // keeping them safe rather than merely convenient.
+        this.unpushed = true;
         logger.error("schedule.push-failed", errorFields(error));
       }
     }
