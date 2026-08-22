@@ -13,10 +13,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { asTaskId, type TaskState } from "../domain/task.ts";
+import { asTaskId, type RepoRef, type TaskState } from "../domain/task.ts";
 import { Git } from "../state/git.ts";
-import { collectDay } from "./collect.ts";
-import { windowFor } from "./day.ts";
+import type { AuthoredCommit } from "./attribution.ts";
+import { collectDay, type AuthorshipRead, type AuthorshipReader } from "./collect.ts";
+import { previousWindow, windowFor } from "./day.ts";
 
 const roots: string[] = [];
 
@@ -395,4 +396,143 @@ test("a first-ever digest with no starting commit reports every shard present", 
 
   const change = (await collect(subject.root)).changed[0];
   assert.match(change?.journal ?? "", /The very first entry/);
+});
+
+/* -------------------------------------------------------------------- attribution */
+
+const FLEET_EMAIL = "316492202+caterpillar-agent[bot]@users.noreply.github.com";
+
+/**
+ * An authorship reader that records what it was asked, so the tests can assert on the
+ * QUESTION as well as the answer: which repos, and which two windows.
+ */
+class RecordingAuthorship implements AuthorshipReader {
+  readonly asked: { repos: readonly string[]; from: Date; to: Date }[] = [];
+
+  private readonly commits: readonly AuthoredCommit[];
+  private readonly unavailable: readonly string[];
+
+  constructor(commits: readonly AuthoredCommit[], unavailable: readonly string[] = []) {
+    this.commits = commits;
+    this.unavailable = unavailable;
+  }
+
+  async readAuthorship(
+    repos: readonly RepoRef[],
+    from: Date,
+    to: Date,
+  ): Promise<AuthorshipRead> {
+    this.asked.push({ repos: repos.map((r) => `${r.owner}/${r.name}`), from, to });
+    // The window before is the second call, and the fixture only describes the first: a
+    // baseline of nothing is the ordinary case for a first-ever digest.
+    return this.asked.length === 1
+      ? { commits: this.commits, unavailable: this.unavailable }
+      : { commits: [], unavailable: [] };
+  }
+}
+
+const authored = (email: string, lines: number): AuthoredCommit => ({
+  repo: "acme/widget",
+  sha: `${email}-${lines}`,
+  authorEmail: email,
+  insertions: lines,
+  deletions: 0,
+});
+
+/** A state repo with one task that moved inside the window, on `acme/widget`. */
+const movedTask = async (): Promise<Repo> => {
+  const subject = await repo();
+  const id = asTaskId("TASK-ATTRIB");
+
+  await subject.commit(BEFORE, { "README.md": "state repo\n" });
+  await subject.commit(INSIDE, {
+    [`tasks/${id}/spec.md`]: SPEC("# Fix the widget"),
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "done", sessions: 1 })),
+  });
+
+  return subject;
+};
+
+test("the digest attributes the window's code to the fleet or to a person", async () => {
+  const subject = await movedTask();
+  const reader = new RecordingAuthorship([
+    authored(FLEET_EMAIL, 90),
+    authored("dev@example.invalid", 10),
+  ]);
+
+  const digest = await collectDay({
+    git: new Git(subject.root),
+    window: WINDOW,
+    authorship: reader,
+    identity: { emails: [FLEET_EMAIL] },
+  });
+
+  assert.equal(digest.attribution?.total.fleet.lines, 90);
+  assert.equal(digest.attribution?.total.human.lines, 10);
+  assert.equal(digest.attribution?.total.fleetLineShare, 0.9);
+});
+
+test("the trend is read from the window before this one, at the same repos", async () => {
+  const subject = await movedTask();
+  const reader = new RecordingAuthorship([authored(FLEET_EMAIL, 10)]);
+
+  await collectDay({
+    git: new Git(subject.root),
+    window: WINDOW,
+    authorship: reader,
+    identity: { emails: [FLEET_EMAIL] },
+  });
+
+  const before = previousWindow(WINDOW, { hour: 18, timeZone: "Europe/Berlin" });
+  assert.deepEqual(reader.asked.length, 2, "this window and the one before it");
+  assert.deepEqual(reader.asked[0]?.repos, ["acme/widget"], "the repos the window's tasks name");
+  assert.equal(reader.asked[0]?.from.getTime(), WINDOW.start.getTime());
+  assert.equal(reader.asked[1]?.from.getTime(), before.start.getTime());
+  assert.equal(reader.asked[1]?.to.getTime(), WINDOW.start.getTime(), "the windows must meet");
+});
+
+test("a repo the runner cannot read is carried through, not counted as zero", async () => {
+  // The §19 trap: a task branch lives in the mirror of the runner that worked it, so
+  // another runner has no history for that repo. Reporting 0% fleet there is a false
+  // statement about a repo the fleet may have written entirely.
+  const subject = await movedTask();
+  const reader = new RecordingAuthorship([], ["acme/widget"]);
+
+  const digest = await collectDay({
+    git: new Git(subject.root),
+    window: WINDOW,
+    authorship: reader,
+    identity: { emails: [FLEET_EMAIL] },
+  });
+
+  assert.deepEqual(digest.attribution?.unavailable, ["acme/widget"]);
+  assert.equal(digest.attribution?.measured, false);
+});
+
+test("no authorship reader means no attribution section at all", async () => {
+  // Rather than an all-zero report. A digest that cannot measure authorship must say
+  // nothing about it, not assert that the fleet wrote none of the code.
+  const subject = await movedTask();
+
+  const digest = await collectDay({ git: new Git(subject.root), window: WINDOW });
+
+  assert.equal(digest.attribution, undefined);
+});
+
+test("a reader that throws costs the attribution section and not the day", async () => {
+  // The collector's standing rule (§19): a digest that throws fails identically on every
+  // retry, so the day would never be published at all.
+  const subject = await movedTask();
+
+  const digest = await collectDay({
+    git: new Git(subject.root),
+    window: WINDOW,
+    identity: { emails: [FLEET_EMAIL] },
+    authorship: {
+      readAuthorship: () => Promise.reject(new Error("the mirror is gone")),
+    },
+  });
+
+  assert.equal(digest.attribution, undefined);
+  assert.equal(digest.changed.length, 1, "the rest of the day is still reported");
 });
