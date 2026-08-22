@@ -27,10 +27,13 @@ labelled `agent` became a task 23 seconds later and ran through to `done` and a 
 issue, including one round trip through `ask_human` when the agent hit a supervisor bug it
 could not work around.
 
-Work reaches it three ways: label a tracker item `agent` and intake renders a spec (§14);
-run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and then cut
-into wave-tagged tasks (§14.3); or commit a `tasks/<id>/spec.md` into the state repo by
-hand for full control over the acceptance criteria.
+Work reaches it four ways without a clock: label a tracker item `agent` and intake renders a
+spec (§14); run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and
+then cut into wave-tagged tasks (§14.3); commit a `tasks/<id>/spec.md` into the state repo by
+hand for full control over the acceptance criteria; or let a firing Alertmanager alert become
+one (§20). And with a clock: commit a `schedules/<id>.yaml` and an occurrence of it becomes a
+task, gated by an optional precheck so a quiet week costs a command instead of a session
+(§22).
 
 To hand a GitHub issue or Vikunja task to the agent, label it `agent` and put an `agent`
 block in the body — `acceptance` is required, since a task with no machine-checkable
@@ -210,6 +213,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/remediation/policy.ts` | `alerts/policy.yaml` — which alerts may become tasks. Pure (§20). |
 | `src/remediation/receiver.ts` | The Alertmanager webhook. Answers fast, writes nothing, trusts nothing (§20). |
 | `src/remediation/queue.ts` | Firing alert → `spec.md`, on the loop's thread of control (§20). |
+| `src/schedule/occurrence.ts` | Cron + IANA zone → the next occurrence. Pure, clock injected (§22). |
+| `src/schedule/definition.ts` | `schedules/<id>.yaml` — one scheduled unit of work. Pure (§22). |
+| `src/schedule/precheck.ts` | The bounded command that decides whether to spend a session (§22). |
+| `src/schedule/run.ts` | Claim the occurrence, fire it, release the claim if that failed (§22). |
 | `src/redis/client.ts` | The nine-method Redis surface. The driver stops here (§21). |
 | `src/redis/guarded.ts` | The one place a Redis failure becomes a value instead of a throw (§21). |
 | `src/redis/inbox.ts` | Chat intents over a list, outcomes over a reply channel (§21). |
@@ -346,8 +353,8 @@ A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Aut
 what is running where, the fleet's logs, the messages of the sessions in flight, every
 stored transcript, and each task's spec, journal, questions, council verdicts and
 artifacts. `/intake` is where a **refusal** shows up: a labelled item that could not become
-a task, an alert that fired with no policy entry, and whether the alert receiver is
-listening at all.
+a task, an alert that fired with no policy entry, a schedule whose file will not parse, and
+whether the alert receiver and this runner's scheduler are switched on at all.
 
 Every runner serves it on its own port, in-cluster. In front of them sits
 **`caterpillar-view`** — the same image with a different command — which discovers the ready
@@ -548,6 +555,69 @@ in an order that matters. **`docs/remediation-runbook.md`** is the end-to-end gu
 order of operations, how to test the webhook by hand with `curl`, two worked
 `alerts/policy.yaml` entries, the three levers for turning it off in a hurry, and what to do
 about a 401, a 403 or an empty Loki result.
+
+## Work on a schedule
+
+The sixth intake path (§14, §22). "Every weekday at 09:00, audit the dependency updates in
+these repos" is a file in the state repo, and an occurrence of it becomes an ordinary task —
+claimed, sessioned, gated by §12, ending in a pull request.
+
+```json
+"schedule": { "enabled": true }
+```
+
+That is the whole of the runner's side of it. There is no new port, no new Deployment and no
+`CronJob`: the supervisor's housekeeping loop already runs every few seconds whether or not a
+session is in flight, and "has an occurrence come due" is a question about a checkout it
+already has.
+
+Everything else lives in the state repo, one file per schedule:
+
+```yaml
+# schedules/deps-audit.yaml
+version: 1
+trigger:
+  cron: "0 9 * * 1-5"           # five fields; no @daily, no seconds, no L or #
+  timezone: Europe/Berlin       # a NAMED zone, never +02:00
+workspace: primary
+repos:
+  - github.com/acme/widget
+prompt: |
+  Audit dependency updates across these repos. Open one PR per safe upgrade.
+acceptance:                     # required — a schedule that cannot express
+  - npm test                    # machine-checkable completion may not exist (§12)
+precheck:                       # optional: exit 0 to spend a session
+  command: "npm outdated --json | grep -q ."
+  timeoutSeconds: 120
+enabled: true                   # optional; false is how you turn one off
+maxOpenTasks: 1                 # optional
+```
+
+**The precheck is the part worth understanding.** Without one, every occurrence becomes a
+task, and a week with no dependency updates costs a full session to discover there was
+nothing to do — which the no-progress detector then scores honestly and, after three of them,
+parks (§11.1). With one, the command runs first, in the same worktree and the same nix
+environment the session would have had; a non-zero exit records a **skipped** occurrence and
+spends nothing. A timeout counts as non-zero, deliberately: a check that cannot answer in its
+own budget has not established that there is work.
+
+**Exactly one runner in the fleet fires each occurrence**, settled by the same
+compare-and-swap that claims a task — `refs/schedules/<id>/<occurrence>`. The claim is taken
+before the task is created and handed back if creating it failed, because firing twice is
+visible and firing never is silent.
+
+**Catch-up reaches back one occurrence and six hours.** A pod rolled through 09:00 (Keel rolls
+this one on every push to main) still owes that morning's audit; a pod that was off for a week
+does not owe seven of them.
+
+**A malformed schedule is refused when you commit it**, on the intake pass, and shown on
+`/intake` — not discovered at 09:00 by a runner that then has nothing useful to do. The same
+page carries the occurrence ledger, so a schedule that keeps skipping is legible instead of
+looking like a scheduler that stopped.
+
+Off by default, like the digest: firing an occurrence writes tasks into the shared state repo,
+and a runner someone started on a workstation must not begin doing that because it was
+upgraded.
 
 ## Turning on Redis
 
