@@ -276,3 +276,67 @@ test("the fleet page carries one line saying when intake last ran", async () => 
   );
   assert.match(skipped, /another runner served this interval/);
 });
+
+test("the intake page shows a malformed schedule, and says which runner fires them", async () => {
+  // A schedule that will not parse is refused when it is committed (§22) — and until this
+  // page showed it, that refusal was a warn line in one pod's stdout. The other half is
+  // the switch: a fleet where nothing has `schedule.enabled` fires nothing, and an empty
+  // occurrence ledger is exactly what that looks like.
+  const page = render(
+    intakePage({
+      ...INTAKE,
+      scheduling: false,
+      schedules: [],
+      scheduleErrors: [
+        {
+          schedule: "deps-audit",
+          message: "schedules/deps-audit.yaml is invalid: `acceptance` must list at least one command",
+        },
+      ],
+      occurrences: [],
+    }),
+  );
+
+  assert.match(page, /deps-audit/);
+  assert.match(page, /must list at least one command/);
+  assert.match(page, /<code>schedule\.enabled<\/code> is false/);
+});
+
+test("a skipped occurrence is shown with its reason, so a quiet schedule is legible", async () => {
+  // The whole point of recording a skip: "the precheck said no" and "nothing is polling
+  // this schedule" produce the same number of tasks, and only the ledger tells them apart.
+  const page = render(
+    intakePage({
+      ...INTAKE,
+      scheduling: true,
+      schedules: [
+        {
+          id: "deps-audit",
+          version: 1,
+          trigger: { cron: "0 9 * * 1-5", timeZone: "Europe/Berlin" },
+          workspace: asWorkspaceName("primary"),
+          repos: [{ host: "github.com", owner: "acme", name: "widget" }],
+          prompt: "audit the dependencies",
+          acceptance: ["npm test"],
+          requires: [],
+          enabled: true,
+          maxOpenTasks: 1,
+        },
+      ],
+      occurrences: [
+        {
+          schedule: "deps-audit",
+          occurrence: "2026-08-17T0700Z",
+          outcome: "skipped",
+          detail: "exit 1: <script>alert('x')</script>",
+          at: "2026-08-17T07:00:04.000Z",
+        },
+      ],
+    }),
+  );
+
+  assert.match(page, /0 9 \* \* 1-5/);
+  assert.match(page, /Europe\/Berlin/);
+  assert.match(page, /skipped/);
+  assert.doesNotMatch(page, /<script>alert/, "a precheck's output is untrusted like any other");
+});

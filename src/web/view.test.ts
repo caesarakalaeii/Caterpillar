@@ -599,3 +599,51 @@ test("a tracker task whose goal lost its link still names its source", async () 
   assert.equal(origins.get(asTaskId("VK-7-42"))?.url, undefined);
   assert.match(origins.get(asTaskId("VK-7-42"))?.label ?? "", /vikunja/);
 });
+
+test("intakeView carries the schedules, their errors and the last occurrences", async () => {
+  // The fifth intake path on the page that already explains the other two refusals (§22).
+  // A malformed schedule and a schedule that keeps skipping are both invisible everywhere
+  // else: one is a warn line in a pod's stdout, the other is an absence of tasks.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-view-schedule-"));
+  roots.push(root);
+  const subject = new StateStore(root, new Git(root));
+
+  const good = [
+    "version: 1",
+    "trigger:",
+    '  cron: "0 9 * * 1-5"',
+    "  timezone: Europe/Berlin",
+    "workspace: primary",
+    "repos:",
+    "  - github.com/acme/widget",
+    "prompt: audit the dependencies",
+    "acceptance:",
+    "  - npm test",
+    "",
+  ].join("\n");
+  await mkdir(join(root, "schedules"), { recursive: true });
+  await writeFile(join(root, "schedules", "deps-audit.yaml"), good, "utf8");
+  await writeFile(
+    join(root, "schedules", "broken.yaml"),
+    good.replace("acceptance:", "acceptence:"),
+    "utf8",
+  );
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "exit 1: nothing outdated",
+  });
+
+  const view = await intakeView({ store: subject, config: CONFIG });
+
+  assert.deepEqual(
+    view.schedules.map((schedule) => schedule.id),
+    ["deps-audit"],
+  );
+  assert.equal(view.scheduleErrors.length, 1);
+  assert.equal(view.scheduleErrors[0]?.schedule, "broken");
+  assert.equal(view.occurrences.length, 1);
+  assert.equal(view.occurrences[0]?.outcome, "skipped");
+  assert.equal(view.scheduling, false, "this runner is not firing them");
+});
