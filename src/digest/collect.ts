@@ -73,9 +73,9 @@ export interface AuthorshipRead {
  * Reads who authored a window's commits.
  *
  * Separate from `ChangeReader` because it asks a different question of the same mirrors:
- * not "what did this task produce" but "who wrote this repo", across every ref rather
- * than one task branch. Both are implemented by `MirrorChangeReader` and both inherit its
- * rule — a repo this runner has no mirror of is NAMED, never counted as zero.
+ * not "what did this task produce" but "who wrote this repo", across every branch rather
+ * than one task's. Both are implemented by `MirrorChangeReader` and both inherit its rule
+ * — a repo this runner has no mirror of is NAMED, never counted as zero.
  */
 export interface AuthorshipReader {
   readAuthorship(repos: readonly RepoRef[], from: Date, to: Date): Promise<AuthorshipRead>;

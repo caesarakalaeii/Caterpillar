@@ -265,6 +265,20 @@ test("the share is shown against the previous window, because one day says nothi
   assert.match(text, /\bup\b/i);
 });
 
+test("a share that has not moved says it is unchanged, against a stated baseline", () => {
+  const text = withAttribution(
+    [authored("acme/widget", FLEET_EMAIL, 50), authored("acme/widget", "dev@example.invalid", 50)],
+    {
+      previous: [
+        authored("acme/widget", FLEET_EMAIL, 10),
+        authored("acme/widget", "dev@example.invalid", 10),
+      ],
+    },
+  );
+
+  assert.match(text, /Unchanged from 50% of lines in the previous window/);
+});
+
 test("a first window with nothing to compare against says so rather than showing no change", () => {
   // "flat" would be a claim about a yesterday that was never measured.
   const text = withAttribution([authored("acme/widget", FLEET_EMAIL, 40)]);

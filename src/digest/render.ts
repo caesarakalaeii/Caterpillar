@@ -225,7 +225,7 @@ const shareLine = (report: AttributionReport): readonly string[] => {
 const TREND: Readonly<Record<AttributionTrend, string>> = {
   up: "Up",
   down: "Down",
-  flat: "Flat",
+  flat: "Unchanged",
 };
 
 const repoShare = (entry: RepoAttribution): string => {
