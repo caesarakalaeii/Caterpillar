@@ -6,7 +6,7 @@
  * the losing step was a CAS against a ref that had already been deleted.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -34,6 +34,7 @@ import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
+import { removeTempTree } from "../testing/tempdir.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
@@ -61,7 +62,13 @@ const origin = join(root, "origin.git");
 const statePath = join(root, "state");
 
 after(async () => {
-  await rm(root, { recursive: true, force: true });
+  // Not a plain `rm`: `Supervisor.run` can resolve while a housekeeping pass is still
+  // in flight, because `housekeepingLoop` checks the abort signal only between passes.
+  // That pass's `store.pull` git child then writes into `state/.git/objects` after the
+  // test's `await running` has returned, and deleting the tree under it failed this whole
+  // file in a hook with ENOTEMPTY — intermittently, on whichever CI matrix leg lost the
+  // race. See src/testing/tempdir.ts.
+  await removeTempTree(root);
 });
 
 const setup = new Git(root);

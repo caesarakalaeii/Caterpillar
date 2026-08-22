@@ -30,7 +30,7 @@
  *
  * The TAP plan (`1..N`) is deliberately NOT compared against that count. They differ by
  * design — nested subtests count toward `tests` but only top-level ones appear in the
- * root plan, so a fully green run prints `1..1435` against `# tests 1446`. Using the
+ * root plan, so a fully green run prints `1..1438` against `# tests 1449`. Using the
  * disagreement as a truncation signal would reject every green run.
  */
 
@@ -67,10 +67,10 @@ export interface JudgeOptions {
  * which is the exact failure it exists to catch. Raise it when you add tests — `npm
  * test` prints the number it saw, and a run below this refuses rather than passing.
  */
-export const EXPECTED_TEST_COUNT = 1446;
+export const EXPECTED_TEST_COUNT = 1449;
 
 /**
- * `# tests 1446` and friends. The count is the last such line, because a run over
+ * `# tests 1449` and friends. The count is the last such line, because a run over
  * several files prints one summary per file before the root summary.
  *
  * Both reporter prefixes are accepted: TAP marks summary lines with `#`, and the spec
