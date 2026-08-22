@@ -192,6 +192,39 @@ test("a mirror whose window is empty is readable and simply has no commits", asy
   assert.deepEqual(read.unavailable, []);
 });
 
+test("a commit that is only on a forge's own ref is not counted as authorship", async () => {
+  // A mirror fetches `+refs/*:refs/*`, so on GitHub it carries `refs/pull/*` too. Those
+  // hold the heads of pull requests that were closed without merging and of branches that
+  // were force-pushed over — code nobody landed. Counting it would report work that does
+  // not exist in the repository.
+  const git = await authoredMirror();
+  const head = await git.run("rev-parse", "HEAD");
+  await git.run("update-ref", "refs/pull/7/head", head);
+  await git.run("checkout", "--quiet", "--detach", head);
+  await writeFile(join(await git.run("rev-parse", "--show-toplevel"), "abandoned.ts"), "1\n");
+  await git.run("add", "-A");
+  await git
+    .withEnv({
+      GIT_AUTHOR_NAME: "caterpillar-agent[bot]",
+      GIT_AUTHOR_EMAIL: FLEET,
+      GIT_AUTHOR_DATE: "2026-08-16T11:00:00Z",
+      GIT_COMMITTER_NAME: "caterpillar-agent[bot]",
+      GIT_COMMITTER_EMAIL: FLEET,
+      GIT_COMMITTER_DATE: "2026-08-16T11:00:00Z",
+    })
+    .run("commit", "-m", "abandoned");
+  await git.run("update-ref", "refs/pull/7/head", await git.run("rev-parse", "HEAD"));
+  await git.run("checkout", "--quiet", "main");
+
+  const read = await new MirrorChangeReader({ localMirror: () => git }).readAuthorship(
+    [REPO],
+    WINDOW_START,
+    WINDOW_END,
+  );
+
+  assert.equal(read.commits.length, 2, "the two commits on branches, and not the abandoned one");
+});
+
 test("a commit reachable from two refs is counted once", async () => {
   // A merged task branch is reachable from both `agent/<task>` and the default branch. The
   // fleet's share would be inflated by every branch that was kept if this double-counted.
