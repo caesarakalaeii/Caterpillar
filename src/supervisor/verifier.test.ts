@@ -518,7 +518,6 @@ const evidenceStore = (
   return {
     stored,
     store: {
-      listArtifacts: () => Promise.resolve([...stored.keys()].sort()),
       writeArtifact: (_task, name, contents) => {
         if (contents.byteLength > maxBytes) {
           return Promise.reject(
@@ -582,7 +581,7 @@ test("the evidence directory exists before the gate runs", async () => {
     state,
   );
 
-  assert.equal(result.detail, NO_PR, "the gate itself must have passed");
+  assert.match(result.detail, new RegExp(NO_PR), "the gate itself must have passed");
   assert.deepEqual([...stored.keys()], ["empty.txt"]);
 });
 
@@ -633,7 +632,11 @@ test("evidence over the cap does not change the verdict", async () => {
     state,
   );
 
-  assert.equal(passed.detail, NO_PR, "gate 1 passed, so gate 2 is what refuses");
+  // Gate 1 passed, so the only thing left to refuse is gate 2's missing PR. The oversized
+  // file is reported alongside it rather than instead of it.
+  assert.match(passed.detail, new RegExp(NO_PR));
+  assert.match(passed.detail, /big\.png/);
+  assert.doesNotMatch(passed.detail, /Acceptance criteria failed/);
 });
 
 test("a gate that leaves nothing behind says nothing about evidence", async () => {
