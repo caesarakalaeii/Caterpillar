@@ -590,6 +590,8 @@ const createDigest = (options: {
     summarise: digest.summarise,
   });
 
+  const mirrors = new MirrorChangeReader(options.worktrees);
+
   return new DailyDigest({
     git: options.git,
     store: options.store,
@@ -600,8 +602,13 @@ const createDigest = (options: {
     runner: config.runnerId,
     branch: config.stateRepo.branch,
     // Read-only, and strictly local: the digest reports on mirrors this runner already
-    // has and never fetches one to do it.
-    changes: new MirrorChangeReader(options.worktrees),
+    // has and never fetches one to do it. One reader serves both questions it is asked —
+    // what a task produced, and who authored the window.
+    changes: mirrors,
+    authorship: mirrors,
+    // Every address that has ever been this fleet, current one first. The retired ones are
+    // how a window straddling a change of identity (§9.7) is not read as a person's work.
+    identity: { emails: [config.identity.email, ...(config.identity.pastEmails ?? [])] },
     ...(digest.summarise
       ? {
           summariser: new LlmSummariser({
@@ -614,6 +621,7 @@ const createDigest = (options: {
       : {}),
     onPublished: (_date, quiet) =>
       options.metrics.digests.inc({ runner: config.runnerId, quiet: String(quiet) }),
+    onAttributed: (report) => options.metrics.recordAttribution(config.runnerId, report),
   });
 };
 
