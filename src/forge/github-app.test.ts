@@ -673,3 +673,49 @@ test("review comments are refused for a repo outside the task's scope", async ()
     /not in this task's scope/,
   );
 });
+
+test("a GitHub review's own body is guidance too, not just its line comments", async () => {
+  // The asymmetry that nearly shipped. `reviewThreads` carries the comments written against
+  // lines and nothing else; "this is the wrong approach" is written on the REVIEW, which
+  // lives on `pullRequest.reviews`. The Forgejo side reads both, and a session must not see
+  // a different review depending on which forge its repo happens to be on.
+  const { factory } = github(
+    withToken((route, init) => {
+      if (route === "/graphql") {
+        const query = String(JSON.parse(String(init?.body ?? "{}")).query);
+        assert.match(query, /reviews\(/, "the query must ask for review bodies");
+        return {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+                reviews: {
+                  nodes: [
+                    {
+                      author: { __typename: "User", login: "a-human" },
+                      body: "this is the wrong approach",
+                      url: "https://github.com/acme/widget/pull/7#pullrequestreview-1",
+                      submittedAt: "2026-08-13T10:00:00.000Z",
+                    },
+                    // An APPROVED review with no prose is the ordinary way to approve.
+                    // Rendered, it would be a blank quote saying a human objected to nothing.
+                    { author: { __typename: "User", login: "a-human" }, body: "" },
+                  ],
+                },
+              },
+            },
+          },
+        };
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0]?.body, "this is the wrong approach");
+  assert.equal(comments[0]?.path, undefined, "a review body is attached to no file");
+  assert.equal(comments[0]?.resolved, false, "a review body belongs to no thread");
+});
