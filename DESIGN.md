@@ -3127,13 +3127,30 @@ session whose work is waved through by it is a session whose defect surfaces lat
 someone with less context.
 
 Force-exit is gone. It was added as a hang backstop — a hung test once held CI open for
-twenty minutes — so removing it required the hang to still be caught, and `--test-timeout`
-alone catches it: a leaked-handle test is reported `cancelled` and the run exits 1, checked
-on node 22 against three deliberately hanging files including the original incident's exact
-shape. Force-exit turned out to be the weaker of the two, not the stronger: with stdout
-piped it reported that same hanging file as a **pass with exit 0**. The suite is now
+twenty minutes — so removing it required the hang to still be caught. Force-exit turned out
+to be the weaker of the two, not the stronger: with stdout piped it reported a deliberately
+hanging file as a **pass with exit 0**, on every version tried. The suite is now
 deterministic, at unchanged speed. `--test-concurrency=1` also stabilised it, and was
 rejected — 47% more wall time to narrow a race rather than remove it.
+
+**Two things about `node --test` differ by node version, and the CI matrix spans two
+versions deliberately (§12), so getting this right on the machine to hand is not getting it
+right.** Both were found only by running the suite under node 24 as a proxy for the node 26
+leg — the leg that had rejected two consecutive completion claims on this very task with a
+verdict no one could reproduce.
+
+- **The summary format.** node 22 emits TAP when stdout is a pipe; node 24+ emits `spec`,
+  which marks summary lines with `ℹ` rather than `#`. A verdict matching only `#` sees no
+  summary at all and rejects a green tree. The reporter is now pinned with
+  `--test-reporter=tap`, and the parser accepts either prefix — belt and braces, because a
+  parser that silently matches nothing is precisely how the defect above worked.
+- **Whether the runner exits after reporting a timeout.** node 22 reaps the hung file's
+  process and exits 1. node 24 reports the timeout and then waits forever, so a wrapper
+  that waits on the runner inherits the hang — the twenty-minute stall again, on the newer
+  leg only. `npm test` therefore keeps a deadline of its own (twenty minutes, against a
+  150-second suite) and SIGKILLs the runner past it. It waits on the child's `exit` rather
+  than `close`, since a killed runner can leave a grandchild holding the pipe open and
+  `close` would wait on that instead.
 
 Belt and braces, in `src/testing/run-report.ts`: the run is judged against a known test
 count, so a result lost for some other reason — a file that fails to load registers nothing
