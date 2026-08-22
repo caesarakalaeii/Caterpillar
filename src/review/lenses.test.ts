@@ -192,3 +192,17 @@ test("a repo cannot displace the standard the lens already grades against", () =
   assert.ok(tests.prompt.includes(TEST_FIRST_STANDARD));
   assert.ok(tests.prompt.includes(REVIEW_STANDARD));
 });
+
+test("a plan reviewer is handed no repo standards, because nothing has been written", () => {
+  // A repo's rules are about code, and a plan is not code. This holds because no plan lens
+  // key can own a repo section — and it is asserted across EVERY owner key, so widening
+  // `REPO_STANDARD_OWNERS` to a plan lens fails here rather than quietly grading a plan
+  // against a rule about source files.
+  const standards = REPO_STANDARD_OWNERS.map((key) =>
+    parseRepoStandards("acme/web", `## ${key}: Rule\n\nRepo rule for ${key}.\n`),
+  ).flat();
+
+  for (const lens of repoLenses(PLAN_LENSES, standards)) {
+    assert.ok(!lens.prompt.includes("Repo rule for"), lens.key);
+  }
+});

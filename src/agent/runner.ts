@@ -48,6 +48,7 @@ import type { ToolchainResolver } from "../workspace/toolchain.ts";
 import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { buildPrompt, systemPromptFor } from "./prompt.ts";
+import { readRepoStandards, repoCheckoutsOf } from "./standards.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
 import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
@@ -162,6 +163,16 @@ export class AgentSessionRunner {
       const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id);
       const worktree = checkout.root;
       const recoveryNote = await this.recoverInterrupted(worktree);
+
+      // The declared repos' own standards (DESIGN.md §12.2). Read here, before anything is
+      // built, because a file this system cannot use must stop the session rather than be
+      // worked around: the throw reaches `SupervisorLoop.parkFailed` and the task parks
+      // naming the repo and the file. Carrying on would hold the author to a rule the
+      // council cannot see, or the reverse — and neither is visible from outside.
+      //
+      // The council reads the same files from the same checkout when it convenes
+      // (`review/council.ts`), so both sides are given identical text.
+      const repoStandards = await readRepoStandards(repoCheckoutsOf(spec.repos, checkout));
 
       const control: ControlSink = {};
       const tracker = this.options.bindings.trackers.get(spec.workspace);
@@ -295,7 +306,7 @@ export class AgentSessionRunner {
         timeoutSeconds: this.options.config.limits.maxSessionSeconds,
         models: llm.models,
         model: llm.model,
-        systemPrompt: `${systemPromptFor(spec.kind)}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,
+        systemPrompt: `${systemPromptFor(spec.kind, repoStandards)}\n\nYour working directory is ${worktree}.${layout}${environment}${environmentNote}`,
         initialPrompt: prompt,
         tools,
         budget,

@@ -489,7 +489,8 @@ test("the repo's own standards reach the session's system prompt", async () => {
   await runner.run(standardsSpec, state({ id: STANDARDS_TASK }));
 
   assert.match(systemPrompt, /Never merge without a changelog entry\./);
-  assert.match(systemPrompt, /acme\/widget/);
+  // Headed with the repo that supplied it — the per-repo scoping a multi-repo task needs.
+  assert.match(systemPrompt, /acme\/housestyle/);
 });
 
 test("a session is told its repo's standards cannot switch the fleet's own off", async () => {

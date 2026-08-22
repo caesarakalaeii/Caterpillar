@@ -53,7 +53,8 @@ import type { WorktreeManager } from "../workspace/worktree.ts";
 import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
-import { PLAN_LENSES, prLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
+import { PLAN_LENSES, prLenses, repoLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
+import { readRepoStandards, repoCheckoutsOf } from "../agent/standards.ts";
 import {
   prepareSabotageCopy,
   SabotageExecutionEnv,
@@ -247,10 +248,18 @@ export class ReviewCouncil implements Council {
     const commits =
       base === undefined ? [] : await this.options.worktrees.commitsSince(checkout.root, base);
 
+    // The declared repos' own standards, read from the SAME checkout the session used, so
+    // the reviewers grade against the same text its author was handed (DESIGN.md §12.2).
+    // `repoLenses` routes each section to the one lens its heading names.
+    const repoStandards = await readRepoStandards(repoCheckoutsOf(spec.repos, checkout));
+
     return this.convene(
       // `touchesSource` is the "is there anything to break" question, already answered here
       // for the evidence block the prompt carries.
-      this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
+      repoLenses(
+        this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
+        repoStandards,
+      ),
       checkout.root,
       reviewPrompt(spec, state, base, commits),
       spec,

@@ -323,6 +323,32 @@ export interface RepoCheckout {
 }
 
 /**
+ * Where each of a task's repos was checked out. See `WorktreeManager.ensureTaskCheckout`.
+ *
+ * Both the session runner and the council need this list and neither has it in one place:
+ * `repos[0]` is at the checkout root and the siblings are keyed by slug beneath it
+ * (§9.4.1). Derived here rather than at each call site, because two copies of this would
+ * be the reviewer reading a different set of repos from the author.
+ *
+ * Structurally typed on purpose: it takes what `TaskCheckout` and `RepoRef` happen to
+ * provide without this module depending on either.
+ */
+export const repoCheckoutsOf = (
+  repos: readonly { readonly owner: string; readonly name: string }[],
+  checkout: { readonly root: string; readonly siblings: ReadonlyMap<string, string> },
+): readonly RepoCheckout[] =>
+  repos.flatMap((repo, index) => {
+    const slug = `${repo.owner}/${repo.name}`;
+    if (index === 0) return [{ repo: slug, path: checkout.root }];
+    const path = checkout.siblings.get(slug);
+    // A declared repo with no checkout is a programming error upstream of here, and
+    // guessing a path would read a file from the wrong repository. Skipped rather than
+    // thrown: the session's own working directory is the root, and a missing sibling is
+    // already fatal to the work for reasons that have nothing to do with standards.
+    return path === undefined ? [] : [{ repo: slug, path }];
+  });
+
+/**
  * Read `.caterpillar/standards.md` from every repo a task declares.
  *
  * Absent is the ordinary case and costs one failed `readFile` per repo. Read per SESSION
