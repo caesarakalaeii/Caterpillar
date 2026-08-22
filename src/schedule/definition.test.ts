@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   parseSchedule,
+  scheduleOf,
   scheduleTaskId,
   ScheduleParseError,
   SCHEDULE_VERSION,
@@ -156,4 +157,15 @@ test("the task id names the schedule and the occurrence it came from", () => {
   );
   assert.equal(scheduleTaskId("deps-audit", "not-an-occurrence"), undefined);
   assert.equal(scheduleTaskId("../escape", "2026-08-17T0700Z"), undefined);
+});
+
+test("the schedule a task came from is read back out of its id", async () => {
+  // The page needs it and nothing else carries it: a scheduled spec has no `kind` and no
+  // `tracker` (§22), so the id is the whole record of where the task came from.
+  assert.equal(scheduleOf("SCHED-deps-audit-2026-08-17T0700Z"), "deps-audit");
+  assert.equal(scheduleOf("SCHED-a-2026-08-17T0700Z"), "a");
+  // Not a schedule task, or one whose id has been tampered with by hand.
+  assert.equal(scheduleOf("GH-acme-widget-12"), undefined);
+  assert.equal(scheduleOf("SCHED-deps-audit"), undefined);
+  assert.equal(scheduleOf("SCHED--2026-08-17T0700Z"), undefined);
 });
