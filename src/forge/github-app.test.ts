@@ -510,3 +510,166 @@ test("the ordinary path still opens one PR and looks nothing up", async () => {
   });
   assert.equal(routes.filter((r) => r.includes("/pulls?")).length, 0, "no lookup on the happy path");
 });
+
+/* ─────────────────────── review comments as task guidance ─────────────────────── */
+
+/**
+ * Resolution is the reason this one query is GraphQL (DESIGN.md §7.3).
+ *
+ * REST's `pulls/{n}/comments` carries no resolved flag at all — GitHub exposes thread
+ * resolution nowhere but `pullRequest.reviewThreads`. Without it every comment a human
+ * ever accepted would come back as an open instruction on every session.
+ */
+const reviewThreads = (
+  threads: readonly Record<string, unknown>[],
+  hasNextPage = false,
+  endCursor: string | null = null,
+): unknown => ({
+  data: {
+    repository: {
+      pullRequest: {
+        reviewThreads: { pageInfo: { hasNextPage, endCursor }, nodes: threads },
+      },
+    },
+  },
+});
+
+const thread = (
+  comments: readonly Record<string, unknown>[],
+  over: Record<string, unknown> = {},
+): Record<string, unknown> => ({ isResolved: false, isOutdated: false, comments: { nodes: comments }, ...over });
+
+const graphqlComment = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: "PRRC_1",
+  author: { __typename: "User", login: "a-human" },
+  body: "this swallows the error",
+  path: "src/index.ts",
+  line: 12,
+  url: "https://github.com/acme/widget/pull/7#discussion_r1",
+  createdAt: "2026-08-13T10:00:00.000Z",
+  ...over,
+});
+
+test("review comments come back with their file, line and thread state", async () => {
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([graphqlComment()]),
+          thread([graphqlComment({ id: "PRRC_2", body: "dealt with" })], { isResolved: true }),
+          thread([graphqlComment({ id: "PRRC_3", body: "moved" })], { isOutdated: true }),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+
+  assert.equal(comments.length, 3, "resolved and outdated ones are returned, not filtered");
+  assert.deepEqual(
+    comments.map((c) => [c.body, c.resolved, c.outdated]),
+    [
+      ["this swallows the error", false, false],
+      ["dealt with", true, false],
+      ["moved", false, true],
+    ],
+  );
+  const first = comments[0];
+  assert.equal(first?.path, "src/index.ts");
+  assert.equal(first?.line, 12);
+  assert.equal(first?.author, "a-human");
+  assert.equal(first?.fromFleet, false);
+  assert.deepEqual(first?.repo, REPO);
+  assert.equal(first?.pr, 7);
+});
+
+test("a comment from an App is marked as the fleet's own, not as a human's", async () => {
+  // `__typename` is the only reliable discriminator: the authoring App, the reviewer
+  // identity and any other bot all report as `Bot`, and none of them is a human whose
+  // objection should forgive a review round (§12.1).
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([
+            graphqlComment({ author: { __typename: "Bot", login: "caterpillar" }, body: "mine" }),
+          ]),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments[0]?.fromFleet, true);
+});
+
+test("a comment whose line has gone is reported without one rather than as line null", async () => {
+  // GitHub answers `line: null` for an outdated comment. Carried through as a number it
+  // renders as `src/index.ts:null`, which points a session at nothing.
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([graphqlComment({ line: null, path: null })], { isOutdated: true }),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments[0]?.line, undefined);
+  assert.equal(comments[0]?.path, undefined);
+});
+
+test("every page of review threads is read, not just the first", async () => {
+  // The same omission that let a red matrix build through the CI gate: one unpaginated
+  // request looks identical to a complete answer, and the comment a human is waiting on
+  // is as likely to be on page two as page one.
+  let calls = 0;
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        calls += 1;
+        return calls === 1
+          ? reviewThreads([thread([graphqlComment({ body: "page one" })])], true, "cursor-1")
+          : reviewThreads([thread([graphqlComment({ id: "PRRC_9", body: "page two" })])]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.deepEqual(comments.map((c) => c.body), ["page one", "page two"]);
+});
+
+test("GraphQL errors are thrown, so an empty list never means 'could not ask'", async () => {
+  // The caller logs and continues past a failure (invariant 6), and it can only do that
+  // if a failure is distinguishable from a pull request nobody has commented on.
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return { errors: [{ message: "Resource not accessible by integration" }] };
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.listReviewComments(REPO, 7), /not accessible/);
+});
+
+test("review comments are refused for a repo outside the task's scope", async () => {
+  const { factory } = github(withToken(() => ({})));
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(
+    () => forge.listReviewComments({ host: "github.com", owner: "acme", name: "elsewhere" }, 1),
+    /not in this task's scope/,
+  );
+});
