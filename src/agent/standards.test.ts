@@ -35,6 +35,7 @@ import {
   lensRepoStandards,
   parseRepoStandards,
   readRepoStandards,
+  repoCheckoutsOf,
 } from "./standards.ts";
 
 test("the author's standards are composed of the parts, verbatim", () => {
@@ -235,4 +236,41 @@ test("a malformed standards file names the repo it came from when it refuses", a
     assert.match(error.message, /standards\.md/);
     return true;
   });
+});
+
+test("the primary repo is read at the checkout root and each sibling at its own path", () => {
+  // §9.4.1's layout, in the one place both the runner and the council read it from. Two
+  // copies of this derivation would be the reviewer reading a different set of repos from
+  // the author, which is the whole failure this module exists to prevent.
+  assert.deepEqual(
+    repoCheckoutsOf(
+      [
+        { owner: "acme", name: "widget" },
+        { owner: "acme", name: "gadget" },
+      ],
+      {
+        root: "/work/tasks/TASK-1/widget",
+        siblings: new Map([["acme/gadget", "/work/tasks/TASK-1/widget/repos/gadget"]]),
+      },
+    ),
+    [
+      { repo: "acme/widget", path: "/work/tasks/TASK-1/widget" },
+      { repo: "acme/gadget", path: "/work/tasks/TASK-1/widget/repos/gadget" },
+    ],
+  );
+});
+
+test("a declared repo with no checkout is skipped rather than guessed at", () => {
+  // Guessing a path reads a standards file out of the wrong repository, and a task whose
+  // sibling failed to check out has already failed for better reasons.
+  assert.deepEqual(
+    repoCheckoutsOf(
+      [
+        { owner: "acme", name: "widget" },
+        { owner: "acme", name: "missing" },
+      ],
+      { root: "/work/tasks/TASK-1/widget", siblings: new Map() },
+    ),
+    [{ repo: "acme/widget", path: "/work/tasks/TASK-1/widget" }],
+  );
 });

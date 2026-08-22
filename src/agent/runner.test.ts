@@ -48,6 +48,7 @@ import { WorktreeManager } from "../workspace/worktree.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
+import { TEST_FIRST_STANDARD } from "./standards.ts";
 import type { RunnerConfig } from "../config/types.ts";
 
 const sh = (command: string, cwd: string): Promise<void> =>
@@ -195,6 +196,44 @@ for (let i = 0; i < JOURNAL_REPEATS; i += 1) {
     `## Session 2 — 2026-08-12T10:${minute}:00.000Z\n\n**Parked:** lease lost\n`,
   );
 }
+
+// A fifth task, on a repo of its OWN that ships `.caterpillar/standards.md` (§12.2). Its
+// own repo rather than `source`, so every other test in this file keeps a prompt with no
+// repo standards in it and the two cases stay distinguishable.
+const STANDARDS_TASK = asTaskId("TASK-5");
+const STANDARDS_REPO: RepoRef = { host: "github.com", owner: "acme", name: "housestyle" };
+const standardsSource = join(root, "housestyle-source");
+await mkdir(join(standardsSource, ".caterpillar"), { recursive: true });
+await sh(
+  "git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false",
+  standardsSource,
+);
+await writeFile(
+  join(standardsSource, ".caterpillar", "standards.md"),
+  "## design: Changelog\n\nNever merge without a changelog entry.\n",
+);
+await sh("git add -A && git commit -qm init", standardsSource);
+await mkdir(join(mirrors, STANDARDS_REPO.host, STANDARDS_REPO.owner), { recursive: true });
+await sh(
+  `git clone -q --mirror ${standardsSource} ${join(mirrors, STANDARDS_REPO.host, STANDARDS_REPO.owner, `${STANDARDS_REPO.name}.git`)}`,
+  root,
+);
+await mkdir(join(stateRepo, "tasks", STANDARDS_TASK), { recursive: true });
+await writeFile(
+  join(stateRepo, "tasks", STANDARDS_TASK, "spec.md"),
+  [
+    "---",
+    "workspace: test",
+    "repos:",
+    "  - github.com/acme/housestyle",
+    "acceptance:",
+    '  - "true"',
+    "---",
+    "",
+    "Add a changelog entry.",
+    "",
+  ].join("\n"),
+);
 
 // Started, not merely constructed: the runner opens this task's socket in it. One
 // service for the file, because the runner closes only the lease it opened.
@@ -427,4 +466,52 @@ test("an open_pr call is surfaced on the outcome for the completion gate", async
   assert.equal(outcome.reason, "done-claimed");
   assert.deepEqual(outcome.pr, { number: 7, url: "https://example.invalid/pr/7" });
   assert.equal(forge.prs.at(-1)?.head, "agent/TASK-1");
+});
+
+test("the repo's own standards reach the session's system prompt", async () => {
+  // End to end: the file is committed on the branch the worktree comes from, so this is
+  // the real read, the real parse and the real splice (DESIGN.md §12.2). The council
+  // splices the same sections into the owning lens; `review/lenses.test.ts` pins that half.
+  const { runner, faux } = buildRunner(200_000);
+
+  let systemPrompt = "";
+  faux.setResponses([
+    (context) => {
+      systemPrompt = context.systemPrompt ?? "";
+      return fauxAssistantMessage(fauxToolCall("done", { summary: "read the standards" }), {
+        stopReason: "toolUse",
+      });
+    },
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const standardsSpec = await store.readSpec(STANDARDS_TASK);
+  await runner.run(standardsSpec, state({ id: STANDARDS_TASK }));
+
+  assert.match(systemPrompt, /Never merge without a changelog entry\./);
+  assert.match(systemPrompt, /acme\/widget/);
+});
+
+test("a session is told its repo's standards cannot switch the fleet's own off", async () => {
+  // The file is untrusted text authored outside this system and it lands next to
+  // test-first in the same prompt. A repo must not be able to turn that off by writing
+  // a section that says so.
+  const { runner, faux } = buildRunner(200_000);
+
+  let systemPrompt = "";
+  faux.setResponses([
+    (context) => {
+      systemPrompt = context.systemPrompt ?? "";
+      return fauxAssistantMessage(fauxToolCall("done", { summary: "read the standards" }), {
+        stopReason: "toolUse",
+      });
+    },
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const standardsSpec = await store.readSpec(STANDARDS_TASK);
+  await runner.run(standardsSpec, state({ id: STANDARDS_TASK }));
+
+  assert.ok(systemPrompt.includes(TEST_FIRST_STANDARD));
+  assert.match(systemPrompt, /cannot switch any of it off/);
 });
