@@ -64,6 +64,45 @@ export const newestHumanComment = (
   return newest?.at;
 };
 
+/**
+ * Whether these comments should clear the review council's round count (§12.1, §7.3).
+ *
+ * The cap exists because the agent and the council can trade a task forever with nothing new
+ * entering the loop, and a human objection is exactly something new — the same argument
+ * §7.3 makes for typed guidance, reaching the same answer for the surface a reviewer is
+ * actually looking at.
+ *
+ * `seen` is the newest comment a previous session already had forgiven for it. Forgiving
+ * without it would delete the cap rather than inform it: one comment would buy a round on
+ * every session for the rest of the task's life, and the loop the cap exists to detect would
+ * run forever.
+ *
+ * A `seen` that does not parse is treated as no watermark at all. State files are written by
+ * earlier deploys and edited by hand, and a NaN comparison is false in both directions — so
+ * the alternative is quietly never forgiving anything again.
+ */
+export const reviewRoundsForgiven = (
+  comments: readonly ReviewComment[],
+  seen: string | undefined,
+): boolean => isNewerComment(newestHumanComment(comments), seen);
+
+/**
+ * The same rule stated over timestamps, for the caller that has one rather than a list.
+ *
+ * The supervisor is that caller: it holds no minting forge (`SupervisorDeps.forges` is
+ * narrowed to `RepoReach` on purpose), so what reaches it is the one timestamp the session
+ * reported on its outcome. Sharing this rather than re-deriving the comparison there is what
+ * keeps "newer than what was already acted on" from being written twice and drifting.
+ */
+export const isNewerComment = (
+  comment: string | undefined,
+  seen: string | undefined,
+): boolean => {
+  if (comment === undefined) return false;
+  const seenMs = seen === undefined ? NaN : Date.parse(seen);
+  return Number.isNaN(seenMs) || Date.parse(comment) > seenMs;
+};
+
 /** `path:line`, `path` or nothing — however much of a location the forge gave us. */
 const where = (comment: ReviewComment): string => {
   if (comment.path === undefined) return "on the pull request";
