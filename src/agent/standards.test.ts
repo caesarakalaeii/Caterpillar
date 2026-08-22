@@ -274,3 +274,45 @@ test("a declared repo with no checkout is skipped rather than guessed at", () =>
     [{ repo: "acme/widget", path: "/work/tasks/TASK-1/widget" }],
   );
 });
+
+test("an oversized standards file on disk is refused, naming the repo", async () => {
+  // The cap has to bind on the way through the loader too, not only in the parse: this is
+  // untrusted input and the loader is the only thing between a committed file and a prompt.
+  const oversized = `## tests: Long\n\n${"x".repeat(REPO_STANDARDS_MAX_BYTES * 4)}`;
+  const root = await checkoutWith({ [REPO_STANDARDS_PATH]: oversized });
+
+  await assert.rejects(
+    () => readRepoStandards([{ repo: "acme/web", path: root }]),
+    (error: unknown) => {
+      assert.ok(error instanceof RepoStandardsError);
+      assert.match(error.message, /acme\/web/);
+      assert.match(error.message, /byte limit/);
+      return true;
+    },
+  );
+});
+
+test("a standards file exactly at the cap is accepted", async () => {
+  // The boundary in the direction that matters: the loader reads a bounded number of bytes,
+  // so an off-by-one there would reject the largest legitimate file with a message about a
+  // limit it does not exceed.
+  const heading = "## tests: Exact\n\n";
+  const body = "x".repeat(REPO_STANDARDS_MAX_BYTES - heading.length);
+  const root = await checkoutWith({ [REPO_STANDARDS_PATH]: heading + body });
+
+  assert.deepEqual(await readRepoStandards([{ repo: "acme/web", path: root }]), [
+    { repo: "acme/web", lens: "tests", title: "Exact", body },
+  ]);
+});
+
+test("a multi-byte character at the cap is not mangled into a replacement char", async () => {
+  // The bounded read counts BYTES and the parse counts bytes too, but the string in between
+  // is decoded. A file that ends in an em dash on the byte boundary must come back whole.
+  const heading = "## tests: Unicode\n\n";
+  const dashes = "—".repeat((REPO_STANDARDS_MAX_BYTES - heading.length) / 3);
+  const root = await checkoutWith({ [REPO_STANDARDS_PATH]: heading + dashes });
+
+  const parsed = await readRepoStandards([{ repo: "acme/web", path: root }]);
+  assert.equal(parsed[0]?.body, dashes);
+  assert.ok(!parsed[0]?.body.includes("\uFFFD"), "the read split a character");
+});

@@ -22,7 +22,7 @@
  * `.caterpillar/standards.md` per repository, spliced into the author's prompt and the
  * owning lens from one parse, for the same reason and with the same property.
  */
-import { readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -349,6 +349,26 @@ export const repoCheckoutsOf = (
   });
 
 /**
+ * At most one byte past the cap, so `parseRepoStandards` can tell over from exactly-at.
+ *
+ * A plain `readFile` would pull the whole thing into a string and only then find out it is
+ * too big: this is a file any pusher to the repo controls, and a runner that can be made to
+ * allocate a gigabyte by committing one is a denial of service with a `git push` for a
+ * payload. The refusal itself still comes from the parse, which is the only place the limit
+ * is stated.
+ */
+const readBounded = async (path: string): Promise<string> => {
+  const handle = await open(path, "r");
+  try {
+    const buffer = Buffer.alloc(REPO_STANDARDS_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+};
+
+/**
  * Read `.caterpillar/standards.md` from every repo a task declares.
  *
  * Absent is the ordinary case and costs one failed `readFile` per repo. Read per SESSION
@@ -365,7 +385,7 @@ export const readRepoStandards = async (
   const standards: RepoStandard[] = [];
 
   for (const checkout of checkouts) {
-    const text = await readFile(join(checkout.path, REPO_STANDARDS_PATH), "utf8").catch(
+    const text = await readBounded(join(checkout.path, REPO_STANDARDS_PATH)).catch(
       (error: NodeJS.ErrnoException) => {
         // Only "there is no such file" is ordinary. A permission error or a directory in
         // its place is a broken checkout, and reading it as "no standards" would hand the
