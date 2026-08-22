@@ -1813,8 +1813,10 @@ answer is narrower than "all of them" in two ways that matter:
 - **A closed thread is not an instruction.** A resolved comment was accepted and an outdated
   one was written against a line that no longer exists. Quoted in full they send the agent to
   redo work that already landed, and on an old pull request they are most of what there is to
-  read. So they are counted rather than quoted — the count is what tells the agent a review
-  happened at all, which a bare absence cannot say.
+  read. So they are counted rather than quoted, and the count appears only BESIDE something
+  still open — it says "part of this review is already answered", which is worth knowing next
+  to the part that is not and is a sentence about finished work on its own. A pull request
+  whose every thread is resolved renders no section at all.
 - **The fleet's own voice is not guidance.** The agent replies to reviews and the reviewer
   identity posts approvals, both onto the pull request being graded. Read back, they are a
   loop with no human in it. On GitHub the discriminator is GraphQL's `author.__typename`,

@@ -342,11 +342,10 @@ export class AgentSessionRunner {
         ...result.outcome,
         ...(prs.length > 0 ? { prs } : {}),
         ...(primary !== undefined ? { pr: { number: primary.number, url: primary.url } } : {}),
-        // Reported even when the session ignored the section: what the agent was SHOWN is
-        // what a round is forgiven for, by `arrived()`'s argument in `steering.ts` — a steer
-        // that lands in the same turn as a handoff is never read and is journalled anyway,
-        // because being wrong towards "the human's words are still in front of the agent" is
-        // the safe direction.
+        // What the agent was SHOWN, not what it acted on — `steering.ts`'s `arrived()` makes
+        // the same choice for the same reason. A session can be cut off by the context budget
+        // a turn after reading this, and forgiving the round anyway leaves the objection in
+        // front of the next session; the other way round loses it between two sessions.
         ...(review.newest === undefined ? {} : { reviewComment: review.newest }),
       };
     } finally {

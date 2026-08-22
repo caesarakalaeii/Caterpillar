@@ -16,8 +16,9 @@
  *   A closed thread is not guidance. A resolved comment was said, dealt with and accepted;
  *   an outdated one was written against a line that no longer exists. Quoted in full they
  *   send the agent to redo work that already landed, and on an old pull request they are the
- *   bulk of what there is to read. So they are counted, not quoted — the count is what tells
- *   the agent a review happened, which is the thing a bare absence cannot say.
+ *   bulk of what there is to read. So they are counted, not quoted — and only beside
+ *   something still open, because "part of this review is already answered" is worth knowing
+ *   next to the part that is not, and is a sentence about finished work on its own.
  *
  *   The fleet's own voice is not guidance. The agent replies to reviews and the reviewer
  *   identity posts approvals, both onto the same pull request. Fed back, they are a loop
@@ -139,6 +140,10 @@ const byPullRequest = (
  * `undefined` rather than an empty string, because `prompt.ts` renders a heading for
  * anything non-blank: "Review comments on your pull request" with nothing under it reads as
  * a human having reviewed the change and said nothing, which is the opposite of the truth.
+ *
+ * Also `undefined` when every thread is CLOSED. The counts below exist to qualify something
+ * still open; alone they are a paragraph about finished work, charged to the context budget
+ * on every session for the rest of the task's life.
  */
 export const renderReviewGuidance = (
   comments: readonly ReviewComment[],

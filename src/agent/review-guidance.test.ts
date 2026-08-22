@@ -180,3 +180,13 @@ test("a watermark that does not parse is treated as no watermark at all", () => 
   // false in both directions, which would silently stop forgiving anything ever again.
   assert.equal(reviewRoundsForgiven([comment()], "whenever"), true);
 });
+
+test("a pull request whose every comment is resolved renders nothing at all", () => {
+  // The counts exist to say "part of this review is already answered" NEXT TO the part that
+  // is not. On their own they are a sentence about work that is finished, paid for out of
+  // the context budget on every session for the rest of the task's life.
+  assert.equal(
+    renderReviewGuidance([comment({ resolved: true }), comment({ id: "2", outdated: true })]),
+    undefined,
+  );
+});
