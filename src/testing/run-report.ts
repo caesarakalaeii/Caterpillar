@@ -17,12 +17,12 @@
  * fact the weaker of the two — with stdout piped it reported that same file as a PASS
  * with exit 0, while without it the run correctly exits 1.
  *
- * Removing it also made the suite deterministic: 1444 tests on six consecutive runs,
+ * Removing it also made the suite deterministic: the same count on six consecutive runs,
  * where before the count varied.
  *
- * What neither setting survives is a test that leaves a GRANDCHILD holding stdout open;
- * the wrapper then waits on the pipe. No test here does that, and it is not worth a
- * timeout of our own until one does.
+ * Whether the runner ends at all after reporting a timeout is version-dependent: node 22
+ * reaps the file's process, node 24 does not and waits forever. run-tests.ts therefore
+ * keeps a deadline of its own rather than trusting either.
  *
  * The count is still checked here, because losing a result must never read as a pass
  * again: the summary's own `tests` count is held to EXPECTED_TEST_COUNT, which also
@@ -30,7 +30,7 @@
  *
  * The TAP plan (`1..N`) is deliberately NOT compared against that count. They differ by
  * design — nested subtests count toward `tests` but only top-level ones appear in the
- * root plan, so a fully green run prints `1..1430` against `# tests 1444`. Using the
+ * root plan, so a fully green run prints `1..1432` against `# tests 1446`. Using the
  * disagreement as a truncation signal would reject every green run.
  */
 
@@ -67,7 +67,7 @@ export interface JudgeOptions {
  * which is the exact failure it exists to catch. Raise it when you add tests — `npm
  * test` prints the number it saw, and a run below this refuses rather than passing.
  */
-export const EXPECTED_TEST_COUNT = 1444;
+export const EXPECTED_TEST_COUNT = 1446;
 
 /**
  * `# tests 1444` and friends. The count is the last such line, because a run over

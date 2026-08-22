@@ -181,5 +181,5 @@ test("a single-file run with a failure is still rejected", () => {
 test("the expected count is not below what the suite has, so the floor can bite", () => {
   // If this drops to 0 or goes stale downwards the check silently stops working. It is
   // a constant precisely so a reviewer sees it move when tests are added.
-  assert.ok(EXPECTED_TEST_COUNT >= 1444);
+  assert.ok(EXPECTED_TEST_COUNT >= 1446);
 });
