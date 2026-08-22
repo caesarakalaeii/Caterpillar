@@ -37,6 +37,26 @@ const SCHEDULE = parseSchedule(
   ].join("\n"),
 );
 
+/** The same schedule, gated on a precheck the runner has to consult first. */
+const WITH_PRECHECK = parseSchedule(
+  "deps-audit",
+  [
+    "version: 1",
+    "trigger:",
+    '  cron: "0 9 * * 1-5"',
+    "  timezone: Europe/Berlin",
+    "workspace: primary",
+    "repos:",
+    "  - github.com/acme/widget",
+    "prompt: Audit dependency updates.",
+    "acceptance:",
+    "  - npm test",
+    "precheck:",
+    '  command: "npm outdated --json | grep -q ."',
+    "",
+  ].join("\n"),
+);
+
 /** 09:05 Berlin on Monday the 17th: the 09:00 occurrence is due and five minutes late. */
 const MONDAY_MORNING = new Date("2026-08-17T07:05:00Z");
 /** 08:00 Berlin on the same Monday. Nothing has come due yet. */
@@ -244,7 +264,10 @@ test("a failed claim with no ref behind it is a dead network, and is retried", a
 test("a precheck that exits non-zero skips the occurrence and spends no session", async () => {
   // The whole point of the gate (§22, §11.1): work whose only blocker is external state
   // must not cost a session to discover there was nothing to do.
-  const subject = harness({ precheck: { ok: false, detail: "exit 1: no updates" } });
+  const subject = harness({
+    schedules: [WITH_PRECHECK],
+    precheck: { ok: false, detail: "exit 1: no updates" },
+  });
 
   await subject.runner.maybeFire(MONDAY_MORNING);
 
@@ -262,7 +285,7 @@ test("a precheck that cannot be run is a failure, so the claim goes back", async
   // Distinct from a precheck that says no. "The environment could not be built" is not
   // evidence about the work, so the occurrence must stay available to a runner that can
   // build it — the machine that owns `requires` may not be this one.
-  const subject = harness({ precheckThrows: true });
+  const subject = harness({ schedules: [WITH_PRECHECK], precheckThrows: true });
 
   await subject.runner.maybeFire(MONDAY_MORNING);
 
@@ -329,4 +352,17 @@ test("an occurrence already settled in the ledger is not fired again", async () 
 
   assert.deepEqual(subject.claims, []);
   assert.deepEqual(subject.specs, []);
+});
+
+test("a schedule that declares a precheck is not fired by a runner that cannot run one", async () => {
+  // Firing anyway would ignore the condition the operator wrote; recording a skip would
+  // write off an occurrence over a fact about this process. So the claim goes back and the
+  // occurrence stays available to a runner that can answer.
+  const subject = harness({ schedules: [WITH_PRECHECK] });
+
+  await subject.runner.maybeFire(MONDAY_MORNING);
+
+  assert.deepEqual(subject.specs, []);
+  assert.deepEqual(subject.records, []);
+  assert.deepEqual(subject.released, [scheduleRef("deps-audit", OCCURRENCE)]);
 });
