@@ -251,8 +251,20 @@ export class RepoStandardsError extends Error {
   }
 }
 
-/** `## <lens>: <title>` — the lens that owns the section is part of its heading. */
-const SECTION = /^## +([A-Za-z-]+) *: *(.+?) *$/;
+/**
+ * Any `##` heading. EVERY one of them must be a section, valid or not.
+ *
+ * Recognising only well-formed ones would leave the rest inside a body, and a body is
+ * quoted verbatim into a prompt whose own sections are at this level — so a repo could
+ * write `## Test-first, without exception` and have it render as a PEER of the fleet's
+ * standards rather than as a rule inside its own section. That is a repo overriding the
+ * text it is explicitly told it cannot override, with markdown for a payload. Matched here
+ * and refused in the parse, so the failure is loud rather than a heading that went missing.
+ */
+const HEADING = /^## +(.*)$/;
+
+/** The part of a heading that says who owns the section: `<lens>: <title>`. */
+const OWNED = /^([A-Za-z-]+) *: *(.+?) *$/;
 
 const isOwner = (key: string): key is RepoStandardOwner =>
   (REPO_STANDARD_OWNERS as readonly string[]).includes(key);
@@ -281,8 +293,10 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
 
   const lines = text.split("\n");
   const headings = lines.flatMap((line, index) => {
-    const matched = SECTION.exec(line);
-    return matched === null ? [] : [{ index, line, key: matched[1] ?? "", title: matched[2] ?? "" }];
+    const heading = HEADING.exec(line);
+    if (heading === null) return [];
+    const owned = OWNED.exec(heading[1] ?? "");
+    return [{ index, line, key: owned?.[1] ?? "", title: owned?.[2] ?? "" }];
   });
 
   const first = headings[0];
