@@ -153,7 +153,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/exec.ts` | The agent's shell with a per-command ceiling — the hang detector (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
-| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against (§12.2). |
+| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
@@ -322,7 +322,13 @@ awkward, the change is probably wrong.
     trees, so `git diff` cannot tell them apart and only `git log` can. The supervisor
     reads that order and states it; `src/review/tdd.ts` reaches no verdict, and the one
     lens that does is told the carve-out — documentation, comments, formatting and pure
-    config have no behaviour to test (§12.2).
+    config have no behaviour to test (§12.2). **That holds for a repository's own rules
+    too.** A repo may ship `.caterpillar/standards.md`, and every section of it names the
+    lens that grades it in its own heading (`## <lens>: <title>`); a section naming no lens,
+    or one no council convenes, parks the task rather than becoming a rule nobody grades.
+    The text is untrusted — capped at 4 KiB, and it adds to code health, test-first and
+    attribution without being able to switch any of them off. A task spanning several repos
+    scopes each file to its own repo, so two repos disagreeing is not a conflict.
 16. **A session that cannot possibly succeed must not be started, and the environment the
     gate grades in must be one the acceptance list can satisfy.** Both halves come from a
     single park: `BS-…-07` hit the no-progress limit with a green branch and an open PR.

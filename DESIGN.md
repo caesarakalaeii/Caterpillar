@@ -3226,6 +3226,7 @@ the change author's guide to writing a description:
 | `TEST_FIRST_STANDARD` | the same | the `tests` lens |
 | `WRITING_STANDARD` | the same | the `design` lens |
 | `REVIEW_STANDARD` | **nobody** — see below | every PR lens |
+| a repo's `.caterpillar/standards.md` section | every implementation and remediation session on that repo | the lens its heading names — see *A repository's own standards* |
 
 `REVIEW_STANDARD` is the one asymmetry and it is deliberate. Its central sentence is
 Google's — *approve once the change definitely improves the overall health of the codebase,
@@ -3264,6 +3265,61 @@ Its cost is a fourth concurrent reviewer on every round of every task, roughly a
 review spend. That buys the one defect class both earlier gates are blind to *by
 construction*: a test weakened until the suite goes green passes acceptance and passes CI,
 because the suite is green precisely because the test stopped asking.
+
+#### A repository's own standards
+
+Everything above is the fleet's, and identical in every repository it is pointed at. A repo
+with house rules of its own had nowhere to put them **that the council would also read**:
+put them in `AGENTS.md` and the implementation agent reads them while the reviewers do not,
+which is precisely the asymmetry the paragraphs above exist to forbid.
+
+So: an optional `.caterpillar/standards.md` per repo, read from the task's checkout by
+`readRepoStandards`, spliced into the author's system prompt (`systemPromptFor`) **and**
+into the reviewer prompts (`repoLenses`) from the *same parse* and through the same
+renderer. One file read from the repo, and deliberately nothing else — no registry, no
+sharing links, no install flow, no content hashing, no versioned bundles. Those solve a
+distribution problem a self-hosted fleet does not have.
+
+**Every section names the lens that owns it, in its own heading.** The format is
+`## <lens>: <title>`, with `<lens>` one of `correctness`, `design`, `tests`
+(`REPO_STANDARD_OWNERS`). That is what extends the one-owning-lens property to text this
+system did not write: a repo adding a rule says who grades it in the same edit, and there is
+no second mapping file to fall out of step with the first. `parseRepoStandards` refuses,
+rather than dropping, every case where a rule would exist with no grader — a heading naming
+an unknown or non-owning lens, an empty section, and prose before the first heading, which
+has no owning lens and is made to look accounted for by the sections after it.
+
+Not `fit`, which grades the change against the TASK, and no repository has an opinion about
+that. Not `sabotage`, which is convened only when the diff touches source: a rule routed
+there would be graded on some rounds and not others, which is the same failure wearing a
+schedule. `review/lenses.test.ts` checks the owner keys against the standing council, and
+that plan lenses receive none of it — a plan is not code.
+
+**The text is untrusted**, authored outside this system by whoever can push to the repo, and
+it reaches a model prompt. Two bounds follow. It is capped at `REPO_STANDARDS_MAX_BYTES`
+(4 KiB), small because it is paid for by every session of every task on that repo *and* by
+every reviewer of every round, so the cost is multiplied by the council. And it cannot
+override what it sits beside: code health, test-first and the attribution rules are the
+fleet's, both the author's block and the lens's say so in as many words, and a repo rule
+that contradicts them does not apply.
+
+A file this system cannot use **fails the session** rather than being skipped. The throw
+reaches `SupervisorLoop.parkFailed`, so the task parks with a reason naming the repo and the
+file. Skipping it would hold the author to a rule the council cannot see, or the reverse, and
+neither is visible from outside — the whole class of bug this feature exists to remove.
+
+**Multi-repo (§9.4.1) is scoped per repo. Not merged, and not refused.** A task declaring
+several repos reads each one's file separately, and every section is rendered headed with
+the repo that supplied it; both blocks state that a rule governs only the files of the repo
+it came from. Two repos saying opposite things is then **not a conflict at all** and nothing
+has to arbitrate — which is the only one of the three options that needs no policy, cannot
+surprise a repo by having another repo's rule applied to it, and does not make one repo's
+bad file block work on a sibling. Merging would need a precedence order nobody has a basis
+to pick; refusing would let any repo in a workspace veto every multi-repo task touching it.
+
+Read per session and per round rather than cached, because the file is on the branch the
+task is working: a session that adds a rule is held to it, and so is the council reviewing
+that very change.
 
 ---
 
