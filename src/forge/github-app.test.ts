@@ -528,6 +528,19 @@ const reviewThreads = (
   data: {
     repository: {
       pullRequest: {
+        // Returned on EVERY page, exactly as GitHub does: `reviews` is a second connection
+        // on the same pull request and is not paged with the threads. A reader that appended
+        // it per page would quote every review body once per page of comments.
+        reviews: {
+          nodes: [
+            {
+              id: "PRR_1",
+              author: { __typename: "User", login: "a-human" },
+              body: "the shape is wrong",
+              submittedAt: "2026-08-12T10:00:00.000Z",
+            },
+          ],
+        },
         reviewThreads: { pageInfo: { hasNextPage, endCursor }, nodes: threads },
       },
     },
@@ -567,16 +580,19 @@ test("review comments come back with their file, line and thread state", async (
   const forge = await factory.forTask(SPEC);
   const comments = await forge.listReviewComments(REPO, 7);
 
-  assert.equal(comments.length, 3, "resolved and outdated ones are returned, not filtered");
+  assert.equal(comments.length, 4, "resolved and outdated ones are returned, not filtered");
   assert.deepEqual(
     comments.map((c) => [c.body, c.resolved, c.outdated]),
     [
+      // The review body first: it is prose about the change as a whole, so it belongs to no
+      // thread and there is nothing about it to resolve or to go outdated.
+      ["the shape is wrong", false, false],
       ["this swallows the error", false, false],
       ["dealt with", true, false],
       ["moved", false, true],
     ],
   );
-  const first = comments[0];
+  const first = comments[1];
   assert.equal(first?.path, "src/index.ts");
   assert.equal(first?.line, 12);
   assert.equal(first?.author, "a-human");
@@ -604,7 +620,7 @@ test("a comment from an App is marked as the fleet's own, not as a human's", asy
 
   const forge = await factory.forTask(SPEC);
   const comments = await forge.listReviewComments(REPO, 7);
-  assert.equal(comments[0]?.fromFleet, true);
+  assert.equal(comments.find((c) => c.body === "mine")?.fromFleet, true);
 });
 
 test("a comment whose line has gone is reported without one rather than as line null", async () => {
@@ -646,7 +662,10 @@ test("every page of review threads is read, not just the first", async () => {
 
   const forge = await factory.forTask(SPEC);
   const comments = await forge.listReviewComments(REPO, 7);
-  assert.deepEqual(comments.map((c) => c.body), ["page one", "page two"]);
+  // Both pages of thread comments, and the review body ONCE. `reviews` is a second
+  // connection on the same pull request rather than something paged alongside the threads,
+  // so a reader that appended it per page would quote every review body per page of comments.
+  assert.deepEqual(comments.map((c) => c.body), ["the shape is wrong", "page one", "page two"]);
 });
 
 test("GraphQL errors are thrown, so an empty list never means 'could not ask'", async () => {

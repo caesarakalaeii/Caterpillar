@@ -56,6 +56,15 @@ const REVIEW_THREAD_PAGE_SIZE = 100;
 const REVIEW_THREAD_PAGES = 10;
 /** Comments per thread. A conversation longer than this has stopped being a review. */
 const THREAD_COMMENTS = 50;
+/**
+ * Review bodies read per request, newest last.
+ *
+ * Unpaginated on purpose, unlike the threads: a review body is the prose about the change as
+ * a whole, a pull request accumulates one per submitted review, and the ones worth reading
+ * are the recent ones. Fifty is more submitted reviews than any pull request a session is
+ * still working on has.
+ */
+const REVIEW_BODIES = 50;
 
 /** Re-mint this long before expiry so a slow push never straddles the boundary. */
 const RENEW_MARGIN_MS = 10 * 60 * 1000;
@@ -199,6 +208,19 @@ interface ReviewThreadsResponse {
   readonly data?: {
     readonly repository?: {
       readonly pullRequest?: {
+        /**
+         * The prose each reviewer wrote about the change as a whole — a separate connection
+         * from `reviewThreads`, which only carries what was written against a line.
+         */
+        readonly reviews?: {
+          readonly nodes?: readonly {
+            readonly id?: string;
+            readonly author?: { readonly __typename?: string; readonly login?: string } | null;
+            readonly body?: string;
+            readonly url?: string;
+            readonly submittedAt?: string;
+          }[];
+        };
         readonly reviewThreads?: {
           readonly pageInfo?: {
             readonly hasNextPage?: boolean;
@@ -225,9 +247,12 @@ interface ReviewThreadsResponse {
   };
 }
 
-const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$threads:Int!,$comments:Int!,$cursor:String){
+const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$threads:Int!,$comments:Int!,$reviews:Int!,$cursor:String){
   repository(owner:$owner,name:$name){
     pullRequest(number:$number){
+      reviews(last:$reviews){
+        nodes{id author{__typename login} body url submittedAt}
+      }
       reviewThreads(first:$threads,after:$cursor){
         pageInfo{hasNextPage endCursor}
         nodes{
@@ -446,6 +471,11 @@ class GitHubAppForge implements Forge {
    * Resolved and outdated threads are returned rather than filtered: the caller states how
    * many of a review are already answered beside the ones that are not, and a list it had
    * pre-filtered could not say. Deciding what is quoted is `agent/review-guidance.ts`'s job.
+   *
+   * Two levels, as on Forgejo: a review's own BODY is where "this is the wrong approach" gets
+   * written, and it lives on `reviews` rather than on `reviewThreads`. Reading only the
+   * second drops every objection that is not about a particular line — and would make the
+   * review a session sees depend on which forge its repo happens to be on.
    */
   async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
     assertInScope(repo, this.allowed);
@@ -460,8 +490,33 @@ class GitHubAppForge implements Forge {
         number: pr,
         threads: REVIEW_THREAD_PAGE_SIZE,
         comments: THREAD_COMMENTS,
+        reviews: REVIEW_BODIES,
         ...(cursor === undefined ? {} : { cursor }),
       });
+
+      // First page only: `reviews` is not paged with the threads, and asking again on page
+      // two would return the same bodies and quote every one of them twice.
+      if (page === 0) {
+        for (const review of body.data?.repository?.pullRequest?.reviews?.nodes ?? []) {
+          // An APPROVED review with no prose is the ordinary way to approve. Quoted, it
+          // would say a human had objected to nothing.
+          if ((review.body ?? "").trim().length === 0) continue;
+          comments.push({
+            id: review.id ?? "",
+            repo,
+            pr,
+            author: review.author?.login ?? "(unknown)",
+            fromFleet: review.author?.__typename === "Bot",
+            body: review.body ?? "",
+            ...(review.url === undefined ? {} : { url: review.url }),
+            createdAt: review.submittedAt ?? "",
+            // A review body belongs to no thread, so there is nothing to resolve and no line
+            // for it to drift off.
+            resolved: false,
+            outdated: false,
+          });
+        }
+      }
 
       const threads = body.data?.repository?.pullRequest?.reviewThreads;
       for (const thread of threads?.nodes ?? []) {
