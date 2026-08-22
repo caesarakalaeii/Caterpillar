@@ -19,7 +19,7 @@
  * It runs on the HOUSEKEEPING loop, so it is deliberately cheap and deliberately bounded:
  * one occurrence per schedule per pass, no listener, no port, no Deployment (§22).
  */
-import { EMPTY_USAGE, type TaskSpec, type TaskState } from "../domain/task.ts";
+import { EMPTY_USAGE, type TaskId, type TaskSpec, type TaskState } from "../domain/task.ts";
 import type { Notifier } from "../notify/discord.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { ScheduleListing, ScheduleRecord } from "../state/store.ts";
@@ -60,7 +60,7 @@ export type PrecheckRunner = (
 /** The part of `StateStore` this path uses, written out for `AlertStore`'s reason. */
 export interface ScheduleStore {
   listSchedules(): Promise<ScheduleListing>;
-  hasTask(id: string): Promise<boolean>;
+  hasTask(id: TaskId): Promise<boolean>;
   countOpenScheduleTasks(schedule: string): Promise<number>;
   readScheduleRecord(schedule: string, occurrence: string): Promise<ScheduleRecord | undefined>;
   writeScheduleRecord(
@@ -95,25 +95,6 @@ export interface ScheduleRunnerOptions {
   readonly onSettled?: (schedule: string, outcome: ScheduleRecord["outcome"]) => void;
 }
 
-/** What one pass did, so an idle scheduler is distinguishable from a broken one. */
-export interface SchedulePass {
-  /** Schedules read, including disabled ones. */
-  readonly schedules: number;
-  readonly fired: number;
-  readonly skipped: number;
-  readonly refused: number;
-  /** Files under `schedules/` that are not schedules. Reported, never fired. */
-  readonly invalid: number;
-}
-
-const EMPTY_PASS: SchedulePass = {
-  schedules: 0,
-  fired: 0,
-  skipped: 0,
-  refused: 0,
-  invalid: 0,
-};
-
 export class ScheduleRunner {
   private readonly options: ScheduleRunnerOptions;
 
@@ -130,7 +111,7 @@ export class ScheduleRunner {
    * coincide, and deferring one of them to the next pass would silently make a fleet with
    * six 09:00 schedules take six housekeeping intervals to start them.
    */
-  async maybeFire(now: Date, signal?: AbortSignal): Promise<SchedulePass> {
+  async maybeFire(now: Date, signal?: AbortSignal): Promise<void> {
     const { store, logger } = this.options;
 
     let listing: ScheduleListing;
@@ -140,7 +121,7 @@ export class ScheduleRunner {
       // A read of the state repo that fails is an IO problem the next pass may survive.
       // Nothing is written and nothing is claimed.
       logger.warn("schedule.list-failed", errorFields(error));
-      return EMPTY_PASS;
+      return;
     }
 
     let fired = 0;
@@ -177,9 +158,15 @@ export class ScheduleRunner {
       }
     }
 
-    // Once per pass rather than per occurrence: six schedules firing at 09:00 should be
-    // one push, and the state repo's history should read as scheduling events.
+    // Only when something happened. An idle pass is the overwhelmingly common case — this
+    // runs every housekeeping interval and a schedule fires once a day — so logging one
+    // would bury every other line the loop writes. What an idle scheduler looks like is
+    // answered by `/intake` and by `caterpillar_schedule_occurrences_total`, both of which
+    // report the counts this method used to return to a caller that ignored them.
+    // Committed once per pass rather than per occurrence: six schedules firing at 09:00
+    // should be one push, and the state repo's history should read as scheduling events.
     if (changed) {
+      logger.info("schedule.pass", { fired, skipped, refused });
       try {
         await store.commitAndPush(
           fired > 0
@@ -198,14 +185,6 @@ export class ScheduleRunner {
         logger.error("schedule.push-failed", errorFields(error));
       }
     }
-
-    return {
-      schedules: listing.schedules.length,
-      fired,
-      skipped,
-      refused,
-      invalid: listing.errors.length,
-    };
   }
 
   /**
@@ -272,7 +251,7 @@ export class ScheduleRunner {
   private async settle(
     schedule: Schedule,
     occurrence: string,
-    task: ReturnType<typeof scheduleTaskId> & string,
+    task: TaskId,
     signal?: AbortSignal,
   ): Promise<ScheduleRecord["outcome"]> {
     const { store, logger } = this.options;
@@ -323,8 +302,14 @@ export class ScheduleRunner {
 
     // ORDER IS LOAD-BEARING, exactly as at intake (§14.2) and on the alert path (§20):
     // state first, spec last, because `hasTask` keys on `spec.md`. A crash between the two
-    // leaves a task the claim loop skips and that nothing recreates — the claim ref is
-    // held — which is the failure the ledger entry below makes visible.
+    // leaves a half-written task the claim loop skips rather than one it claims and cannot
+    // read.
+    //
+    // The ledger entry comes AFTER both, and that ordering is forced by the release path: a
+    // write that throws hands the claim back, and a "fired" record already on disk would
+    // then stop this runner — and only this runner, since the record is unpushed — from ever
+    // retrying the occurrence. So the record means "this occurrence is settled and needs no
+    // retry", which is exactly what a released claim is not.
     await store.writeState({
       id: task,
       status: "ready",
@@ -368,15 +353,11 @@ export class ScheduleRunner {
   }
 
   /** A notification that fails is logged and forgotten: the record in git is the truth. */
-  private async notify(
-    schedule: Schedule,
-    occurrence: string,
-    task: string,
-  ): Promise<void> {
+  private async notify(schedule: Schedule, occurrence: string, task: TaskId): Promise<void> {
     try {
       await this.options.notifier.notify({
         kind: "schedule-task",
-        task: task as TaskState["id"],
+        task,
         schedule: schedule.id,
         occurrence,
       });
@@ -402,7 +383,7 @@ export class ScheduleRunner {
  * whose whole reason for existing as a kind is a brief about a cluster it must not write.
  */
 export const renderScheduleSpec = (
-  task: TaskSpec["id"],
+  task: TaskId,
   schedule: Schedule,
   occurrence: string,
 ): TaskSpec => ({

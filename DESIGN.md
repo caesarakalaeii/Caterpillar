@@ -4679,6 +4679,19 @@ exists, and nobody finds out until they wonder why the Monday audit stopped happ
 push is also what a dead network looks like, and getting this backwards writes off an
 occurrence nobody fired.
 
+Inside the claim the order is `state.json`, then `spec.md`, then the ledger entry — and that
+last position is forced rather than chosen. A write that throws hands the claim back, and a
+`fired` record already on disk would stop this runner (and only this runner, since the record
+is unpushed) from ever retrying: the record means "settled, no retry needed", which is
+precisely what a released claim is not.
+
+That leaves one residual, stated rather than papered over: a process killed BETWEEN the two
+task writes holds the claim, has written no record, and leaves a task directory the claim loop
+skips because it has no `spec.md`. The occurrence does not fire, and nothing retries it — the
+next occurrence does. It is the narrowest window in the path (two local file writes with no
+network between them) and closing it would need the record and the task to be one atomic
+write, which git does not offer inside a working tree.
+
 Two cheaper, local answers come first, in this order: the occurrence ledger and
 `hasTask`. Both are files in a checkout this runner already has, so an occurrence that has
 already been settled costs no network at all — which matters because the question is asked

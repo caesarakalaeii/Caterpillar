@@ -222,7 +222,7 @@ export interface Scheduler {
    * The signal is the pod's, and it reaches a precheck: a bounded command is still a
    * command, and a shutdown must not wait for one to finish.
    */
-  maybeFire(now: Date, signal?: AbortSignal): Promise<unknown>;
+  maybeFire(now: Date, signal?: AbortSignal): Promise<void>;
 }
 
 export interface SupervisorDeps {
