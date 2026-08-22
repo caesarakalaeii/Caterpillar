@@ -353,18 +353,6 @@ export class ReviewCouncil implements Council {
     );
   }
 
-  /** This task's artifacts, staged read-only beside the checkout. See `stageEvidence`. */
-  private gateEvidenceFor(spec: TaskSpec): Promise<readonly StagedEvidence[]> {
-    const artifacts = this.options.artifacts;
-    if (artifacts === undefined) return Promise.resolve([]);
-
-    return stageEvidence(
-      artifacts,
-      spec.id,
-      evidenceRoot(join(this.options.config.paths.tasks, spec.id)),
-    );
-  }
-
   async reviewPlan(
     spec: TaskSpec,
     state: TaskState,
@@ -375,6 +363,18 @@ export class ReviewCouncil implements Council {
     const checkout = await this.options.worktrees.ensureTaskCheckout(spec.repos, spec.id);
 
     return this.convene(PLAN_LENSES, checkout.root, planPrompt(spec, plan), spec, state);
+  }
+
+  /** This task's artifacts, staged read-only beside the checkout. See `stageEvidence`. */
+  private gateEvidenceFor(spec: TaskSpec): Promise<readonly StagedEvidence[]> {
+    const artifacts = this.options.artifacts;
+    if (artifacts === undefined) return Promise.resolve([]);
+
+    return stageEvidence(
+      artifacts,
+      spec.id,
+      evidenceRoot(join(this.options.config.paths.tasks, spec.id)),
+    );
   }
 
   private async convene(
