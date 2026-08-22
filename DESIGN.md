@@ -3200,6 +3200,41 @@ Two further notes for whoever meets this next:
   other matrix version, then reducing the race to a 40-iteration probe that reproduced the
   identical error 15 times by removing a tree under an un-awaited `git fetch`.
 
+**What the sixth fix did NOT settle, recorded so the next session starts here rather than
+where session 1 did.** The claim after it was rejected with the same verdict again, and the
+tree is green: all three acceptance commands exit 0 from a clean clone under node 22.23.2
+and 24.19.0, `# tests 1449 # pass 1449 # fail 0 # cancelled 0`, with a stable count across
+repeated runs. The following differences between this container and a GitHub runner were
+each tested and are **not** the cause — do not spend a session re-testing them:
+
+- **git identity.** The runner container exports `GIT_AUTHOR_*`/`GIT_COMMITTER_*` and has
+  no global gitconfig; an Actions runner has neither. The suite is green with all four
+  stripped, because the tests set their own.
+- **npm and the registry.** `npm ci --ignore-scripts` exits 0 on a cold cache. `.npmrc`'s
+  `min-release-age=2` cannot bite it: the setting works by pinning `before` to two days
+  ago, `npm ci` resolves from the lockfile's integrity hashes without consulting a
+  packument, and the youngest pinned dependency (`typescript@5.9.3`) was published in
+  2025 regardless — `time.modified` on that packument is recent, which is the package's
+  last change and not that version's release.
+- **Timeouts.** The slowest single test is 16s against a 180s per-test limit, and the
+  whole suite is ~150s against the wrapper's 20-minute deadline.
+- **The count floor.** Exactly 1449 on every run on both versions. The only conditionally
+  registered block is `redis/contract.test.ts`'s live-server `describe`, and a skipped
+  test still counts toward `# tests`.
+- **Checkout shape.** Green on a branch checkout, a detached HEAD, and a `--depth 1`
+  shallow clone with one commit of history — which is what `actions/checkout` produces.
+- **Load and memory.** Green under 8-way CPU oversubscription on 4 CPUs, in a container
+  capped at 4 GiB; an Actions runner has 4 CPUs and 16 GB.
+
+So the red is still unexplained from here, and the two facts that bound any future guess
+are that **both** legs fail — which excludes anything true only of node 26, since node 22
+is green locally — and that the verdict arrives about 3m20s after the push, four times
+running, while the `check` job's `npm test` step alone takes ~150s. Four *completed,
+failed* check-runs that fast means the jobs died early rather than running the suite to a
+red result, and `awaitChecks` never got to use its 20-minute budget because `summarise`
+returned `failure` on the first poll rather than `pending`. The next useful move is not
+another local run: it is reading the job log, which needs someone who can open the URL.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
