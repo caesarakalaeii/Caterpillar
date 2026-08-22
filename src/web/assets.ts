@@ -243,9 +243,10 @@ section > h2 {
 }
 .chip.on { border-color: var(--signal); color: var(--signal); }
 
-/* Where a task came from (§14). An alert task is the one worth spotting in a scan: it is
-   work the fleet opened for itself, without a human asking for it. */
+/* Where a task came from (§14). An alert task and a scheduled one are the two worth
+   spotting in a scan: both are work the fleet opened for itself, without a human asking. */
 .chip[data-origin="alert"] { border-color: var(--awaiting); color: var(--awaiting); }
+.chip[data-origin="schedule"] { border-color: var(--awaiting); color: var(--awaiting); }
 .chip[data-origin="brainstorm"] { border-color: var(--ready); color: var(--ready); }
 
 /* ---------------------------------------------------------------- panels */

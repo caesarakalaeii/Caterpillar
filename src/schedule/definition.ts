@@ -410,3 +410,26 @@ export const scheduleTaskId = (schedule: string, occurrence: string): TaskId | u
 
 /** True when this task id was created by the schedule path. */
 export const isScheduleTaskId = (id: string): boolean => id.startsWith(SCHEDULE_TASK_PREFIX);
+
+/**
+ * The schedule a task came from, read back out of its id, or nothing.
+ *
+ * `scheduleTaskId`'s inverse, and the only way to answer the question: a scheduled spec has
+ * no `kind` and no `tracker` (§22), so the id is the whole record of its origin.
+ *
+ * Matched on the OCCURRENCE's shape rather than split on a hyphen, because both halves
+ * contain hyphens — a schedule id may (`deps-audit`) and an occurrence id always does
+ * (`2026-08-17T0700Z`). Undefined when either half is not one, which is what keeps a
+ * hand-edited id from being reported as a schedule that exists.
+ */
+export const scheduleOf = (id: string): string | undefined => {
+  if (!isScheduleTaskId(id)) return undefined;
+
+  const rest = id.slice(SCHEDULE_TASK_PREFIX.length);
+  const boundary = rest.length - "-YYYY-MM-DDTHHMMZ".length;
+  if (boundary <= 0) return undefined;
+
+  const schedule = rest.slice(0, boundary);
+  const occurrence = rest.slice(boundary + 1);
+  return isScheduleId(schedule) && isOccurrenceId(occurrence) ? schedule : undefined;
+};

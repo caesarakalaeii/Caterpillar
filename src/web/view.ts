@@ -27,7 +27,7 @@ import type {
 import type { IntakeStatusView } from "../intake/status.ts";
 import type { LiveSession } from "../obs/live.ts";
 import { PolicyParseError, type AlertPolicyEntry } from "../remediation/policy.ts";
-import type { Schedule } from "../schedule/definition.ts";
+import { isScheduleTaskId, scheduleOf, type Schedule } from "../schedule/definition.ts";
 import type {
   AlertRefusal,
   IntakeRejectionRecord,
@@ -69,9 +69,9 @@ export interface TaskRow {
 /**
  * Where a task came from (DESIGN.md §14).
  *
- * There are four ways a task can exist and until this existed the view showed none of
- * them: a labelled tracker item, a brainstorm's plan, a firing alert, and a spec someone
- * committed by hand. `spec.tracker` has carried the first since intake shipped and no page
+ * There are five ways a task can exist and until this existed the view showed none of
+ * them: a labelled tracker item, a brainstorm's plan, a firing alert, a schedule's
+ * occurrence, and a spec someone committed by hand. `spec.tracker` has carried the first since intake shipped and no page
  * rendered it, so the fleet page could not distinguish work a human asked for from work
  * the fleet proposed to itself.
  *
@@ -83,7 +83,7 @@ export interface TaskRow {
  * no source at all.
  */
 export interface TaskOrigin {
-  readonly kind: "tracker" | "brainstorm" | "alert" | "spec";
+  readonly kind: "tracker" | "brainstorm" | "alert" | "schedule" | "spec";
   /** Human-facing name of the source: `github-issues #724`, `alert CaterpillarContextOverrun`. */
   readonly label: string;
   /** The tracker item, the alert's rule in Prometheus — scheme-checked before rendering. */
@@ -552,6 +552,14 @@ export const taskOrigin = (
   }
 
   if (spec.kind === "brainstorm") return { kind: "brainstorm", label: "a brainstorm" };
+
+  // Before the hand-committed fallback, and by ID rather than by `kind`: a scheduled task is
+  // `implement` on purpose (§22), so its id is the only thing that distinguishes it from a
+  // spec somebody wrote — and "a hand-committed spec" is a false statement about work nobody
+  // committed, which is worse than saying nothing.
+  if (isScheduleTaskId(spec.id)) {
+    return { kind: "schedule", label: `schedule ${scheduleOf(spec.id)}` };
+  }
 
   const tracker = spec.tracker;
   if (tracker === undefined) return { kind: "spec", label: "a hand-committed spec" };
