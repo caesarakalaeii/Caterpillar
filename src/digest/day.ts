@@ -183,6 +183,17 @@ export const windowFor = (date: string, boundary: DayBoundary): DigestWindow => 
 };
 
 /**
+ * The window immediately before `window` — the baseline a trend is measured against.
+ *
+ * Recomputed from the calendar date rather than by subtracting the window's own length.
+ * Consecutive windows meet exactly but are not equal in length: 18:00 to 18:00 across a
+ * spring-forward is 23 hours, and a baseline built by subtraction would silently compare a
+ * 23-hour day against a 24-hour one on exactly the day the clocks moved.
+ */
+export const previousWindow = (window: DigestWindow, boundary: DayBoundary): DigestWindow =>
+  windowFor(minusDays(window.date, 1), boundary);
+
+/**
  * Every window that is publishable at `now`, oldest first.
  *
  * Oldest first matters: a runner that missed yesterday's cutoff owes two digests, and
