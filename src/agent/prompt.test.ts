@@ -9,6 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ARTIFACT_BYTES } from "../state/store.ts";
 import { AUTHOR_STANDARDS, TEST_FIRST_STANDARD, WRITING_STANDARD } from "./standards.ts";
 import {
   asTaskId,
@@ -102,6 +103,9 @@ test("a session is told where a gate may leave evidence", () => {
   // Beside the criteria it belongs to, not in some later section: an agent reading about
   // the gate is the one moment this is relevant.
   assert.ok(prompt.indexOf("npm test") < prompt.indexOf("CATERPILLAR_EVIDENCE_DIR"));
+  // From the cap the store enforces, not from prose beside it. A number transcribed here
+  // and changed there sends every agent hunting for a limit that does not exist.
+  assert.match(prompt, new RegExp(`${ARTIFACT_BYTES / 1024 ** 2} MiB`));
 });
 
 test("a brainstorm gets no evidence line, because it declares no acceptance criteria", () => {
