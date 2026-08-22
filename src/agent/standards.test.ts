@@ -339,3 +339,22 @@ test("a repo body cannot open a heading above the fleet's own level either", () 
     RepoStandardsError,
   );
 });
+
+test("a `#` heading is refused even when it names an owning lens", () => {
+  // The level is what matters, not the words after it. `# tests: Rule` outranks every
+  // section of the prompt it lands in, so it cannot be a valid section however it reads.
+  assert.throws(
+    () => parseRepoStandards("acme/web", "# tests: Rule\n\nCover it.\n"),
+    RepoStandardsError,
+  );
+});
+
+test("a `###` subheading inside a body is left alone", () => {
+  // It nests under the `###` a section is rendered with, so a repo structuring its own
+  // rule is doing nothing a prompt needs protecting from — and refusing it would make the
+  // format hostile to the ordinary case.
+  assert.deepEqual(
+    parseRepoStandards("acme/web", "## tests: Rule\n\n### Why\n\nBecause.\n"),
+    [{ repo: "acme/web", lens: "tests", title: "Rule", body: "### Why\n\nBecause." }],
+  );
+});

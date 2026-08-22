@@ -252,18 +252,22 @@ export class RepoStandardsError extends Error {
 }
 
 /**
- * Any `##` heading. EVERY one of them must be a section, valid or not.
+ * Any heading at `##` or above. EVERY one of them must be a section, valid or not.
  *
  * Recognising only well-formed ones would leave the rest inside a body, and a body is
- * quoted verbatim into a prompt whose own sections are at this level — so a repo could
- * write `## Test-first, without exception` and have it render as a PEER of the fleet's
- * standards rather than as a rule inside its own section. That is a repo overriding the
- * text it is explicitly told it cannot override, with markdown for a payload. Matched here
- * and refused in the parse, so the failure is loud rather than a heading that went missing.
+ * quoted verbatim into a prompt whose own sections are at `##` — so a repo could write
+ * `## Test-first, without exception`, or `# Attribution` a level higher still, and have it
+ * render as a PEER of the fleet's standards rather than as a rule inside its own section.
+ * That is a repo overriding the text it is explicitly told it cannot override, with
+ * markdown for a payload. Matched here and refused in the parse, so the failure is loud
+ * rather than a heading that quietly went missing.
+ *
+ * `###` and below are left alone: they nest UNDER the `###` a section is rendered with, so
+ * a repo structuring its own rule is doing nothing a prompt has to be protected from.
  */
-const HEADING = /^## +(.*)$/;
+const HEADING = /^(#{1,2}) +(.*)$/;
 
-/** The part of a heading that says who owns the section: `<lens>: <title>`. */
+/** A well-formed section heading, after the `##`: `<lens>: <title>`. */
 const OWNED = /^([A-Za-z-]+) *: *(.+?) *$/;
 
 const isOwner = (key: string): key is RepoStandardOwner =>
@@ -295,7 +299,9 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
   const headings = lines.flatMap((line, index) => {
     const heading = HEADING.exec(line);
     if (heading === null) return [];
-    const owned = OWNED.exec(heading[1] ?? "");
+    // A `#` heading is a boundary but never a valid section, whatever it says after the
+    // hash: it outranks every section of the prompt it is spliced into.
+    const owned = heading[1] === "##" ? OWNED.exec(heading[2] ?? "") : null;
     return [{ index, line, key: owned?.[1] ?? "", title: owned?.[2] ?? "" }];
   });
 
