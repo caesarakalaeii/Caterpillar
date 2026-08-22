@@ -171,6 +171,60 @@ test("a runner without bash fails loudly instead of falling back to sh", async (
   await assert.rejects(() => blind.resolve(spec, "/tmp/wt"), ToolchainError);
 });
 
+// ------------------------------------------------------------------- browser cache
+
+test("every task environment gets a writable cache directory on the work volume", async () => {
+  // A rendered-output gate runs a browser, and a browser wants somewhere to cache. This
+  // is the one place that decides where, so no task has to (DESIGN.md §12).
+  const tasksDir = await scratch();
+  const resolved = await resolver({}, tasksDir).resolve(spec, "/tmp/wt");
+
+  assert.equal(resolved.env["XDG_CACHE_HOME"], join(tasksDir, ".cache"));
+  assert.ok(existsSync(join(tasksDir, ".cache")), "the directory has to exist to be usable");
+});
+
+test("the browser cache is shared between tasks rather than cut per task", async () => {
+  // Playwright's browser bundle is hundreds of megabytes. Keyed on the task it would be
+  // re-downloaded for every task, on every runner, forever.
+  const tasksDir = await scratch();
+  const shared = resolver({}, tasksDir);
+
+  const first = await shared.resolve(spec, "/tmp/wt");
+  const second = await shared.resolve({ ...spec, id: asTaskId("TASK-2") }, "/tmp/wt");
+
+  assert.equal(first.env["XDG_CACHE_HOME"], join(tasksDir, ".cache"));
+  assert.equal(second.env["XDG_CACHE_HOME"], first.env["XDG_CACHE_HOME"]);
+});
+
+test("an operator's own XDG_CACHE_HOME is left alone", async () => {
+  // A machine runner has a real one, already writable and already populated. Overriding
+  // it would throw away a warm cache to enforce a location that only matters in the
+  // container, where nothing sets it.
+  const tasksDir = await scratch();
+  const resolved = await resolver({ XDG_CACHE_HOME: "/home/op/.cache" }, tasksDir).resolve(
+    spec,
+    "/tmp/wt",
+  );
+
+  assert.equal(resolved.env["XDG_CACHE_HOME"], "/home/op/.cache");
+});
+
+test("a devShell cannot move the cache out from under the supervisor", async () => {
+  // Reserved for the same reason HOME is: the cache directory is the supervisor's
+  // decision about the work volume, and a repo-authored mkShell exporting a store path
+  // would point every browser at a read-only /nix/store directory.
+  const worktree = await scratch();
+  const tasksDir = await scratch();
+  await seedCache(tasksDir, worktree, "{ cache }", {
+    PATH: LIVE_STORE_BIN,
+    XDG_CACHE_HOME: "/nix/store/deadbeef-cache",
+  });
+
+  const resolved = await resolver({}, tasksDir).resolve(spec, worktree);
+
+  assert.equal(resolved.env["XDG_CACHE_HOME"], join(tasksDir, ".cache"));
+});
+
 // ---------------------------------------------------------------------------- detection
 
 test("an explicit `inherit` beats a flake.nix sitting in the repo", async () => {
