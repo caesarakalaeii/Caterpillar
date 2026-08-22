@@ -483,7 +483,7 @@ test("the trend is read from the window before this one, at the same repos", asy
     identity: { emails: [FLEET_EMAIL] },
   });
 
-  const before = previousWindow(WINDOW, { hour: 18, timeZone: "Europe/Berlin" });
+  const before = previousWindow(WINDOW);
   assert.deepEqual(reader.asked.length, 2, "this window and the one before it");
   assert.deepEqual(reader.asked[0]?.repos, ["acme/widget"], "the repos the window's tasks name");
   assert.equal(reader.asked[0]?.from.getTime(), WINDOW.start.getTime());
