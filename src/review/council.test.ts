@@ -18,9 +18,11 @@ import {
 } from "../domain/task.ts";
 import type { Commit } from "./tdd.ts";
 import { prLenses, SABOTAGE_LENS } from "./lenses.ts";
+import { parseRepoStandards } from "../agent/standards.ts";
 import type { PrepareOptions, PrepareResult } from "./sabotage.ts";
 import {
   planPrompt,
+  reviewLenses,
   reviewerPlan,
   reviewPrompt,
   sabotageAbstentionFor,
@@ -226,4 +228,41 @@ test("a refusal reaches the body as a reason and needs no cleanup", async () => 
   const seen = await withSabotageCopy(prepare, prepareOptions(), async (copy) => copy);
 
   assert.deepEqual(seen, { ok: false, reason: "no disk" });
+});
+
+test("the council convenes its lenses carrying the repos' own standards", () => {
+  // The half of §12.2 the council owns. `review()` needs a provider, a worktree and five
+  // concurrent sessions to reach, so the decision is extracted here for the same reason
+  // `reviewerPlan` is: drop the standards at the call site and every review still runs,
+  // still passes, and silently stops grading the rules a repository shipped.
+  const standards = parseRepoStandards("acme/widget", "## tests: Rule\n\nCover the error path.\n");
+
+  const graded = reviewLenses(undefined, false, standards).filter((lens) =>
+    lens.prompt.includes("Cover the error path."),
+  );
+
+  assert.deepEqual(
+    graded.map((lens) => lens.key),
+    ["tests"],
+  );
+});
+
+test("a configured lens set is still given the repos' standards", () => {
+  // `options.lenses` exists so a caller can convene its own council. It must not be a way
+  // to convene one that grades against less than the author was handed.
+  const standards = parseRepoStandards("acme/widget", "## design: Rule\n\nNo new deps.\n");
+  const only = prLenses(false).filter((lens) => lens.key === "design");
+
+  assert.match(reviewLenses(only, false, standards)[0]?.prompt ?? "", /No new deps\./);
+});
+
+test("the sabotage lens joins or sits out exactly as it did before repo standards", () => {
+  assert.deepEqual(
+    reviewLenses(undefined, true, []).map((lens) => lens.key),
+    ["correctness", "design", "tests", "fit", "sabotage"],
+  );
+  assert.deepEqual(
+    reviewLenses(undefined, false, []).map((lens) => lens.key),
+    ["correctness", "design", "tests", "fit"],
+  );
 });

@@ -391,7 +391,7 @@ const readBounded = async (path: string): Promise<string> => {
 /**
  * Read `.caterpillar/standards.md` from every repo a task declares.
  *
- * Absent is the ordinary case and costs one failed `readFile` per repo. Read per SESSION
+ * Absent is the ordinary case and costs one failed `open` per repo. Read per SESSION
  * rather than cached, because the file is on the branch the task is working: a session that
  * adds a rule is held to it, and so is the council that reviews it.
  *
