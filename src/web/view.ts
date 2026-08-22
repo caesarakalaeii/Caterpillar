@@ -27,7 +27,14 @@ import type {
 import type { IntakeStatusView } from "../intake/status.ts";
 import type { LiveSession } from "../obs/live.ts";
 import { PolicyParseError, type AlertPolicyEntry } from "../remediation/policy.ts";
-import type { AlertRefusal, IntakeRejectionRecord, StateStore } from "../state/store.ts";
+import type { Schedule } from "../schedule/definition.ts";
+import type {
+  AlertRefusal,
+  IntakeRejectionRecord,
+  ScheduleListing,
+  ScheduleRecord,
+  StateStore,
+} from "../state/store.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
 import { entriesOf, type TranscriptEntry } from "./transcript.ts";
 
@@ -169,6 +176,21 @@ export interface IntakeView {
   readonly policyMissing: boolean;
   /** Whether the alert receiver is listening on this runner, and why not if it is not. */
   readonly receiver: ReceiverView;
+  /** The operator's schedules (§22), in file-name order. Empty is the common case. */
+  readonly schedules: readonly Schedule[];
+  /**
+   * Files under `schedules/` that are not schedules.
+   *
+   * The mirror of `policyError` and there for the same reason: a schedule that will not
+   * parse is refused on the intake pass, and until this page showed it that refusal was a
+   * warn line in one pod's stdout. Per FILE rather than one message, because the whole
+   * point of one schedule per file is that a typo costs one schedule.
+   */
+  readonly scheduleErrors: readonly { readonly schedule: string; readonly message: string }[];
+  /** The occurrence ledger, newest first — including the ones that fired nothing. */
+  readonly occurrences: readonly ScheduleRecord[];
+  /** Whether THIS runner fires schedules. A fleet where nobody does fires nothing. */
+  readonly scheduling: boolean;
 }
 
 /**
@@ -216,10 +238,22 @@ export const intakeView = async (options: IntakeOptions): Promise<IntakeView> =>
 
   const pass = options.intake?.current();
 
+  // One read for both halves: the schedules that parsed and the files that did not. A
+  // listing that throws is an unreadable state repo, which this page renders as "none"
+  // rather than as a stack trace — `listIntakeRejections` below is defensive for the same
+  // reason, and here the page IS the report.
+  const schedules = await store
+    .listSchedules()
+    .catch(() => ({ schedules: [], errors: [] }) as ScheduleListing);
+
   return {
     ...(pass === undefined ? {} : { pass }),
     rejections: [...(await store.listIntakeRejections().catch(() => []))].sort(byRecency),
     alerts: [...(await store.listAlertRefusals().catch(() => []))].sort(byRecency),
+    schedules: schedules.schedules,
+    scheduleErrors: schedules.errors,
+    occurrences: [...(await store.listScheduleRecords().catch(() => []))].sort(byRecency),
+    scheduling: config.schedule.enabled,
     policy,
     ...(policyError === undefined ? {} : { policyError }),
     policyMissing: policyError === undefined && !(await store.hasAlertPolicy()),

@@ -3102,7 +3102,14 @@ test("intake keeps running while a session holds the runner", async () => {
     intake: {
       ingest: () => {
         passes += 1;
-        return Promise.resolve({ seen: 0, created: 0, rejected: 0, failed: 0 });
+        return Promise.resolve({
+          seen: 0,
+          created: 0,
+          rejected: 0,
+          failed: 0,
+          schedules: 0,
+          schedulesInvalid: 0,
+        });
       },
     },
   });

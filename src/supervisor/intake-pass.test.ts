@@ -176,7 +176,14 @@ const runUntil = async (supervisor: Supervisor, done: () => boolean): Promise<vo
   await running.catch(() => undefined);
 };
 
-const PASS: IntakePass = { seen: 3, created: 0, rejected: 1, failed: 0 };
+const PASS: IntakePass = {
+  seen: 3,
+  created: 0,
+  rejected: 1,
+  failed: 0,
+  schedules: 0,
+  schedulesInvalid: 0,
+};
 
 test("the last intake pass is remembered where the web view can read it", async () => {
   // `IntakePass` was returned, logged once at info, and thrown away. `seen` is the field

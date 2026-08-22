@@ -148,6 +148,10 @@ const INTAKE: IntakeView = {
   policy: [],
   policyMissing: true,
   receiver: { enabled: false, port: 8081, clusterEnabled: false, namespaces: [] },
+  schedules: [],
+  scheduleErrors: [],
+  occurrences: [],
+  scheduling: false,
 };
 
 test("the intake page escapes an alert annotation that tries to be markup", async () => {

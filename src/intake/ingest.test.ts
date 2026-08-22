@@ -311,11 +311,15 @@ test("a pass reports what it saw, not only what it created", async () => {
   const tracker = new FakeTracker([item(VALID, "1"), item("no block here", "2")]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
+  // Whole-object comparisons, so a field added to `IntakePass` has to be accounted for
+  // here rather than quietly ignored: the counts are what a page and a metric read.
   assert.deepEqual(await subject.ingest("origin", "main"), {
     seen: 2,
     created: 1,
     rejected: 1,
     failed: 0,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 
   // Second pass: both items still come back from the tracker, and neither does anything.
@@ -324,6 +328,8 @@ test("a pass reports what it saw, not only what it created", async () => {
     created: 0,
     rejected: 0,
     failed: 0,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 });
 
@@ -339,6 +345,8 @@ test("a tracker that cannot be listed is counted, not silently dropped", async (
     created: 0,
     rejected: 0,
     failed: 1,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 });
 

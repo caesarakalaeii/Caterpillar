@@ -90,6 +90,10 @@ export interface IntakePass {
   readonly rejected: number;
   /** Trackers that could not be listed at all. */
   readonly failed: number;
+  /** Schedules in the state repo that parsed (DESIGN.md §22). */
+  readonly schedules: number;
+  /** Files under `schedules/` that are not schedules. Warned about once per pass. */
+  readonly schedulesInvalid: number;
 }
 
 /** What intake decided about one item. Mirrored into the metric's `outcome` label. */
@@ -177,6 +181,7 @@ export class Ingester {
    */
   async ingest(remote: string, branch: string): Promise<IntakePass> {
     const { store, trackers, logger } = this.deps;
+    const schedules = await this.validateSchedules();
     let created = 0;
     let seen = 0;
     let rejected = 0;
@@ -222,7 +227,50 @@ export class Ingester {
         branch,
       );
     }
-    return { seen, created, rejected, failed };
+    return { seen, created, rejected, failed, ...schedules };
+  }
+
+  /**
+   * Read every schedule and report the ones that are not (DESIGN.md §22).
+   *
+   * HERE rather than in the firing pass, because the two answer to different audiences. The
+   * firing pass runs at 09:00 with nobody watching and can only skip what it cannot parse;
+   * intake runs on a timer whose whole output is a report, and the moment a schedule becomes
+   * malformed is the commit that made it so — which is when somebody is looking.
+   *
+   * It creates nothing and refuses nothing durably. There is no tracker item to comment on
+   * and no author to tell: a schedule is committed by an operator, so the report goes where
+   * an operator looks, which is this runner's log and the `/intake` page.
+   *
+   * Never throws. A state repo whose `schedules/` cannot be read must not stop the tracker
+   * pass that is the rest of this method.
+   */
+  private async validateSchedules(): Promise<{
+    readonly schedules: number;
+    readonly schedulesInvalid: number;
+  }> {
+    try {
+      const listing = await this.deps.store.listSchedules();
+      for (const error of listing.errors) {
+        // At WARN and once per pass. An operator who has just committed a broken schedule
+        // gets a line naming the file and the field; a fleet that has been carrying one for
+        // a week gets one line per interval per runner, which is the same rate intake
+        // already logs its own pass at.
+        this.deps.logger.warn("intake.schedule-invalid", {
+          schedule: error.schedule,
+          reason: error.message,
+        });
+      }
+      return {
+        schedules: listing.schedules.length,
+        schedulesInvalid: listing.errors.length,
+      };
+    } catch (error) {
+      this.deps.logger.warn("intake.schedules-unreadable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { schedules: 0, schedulesInvalid: 0 };
+    }
   }
 
   /**
