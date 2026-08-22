@@ -225,6 +225,25 @@ test("a devShell cannot move the cache out from under the supervisor", async () 
   assert.equal(resolved.env["XDG_CACHE_HOME"], join(tasksDir, ".cache"));
 });
 
+test("a devShell cannot move the cache an operator chose either", async () => {
+  // The other half of the same rule, and the half a spread does not cover: where the
+  // operator set the variable the supervisor keeps THEIR value, so the defence has to be
+  // in `RESERVED` rather than in the order the maps are merged.
+  const worktree = await scratch();
+  const tasksDir = await scratch();
+  await seedCache(tasksDir, worktree, "{ cache-again }", {
+    PATH: LIVE_STORE_BIN,
+    XDG_CACHE_HOME: "/nix/store/deadbeef-cache",
+  });
+
+  const resolved = await resolver({ XDG_CACHE_HOME: "/home/op/.cache" }, tasksDir).resolve(
+    spec,
+    worktree,
+  );
+
+  assert.equal(resolved.env["XDG_CACHE_HOME"], "/home/op/.cache");
+});
+
 // ---------------------------------------------------------------------------- detection
 
 test("an explicit `inherit` beats a flake.nix sitting in the repo", async () => {

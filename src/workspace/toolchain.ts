@@ -149,6 +149,8 @@ export class ToolchainResolver {
   private lastGcAt = 0;
   /** Memoised: nix does not appear or vanish while the process runs. */
   private nix: Promise<boolean> | undefined;
+  /** Memoised: the browser cache is one directory per runner — see `browserCache`. */
+  private cache: Promise<Record<string, string>> | undefined;
 
   private readonly repo: (() => RepoInspector | undefined) | undefined;
 
@@ -180,12 +182,13 @@ export class ToolchainResolver {
    */
   async resolve(spec: TaskSpec, worktree: string): Promise<ResolvedEnv> {
     const shell = await this.taskShell();
+    const cache = await this.browserCache();
     const plan = await this.plan(spec, worktree);
 
     if (plan === undefined) {
       const note = await this.staleBranchNote(spec, worktree);
       return this.log(spec, {
-        env: { ...this.baseEnv },
+        env: { ...this.baseEnv, ...cache },
         shell,
         source: "inherited",
         ...(note === undefined ? {} : { note }),
@@ -193,7 +196,55 @@ export class ToolchainResolver {
     }
 
     const env = await this.materialise(spec, worktree, plan);
-    return this.log(spec, { env, shell, source: plan.source });
+    return this.log(spec, { env: { ...env, ...cache }, shell, source: plan.source });
+  }
+
+  /**
+   * Where a browser may cache, decided once for the whole fleet (DESIGN.md §12).
+   *
+   * An acceptance gate that renders a page runs a browser, and a browser wants a writable
+   * cache directory. Two things about that are the supervisor's to decide, and neither is
+   * knowable from inside a task:
+   *
+   * **Where.** `XDG_CACHE_HOME` on the work volume, next to the mirrors and worktrees,
+   * because that is the only directory in the container guaranteed to be both writable and
+   * durable. `HOME` is neither on every deployment. Playwright resolves its browser
+   * registry to `$XDG_CACHE_HOME/ms-playwright` on Linux when `PLAYWRIGHT_BROWSERS_PATH` is
+   * unset, so setting this one variable is enough, and it is the same variable npm, pip and
+   * nix already honour — one answer rather than one per tool.
+   *
+   * **Shared, not per task.** A Playwright browser bundle is a few hundred megabytes. Keyed
+   * on the task id it would be downloaded again for every task on every runner, and the
+   * per-task directory is reaped when the task finishes (`§2`), so the download would never
+   * amortise. Sharing it means the second task that needs a browser pays nothing.
+   *
+   * An operator's own value wins: a machine runner has a real, warm cache already, and
+   * replacing it to enforce a location that only matters inside the container would throw
+   * that away. The container sets nothing, so there the directory below is what is used.
+   *
+   * **The sandbox.** Nothing here disables one and nothing here needs privileges, which is
+   * worth stating because the obvious next step — `--privileged`, or `CAP_SYS_ADMIN` in the
+   * pod's securityContext — is a large permission for a small reason. Chromium's own
+   * sandbox needs unprivileged user namespaces; Playwright already knows it will not get
+   * them, and launches the `chromium` channel with `--no-sandbox` on Linux unless a repo
+   * asks for `chromiumSandbox: true` (playwright-core 1.62: `validateBrowserConfig`, and
+   * the `options.chromiumSandbox !== true` branch in the chromium launcher). So the browser
+   * a repo's flake provides runs as-is. A repo that genuinely wants the sandbox says so in
+   * its own config and needs a runner configured for it — that is a machine property, which
+   * makes it `requires` (§8), not something this function can grant.
+   */
+  private browserCache(): Promise<Record<string, string>> {
+    // Memoised: the answer is per runner, and every task asks. mkdir is idempotent but a
+    // syscall per resolve for a constant is still a syscall per resolve.
+    this.cache ??= (async () => {
+      const existing = this.baseEnv[CACHE_HOME];
+      if (existing !== undefined && existing.length > 0) return {};
+
+      const dir = join(this.tasksDir, ".cache");
+      await mkdir(dir, { recursive: true });
+      return { [CACHE_HOME]: dir };
+    })();
+    return this.cache;
   }
 
   /**
@@ -808,6 +859,15 @@ const CACHE_VERSION = "v1";
 const PROBE_TIMEOUT_MS = 10_000;
 
 /**
+ * The variable that decides where a browser — and npm, and pip — may cache.
+ *
+ * A named constant because `browserCache` writes it and `RESERVED` defends it, and the two
+ * agreeing is the whole point: a devShell that could move this would aim a browser at a
+ * read-only store path. See `browserCache`.
+ */
+const CACHE_HOME = "XDG_CACHE_HOME";
+
+/**
  * The four variables that decide whose name a commit carries. See `withCommitIdentity`.
  *
  * Named separately from `RESERVED` because they are the only entries the supervisor
@@ -832,6 +892,7 @@ const IDENTITY_VARIABLES: readonly string[] = [
 const RESERVED: readonly string[] = [
   ...IDENTITY_VARIABLES,
   "HOME",
+  CACHE_HOME,
   "RUNNER_ID",
   "CONFIG_PATH",
   "CRED_SOCKET",
