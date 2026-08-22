@@ -10,7 +10,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { RepoRef } from "../domain/task.ts";
 import type { ReviewComment } from "../forge/types.ts";
-import { newestHumanComment, renderReviewGuidance } from "./review-guidance.ts";
+import {
+  newestHumanComment,
+  renderReviewGuidance,
+  reviewRoundsForgiven,
+} from "./review-guidance.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
 
@@ -136,4 +140,43 @@ test("an unparseable timestamp is ignored rather than becoming a permanent water
   // The timestamps are forge-authored strings. One that does not parse compares as NaN
   // against every watermark, and `Math.max` over it poisons the answer for good.
   assert.equal(newestHumanComment([comment({ createdAt: "not a date" })]), undefined);
+});
+
+/**
+ * Forgiving a review round (DESIGN.md §12.1, §7.3).
+ *
+ * The cap exists because the agent and the council can trade a task forever with nothing
+ * new entering the loop. A human objecting on the pull request is exactly something new, for
+ * the same reason typed guidance is — and for the same reason it must be forgiven ONCE per
+ * objection rather than on every session from now on.
+ */
+test("a comment newer than the one already acted on forgives the rounds", () => {
+  assert.equal(
+    reviewRoundsForgiven([comment({ createdAt: "2026-08-14T10:00:00.000Z" })], "2026-08-13T10:00:00.000Z"),
+    true,
+  );
+});
+
+test("the same comment does not forgive a round twice", () => {
+  // Without the watermark a single objection would forgive a round on every session for the
+  // rest of the task's life, which is the round cap deleted rather than informed.
+  assert.equal(
+    reviewRoundsForgiven([comment({ createdAt: "2026-08-13T10:00:00.000Z" })], "2026-08-13T10:00:00.000Z"),
+    false,
+  );
+});
+
+test("the first comment on a task nobody has reviewed forgives a round", () => {
+  assert.equal(reviewRoundsForgiven([comment()], undefined), true);
+});
+
+test("no open human comment forgives nothing", () => {
+  assert.equal(reviewRoundsForgiven([], undefined), false);
+  assert.equal(reviewRoundsForgiven([comment({ fromFleet: true })], undefined), false);
+});
+
+test("a watermark that does not parse is treated as no watermark at all", () => {
+  // State files are written by earlier deploys and edited by hand. A NaN comparison is
+  // false in both directions, which would silently stop forgiving anything ever again.
+  assert.equal(reviewRoundsForgiven([comment()], "whenever"), true);
 });
