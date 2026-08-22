@@ -17,7 +17,12 @@
  *     finished today or was already finished yesterday.
  */
 import type { TaskStatus } from "../domain/task.ts";
-import type { AttributionReport, AuthorSplit, RepoAttribution } from "./attribution.ts";
+import type {
+  AttributionReport,
+  AttributionTrend,
+  AuthorSplit,
+  RepoAttribution,
+} from "./attribution.ts";
 import type { DayDigest, OpenTask, RepoChange, TaskChange } from "./collect.ts";
 
 export interface RenderOptions {
@@ -195,15 +200,17 @@ const authorship = (report: AttributionReport | undefined): readonly string[] =>
  * check, and this is a figure an owner will quote at somebody.
  */
 const shareLine = (report: AttributionReport): readonly string[] => {
-  const share = report.total.fleetLineShare;
+  const { fleetLineShare, fleetCommitShare } = report.total;
   const before = report.previousFleetLineShare;
 
+  // Both shares or neither. A window with a line share has lines, so it has commits, so it
+  // has a commit share too — checking both is what says that in code rather than in prose.
   const now =
-    share === undefined
+    fleetLineShare === undefined || fleetCommitShare === undefined
       ? `**${plural(commits(report.total), "commit")}** and no line changed — nothing to ` +
         "split at line level"
-      : `The fleet wrote **${percent(share)}** of ${plural(lines(report.total), "line")}` +
-        ` and ${percent(report.total.fleetCommitShare)} of ` +
+      : `The fleet wrote **${percent(fleetLineShare)}** of ` +
+        `${plural(lines(report.total), "line")} and ${percent(fleetCommitShare)} of ` +
         `${plural(commits(report.total), "commit")}`;
 
   const trend =
@@ -214,8 +221,8 @@ const shareLine = (report: AttributionReport): readonly string[] => {
   return [`${now}. ${trend}`];
 };
 
-/** How a direction reads. Words as well as an arrow: Discord renders both, a reader scans one. */
-const TREND: Readonly<Record<"up" | "down" | "flat", string>> = {
+/** How a direction reads. A word, because Discord renders no icon a reader can rely on. */
+const TREND: Readonly<Record<AttributionTrend, string>> = {
   up: "Up",
   down: "Down",
   flat: "Flat",
@@ -256,8 +263,7 @@ const lines = (split: AuthorSplit): number => split.fleet.lines + split.human.li
 const commits = (split: AuthorSplit): number => split.fleet.commits + split.human.commits;
 
 /** A share as whole percent. Tenths of a percent of one day's commits are noise. */
-const percent = (share: number | undefined): string =>
-  share === undefined ? "no" : `${Math.round(share * 100)}%`;
+const percent = (share: number): string => `${Math.round(share * 100)}%`;
 
 const open = (tasks: readonly OpenTask[], timeZone: string): readonly string[] => {
   if (tasks.length === 0) return [];
