@@ -29,6 +29,7 @@ import {
   type TaskStatus,
 } from "../domain/task.ts";
 import type { Git } from "../state/git.ts";
+import type { AuthoredCommit } from "./attribution.ts";
 import type { DigestWindow } from "./day.ts";
 
 /** Work that landed in one repo, as this runner's own mirror records it. */
@@ -54,6 +55,25 @@ export interface RepoChange {
  */
 export interface ChangeReader {
   read(task: TaskId, repos: readonly RepoRef[]): Promise<readonly RepoChange[]>;
+}
+
+/** Commits in a window, and the repos nobody here can speak for. */
+export interface AuthorshipRead {
+  readonly commits: readonly AuthoredCommit[];
+  /** `owner/name` of repos with no readable history on this runner. */
+  readonly unavailable: readonly string[];
+}
+
+/**
+ * Reads who authored a window's commits.
+ *
+ * Separate from `ChangeReader` because it asks a different question of the same mirrors:
+ * not "what did this task produce" but "who wrote this repo", across every ref rather
+ * than one task branch. Both are implemented by `MirrorChangeReader` and both inherit its
+ * rule — a repo this runner has no mirror of is NAMED, never counted as zero.
+ */
+export interface AuthorshipReader {
+  readAuthorship(repos: readonly RepoRef[], from: Date, to: Date): Promise<AuthorshipRead>;
 }
 
 /** One task, as the window moved it. */
