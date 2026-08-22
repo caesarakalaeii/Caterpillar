@@ -1,12 +1,17 @@
 /**
- * The code a task actually produced, read from this runner's bare mirrors. See DESIGN.md §19.
+ * The code itself, read from this runner's bare mirrors. See DESIGN.md §19.
+ *
+ * Two questions of the same repos: what a task produced (`read`), and who authored the
+ * window (`readAuthorship`). One class, because they need the same access to the same
+ * mirrors and inherit the same rule about not having it.
  *
  * Everything else in a digest comes from the state repo, which every runner has. This does
  * not: a task branch exists in the mirror of the runner that WORKED it, so a fleet of
  * several runners has a digest-publishing runner that can see some tasks' diffs and not
  * others. That asymmetry is declared rather than hidden — a repo with no mirror produces
  * no record here, and `collect.ts` turns the absence into a line saying so. A zeroed
- * diffstat would read as "this task changed nothing", which is the one wrong answer.
+ * diffstat would read as "this task changed nothing", and a 0% share would read as "the
+ * fleet wrote none of this repo"; both are the one wrong answer.
  *
  * Strictly local. No fetch, no credential, no network: the mirror is read exactly as it
  * stands, which is also why this can run while the credential service is refusing to
@@ -47,10 +52,15 @@ export class MirrorChangeReader implements ChangeReader {
    * that is the day the work landed. Author dates would report a cherry-picked month-old
    * patch as a month-old day.
    *
-   * `--all`, because the interesting commits are on several refs at once — the fleet's work
+   * Every BRANCH, because the interesting commits are on several at once — the fleet's work
    * on `agent/<task>`, a person's on the default branch — and a commit reachable from two
    * of them is listed once, so a merged branch the mirror still holds does not inflate the
    * fleet's share.
+   *
+   * Branches and not `--all`: a mirror fetches `+refs/*:refs/*`, so on GitHub it also holds
+   * `refs/pull/*` — the heads of pull requests closed without merging and of branches
+   * force-pushed over. That is code nobody landed, and counting it would report work the
+   * repository does not contain.
    *
    * `--no-merges`, because a merge introduces no line and its commits are already counted.
    * Keeping them would count a pull request's landing twice at commit level, and every
@@ -77,7 +87,7 @@ export class MirrorChangeReader implements ChangeReader {
       // for the digest's purpose they are the same statement: this runner cannot say.
       const log = await git.tryRun(
         "log",
-        "--all",
+        "--branches",
         "--no-merges",
         "--numstat",
         // Oldest first, like every other list in a digest: a day reads forwards.
