@@ -41,7 +41,15 @@ const runWrapper = async (file: string, timeoutMs?: number): Promise<Run> => {
     stdio: ["ignore", "pipe", "pipe"],
     ...(timeoutMs === undefined
       ? {}
-      : { env: { ...process.env, CATERPILLAR_TEST_TIMEOUT_MS: String(timeoutMs) } }),
+      : {
+          env: {
+            ...process.env,
+            CATERPILLAR_TEST_TIMEOUT_MS: String(timeoutMs),
+            // The wrapper's own deadline, kept just above the per-test one so the
+            // runner gets a chance to report the timeout before being killed.
+            CATERPILLAR_RUN_DEADLINE_MS: String(timeoutMs * 3),
+          },
+        }),
   });
 
   let output = "";
@@ -64,9 +72,13 @@ const runWrapper = async (file: string, timeoutMs?: number): Promise<Run> => {
 };
 
 test("a test that leaks a handle fails the run instead of hanging the wrapper", async () => {
-  // The regression this guards: waiting for the child's stdio to close, rather than for
-  // the child to exit, means a leaked handle in ANY test file wedges `npm test` forever
-  // — the twenty-minute silent CI hang that --test-force-exit was originally added for.
+  // The twenty-minute silent CI hang, which is version-dependent and so easy to declare
+  // fixed from one node: node 22's runner reaps a leaked handle after --test-timeout and
+  // exits 1, but node 24's does not and waits forever. The wrapper therefore keeps a
+  // deadline of its own rather than trusting the runner to end.
+  //
+  // --test-force-exit is NOT the answer here: on both versions it makes this very file
+  // exit 0, reporting a hung test as a pass.
   const dir = await mkdtemp(join(tmpdir(), "caterpillar-run-tests-"));
   const file = join(dir, "leaks.test.ts");
   await writeFile(
