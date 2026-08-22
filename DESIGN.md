@@ -3118,6 +3118,53 @@ tracker item (§9.5). The agent participates in none of these three steps — it
 > and ships no `nix`, so flake-provided acceptance commands cannot run there until it does.
 > That is the prerequisite for this approach, and it is not yet met.
 
+**A gate can leave evidence, and the exit code still decides.** "A shell command that exits
+0" is the right primitive and it cannot express what a change *renders*. A task that alters
+a page, a component or a layout can pass every gate — acceptance green, CI green, council
+satisfied reading the diff — and be visibly wrong, because nothing in the pipeline ever
+looked at it. That is also the honest answer to "why can't you write an end-to-end test for
+this": until now, because a gate could not produce or return an image.
+
+So gate 1 creates an empty directory, names it in **`CATERPILLAR_EVIDENCE_DIR`**, runs the
+commands, and publishes whatever they left there as §17 artifacts — **whether the gate
+passed or failed.** A repo whose `flake.nix` provides Playwright writes
+`acceptance: ["npx playwright test"]` and the fleet gates on rendered output, with no new
+subsystem in the supervisor.
+
+Five properties, and each is a decision rather than an accident:
+
+- **Failure is when the image matters most.** Publishing only on success would discard the
+  evidence in the one case that needs explaining. The failure text names what it collected.
+- **It is never the pass condition.** Nothing in the collection path returns a verdict. An
+  image is evidence for a human and for the council; the command's exit code is the whole
+  gate. A green gate that wrote a 4 MB screenshot has passed; a red one that wrote a tidy
+  small one has not.
+- **The directory is emptied first, and lives outside the checkout.** The per-task scratch
+  survives between sessions by design (§6.2), so a screenshot from three sessions ago would
+  otherwise be published as evidence about a diff it predates — worse than none, because it
+  looks current. And a file inside the worktree is a file in `git status`: the next session
+  to run `git add -A` would commit a screenshot into the pull request.
+- **Over the cap is refused, and legibly.** See §17 — the bytes do not land, but the size
+  and the limit are reported, because "too big to commit" and "the gate wrote nothing" must
+  not read the same way in a journal.
+- **The browser environment is decided once, in `workspace/toolchain.ts`.** A browser needs
+  a writable cache directory and it needs a sandbox decision, and neither is something a
+  task should discover for itself. `XDG_CACHE_HOME` points at `<paths.tasks>/.cache`,
+  created before the first task command runs, shared across tasks and reserved against a
+  devShell the same way `HOME` is: that is the variable Playwright resolves its browser
+  registry from on Linux when `PLAYWRIGHT_BROWSERS_PATH` is unset, and npm, pip and nix
+  honour it too. Shared rather than per-task because a browser bundle is a few hundred
+  megabytes and the per-task directory is reaped when the task finishes, so a per-task cache
+  would never amortise one download. An operator's own value wins; the container sets none.
+
+  **No privileges are asked for and no sandbox is disabled.** Worth stating because the
+  obvious next step — `--privileged`, or `CAP_SYS_ADMIN` in the pod's securityContext — is a
+  large permission for a small reason. `playwright-core` launches the `chromium` channel
+  with `--no-sandbox` on Linux of its own accord, so the browser a flake provides runs as
+  is. A repo that genuinely wants the real sandbox needs a runner configured for it, and
+  that is a machine property — which makes it `requires` (§8), not something the resolver
+  can grant.
+
 ### 12.1 The review council
 
 A third gate, after those two and never instead of them. Both of the first pair measure
@@ -3202,6 +3249,26 @@ That degradation is deliberate, and it is also why the `Merge anyway` button on 
 review only appears when a reviewer identity exists: from the authoring App the merge would
 be refused by branch protection every time, and a button that always fails is worse than no
 button.
+
+**The reviewers are shown the gate's evidence, read-only.** An artifact the gate produced
+(§12) is staged into `<taskDir>/evidence-in/` before the round starts and the paths are
+named in every lens's prompt — which is the whole difference between an artifact being
+*stored* and it being *evidence*: a reviewer told "there are screenshots" and not where has
+been told nothing it can act on. No new tool; `read` handles text and `bash` handles the
+rest.
+
+Three things about it, for the same reasons the gate side has them. It is the task's **own**
+artifacts, not its blockers' — along a `blockedBy` edge an artifact is input to the next
+task's work (§17), here it is evidence about the change under review. The files are written
+**read-only** (`0o444`): four reviewers hold no writable tool but `sabotage` holds `write`
+and `edit`, and all five run concurrently, so a reviewer that edited the screenshot it was
+shown would change what the others are looking at mid-round. And it is staged **beside** the
+checkout, never inside it, so evidence never shows up as an uncommitted change in the shared
+worktree or in the sabotage copy of it. A round with nothing to show gets no directory and no
+section — "Evidence: none" would be carried by every task that renders nothing, and it reads
+as a finding about the change rather than a fact about the pipeline. Staging that fails is
+logged and the round proceeds on the diff alone, which is what every round did before this
+existed.
 
 Verdicts are written to `tasks/<id>/reviews/NNN-verdict.md`, numbered by session and never
 overwritten, and appended to the journal — the journal is what the next session actually
@@ -3738,6 +3805,32 @@ can read them, and says so in the prompt. No new tool to read one — `read` and
 already work on a file. This reuses the dependency graph a plan already carries (§14.3),
 which means the plan agent controls artifact flow by declaring dependencies, and there is
 no second, parallel notion of "which task feeds which".
+
+**A second producer: the acceptance gate.** `publish_artifact` is not the only way in.
+Anything a §12 gate leaves in `CATERPILLAR_EVIDENCE_DIR` is committed here too, and it lands
+in the same directory under the same caps — one place a reader looks, one set of limits, one
+route serving it. The two differ only in audience: an agent's artifact is *input* for the
+tasks that declare this one as a blocker, and a gate's is *evidence* about this task's own
+change, read by a human on the web view and by the review council (§12.1).
+
+**Over the cap, a gate is refused in words rather than truncated.** A screenshot is not
+small, so this is the common case rather than the corner one, and it is where the caps stop
+being theoretical. The bytes do not land: every runner clones this repo and git keeps
+whatever reaches it forever, so a 4 MB PNG per failed session is paid for by every machine
+in the fleet in perpetuity. Truncating was rejected — half a PNG is not a smaller PNG, and a
+truncated trace is not a shorter trace, so the reader would be handed something that looks
+like evidence and is not. Instead the verdict's detail names the file, its size and the
+limit, so the journal distinguishes "too big to commit" from "the gate wrote nothing", and
+says what a repo can do about it: a lower resolution, a JPEG rather than a PNG, one
+screenshot rather than Playwright's whole output tree. An agent that hits the cap through
+`publish_artifact` is told to summarise; a gate that hits it is told to render less. The
+same refusal, aimed at what the caller can actually change.
+
+**On the web view an artifact is a download, never a document** — `application/octet-stream`
+as an attachment, with the link carrying `download` to agree with the header. That rule
+predates images and does not bend for them: these are agent-authored bytes on the origin
+that serves every transcript (§18, invariant 8). A screenshot is not exempt for being
+something a browser could render; being renderable is the hazard.
 
 ### 17.1 Large artifacts — designed, not built
 
