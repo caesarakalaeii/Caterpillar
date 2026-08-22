@@ -66,18 +66,34 @@ export const isTimeZone = (zone: string): boolean => {
   }
 };
 
+/** A wall-clock reading in some zone: what a clock on the wall there says. */
+export interface WallClock {
+  readonly year: number;
+  /** 1–12, as a human writes it, not `Date`'s 0–11. */
+  readonly month: number;
+  readonly day: number;
+  readonly hour: number;
+  readonly minute: number;
+  readonly second: number;
+}
+
 /**
  * Wall-clock parts of `instant` in `timeZone`.
+ *
+ * Exported for `schedule/occurrence.ts`, which asks the same question of the same zone
+ * database for the same reason: a cron expression is a statement about a wall clock. One
+ * implementation, deliberately — two readings of `formatToParts` that disagreed about the
+ * `h23` hour cycle would put a digest and a schedule an hour apart on the same day.
  *
  * `formatToParts` rather than a formatted string: a locale's date order is not a contract,
  * and assembling the parts by name is the only reading that cannot be broken by an ICU
  * update. `hourCycle: "h23"` because `en-US` renders midnight as `24` in `h24`, which
  * parses to a day that does not exist.
  */
-const partsIn = (
+export const wallClockIn = (
   instant: Date,
   timeZone: string,
-): { year: number; month: number; day: number; hour: number; minute: number; second: number } => {
+): WallClock => {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
     hourCycle: "h23",
@@ -106,7 +122,7 @@ const partsIn = (
 
 /** The zone's offset from UTC at `instant`, in milliseconds. */
 const offsetAt = (instant: Date, timeZone: string): number => {
-  const parts = partsIn(instant, timeZone);
+  const parts = wallClockIn(instant, timeZone);
   const asUtc = Date.UTC(
     parts.year,
     parts.month - 1,
@@ -122,7 +138,7 @@ const offsetAt = (instant: Date, timeZone: string): number => {
 
 /** The local calendar date at `instant`, as `YYYY-MM-DD`. */
 export const localDate = (instant: Date, timeZone: string): string => {
-  const { year, month, day } = partsIn(instant, timeZone);
+  const { year, month, day } = wallClockIn(instant, timeZone);
   return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`;
 };
 
@@ -138,20 +154,40 @@ const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
  * within an hour of a DST change, and one refinement is enough to land on the correct side
  * of it. A wall-clock time that a spring-forward deletes has no instant at all; it
  * resolves to the moment the clocks reach, which is the only answer that exists.
+ *
+ * Exported alongside `wallClockIn` and used by `schedule/occurrence.ts`: a cron field set
+ * names a wall clock, and turning one into an instant is this function's whole job.
  */
+export const instantOfWallClock = (
+  wall: Omit<WallClock, "second"> & { readonly second?: number },
+  timeZone: string,
+): Date => {
+  const naive = Date.UTC(
+    wall.year,
+    wall.month - 1,
+    wall.day,
+    wall.hour,
+    wall.minute,
+    wall.second ?? 0,
+  );
+  const first = naive - offsetAt(new Date(naive), timeZone);
+  return new Date(naive - offsetAt(new Date(first), timeZone));
+};
+
 const instantOf = (date: string, hour: number, timeZone: string): Date => {
   const match = DATE.exec(date);
   if (match === null) throw new Error(`'${date}' is not a YYYY-MM-DD date`);
 
-  const [year, month, day] = [
-    Number.parseInt(match[1] as string, 10),
-    Number.parseInt(match[2] as string, 10),
-    Number.parseInt(match[3] as string, 10),
-  ];
-
-  const naive = Date.UTC(year, month - 1, day, hour);
-  const first = naive - offsetAt(new Date(naive), timeZone);
-  return new Date(naive - offsetAt(new Date(first), timeZone));
+  return instantOfWallClock(
+    {
+      year: Number.parseInt(match[1] as string, 10),
+      month: Number.parseInt(match[2] as string, 10),
+      day: Number.parseInt(match[3] as string, 10),
+      hour,
+      minute: 0,
+    },
+    timeZone,
+  );
 };
 
 /** The local date `days` before `date`, as `YYYY-MM-DD`. */

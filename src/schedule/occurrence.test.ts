@@ -45,14 +45,38 @@ test("a day the schedule excludes is skipped, not approximated", () => {
   );
 });
 
-test("an occurrence the clocks skip over still happens, once", () => {
+test("an occurrence the clocks skip over still happens, exactly once", () => {
   // Berlin springs forward at 02:00 on 2026-03-29 (a Sunday), so 02:30 does not exist
-  // that day. A schedule at 02:30 must still fire — at the instant the clocks reach —
+  // that day. A schedule at 02:30 must still fire — the shifted instant, an hour past
+  // the gap, which is what `instantOfWallClock` resolves a deleted wall clock to —
   // rather than be silently dropped for the year.
   const nightly = { cron: "30 2 * * *", timeZone: BERLIN } as const;
   const fired = nextOccurrence(new Date("2026-03-29T00:00:00Z"), nightly);
 
-  assert.equal(fired?.toISOString(), "2026-03-29T01:00:00.000Z", "03:00 local, the moment reached");
+  assert.equal(fired?.toISOString(), "2026-03-29T01:30:00.000Z", "03:30 local, past the gap");
+
+  // And once: searching on from it lands on the next day, not on a second reading of the
+  // same missing minute.
+  assert.equal(
+    nextOccurrence(fired as Date, nightly)?.toISOString(),
+    "2026-03-30T00:30:00.000Z",
+  );
+});
+
+test("an occurrence the clocks repeat fires once, not twice", () => {
+  // Berlin falls back at 03:00 on 2026-10-25, so 02:30 happens twice that morning — once
+  // at 00:30Z in CEST and again at 01:30Z in CET. A daily schedule at 02:30 must produce
+  // one occurrence that day, or the audit runs twice and the second run finds nothing to
+  // do and spends a session saying so.
+  const nightly = { cron: "30 2 * * *", timeZone: BERLIN } as const;
+
+  const first = nextOccurrence(new Date("2026-10-24T12:00:00Z"), nightly) as Date;
+  assert.equal(first.toISOString(), "2026-10-25T01:30:00.000Z");
+  assert.equal(
+    nextOccurrence(first, nightly)?.toISOString(),
+    "2026-10-26T01:30:00.000Z",
+    "the next one is the following day, not the other 02:30",
+  );
 });
 
 test("catch-up reaches back exactly one occurrence", () => {
@@ -73,6 +97,19 @@ test("catch-up reaches back exactly one occurrence", () => {
     ["2026-08-28T07:00:00.000Z"],
     "a week away owes the latest occurrence and nothing older",
   );
+});
+
+test("an occurrence nobody was there for goes stale rather than firing late", () => {
+  // Count alone is not a bound. "The previous occurrence" of a weekly schedule can be six
+  // days old, and firing a Monday audit on Saturday evening produces a task nobody asked
+  // for against a repo that has moved on. `MAX_LATENESS_MS` is the second bound.
+  const weekly = { cron: "0 9 * * 1", timeZone: BERLIN } as const;
+
+  const soonAfter = new Date("2026-08-24T09:00:00Z"); // 11:00 Berlin, two hours late.
+  assert.equal(dueOccurrences(soonAfter, weekly).length, 1);
+
+  const nextDay = new Date("2026-08-25T09:00:00Z"); // A day late.
+  assert.deepEqual(dueOccurrences(nextDay, weekly), []);
 });
 
 test("nothing is due before the first occurrence has passed", () => {
