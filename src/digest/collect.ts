@@ -29,8 +29,13 @@ import {
   type TaskStatus,
 } from "../domain/task.ts";
 import type { Git } from "../state/git.ts";
-import type { AuthoredCommit } from "./attribution.ts";
-import type { DigestWindow } from "./day.ts";
+import {
+  attribute,
+  type AttributionReport,
+  type AuthoredCommit,
+  type FleetIdentity,
+} from "./attribution.ts";
+import { previousWindow, type DigestWindow } from "./day.ts";
 
 /** Work that landed in one repo, as this runner's own mirror records it. */
 export interface RepoChange {
@@ -137,6 +142,14 @@ export interface DayDigest {
   /** True when nothing moved at all. A quiet day is still worth saying out loud. */
   readonly quiet: boolean;
   /**
+   * Who wrote the code — the fleet or a person — and which way that is going.
+   *
+   * Absent rather than zeroed when nothing could measure it: no reader, no identity, or a
+   * reader that failed. An all-zero report would claim the fleet wrote none of the code,
+   * which is the same false statement `changesUnavailable` exists to avoid.
+   */
+  readonly attribution?: AttributionReport;
+  /**
    * Tasks whose records could not be read at all.
    *
    * Named rather than dropped. One malformed `state.json` must not cost the day — a digest
@@ -152,6 +165,10 @@ export interface CollectOptions {
   readonly git: Git;
   readonly window: DigestWindow;
   readonly changes?: ChangeReader;
+  /** Reads who authored the window's commits. Absent means no authorship section. */
+  readonly authorship?: AuthorshipReader;
+  /** The fleet's commit identity (§9.7). Required for authorship to mean anything. */
+  readonly identity?: FleetIdentity;
 }
 
 /**
@@ -208,6 +225,8 @@ export const collectDay = async (options: CollectOptions): Promise<DayDigest> =>
   const changed: TaskChange[] = [];
   const open: OpenTask[] = [];
   const unreadable: TaskId[] = [];
+  // Deduplicated by slug: two tasks on the same repo are one repo to read the history of.
+  const workedRepos = new Map<string, RepoRef>();
 
   const collectOne = async (id: TaskId): Promise<void> => {
     const after = await readState(git, to, id);
@@ -251,6 +270,8 @@ export const collectDay = async (options: CollectOptions): Promise<DayDigest> =>
       ...(await journalOf(git, from, to, id)),
       ...(await changesOf(options.changes, id, facts.repos)),
     });
+
+    for (const repo of facts.repos) workedRepos.set(`${repo.owner}/${repo.name}`, repo);
   };
 
   for (const id of present) {
@@ -275,7 +296,46 @@ export const collectDay = async (options: CollectOptions): Promise<DayDigest> =>
     unreadable,
     totals: total(changed),
     quiet: changed.length === 0,
+    ...(await attributionOf(options, [...workedRepos.values()])),
   };
+};
+
+/**
+ * Who wrote the code in the repos this window's tasks name.
+ *
+ * The repo set is the one the WINDOW's tasks worked, not every repo the fleet has ever
+ * touched. That keeps the read bounded — one `git log` per repo per digest, and the fleet's
+ * repo list only grows — and it matches what the rest of the document is about. A repo
+ * nobody worked today has no line in the digest to attribute.
+ *
+ * Never throws. A mirror that has gone missing under the reader costs the section and not
+ * the day: the collector is deterministic, so a digest that throws is a digest that fails
+ * identically on every retry and a day that is never published at all (§19).
+ */
+const attributionOf = async (
+  options: CollectOptions,
+  repos: readonly RepoRef[],
+): Promise<{ attribution?: AttributionReport }> => {
+  const { authorship, identity, window } = options;
+  if (authorship === undefined || identity === undefined || repos.length === 0) return {};
+
+  const before = previousWindow(window);
+
+  try {
+    const now = await authorship.readAuthorship(repos, window.start, window.end);
+    const baseline = await authorship.readAuthorship(repos, before.start, before.end);
+
+    return {
+      attribution: attribute({
+        identity,
+        commits: now.commits,
+        previous: baseline.commits,
+        unavailable: now.unavailable,
+      }),
+    };
+  } catch {
+    return {};
+  }
 };
 
 /**
