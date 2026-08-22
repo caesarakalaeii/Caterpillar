@@ -43,16 +43,17 @@ test("a tree still being written into by another process is removed, not refused
   const busy = join(root, "busy");
   await mkdir(busy, { recursive: true });
 
-  // Creates files under `busy` as fast as it can, for longer than the removal takes to
-  // start, and dies with its parent rather than outliving the test.
+  // Models a git child that is FINISHING: it writes a burst and exits, which is what the
+  // leaked `store.pull` fetch does. Deliberately not an endless writer — a process that
+  // refills the tree forever cannot be removed by any bounded number of attempts, so
+  // testing against one would only be asserting the retry budget's exact size.
   const writer = spawn(
     process.execPath,
     [
       "-e",
       `const {writeFileSync}=require("fs");const {join}=require("path");` +
-        `const dir=${JSON.stringify(busy)};let n=0;` +
-        `const t=setInterval(()=>{try{writeFileSync(join(dir,"f"+n++),"x")}catch{clearInterval(t);process.exit(0)}},1);` +
-        `setTimeout(()=>{clearInterval(t);process.exit(0)},2000);`,
+        `const dir=${JSON.stringify(busy)};` +
+        `for(let n=0;n<400;n++){try{writeFileSync(join(dir,"f"+n),"x")}catch{break}}`,
     ],
     { stdio: "ignore" },
   );
