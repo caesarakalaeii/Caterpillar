@@ -47,6 +47,45 @@ export interface CheckStatus {
 }
 
 /**
+ * One comment a reviewer left on a pull request (DESIGN.md §7.3).
+ *
+ * Read by the supervisor and rendered into the next session's prompt by
+ * `agent/review-guidance.ts`, which is why the flags are here rather than being decided by
+ * each backend: whether a closed thread is worth quoting is a rendering decision, and it
+ * has to be the same one on both forges.
+ */
+export interface ReviewComment {
+  /** Forge-assigned, and stable across reads. Only used to distinguish two comments. */
+  readonly id: string;
+  /** Which pull request this was left on — a task may have one per repo (§9.4.1). */
+  readonly repo: RepoRef;
+  readonly pr: number;
+  /** Login as the forge spells it, so the agent can tell two reviewers apart. */
+  readonly author: string;
+  /**
+   * True when the fleet itself wrote this — the authoring App, the reviewer identity, or
+   * the account the Forgejo tokens belong to.
+   *
+   * The agent's own replies and the council's approvals land on the same pull request as a
+   * human's objections. Reading them back as guidance is a loop with no human in it, and it
+   * would forgive a review round on every session forever.
+   */
+  readonly fromFleet: boolean;
+  readonly body: string;
+  /** Absent on a review body or a conversation comment, which is attached to no file. */
+  readonly path?: string;
+  /** The line in the head commit. Absent once the comment goes outdated. */
+  readonly line?: number;
+  readonly url?: string;
+  /** ISO 8601, as the forge reported it. Not re-parsed here. */
+  readonly createdAt: string;
+  /** The thread was marked resolved. The conversation is over. */
+  readonly resolved: boolean;
+  /** The line it was written against no longer exists in the diff. */
+  readonly outdated: boolean;
+}
+
+/**
  * Everything the supervisor needs from a forge. One instance is bound to one
  * workspace profile and one task's repo scope.
  */
@@ -65,6 +104,20 @@ export interface Forge {
 
   /** CI state for a ref — the second gate in DESIGN.md §12. */
   checks(repo: RepoRef, ref: string): Promise<CheckStatus>;
+
+  /**
+   * Every review comment on a pull request, resolved and outdated ones included
+   * (DESIGN.md §7.3).
+   *
+   * Included rather than filtered because a caller that is told only about the live ones
+   * cannot say how many were dealt with, and "three threads, all resolved" is what tells
+   * the agent a review happened at all. `agent/review-guidance.ts` decides what is quoted.
+   *
+   * A forge that cannot be reached must not fail the task, so callers log and continue —
+   * see `AgentSessionRunner.reviewGuidance`. This method still throws, because swallowing
+   * here would make an empty list mean both "nobody commented" and "nobody could ask".
+   */
+  listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]>;
 
   /**
    * Submit an APPROVING review on a pull request.
