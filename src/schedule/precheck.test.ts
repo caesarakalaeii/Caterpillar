@@ -126,7 +126,7 @@ test("a command that outruns its timeout is a skip, not a stalled housekeeping p
   const result = await run(scheduleWith("sleep 30", 1));
 
   assert.equal(result.ok, false);
-  assert.match(result.detail, /timed out|exit/i);
+  assert.match(result.detail, /timed out after 1s/);
 });
 
 test("an environment that will not resolve is a throw, not a skip", async () => {
