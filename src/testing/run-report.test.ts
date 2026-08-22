@@ -123,6 +123,35 @@ test("output with no summary at all is rejected rather than read as zero failure
   assert.match(verdict.reason ?? "", /summary/);
 });
 
+test("the spec reporter's summary is read too, not just TAP's", () => {
+  // node 24+ defaults to the spec reporter when stdout is not a TTY, and it marks the
+  // summary with `ℹ` instead of `#`. Reading only the TAP form made every run on those
+  // versions look like it had printed no summary at all — which is how the whole suite
+  // was rejected on the CI leg that runs a newer node, while node 22 stayed green.
+  const spec = `
+ℹ tests 1444
+ℹ suites 3
+ℹ pass 1444
+ℹ fail 0
+ℹ cancelled 0
+`;
+
+  const verdict = judgeRun(spec, { expected: 1444 });
+
+  assert.equal(verdict.ok, true, verdict.reason);
+});
+
+test("a failure reported by the spec reporter is still rejected", () => {
+  const spec = `
+ℹ tests 1444
+ℹ pass 1443
+ℹ fail 1
+ℹ cancelled 0
+`;
+
+  assert.equal(judgeRun(spec, { expected: 1444 }).ok, false);
+});
+
 test("a single-file run is judged without a count floor", () => {
   // `node src/cli/run-tests.ts src/one.test.ts` is not the whole suite, so the total is
   // meaningless for it. Failures and cancellations must still be caught.
