@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
+import { attribute, type AuthoredCommit } from "./attribution.ts";
 import type { DayDigest, TaskChange } from "./collect.ts";
 import { renderDigest, summaryLine } from "./render.ts";
 
@@ -211,4 +212,91 @@ test("a timestamp that will not parse is printed rather than thrown over", () =>
   );
 
   assert.match(text, /yesterday afternoon/);
+});
+
+/* -------------------------------------------------------------------- attribution */
+
+const FLEET_EMAIL = "316492202+caterpillar-agent[bot]@users.noreply.github.com";
+
+const authored = (repo: string, email: string, lines: number): AuthoredCommit => ({
+  repo,
+  sha: `${repo}-${email}-${lines}`,
+  authorEmail: email,
+  insertions: lines,
+  deletions: 0,
+});
+
+const withAttribution = (
+  commits: readonly AuthoredCommit[],
+  extra: { previous?: readonly AuthoredCommit[]; unavailable?: readonly string[] } = {},
+): string =>
+  render(
+    digest({
+      quiet: false,
+      attribution: attribute({ identity: { emails: [FLEET_EMAIL] }, commits, ...extra }),
+    }),
+  );
+
+test("authorship is rendered as a share of lines and of commits, per repo", () => {
+  const text = withAttribution([
+    authored("acme/widget", FLEET_EMAIL, 90),
+    authored("acme/widget", "dev@example.invalid", 10),
+  ]);
+
+  assert.match(text, /## Authorship/);
+  assert.match(text, /acme\/widget/);
+  assert.match(text, /90%/, "the fleet's share of lines");
+  assert.match(text, /90 line|90 of|100 lines/, "the absolute numbers, not only the ratio");
+});
+
+test("the share is shown against the previous window, because one day says nothing", () => {
+  const text = withAttribution(
+    [authored("acme/widget", FLEET_EMAIL, 75), authored("acme/widget", "dev@example.invalid", 25)],
+    {
+      previous: [
+        authored("acme/widget", FLEET_EMAIL, 25),
+        authored("acme/widget", "dev@example.invalid", 75),
+      ],
+    },
+  );
+
+  assert.match(text, /75%/);
+  assert.match(text, /25%/, "the window it is compared against is stated, not only the arrow");
+  assert.match(text, /\bup\b/i);
+});
+
+test("a first window with nothing to compare against says so rather than showing no change", () => {
+  // "flat" would be a claim about a yesterday that was never measured.
+  const text = withAttribution([authored("acme/widget", FLEET_EMAIL, 40)]);
+
+  assert.doesNotMatch(text, /\bflat\b/i);
+  assert.match(text, /no earlier window|nothing to compare/i);
+});
+
+test("a repo whose history this runner cannot read is named in the section", () => {
+  // The §19 rule, again: this is the section where a silent zero would be most credible,
+  // because a percentage always looks like a measurement.
+  const text = withAttribution([authored("acme/widget", FLEET_EMAIL, 40)], {
+    unavailable: ["acme/gadget"],
+  });
+
+  assert.match(text, /acme\/gadget/);
+  assert.match(text, /no mirror|cannot be read/i);
+  assert.doesNotMatch(text, /acme\/gadget[^\n]*0%/, "an unreadable repo has no share");
+});
+
+test("a window with no commits in it says nothing was committed, not that the fleet wrote none", () => {
+  const text = withAttribution([]);
+
+  assert.match(text, /## Authorship/);
+  assert.match(text, /no commit/i);
+  assert.doesNotMatch(text, /0%/);
+});
+
+test("a digest with no attribution at all has no authorship section", () => {
+  // A runner with no mirrors and no identity configured must not print a heading whose
+  // body would be an apology.
+  const text = render(digest({ quiet: false }));
+
+  assert.doesNotMatch(text, /## Authorship/);
 });
