@@ -199,7 +199,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
-| `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
+| `src/digest/changes.ts` | Diffstat, commit subjects and authorship from local mirrors. No network (§19). |
+| `src/digest/attribution.ts` | Fleet-versus-human authorship and its trend. Pure, no IO (§19). |
 | `src/digest/render.ts` | The one document Discord, git and the web view all get (§19). |
 | `src/digest/summarise.ts` | The prose paragraph. No tools, and never fails a digest (§19). |
 | `src/digest/publish.ts` | Claim the day, publish it, release the claim if that failed (§19). |
@@ -444,14 +445,27 @@ others find it taken. A pod that was rolled through the cutoff still publishes w
 comes back — catch-up reaches back one day, so a runner returning after a week does not
 post seven digests at once.
 
-Two things it will tell you about itself rather than fake:
+**It also says how much of the change is yours.** One section splits the window's commits
+and lines into fleet and human, per repo, and shows the fleet's share against the previous
+window — because a single day's share says almost nothing and a direction says a lot. The
+split is by commit ADDRESS, never by display name, and the addresses come from `identity`
+(§9.7). If your deployment has changed identity, list the retired addresses in
+`identity.pastEmails` or the window that straddles the change reports the fleet's own work
+as a stranger's. The same numbers are counters —
+`caterpillar_digest_authored_lines_total{runner,repo,author}` and its commit-level twin —
+so the trend is graphable without parsing prose.
+
+Three things it will tell you about itself rather than fake:
 
 - **a missing paragraph says why** — a provider outage prints a line where the prose would
   have been, because a digest that silently lost it looks exactly like one that never had
   a summariser;
 - **a diff it cannot see says so** — a task branch lives in the mirror of the runner that
   worked it, so on another runner the digest names the repo it cannot read instead of
-  printing `0 files changed` about a merged pull request.
+  printing `0 files changed` about a merged pull request;
+- **a share it cannot measure is absent, not 0%** — same rule, and this is where breaking it
+  would be least visible, because a percentage always looks like a measurement. A repo with
+  no mirror here is named; a window with no commits says so.
 
 Enabling it needs nothing else: no new secret, no port, no Deployment. It runs on the
 existing poll loop and uses the notifier that is already configured.
@@ -746,7 +760,8 @@ task worktree carries one configured identity:
 ```json
 "identity": {
   "name": "caterpillar-agent[bot]",
-  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com"
+  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+  "pastEmails": []
 }
 ```
 
@@ -766,6 +781,13 @@ gh api users/<slug>%5Bbot%5D --jq .id
 
 which is a **different** number from the App id in the secret: the App id names the
 application, this names the account it commits as.
+
+**`pastEmails` is read-only history.** Nothing ever commits as one of them; they are there
+so the daily digest's authorship split (§19) recognises the fleet's own past work after you
+reinstall the App, rather than reporting it as a contributor who does not exist. The
+bare-noreply refusal above is deliberately not applied to them — it exists to stop an
+address *authoring* anything, and a deployment that already made that mistake still has to
+be able to describe the history it has.
 
 **And nothing it writes carries a second name.** No `Co-Authored-By` trailer, no "Generated
 with" footer, no 🤖, no model or tool name — in commit messages, PR titles and bodies,
