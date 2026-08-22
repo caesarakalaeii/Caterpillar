@@ -8,7 +8,11 @@
  * review still runs, still passes, and silently stops grading the thing this was built for.
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
 import {
   asTaskId,
   asWorkspaceName,
@@ -20,11 +24,14 @@ import type { Commit } from "./tdd.ts";
 import { prLenses, SABOTAGE_LENS } from "./lenses.ts";
 import type { PrepareOptions, PrepareResult } from "./sabotage.ts";
 import {
+  evidenceRoot,
   planPrompt,
   reviewerPlan,
   reviewPrompt,
   sabotageAbstentionFor,
+  stageEvidence,
   withSabotageCopy,
+  type ArtifactSource,
 } from "./council.ts";
 
 const SPEC: TaskSpec = {
@@ -226,4 +233,128 @@ test("a refusal reaches the body as a reason and needs no cleanup", async () => 
   const seen = await withSabotageCopy(prepare, prepareOptions(), async (copy) => copy);
 
   assert.deepEqual(seen, { ok: false, reason: "no disk" });
+});
+
+/* ─────────────────── artifacts as evidence the council can see (§12.1) ───────────────── */
+
+const temporaries: string[] = [];
+after(async () => {
+  for (const dir of temporaries) await rm(dir, { recursive: true, force: true });
+});
+
+const scratch = async (): Promise<string> => {
+  const dir = await mkdtemp(join(tmpdir(), "caterpillar-council-"));
+  temporaries.push(dir);
+  return dir;
+};
+
+/** The artifact side of the state repo, answering from a map. */
+const artifactStore = (artifacts: Record<string, string>): ArtifactSource => ({
+  listArtifacts: () => Promise.resolve(Object.keys(artifacts).sort()),
+  readArtifact: (_task, name) =>
+    Promise.resolve(
+      artifacts[name] === undefined ? undefined : Buffer.from(artifacts[name] as string),
+    ),
+});
+
+test("the task's own artifacts are staged where a reviewer can read them", async () => {
+  const root = join(await scratch(), "evidence");
+
+  const staged = await stageEvidence(
+    artifactStore({ "shot.png": "pretend png", "trace.zip": "pretend zip" }),
+    asTaskId("TASK-1"),
+    root,
+  );
+
+  assert.deepEqual(
+    staged.map((entry) => entry.name),
+    ["shot.png", "trace.zip"],
+  );
+  assert.equal(await readFile(join(root, "shot.png"), "utf8"), "pretend png");
+  assert.deepEqual(
+    staged.map((entry) => entry.path),
+    [join(root, "shot.png"), join(root, "trace.zip")],
+  );
+});
+
+test("staged evidence is read-only on disk", async () => {
+  // The reviewers share this directory and four of the five hold no writable tool at all,
+  // but the sabotage lens holds `write`. A reviewer that edited the screenshot it was
+  // shown would change what the other four are looking at, mid-round.
+  const root = join(await scratch(), "evidence");
+
+  await stageEvidence(artifactStore({ "shot.png": "pretend png" }), asTaskId("TASK-1"), root);
+
+  const mode = (await stat(join(root, "shot.png"))).mode & 0o222;
+  assert.equal(mode, 0, "no write bit for anyone");
+});
+
+test("staging is outside the checkout the reviewers read", async () => {
+  // Same rule as `runner.ts` staging upstream artifacts: a file in the worktree is a file
+  // in `git status`, and the sabotage reviewer runs the acceptance suite in its own copy
+  // of that checkout. Evidence must not turn up in either as an uncommitted change.
+  const taskDir = await scratch();
+  const root = evidenceRoot(taskDir);
+
+  assert.ok(!root.startsWith(join(taskDir, "widget")));
+  assert.equal(root, join(taskDir, "evidence-in"));
+});
+
+test("a task with no artifacts stages nothing and creates nothing", async () => {
+  const root = join(await scratch(), "evidence");
+
+  const staged = await stageEvidence(artifactStore({}), asTaskId("TASK-1"), root);
+
+  assert.deepEqual(staged, []);
+  assert.equal(existsSync(root), false, "an empty directory is a claim that there is nothing");
+});
+
+test("restaging replaces what a previous round left, rather than accumulating", async () => {
+  // The council runs again after a send-back, and the second round's evidence is about the
+  // second round's diff. A screenshot from round one still sitting there would be offered
+  // as evidence about a change that has since moved on.
+  const root = join(await scratch(), "evidence");
+  await stageEvidence(artifactStore({ "round-one.png": "old" }), asTaskId("TASK-1"), root);
+
+  const staged = await stageEvidence(
+    artifactStore({ "round-two.png": "new" }),
+    asTaskId("TASK-1"),
+    root,
+  );
+
+  assert.deepEqual(
+    staged.map((entry) => entry.name),
+    ["round-two.png"],
+  );
+  assert.equal(existsSync(join(root, "round-one.png")), false);
+});
+
+test("the lenses are told the paths, not merely that evidence exists", () => {
+  // A reviewer that is told "there are screenshots" and not where cannot read one. This is
+  // the whole difference between an artifact being stored and it being evidence.
+  const prompt = reviewPrompt(SPEC, STATE, "base0", commits, [
+    { name: "shot.png", path: "/work/tasks/TASK-1/evidence-in/shot.png" },
+  ]);
+
+  assert.match(prompt, /Evidence/);
+  assert.match(prompt, /\/work\/tasks\/TASK-1\/evidence-in\/shot\.png/);
+  assert.match(prompt, /read-only/i, "a reviewer must not be invited to change it");
+});
+
+test("a review with no evidence gets no evidence section at all", () => {
+  // Not an empty heading. "Evidence: none" reads as a finding about the change, and every
+  // task that renders nothing would carry it.
+  const prompt = reviewPrompt(SPEC, STATE, "base0", commits, []);
+
+  assert.doesNotMatch(prompt, /## Evidence/);
+});
+
+test("the evidence section does not displace the rest of the prompt", () => {
+  const prompt = reviewPrompt(SPEC, STATE, "base0", commits, [
+    { name: "shot.png", path: "/evidence/shot.png" },
+  ]);
+
+  assert.match(prompt, /Test-first evidence/);
+  assert.match(prompt, /Refuse a spec that declares no repos\./);
+  assert.match(prompt, /`npm test`/);
 });
