@@ -213,6 +213,18 @@ export interface Digester {
   maybePublish(now: Date, signal?: AbortSignal): Promise<void>;
 }
 
+/** Scheduled work (§22). Implemented by `ScheduleRunner`. */
+export interface Scheduler {
+  /**
+   * Fire whatever occurrence is due, if this runner wins its claim. Called on every
+   * housekeeping pass; does nothing on almost all of them.
+   *
+   * The signal is the pod's, and it reaches a precheck: a bounded command is still a
+   * command, and a shutdown must not wait for one to finish.
+   */
+  maybeFire(now: Date, signal?: AbortSignal): Promise<unknown>;
+}
+
 export interface SupervisorDeps {
   readonly config: RunnerConfig;
   readonly store: StateStore;
@@ -273,6 +285,11 @@ export interface SupervisorDeps {
    * shared channel and a shared repo, so a runner has to be told to publish one.
    */
   readonly digest?: Digester;
+  /**
+   * Scheduled work (§22). Optional, and off by default for the digest's reason: firing an
+   * occurrence writes tasks into the shared state repo, so a runner has to be told to.
+   */
+  readonly schedule?: Scheduler;
   /**
    * The Alertmanager receiver's queue and the thing that empties it (§20). Optional and
    * off by default: without `remediation.enabled` there is no listener to fill it.
@@ -679,6 +696,7 @@ export class Supervisor {
     await this.applyChatRequests();
     await this.maybeIngest();
     await this.drainAlerts();
+    await this.maybeSchedule(signal);
     await this.maybeDigest(signal);
 
     // AFTER the writes above, so the snapshot a human reads includes what this pass just
@@ -1132,6 +1150,30 @@ export class Supervisor {
       });
     } catch (error) {
       logger.warn("alert.pass-failed", errorFields(error));
+    }
+  }
+
+  /**
+   * Fire whatever scheduled work is due (DESIGN.md §22).
+   *
+   * On the housekeeping loop and NOT the work loop, which is the whole reason this needs no
+   * listener and no second process: an occurrence that comes due while a session is running
+   * must still become a task, and the work loop is blocked for as long as the session takes.
+   * Ahead of the cooldown gate for intake's reason — creating a task spends no tokens, and a
+   * queue that keeps filling while the provider is down is the correct behaviour.
+   *
+   * Failures never propagate. `ScheduleRunner` already releases its claims and swallows its
+   * own errors; this catch is for the one thing it cannot handle, itself throwing, because a
+   * schedule must never be the reason the fleet stops working the tasks it already has.
+   */
+  private async maybeSchedule(signal: AbortSignal): Promise<void> {
+    const { schedule, logger } = this.deps;
+    if (schedule === undefined) return;
+
+    try {
+      await schedule.maybeFire(new Date(), signal);
+    } catch (error) {
+      logger.warn("schedule.pass-failed", errorFields(error));
     }
   }
 

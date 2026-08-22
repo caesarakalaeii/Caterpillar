@@ -281,6 +281,23 @@ export class AgentMetrics {
   );
 
   /**
+   * Occurrences this runner settled, by schedule and outcome (DESIGN.md §22).
+   *
+   * `outcome="skipped"` is the series this metric is worth having for. A schedule whose
+   * precheck never passes creates no tasks — and neither does a schedule nobody is polling,
+   * or one whose cron expression fires at an hour the fleet is always down. Counting the
+   * skips is what separates a gate doing its job from a scheduler that has stopped.
+   *
+   * Not collapsed into fired/other, for `caterpillar_alerts_received_total`'s reason:
+   * `refused` means the fleet already has an open task for this schedule and is a fact about
+   * throughput, while `skipped` means there was nothing to do and is the healthy case.
+   */
+  readonly schedules = this.registry.counter(
+    "caterpillar_schedule_occurrences_total",
+    "scheduled occurrences settled by this runner, by schedule and outcome",
+  );
+
+  /**
    * Task worktrees this runner threw away, by which removal did it (DESIGN.md §3.1).
    *
    * `kind="targeted"` is a task finishing cleanly and being tidied up after; `kind="swept"`

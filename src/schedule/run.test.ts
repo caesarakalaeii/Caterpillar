@@ -76,7 +76,7 @@ interface HarnessOptions {
   readonly precheckThrows?: boolean;
   readonly writeFails?: boolean;
   /** An occurrence this runner has already settled, as the ledger would report it. */
-  readonly settled?: ScheduleRecord;
+  readonly ledger?: ScheduleRecord;
 }
 
 interface Harness {
@@ -89,6 +89,8 @@ interface Harness {
   readonly pushes: string[];
   readonly notifications: Notification[];
   readonly prechecked: string[];
+  /** `<schedule>:<outcome>` per settled occurrence — what the metric is fed. */
+  readonly settled: string[];
 }
 
 const harness = (options: HarnessOptions = {}): Harness => {
@@ -100,8 +102,10 @@ const harness = (options: HarnessOptions = {}): Harness => {
   const pushes: string[] = [];
   const notifications: Notification[] = [];
   const prechecked: string[] = [];
+  const settled: string[] = [];
 
   const runner = new ScheduleRunner({
+    onSettled: (schedule, outcome) => settled.push(`${schedule}:${outcome}`),
     runner: "pod-7f3a",
     branch: "main",
     maxSessionsPerTask: 20,
@@ -113,7 +117,7 @@ const harness = (options: HarnessOptions = {}): Harness => {
       }),
       hasTask: async () => options.existingTask === true,
       countOpenScheduleTasks: async () => options.openTasks ?? 0,
-      readScheduleRecord: async () => options.settled,
+      readScheduleRecord: async () => options.ledger,
       writeScheduleRecord: async (_schedule, _occurrence, record) => {
         records.push(record);
       },
@@ -164,6 +168,7 @@ const harness = (options: HarnessOptions = {}): Harness => {
     pushes,
     notifications,
     prechecked,
+    settled,
   };
 };
 
@@ -345,7 +350,7 @@ test("an occurrence already settled in the ledger is not fired again", async () 
   // this runner skipped is settled, and re-running its precheck every poll until the hour
   // passed would spend the housekeeping loop on a question already answered.
   const subject = harness({
-    settled: { schedule: "deps-audit", occurrence: OCCURRENCE, outcome: "skipped" },
+    ledger: { schedule: "deps-audit", occurrence: OCCURRENCE, outcome: "skipped" },
   });
 
   await subject.runner.maybeFire(MONDAY_MORNING);
@@ -365,4 +370,19 @@ test("a schedule that declares a precheck is not fired by a runner that cannot r
   assert.deepEqual(subject.specs, []);
   assert.deepEqual(subject.records, []);
   assert.deepEqual(subject.released, [scheduleRef("deps-audit", OCCURRENCE)]);
+});
+
+test("every settled occurrence is counted, so a schedule that only skips is visible", async () => {
+  // A precheck that never passes and a schedule nobody is polling produce the same number
+  // of tasks — zero — and only a counter separates them. `outcome` is not collapsed for
+  // the reason `caterpillar_alerts_received_total` keeps its own: "skipped" is the healthy
+  // case and "refused" is the one that needs a human.
+  const subject = harness({
+    schedules: [WITH_PRECHECK],
+    precheck: { ok: false, detail: "exit 1" },
+  });
+
+  await subject.runner.maybeFire(MONDAY_MORNING);
+
+  assert.deepEqual(subject.settled, ["deps-audit:skipped"]);
 });
