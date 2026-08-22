@@ -39,6 +39,21 @@ const testTimeoutMs = (): number => {
   return Number.isFinite(override) && override > 0 ? override : DEFAULT_TEST_TIMEOUT_MS;
 };
 
+/**
+ * How long the whole run gets before this wrapper stops waiting for the runner.
+ *
+ * The runner's own --test-timeout is not enough, because on node 24 a file that leaks a
+ * handle makes the runner report the timeout and then never exit; node 22's reaps it.
+ * The suite takes about 150s, so twenty minutes is far above any healthy run and far
+ * below the twenty-plus-minute stalls this exists to prevent.
+ */
+const DEFAULT_RUN_DEADLINE_MS = 20 * 60_000;
+
+const runDeadlineMs = (): number => {
+  const override = Number(process.env.CATERPILLAR_RUN_DEADLINE_MS);
+  return Number.isFinite(override) && override > 0 ? override : DEFAULT_RUN_DEADLINE_MS;
+};
+
 const DEFAULT_PATTERN = "src/**/*.test.ts";
 
 const main = async (): Promise<number> => {
@@ -52,9 +67,13 @@ const main = async (): Promise<number> => {
   // its own test suite, and costs nothing when it was not set.
   const { NODE_TEST_CONTEXT: _ignored, ...env } = process.env;
 
+  // The reporter is pinned rather than left to the default, which varies: node 22 emits
+  // TAP when stdout is a pipe, node 24+ emits `spec`. This wrapper always reads through a
+  // pipe, so an unpinned reporter means the summary format depends on the node version —
+  // and the CI matrix deliberately spans two of them.
   const child = spawn(
     process.execPath,
-    ["--test", `--test-timeout=${testTimeoutMs()}`, ...patterns],
+    ["--test", "--test-reporter=tap", `--test-timeout=${testTimeoutMs()}`, ...patterns],
     { stdio: ["inherit", "pipe", "inherit"], env },
   );
 
@@ -67,22 +86,48 @@ const main = async (): Promise<number> => {
     process.stdout.write(chunk);
   });
 
-  // `close` rather than `exit`, so the last of the child's output is in hand before the
-  // summary is judged. The runner closes its children's stdio itself, so a test that
-  // leaks a handle still reaches --test-timeout and is reported; only a test that leaves
-  // a grandchild holding stdout open outlasts this, and it outlasts `exit` too.
+  // `exit` rather than `close`: `close` additionally waits for the child's stdio to reach
+  // EOF, and a killed runner can leave a grandchild holding the pipe open, which would
+  // defeat the deadline below. Everything the runner printed before exiting is already in
+  // `output`, because a pipe delivers what was written to it.
+  let timedOut = false;
   const code = await new Promise<number>((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (status, signal) => {
-      // A signal death has no exit code. Report it as a failure rather than as 0.
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      // SIGKILL, not SIGTERM: the runner being unable to end is the case being handled,
+      // so asking it politely is not a step worth waiting through.
+      child.kill("SIGKILL");
+    }, runDeadlineMs());
+
+    child.on("error", (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
+
+    child.on("exit", (status, signal) => {
+      clearTimeout(deadline);
+      // A signal death has no exit code. Report it as a failure rather than as 0 — except
+      // when this wrapper sent the signal, where the deadline message below says more.
       if (status === null) {
-        process.stderr.write(`\nnode --test was killed by ${signal ?? "an unknown signal"}\n`);
+        if (!timedOut) {
+          process.stderr.write(
+            `\nnode --test was killed by ${signal ?? "an unknown signal"}\n`,
+          );
+        }
         resolve(1);
         return;
       }
       resolve(status);
     });
   });
+
+  if (timedOut) {
+    process.stderr.write(
+      `\nnpm test gave up after ${runDeadlineMs()}ms: the test runner did not exit. ` +
+        "A test is holding the process open; the last test to start is the one to look at.\n",
+    );
+    return 1;
+  }
 
   const verdict = judgeRun(output, wholeSuite ? { expected: EXPECTED_TEST_COUNT } : {});
 

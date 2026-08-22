@@ -94,7 +94,10 @@ test("a test that leaks a handle fails the run instead of hanging the wrapper", 
 
     assert.equal(run.timedOut, false, "the wrapper must exit rather than hang");
     assert.notEqual(run.code, 0, "a hung test must not be reported as a pass");
-    assert.match(run.output, /cancelled/, run.output);
+    // How it is reported differs by node version — node 22 reaps the file and prints
+    // `cancelled`, node 24 needs the wrapper's deadline to kill it — so the assertion is
+    // that the run is refused and says why, not which of the two paths got there.
+    assert.match(run.output, /cancelled|did not exit/, run.output);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

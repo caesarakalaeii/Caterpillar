@@ -70,11 +70,16 @@ export interface JudgeOptions {
 export const EXPECTED_TEST_COUNT = 1444;
 
 /**
- * `# tests 1431` and friends. The count is the last such line, because a run over
+ * `# tests 1444` and friends. The count is the last such line, because a run over
  * several files prints one summary per file before the root summary.
+ *
+ * Both reporter prefixes are accepted: TAP marks summary lines with `#`, and the spec
+ * reporter — node 24+'s default when stdout is not a TTY — uses `ℹ`. run-tests.ts pins
+ * the reporter so only one of them should ever appear, but a parser that silently
+ * matches nothing is how this went wrong the first time, so it reads either.
  */
 const readCount = (output: string, field: string): number | undefined => {
-  const matches = [...output.matchAll(new RegExp(`^# ${field} (\\d+)$`, "gm"))];
+  const matches = [...output.matchAll(new RegExp(`^[#\u2139] ${field} (\\d+)$`, "gm"))];
   const last = matches.at(-1)?.[1];
   return last === undefined ? undefined : Number(last);
 };
