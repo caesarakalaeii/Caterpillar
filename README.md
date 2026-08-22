@@ -339,6 +339,18 @@ awkward, the change is probably wrong.
     inside the repo. `ToolchainResolver` strips that one value at the single point every
     task environment is built. Neither was a defect in the detector, and raising its
     threshold would have hidden both (§11.1).
+17. **The no-progress streak measures whether the AGENT is circling, so a session that
+    stopped to ask a human is neither progress nor a stall — and the gauge that reports it
+    must stop reporting when the task stops running.** `BS-…279100223127564-01` fired
+    `CaterpillarTaskThrashing` with one honestly stalled session followed by one that
+    correctly established its acceptance list could not be satisfied from inside its own
+    scope and asked. §7 had already conceded the point by clearing the streak when the
+    *answer* arrives — but the wait for an answer is the whole of the problem, and the
+    alert fired across it. Separately, `caterpillar_no_progress_streak{task=...}` had one
+    writer and no expiry, so a task that parked or merged went on reporting its last
+    streak for the life of the pod: an alerting rule reading a sample nothing held. Both
+    fixed at the meaning rather than the threshold — the exemption loses no information a
+    thrash detector could use, whereas widening the limit would have (§11.1).
 
 ## The web view
 

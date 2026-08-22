@@ -6,7 +6,7 @@
  * the losing step was a CAS against a ref that had already been deleted.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -34,6 +34,7 @@ import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
 import { StateStore } from "../state/store.ts";
+import { removeTempTree } from "../testing/tempdir.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
 import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
@@ -61,7 +62,13 @@ const origin = join(root, "origin.git");
 const statePath = join(root, "state");
 
 after(async () => {
-  await rm(root, { recursive: true, force: true });
+  // Not a plain `rm`: `Supervisor.run` can resolve while a housekeeping pass is still
+  // in flight, because `housekeepingLoop` checks the abort signal only between passes.
+  // That pass's `store.pull` git child then writes into `state/.git/objects` after the
+  // test's `await running` has returned, and deleting the tree under it failed this whole
+  // file in a hook with ENOTEMPTY — intermittently, on whichever CI matrix leg lost the
+  // race. See src/testing/tempdir.ts.
+  await removeTempTree(root);
 });
 
 const setup = new Git(root);
@@ -1551,6 +1558,174 @@ test("/resume clears the no-progress streak, or the task parks again without run
     settled?.status,
     "awaiting-human",
     "a resumed task must reach a session — parking again without running is the bug",
+  );
+});
+
+test("a session that stops to ask a human does not report a no-progress streak", async () => {
+  // CaterpillarTaskThrashing, fingerprint 76f2ff229fea37b1, 2026-08-21.
+  //
+  // BS-1540279100223127564-01's session 3 was a completion claim the verifier rejected
+  // (streak 1). Session 4 read the rejection, worked out that its acceptance list ran
+  // the WHOLE frontend's lint while the task owned only a slice of the errors, and asked
+  // a human — which is the correct move and the only one available. The probe scored it
+  // no-progress, the streak reached 2, and the alert fired against a task that had been
+  // sitting in `awaiting-human` with nothing running for hours.
+  //
+  // Both halves are asserted, because either one alone still fires the alert: the STATE
+  // must not carry the streak, and the GAUGE Prometheus scrapes must agree with it.
+  // `metrics.noProgress.set` in `recordSession` was the gauge's only writer, so a task
+  // that stopped running kept reporting its last streak until the pod restarted.
+  const ASKED = asTaskId("ASK-1");
+  await seedTask(ASKED, {
+    status: "ready",
+    sessions: 3,
+    progress: { lastProgressSession: 2, noProgressStreak: 1 },
+  });
+
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "ask-human",
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "The acceptance list lints the whole app. Whose errors are mine?",
+          summary: "the acceptance list cannot be satisfied from inside this task's scope",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    // No commit: the session spent itself reading and reasoning, exactly as session 4 did.
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // `awaiting-human` is durable — nothing reclaims it without a human — so unlike the
+  // transient `ready` this can be waited for without racing the loop.
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(ASKED);
+    if (state?.status === "awaiting-human") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "awaiting-human", "the question must have been filed");
+  assert.equal(settled?.sessions, 4, "the session still counts against the session budget");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    1,
+    "asking a human is neither progress nor a stall — the streak must be left where it was",
+  );
+  assert.match(
+    metrics.render(),
+    /caterpillar_no_progress_streak\{[^}]*task="ASK-1"[^}]*\} 1/,
+    "the scraped gauge must agree with the state, or the alert fires on a number nothing holds",
+  );
+});
+
+test("a task that reaches a terminal status stops reporting a no-progress streak", async () => {
+  // `caterpillar_no_progress_streak{task="..."}` takes its label from the world, and
+  // `Metric` expires nothing — its own `clear()` docstring names this failure: a sample
+  // "would otherwise keep reporting the size it had when it last made the cut, forever".
+  //
+  // Tasks end. A task that parked or finished never gets another `set`, so its last
+  // streak is immortal and `caterpillar_no_progress_streak >= 2` keeps firing about work
+  // that is over. BS-1540252370968117339-04 reached streak 2 and then went `done`, so its
+  // series stayed at 2 for the life of the pod — a warning about a merged pull request.
+  //
+  // Driven through a park rather than a `done` because parking needs no forge: the point
+  // is the terminal status, and `transition` is the one funnel every status change takes.
+  const ENDED = asTaskId("ENDED-1");
+  await seedTask(ENDED, {
+    status: "ready",
+    sessions: 3,
+    progress: { lastProgressSession: 1, noProgressStreak: 2 },
+  });
+
+  const metrics = new AgentMetrics();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // The third stalled session in a row, which is what `noProgressLimit: 3` parks on.
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "handoff",
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          summary: "still going in circles",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(ENDED);
+    if (state?.status === "parked") {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(settled?.status, "parked", "three stalled sessions must park the task");
+  assert.equal(
+    settled?.progress.noProgressStreak,
+    3,
+    "the streak is history and stays in the state — it is why the task parked",
+  );
+  // The STATE keeps the streak; the gauge does not, because the gauge is a claim about
+  // right now and there is no longer a session to make it about.
+  assert.doesNotMatch(
+    metrics.render(),
+    /caterpillar_no_progress_streak\{[^}]*task="ENDED-1"/,
+    "a parked task must stop reporting a streak, or it alerts forever about settled work",
   );
 });
 

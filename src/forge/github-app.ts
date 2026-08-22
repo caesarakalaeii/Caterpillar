@@ -165,6 +165,26 @@ interface CheckRunsResponse {
     readonly status: string;
     readonly conclusion: string | null;
     readonly name: string;
+    /**
+     * Where a human can read the job log.
+     *
+     * The agent cannot open it — it has no credential and the App holds no
+     * `actions: read` — but it can quote it in a question, and a red leg it cannot
+     * execute locally is precisely when `ask_human` is the right exit.
+     */
+    readonly html_url?: string;
+    /**
+     * The run's own account of what went wrong, when it produced one.
+     *
+     * Optional because GitHub omits it for a job that died before writing one, and most
+     * external checks fill in neither field. For an Actions job `title` is the useful
+     * half ("Process completed with exit code 1"); `summary` is often long markdown, so
+     * only its first line is used.
+     */
+    readonly output?: {
+      readonly title?: string | null;
+      readonly summary?: string | null;
+    };
   }[];
 }
 
@@ -666,6 +686,46 @@ export const trackerTokenSource = (options: GitHubAppOptions): InstallationToken
  * means pending, no signal at all means "none") are easy to get subtly wrong and
  * would let a red build pass the §12 gate.
  */
+/**
+ * Name each distinct failing job, with whatever it said about itself.
+ *
+ * The §12 gate's rejection detail is the whole of what the next session has to act on,
+ * and a bare list of job names is not enough to act on: the agent holds no forge
+ * credential, has no `gh` or `curl`, and the App deliberately has no `actions: read`, so
+ * it cannot fetch the log the name refers to. This repo's own journal records where that
+ * leads — sessions spent re-proving the tree green against a matrix leg the machine
+ * cannot run, and four sessions of blind changes to a check that turned out to need
+ * dashboard triage rather than code. Those are no-progress sessions, so the opacity feeds
+ * `caterpillar_no_progress_streak` directly.
+ *
+ * Deduplicated by name because `push: ['**']` and `pull_request` both trigger the
+ * workflow: every job has two check-runs at one sha, and reporting each twice reads as
+ * twice as many broken jobs. First occurrence wins — the two are the same job, so either
+ * account will do, and keeping one keeps the order the API returned.
+ *
+ * `undefined` rather than an empty string when nothing failed by name, so the caller can
+ * tell "no named failures, fall back to the combined status" from "a job called ''".
+ */
+const describeFailures = (
+  failed: readonly CheckRunsResponse["check_runs"][number][],
+): string | undefined => {
+  const byName = new Map<string, string>();
+
+  for (const run of failed) {
+    if (byName.has(run.name)) continue;
+    // `title` first: for an Actions job it is the one-line verdict, where `summary` is
+    // markdown that can run to pages. Only the first line of either, for the same reason
+    // — this goes into a rejection message a human reads in a chat client.
+    const said = run.output?.title ?? run.output?.summary ?? undefined;
+    const reason = said?.split("\n")[0]?.trim();
+    const link = run.html_url;
+    const detail = [reason, link].filter((part) => part !== undefined && part !== "");
+    byName.set(run.name, detail.length > 0 ? `${run.name} (${detail.join(" — ")})` : run.name);
+  }
+
+  return byName.size === 0 ? undefined : [...byName.values()].join(", ");
+};
+
 export const summarise = (
   runs: CheckRunsResponse,
   combined: CombinedStatusResponse,
@@ -708,10 +768,10 @@ export const summarise = (
   }
 
   if (failedRuns.length > 0 || (hasStatuses && combined.state === "failure")) {
-    const names = failedRuns.map((r) => r.name).join(", ");
+    const described = describeFailures(failedRuns);
     return {
       conclusion: "failure",
-      summary: names.length > 0 ? `failing: ${names}` : "combined status is failure",
+      summary: described === undefined ? "combined status is failure" : `failing: ${described}`,
     };
   }
 

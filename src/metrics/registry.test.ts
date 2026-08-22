@@ -95,6 +95,38 @@ test("a task that drops out of the top N stops reporting instead of freezing", a
   assert.match(rendered, /name="TASK-2".*\} 7/);
 });
 
+test("removing one label set leaves the others reporting", async () => {
+  // `caterpillar_no_progress_streak{task=...}` has the same world-derived label set as the
+  // work gauges, and the same absence of expiry: tasks end, and a task that parked or
+  // finished never gets another `set`, so its last streak is immortal. That is an alerting
+  // rule reading a sample nothing holds.
+  //
+  // `clear()` is the wrong tool for it — it would drop every OTHER task's live streak
+  // along with the dead one, which at N slots is most of them.
+  const registry = new Registry();
+  const streak = registry.gauge("caterpillar_no_progress_streak", "consecutive stalls");
+  streak.set({ task: "DONE-1" }, 2);
+  streak.set({ task: "LIVE-1" }, 1);
+
+  streak.remove({ task: "DONE-1" });
+
+  const rendered = registry.render();
+  assert.doesNotMatch(rendered, /task="DONE-1"/);
+  assert.match(rendered, /caterpillar_no_progress_streak\{task="LIVE-1"\} 1/);
+});
+
+test("removing a label set that was never reported is not an error", async () => {
+  // The caller is a status transition, which fires for tasks that never had a streak
+  // published — a task done on its first session, or one parked before any session ran.
+  // Making that a special case at every call site would be the wrong place for it.
+  const registry = new Registry();
+  const streak = registry.gauge("caterpillar_no_progress_streak", "consecutive stalls");
+
+  streak.remove({ task: "NEVER-1" });
+
+  assert.doesNotMatch(registry.render(), /task="NEVER-1"/);
+});
+
 test("a partial pass overwrites the bytes rather than leaving stale ones looking fresh", async () => {
   // An under-count is visible in `caterpillar_work_partial`. A previous value left in
   // place would be a number that looks current and is not, which is worse.

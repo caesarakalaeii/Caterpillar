@@ -162,6 +162,111 @@ test("a response without total_count is trusted as complete", () => {
 });
 
 /**
+ * What a red verdict TELLS the next session (DESIGN.md §12).
+ *
+ * A rejection is the whole of what the next session gets to act on, and
+ * `failing: <job names>` is not enough to act on. The agent has no forge credential of
+ * its own, no `gh` and no `curl`, and the App deliberately has no `actions: read` — so a
+ * job name it cannot reproduce locally is a dead end, and the recorded outcome is
+ * sessions spent either re-proving the tree green or changing code blind:
+ *
+ *   ALERT-6155db6ffb83deff s2  "Node 26 is not available on this machine ... the one
+ *                               failing leg is the one I cannot execute."
+ *   ALERT-6155db6ffb83deff s7  "I could not read GitHub's job logs ... so the red is
+ *                               unexplained from here."
+ *   BS-1539163866305658891-07  "four sessions were burned on blind changes to a
+ *                               GitGuardian issue that turned out to be dashboard
+ *                               triage."
+ *
+ * Each of those is a no-progress session, which is what `caterpillar_no_progress_streak`
+ * counts and what CaterpillarTaskThrashing fires on.
+ *
+ * GitHub already hands us the answer in the same response the names come from:
+ * `output.title`/`output.summary` and `html_url`, under the `checks: read` permission the
+ * App has held all along. `summarise` read three fields and dropped the rest.
+ */
+test("a red verdict carries the failing run's own summary, not just its name", () => {
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [
+        {
+          status: "completed",
+          conclusion: "failure",
+          name: "check (26)",
+          output: { title: "Process completed with exit code 1", summary: "npm test failed" },
+        },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /Process completed with exit code 1/);
+});
+
+test("a red verdict carries a link to the failing run", () => {
+  // The one thing that always works: the agent cannot open it, but it can put the url in
+  // its question to a human, and `ask_human` is the correct exit for a red leg it cannot
+  // execute. Without it the question is "CI is red somewhere, please look".
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [
+        {
+          status: "completed",
+          conclusion: "failure",
+          name: "check (26)",
+          html_url: "https://github.com/acme/widget/runs/42",
+        },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.match(status.summary, /https:\/\/github\.com\/acme\/widget\/runs\/42/);
+});
+
+test("one job failing once is reported once, however many workflows ran it", () => {
+  // `push: ['**']` and `pull_request` both trigger the same workflow, so every job has
+  // two check-runs at the same sha. The verdict said
+  //   "failing: check (22), check (26), check (26), check (22)"
+  // which reads as four broken jobs and sends the reader looking for a difference
+  // between them. There are two, each reported twice.
+  const status = summarise(
+    {
+      total_count: 4,
+      check_runs: [
+        { status: "completed", conclusion: "failure", name: "check (22)" },
+        { status: "completed", conclusion: "failure", name: "check (26)" },
+        { status: "completed", conclusion: "failure", name: "check (26)" },
+        { status: "completed", conclusion: "failure", name: "check (22)" },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /failing: check \(22\), check \(26\)$/);
+});
+
+test("a run that failed with no output still names the job", () => {
+  // GitHub omits `output` entirely for a job that never got as far as producing one, and
+  // external checks fill in neither field. The name alone is worse than the name plus a
+  // reason, and much better than nothing.
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [{ status: "completed", conclusion: "failure", name: "GitGuardian" }],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /failing: GitGuardian/);
+});
+
+/**
  * Reachability (DESIGN.md §9.1).
  *
  * The 422 these cover cost a real brainstorm its whole session: `/brainstorm
