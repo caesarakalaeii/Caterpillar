@@ -267,6 +267,12 @@ Three details are load-bearing:
   it — which is why `addWorktreeLocked` skips its own fetch on an existing worktree in the
   first place. Only the session-start path holds a live credential lease, so only it
   reconciles.
+- **"Could not ask" is not "nothing there".** Existence is settled with
+  `ls-remote --exit-code`, which exits 2 for an absent ref and 128 for a remote it could not
+  reach; a bare `git fetch` reports both as plain non-zero, so tolerating one tolerates the
+  other and one network blip or one expired credential starts the session on the base. The
+  first case is the ordinary first session. The second refuses — the invariant does not admit
+  a third option.
 - **Divergence throws rather than picking a side.** Local commits the remote lacks *and*
   remote commits the local branch lacks cannot both be kept by moving a ref. Discarding the
   remote re-creates GH-96; discarding the local destroys a session's unpushed work. The error

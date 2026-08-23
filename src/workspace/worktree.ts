@@ -673,7 +673,16 @@ export class WorktreeManager {
    * report as a task nobody had touched. The empty refmap disables opportunistic updates
    * entirely, so the only thing the fetch writes is `FETCH_HEAD`.
    *
-   * Four cases, and the last one is the point:
+   * Whether the branch EXISTS is asked separately, with `ls-remote --exit-code`, and that
+   * separation is the difference between this being an invariant and being a preference. A
+   * bare `git fetch` reports "the remote has no such ref" and "I could not talk to the
+   * remote" as the same plain non-zero, so tolerating one tolerates the other — and one
+   * network blip or one expired credential would then start a session on the base with the
+   * pushed work still upstream, which is GH-96 again by a different route. `ls-remote`
+   * exits 2 for an absent ref and 128 for a remote it could not reach, so the first is the
+   * ordinary first session and the second refuses.
+   *
+   * Four cases after that, and the last one is the point:
    *
    *   - no remote branch: a genuinely untouched task. Nothing to adopt.
    *   - local already contains the remote tip: either equal, or a previous session
@@ -702,17 +711,25 @@ export class WorktreeManager {
     const branch = `agent/${task}`;
     const git = this.git.at(path);
 
-    const fetched = await git.tryRun("fetch", "--refmap=", "origin", `refs/heads/${branch}`);
-    // A remote with no such branch exits non-zero on a ref it cannot find, which is the
-    // ordinary first-session case and not a failure. A fetch that failed for any other
-    // reason — no network, no credential — is indistinguishable from it here, and the safe
-    // reading is the one that does not block the session: `revParse` below then finds no
-    // FETCH_HEAD and there is nothing to adopt. The invariant this protects is about a
-    // branch we could SEE; a fetch that saw nothing cannot be silently behind anything.
-    if (fetched.code !== 0) return;
+    // `--exit-code` so 2 means "no such branch" and anything else means "could not ask".
+    const listed = await git.tryRun("ls-remote", "--exit-code", "origin", `refs/heads/${branch}`);
+    if (listed.code === 2) return;
+    if (listed.code !== 0) {
+      throw new Error(
+        `could not ask origin about ${branch} for ${repo.owner}/${repo.name}: ` +
+          `${listed.stderr.trim() || `git ls-remote exited ${listed.code}`}. Refusing to ` +
+          "start a session that might be behind work already pushed.",
+      );
+    }
 
-    const remote = await git.revParse("FETCH_HEAD");
-    if (remote === undefined) return;
+    const fetched = await git.tryRun("fetch", "--refmap=", "origin", `refs/heads/${branch}`);
+    const remote = fetched.code === 0 ? await git.revParse("FETCH_HEAD") : undefined;
+    if (remote === undefined) {
+      throw new Error(
+        `origin has ${branch} for ${repo.owner}/${repo.name} but it could not be fetched ` +
+          `into ${path}: ${fetched.stderr.trim() || `git fetch exited ${fetched.code}`}`,
+      );
+    }
 
     const local = await git.revParse("HEAD");
     if (local === undefined) {
