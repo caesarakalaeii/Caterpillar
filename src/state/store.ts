@@ -139,6 +139,53 @@ export class SpecParseError extends Error {
   }
 }
 
+/**
+ * One append-only amendment to a task's acceptance criteria (DESIGN.md §12.3).
+ *
+ * `acceptance` is a WHOLE-LIST replacement rather than a positional patch. A positional
+ * diff against an immutable file reads as noise six months later — "replace entry 2"
+ * means nothing without the file open beside it — whereas the full list is the gate,
+ * written out, in the record that changed it.
+ *
+ * Amendments are never merged and never applied in sequence: the highest-numbered one
+ * wins entirely. Merging would resurrect a criterion an earlier amendment deliberately
+ * removed, and there is no way for the writer of amendment 3 to know it was doing that.
+ *
+ * `why` is required. Without it the record is a hand-edited `spec.md` with extra steps.
+ */
+export interface AcceptanceAmendment {
+  /** The `NNN` in the file name, as a number. Monotonically increasing from 1. */
+  readonly index: number;
+  /** The complete replacement acceptance list. */
+  readonly acceptance: readonly string[];
+  /** Why the criteria as filed could not stand. Human-facing, and load-bearing. */
+  readonly why: string;
+  /** Who decided — an operator handle, or the subsystem that filed it. */
+  readonly author: string;
+  /** ISO 8601, stamped by the writer. */
+  readonly at: string;
+}
+
+/**
+ * The keys an amendment file may carry.
+ *
+ * Everything else is refused rather than ignored. `repos` is the forge token's scope, so
+ * changing it is a §9.1 blast-radius decision and not a chat command; `workspace`,
+ * `requires`, `toolchain` and `kind` decide where and how the task runs; and a wrong
+ * prose goal deserves a fresh task with clean history rather than an overlay that makes
+ * the filed document a lie. A file naming one of those is a human asking for something
+ * this mechanism does not do, and answering it with a silent partial application would be
+ * worse than refusing.
+ */
+const AMENDMENT_KEYS: readonly string[] = ["acceptance", "why", "author", "at"];
+
+export class AmendmentParseError extends Error {
+  constructor(task: TaskId, file: string, detail: string) {
+    super(`amendment ${file} for ${task} is invalid: ${detail}`);
+    this.name = "AmendmentParseError";
+  }
+}
+
 interface SpecFrontMatter {
   readonly workspace?: unknown;
   readonly kind?: unknown;
@@ -183,6 +230,82 @@ const requireStringArray = (
     }
     return entry;
   });
+};
+
+/**
+ * One `amendments/NNN.yaml` document.
+ *
+ * Strict in both directions: an unknown key is a refusal (see `AMENDMENT_KEYS`), and a
+ * missing or mistyped known key is too. This file replaces the completion gate of a task
+ * that may already be running, so a field this cannot make sense of must stop the read
+ * rather than be dropped — a partially applied amendment is a gate nobody wrote.
+ */
+const parseAmendment = (
+  value: unknown,
+  task: TaskId,
+  file: string,
+  index: number,
+): AcceptanceAmendment => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AmendmentParseError(task, file, "not a mapping");
+  }
+
+  const forbidden = Object.keys(value).filter((key) => !AMENDMENT_KEYS.includes(key));
+  if (forbidden.length > 0) {
+    throw new AmendmentParseError(
+      task,
+      file,
+      `an amendment may only replace \`acceptance\` — refusing \`${forbidden.join("`, `")}\`. ` +
+        "Changing repos, workspace, requires, toolchain, kind or the goal needs a new task, " +
+        "not an amendment",
+    );
+  }
+
+  const raw = value as {
+    readonly acceptance?: unknown;
+    readonly why?: unknown;
+    readonly author?: unknown;
+    readonly at?: unknown;
+  };
+
+  if (!Array.isArray(raw.acceptance)) {
+    throw new AmendmentParseError(task, file, "`acceptance` must be a list");
+  }
+  const acceptance = raw.acceptance.map((entry, at) => {
+    if (typeof entry !== "string") {
+      throw new AmendmentParseError(
+        task,
+        file,
+        `\`acceptance[${at}]\` must be a string, got ${typeof entry} ` +
+          `(${JSON.stringify(entry)}) — quote it if YAML is coercing it`,
+      );
+    }
+    return entry;
+  });
+  if (acceptance.length === 0) {
+    // Same rule as `readSpec`: a task with no machine-checkable criteria can never satisfy
+    // §12, so an amendment that emptied the list would make the task uncloseable.
+    throw new AmendmentParseError(
+      task,
+      file,
+      "`acceptance` must list at least one command — an amendment cannot leave a task " +
+        "with nothing the supervisor can run",
+    );
+  }
+
+  for (const field of ["why", "author", "at"] as const) {
+    if (typeof raw[field] !== "string" || raw[field] === "") {
+      throw new AmendmentParseError(task, file, `\`${field}\` must be a non-empty string`);
+    }
+  }
+
+  return {
+    index,
+    acceptance,
+    why: raw.why as string,
+    author: raw.author as string,
+    at: raw.at as string,
+  };
 };
 
 /** `host/owner/name` or `owner/name` (host defaults to github.com). */
@@ -710,7 +833,32 @@ export class StateStore {
     return entries.filter((e) => e.isDirectory()).map((e) => asTaskId(e.name));
   }
 
+  /**
+   * The EFFECTIVE spec: `spec.md` with the newest acceptance amendment applied (§12.3).
+   *
+   * This is the seam every caller already uses, and that is deliberate. An opt-in
+   * `readEffectiveSpec` would be a rule each future call site has to remember, and the
+   * site that forgot would be the one where the verifier ran a criterion a human had
+   * already amended away — exactly the failure amendments exist to prevent. A caller that
+   * genuinely wants the document as filed asks for `readBaseSpec` and says so.
+   */
   async readSpec(task: TaskId): Promise<TaskSpec> {
+    const base = await this.readBaseSpec(task);
+    // Highest number wins ENTIRELY: no merge, no sequential application. See
+    // `AcceptanceAmendment`.
+    const newest = (await this.listAmendments(task)).at(-1);
+    if (newest === undefined) return base;
+    return { ...base, acceptance: newest.acceptance };
+  }
+
+  /**
+   * The spec exactly as filed, with no amendment overlay.
+   *
+   * For a reader that needs the original document rather than the current gate — a page
+   * showing what intake actually wrote, or a diff against an amendment. Not for the
+   * verifier: see `readSpec`.
+   */
+  async readBaseSpec(task: TaskId): Promise<TaskSpec> {
     const raw = await readFile(join(this.taskDir(task), "spec.md"), "utf8");
     const match = FRONT_MATTER.exec(raw);
     if (match === null) throw new SpecParseError(task, "missing YAML front matter");
@@ -781,11 +929,17 @@ export class StateStore {
    * Refuses to overwrite. `spec.md` is immutable, and rewriting the spec of a task that
    * is already running would change its acceptance criteria mid-flight.
    *
+   * When a criterion turns out to be unsatisfiable, the supported route is an
+   * AMENDMENT — `writeAmendment`, which appends `amendments/NNN.yaml` and leaves this
+   * file untouched. Hand-editing `spec.md` in the state repo is not it: it destroys the
+   * record of what the task was actually asked to do, and it is what amendments exist to
+   * replace.
+   *
    * The front matter is serialised with the YAML library rather than concatenated,
    * because the goal is tracker prose: a human can paste `---` or `acceptance:` into an
    * issue body, and hand-built front matter would let that terminate the block early and
    * silently redefine the completion gate. The goal goes strictly after the closing
-   * delimiter, where `readSpec`'s regex takes everything remaining as prose.
+   * delimiter, where `readBaseSpec`'s regex takes everything remaining as prose.
    */
   async writeSpec(spec: TaskSpec): Promise<void> {
     return this.write(`tasks/${spec.id}`, async () => {
@@ -824,6 +978,92 @@ export class StateStore {
 
       await mkdir(dir, { recursive: true });
       await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
+    });
+  }
+
+  private amendmentDir(task: TaskId): string {
+    return join(this.taskDir(task), "amendments");
+  }
+
+  /**
+   * Every acceptance amendment for a task, oldest first (DESIGN.md §12.3).
+   *
+   * Ordered by number so a caller can take `.at(-1)` for the effective one and `.length`
+   * for how many times the gate has been argued with. Read-only — the numbering rule
+   * stays with `writeAmendment`, as it does for `questions/` and `reviews/`.
+   *
+   * NOT defensive about an unreadable file, unlike `listIntakeRejections`: that listing
+   * feeds a page where one bad record must not cost the rest, whereas this one decides
+   * what the supervisor runs. Skipping a malformed amendment here would silently fall
+   * back to a criterion a human had already amended away.
+   */
+  async listAmendments(task: TaskId): Promise<readonly AcceptanceAmendment[]> {
+    const dir = this.amendmentDir(task);
+    if (!existsSync(dir)) return [];
+
+    const files = (await readdir(dir))
+      .flatMap((name) => {
+        const digits = /^(\d+)\.yaml$/.exec(name)?.[1];
+        return digits === undefined ? [] : [{ name, index: Number.parseInt(digits, 10) }];
+      })
+      .sort((a, b) => a.index - b.index);
+
+    return Promise.all(
+      files.map(async ({ name, index }) =>
+        parseAmendment(parseYaml(await readFile(join(dir, name), "utf8")), task, name, index),
+      ),
+    );
+  }
+
+  /**
+   * Append one acceptance amendment, allocating the next number (DESIGN.md §12.3).
+   *
+   * Append-only: this never rewrites or removes an earlier file, so the directory listing
+   * IS the audit trail of every time the gate was changed and why. The number comes from
+   * the highest one already on disk, which is the same allocation `writeVerdict` and
+   * `writeQuestion` get from their callers — taken here rather than passed in because a
+   * caller that guessed wrong would overwrite somebody's recorded reasoning.
+   *
+   * `spec.md` is not touched. That is the point.
+   */
+  async writeAmendment(
+    task: TaskId,
+    amendment: {
+      readonly acceptance: readonly string[];
+      readonly why: string;
+      readonly author: string;
+    },
+  ): Promise<AcceptanceAmendment> {
+    return this.write(`tasks/${task}`, async () => {
+      const existing = await this.listAmendments(task);
+      const index = (existing.at(-1)?.index ?? 0) + 1;
+      const record: AcceptanceAmendment = {
+        index,
+        acceptance: [...amendment.acceptance],
+        why: amendment.why,
+        author: amendment.author,
+        at: new Date().toISOString(),
+      };
+
+      const dir = this.amendmentDir(task);
+      await mkdir(dir, { recursive: true });
+      const name = `${String(index).padStart(3, "0")}.yaml`;
+      await writeFile(
+        join(dir, name),
+        stringifyYaml({
+          // `index` is the file name and is deliberately not duplicated inside: two places
+          // saying the same number is two places that can disagree.
+          acceptance: [...record.acceptance],
+          why: record.why,
+          author: record.author,
+          at: record.at,
+        }),
+        "utf8",
+      );
+
+      // Read back rather than trusted, for `writeSpec`'s reason: a record this store
+      // cannot parse would be a gate nothing can read, discovered by the verifier.
+      return parseAmendment(parseYaml(await readFile(join(dir, name), "utf8")), task, name, index);
     });
   }
 
