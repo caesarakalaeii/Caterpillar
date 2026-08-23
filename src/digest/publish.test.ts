@@ -19,6 +19,7 @@ import { asTaskId, type TaskState } from "../domain/task.ts";
 import type { Notification } from "../notify/discord.ts";
 import { JsonLogger } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
+import type { AttributionReport } from "./attribution.ts";
 import { DailyDigest, digestRef } from "./publish.ts";
 
 const roots: string[] = [];
@@ -252,4 +253,85 @@ test("the digest names the day it covers, and says what moved", async () => {
   assert.match(today, /# Daily digest — 2026-08-16/);
   assert.match(today, /TASK-1/);
   assert.match(today, /done/);
+});
+
+/* -------------------------------------------------------------------- attribution */
+
+const FLEET_EMAIL = "316492202+caterpillar-agent[bot]@users.noreply.github.com";
+
+/** The same state repo, plus a spec naming a repo so authorship has somewhere to look. */
+const stateRepoWithSpec = async (): Promise<Git> => {
+  const git = await stateRepo();
+  const root = await git.run("rev-parse", "--show-toplevel");
+
+  const stamped = new Git(root, {
+    ...process.env,
+    GIT_AUTHOR_DATE: "2026-08-16T09:30:00Z",
+    GIT_COMMITTER_DATE: "2026-08-16T09:30:00Z",
+  });
+  await writeFile(
+    join(root, "tasks", "TASK-1", "spec.md"),
+    ["---", "workspace: primary", "repos:", "  - github.com/acme/widget", "---", "", "# Fix it", ""].join("\n"),
+    "utf8",
+  );
+  await stamped.run("add", "-A");
+  await stamped.run("commit", "-m", "the spec");
+
+  return new Git(root);
+};
+
+test("the published digest carries the authorship split and counts it", async () => {
+  const written = new Map<string, string>();
+  const recorded: AttributionReport[] = [];
+
+  const digest = new DailyDigest({
+    git: await stateRepoWithSpec(),
+    boundary: BOUNDARY,
+    runner: "pod-7f3a",
+    branch: "main",
+    logger: new JsonLogger({ level: "error", write: () => undefined }),
+    store: {
+      writeDigest: async (date, body) => {
+        written.set(date, body);
+      },
+      commitAndPush: async () => undefined,
+    },
+    leases: {
+      claimOnce: async (ref) => `oid-for-${ref}`,
+      hasRef: async () => false,
+      releaseRef: async () => undefined,
+    },
+    notifier: { notify: async () => undefined },
+    identity: { emails: [FLEET_EMAIL] },
+    authorship: {
+      readAuthorship: async (repos, from) => ({
+        // Only the window being reported has commits; the baseline before it is empty,
+        // which is the ordinary shape of a first-ever digest.
+        commits:
+          from.getTime() === new Date("2026-08-15T16:00:00Z").getTime()
+            ? [
+                {
+                  repo: `${repos[0]?.owner}/${repos[0]?.name}`,
+                  sha: "abc",
+                  authorEmail: FLEET_EMAIL,
+                  insertions: 40,
+                  deletions: 0,
+                },
+              ]
+            : [],
+        unavailable: [],
+      }),
+    },
+    onAttributed: (report) => recorded.push(report),
+  });
+
+  await digest.maybePublish(EVENING);
+  await digest.maybePublish(EVENING);
+
+  const today = written.get("2026-08-16") ?? "";
+  assert.match(today, /## Authorship/);
+  assert.match(today, /acme\/widget/);
+  assert.match(today, /100%/);
+
+  assert.equal(recorded.at(-1)?.total.fleet.lines, 40, "the metric sees the same report");
 });

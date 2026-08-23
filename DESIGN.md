@@ -2805,6 +2805,13 @@ because a numeric id names exactly one account: it is either yours or it does no
 Only that domain is checked; a runner pushing to Codeberg has no github noreply address
 to get wrong and must not be made to invent an id prefix that means nothing there.
 
+**An identity that has changed leaves history behind it.** `identity.pastEmails` lists the
+addresses this deployment used to commit as, and nothing ever commits as one — they exist so
+the daily digest's authorship split (§19) recognises the fleet's own past work instead of
+inventing a contributor for it. The refusal above is deliberately not applied to them: it
+exists to stop an address AUTHORING anything, and a deployment that already made this
+mistake must still be able to describe the history it has.
+
 The deployed value is the author App's own bot account,
 `caterpillar-agent[bot] <316492202+caterpillar-agent[bot]@users.noreply.github.com>` —
 which is what GitHub already stamps on the merge commits that App makes (§12.1), so the
@@ -3034,6 +3041,9 @@ journal entry so the next session sees it at all.
 | `caterpillar_work_entry_bytes{runner,category,name}` | gauge | the largest few tasks and mirrors, capped |
 | `caterpillar_work_partial{runner}` | gauge | 1 when the walk hit its deadline |
 | `caterpillar_work_measured_timestamp_seconds{runner}` | gauge | how stale the four above are |
+| `caterpillar_digest_authored_lines_total{runner,repo,author}` | counter | `fleet` vs `human` lines in a digest window — §19 |
+| `caterpillar_digest_authored_commits_total{runner,repo,author}` | counter | the same split at commit level |
+| `caterpillar_digest_authorship_unreadable_total{runner,repo}` | counter | windows where a repo's history could not be read |
 
 `kind` on the reaping pair is the label that earns them their place. A healthy runner reaps
 almost everything `targeted`, so a `swept` series that keeps climbing says the supervisor's
@@ -4800,6 +4810,59 @@ saying the diff cannot be read from here — never `0 files changed`, which is a
 statement about a merged pull request rather than a smaller one. Nothing is fetched to
 close the gap: the digest reads what is already on disk, needs no credential, and cannot
 be the reason a repo gets cloned.
+
+### It says how much of the change is the fleet's, and which way that is going
+
+The rest of the digest answers "what moved today". After a month of running, the question an
+owner actually has is a different one: **what share of this repository's change is coming
+from the fleet, and is that share trending?** Nothing else the supervisor publishes can
+answer it, and everything needed to is already here — the digest measures changes from git
+and costs nothing to do so.
+
+So one more section, computed by a pure `digest/attribution.ts`: commits and lines, split
+into fleet and human, per repo, for this window and the one before it.
+
+**Authorship is decided by the ADDRESS.** Never by the display name. §9.7 exists because a
+forge resolves an address to an account; a display name is decoration, two people can share
+one, and a name match would credit one of them with the fleet's work. The address comes from
+config for the same reason §9.7 gives: it names the App installed for *this* deployment, so
+there is nothing correct to hardcode.
+
+**Which means the identity can change inside a window.** A deployment that reinstalls its
+App has commits under the retired address and the current one in the same day, and reading
+the retired half as a person's work invents a contributor and halves the reported share on
+exactly the day someone is most likely to look. `identity.pastEmails` is that list. It is
+read-only — nothing commits as one — which is why `identityFault` is not applied to it: a
+deployment that already made §9.7's mistake must still be able to describe the history it
+has.
+
+**A share is reported against the previous window, or not at all.** A single day's share
+says almost nothing — one human commit in a quiet day reads as 50% — and a direction says a
+lot. The baseline is `previousWindow`, recomputed from the calendar date rather than by
+subtracting the window's own length: consecutive windows meet exactly but are not equal in
+length, and 18:00 to 18:00 across a spring-forward is 23 hours. A window with no measured
+predecessor says so rather than reporting "flat", which would be a claim about a yesterday
+nobody measured.
+
+**And it inherits the mirror rule rather than reintroducing the bug.** This is the section
+where a silent zero would be most credible, because a percentage always looks like a
+measurement. A repo whose history this runner cannot read — a task branch lives in the
+mirror of the runner that worked it — is NAMED, exactly as its diff already is. So is a
+window in which nothing was committed, which is a different fact from one the fleet wrote
+none of. A share whose denominator is zero is absent, never printed as 0%.
+
+Two figures rather than one, because they disagree in ways that matter: a fleet that
+rewrites a file moves many lines in one commit, a person fixing a typo moves one line in
+one commit, and a report showing only lines would describe a reformatting run as having
+written the repository. Merges are excluded from both — a merge introduces no line, its
+commits are already counted, and on GitHub every merge is made by the author App (§12.1),
+so counting them would raise the fleet's share every time a *human's* branch landed.
+
+The prose is not the only output. `caterpillar_digest_authored_lines_total` and
+`caterpillar_digest_authored_commits_total` carry the same split by repo and author, and
+`caterpillar_digest_authorship_unreadable_total` carries the declared gap — so the trend is
+graphable over a fortnight without anyone parsing a paragraph, and a repo with no mirror on
+the publishing runner is distinguishable on a graph from one the fleet stopped working on.
 
 ### Three destinations, one document
 
