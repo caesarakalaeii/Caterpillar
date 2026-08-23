@@ -73,7 +73,7 @@ test("a clean merge-tree run reports no conflicts", () => {
   assert.equal(conflicts, undefined);
 });
 
-test("a conflicted merge-tree run names the files and counts the hunks", () => {
+test("a conflicted merge-tree run names every conflicting path, once, sorted", () => {
   // The real shape: the tree oid, then one `mode oid stage\tpath` line per stage of each
   // conflicted path, then a blank line, then git's messages.
   const stdout = [
@@ -87,32 +87,12 @@ test("a conflicted merge-tree run names the files and counts the hunks", () => {
     "CONFLICT (content): Merge conflict in src/forge/types.ts",
   ].join("\n");
 
-  const conflicts = parseConflicts(
-    { code: 1, stdout },
-    // Marker counts come from the merged blobs, which only the caller can read.
-    new Map([
-      ["src/forge/types.ts", 3],
-      ["DESIGN.md", 1],
-    ]),
-  );
-
-  assert.deepEqual(conflicts, {
+  // Three stage lines for one path are one conflicting file, and `hunks` is deliberately
+  // absent: counting markers means reading the blobs of `tree`, which needs git.
+  assert.deepEqual(parseConflicts({ code: 1, stdout }), {
     tree: "1c1b4945b9cf36400d0636e0c5fcfa146f9bbd9a",
-    files: [
-      { path: "DESIGN.md", hunks: 1 },
-      { path: "src/forge/types.ts", hunks: 3 },
-    ],
+    files: [{ path: "DESIGN.md" }, { path: "src/forge/types.ts" }],
   });
-});
-
-test("a path git listed but nobody could count is reported without a hunk count", () => {
-  // A deleted-vs-modified conflict has no merged blob to count markers in. Naming the
-  // file with an unknown count beats dropping it: it is still a file to rebase.
-  const conflicts = parseConflicts({
-    code: 1,
-    stdout: "abc123\n100644 def456 1\tREADME.md\n",
-  });
-  assert.deepEqual(conflicts, { tree: "abc123", files: [{ path: "README.md" }] });
 });
 
 test("a merge-tree that could not run at all reports nothing rather than a clean tree", () => {
