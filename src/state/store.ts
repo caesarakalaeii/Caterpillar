@@ -1976,12 +1976,17 @@ export class StateStore {
    */
   private async pruneEffects(task: TaskId): Promise<void> {
     const dir = this.effectsDir(task);
-    const names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
-    if (names.length <= EFFECTS_KEPT) return;
+    // Only files this class could have written, so a stray name in the directory is left
+    // alone rather than deleted — and `effectFileName` below cannot be handed one it would
+    // refuse.
+    const ids = (await readdir(dir))
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -".json".length))
+      .filter(isEffectRequestId);
+    if (ids.length <= EFFECTS_KEPT) return;
 
     const records: EffectAge[] = [];
-    for (const name of names) {
-      const requestId = name.slice(0, -".json".length);
+    for (const requestId of ids) {
       const record = await this.recordedEffect(task, requestId);
       records.push({ requestId, ...(record === undefined ? {} : { at: record.at }) });
     }
