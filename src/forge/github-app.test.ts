@@ -934,22 +934,23 @@ test("a GitHub review's own body is guidance too, not just its line comments", a
 /**
  * Merge queues (DESIGN.md §12).
  *
- * `repository.mergeQueue(branch:)` rather than `branchProtectionRule.requiresMergeQueue`,
- * because a queue can be required by a ruleset as well as by a protection rule, and only
- * the former sees both.
+ * `pullRequest.mergeQueue` rather than `branchProtectionRule.requiresMergeQueue`, because a
+ * queue can be required by a ruleset as well as by a protection rule and only the former
+ * sees both — and asking through the pull request means no caller has to know the base
+ * branch's name, which nothing in `state.json` records.
  */
 test("a base branch with a merge queue configured answers 'required'", async () => {
   const { factory } = github(
     withToken((route) => {
       if (route === "/graphql") {
-        return { data: { repository: { mergeQueue: { id: "MQ_1" } } } };
+        return { data: { repository: { pullRequest: { id: "PR_1", mergeQueue: { id: "MQ_1" } } } } };
       }
       throw new Error(`unexpected route ${route}`);
     }),
   );
 
   const forge = await factory.forTask(SPEC);
-  assert.equal(await forge.mergeQueue(REPO, "main"), "required");
+  assert.equal(await forge.mergeQueue(REPO, 7), "required");
 });
 
 test("a base branch with no merge queue answers 'absent', not 'unknown'", async () => {
@@ -957,13 +958,15 @@ test("a base branch with no merge queue answers 'absent', not 'unknown'", async 
   // GitHub returns `mergeQueue: null` for a branch that has none.
   const { factory } = github(
     withToken((route) => {
-      if (route === "/graphql") return { data: { repository: { mergeQueue: null } } };
+      if (route === "/graphql") {
+        return { data: { repository: { pullRequest: { id: "PR_1", mergeQueue: null } } } };
+      }
       throw new Error(`unexpected route ${route}`);
     }),
   );
 
   const forge = await factory.forTask(SPEC);
-  assert.equal(await forge.mergeQueue(REPO, "main"), "absent");
+  assert.equal(await forge.mergeQueue(REPO, 7), "absent");
 });
 
 test("a forge that refuses the question answers 'unknown' instead of throwing", async () => {
@@ -978,7 +981,7 @@ test("a forge that refuses the question answers 'unknown' instead of throwing", 
   );
 
   const forge = await factory.forTask(SPEC);
-  assert.equal(await forge.mergeQueue(REPO, "main"), "unknown");
+  assert.equal(await forge.mergeQueue(REPO, 7), "unknown");
 });
 
 test("enqueuing a pull request resolves its node id and calls enqueuePullRequest", async () => {
@@ -988,8 +991,10 @@ test("enqueuing a pull request resolves its node id and calls enqueuePullRequest
       if (route === "/graphql") {
         const query = String(JSON.parse(String(init?.body ?? "{}")).query);
         queries.push(query);
-        if (query.includes("mutation")) return { data: { enqueuePullRequest: { mergeQueueEntry: { position: 2 } } } };
-        return { data: { repository: { pullRequest: { id: "PR_kwDO" } } } };
+        if (query.includes("mutation")) {
+          return { data: { enqueuePullRequest: { mergeQueueEntry: { position: 2 } } } };
+        }
+        return { data: { repository: { pullRequest: { id: "PR_kwDO", mergeQueue: { id: "MQ_1" } } } } };
       }
       throw new Error(`unexpected route ${route}`);
     }),
@@ -1012,7 +1017,7 @@ test("an enqueue GitHub refuses throws, so the council reports it rather than cl
         if (query.includes("mutation")) {
           return { errors: [{ message: "Pull request is not mergeable" }] };
         }
-        return { data: { repository: { pullRequest: { id: "PR_kwDO" } } } };
+        return { data: { repository: { pullRequest: { id: "PR_kwDO", mergeQueue: { id: "MQ_1" } } } } };
       }
       throw new Error(`unexpected route ${route}`);
     }),
