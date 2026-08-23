@@ -594,6 +594,154 @@ export class WorktreeManager {
   }
 
   /**
+   * `ensureTaskCheckout`, plus the guarantee that every worktree carries the work a
+   * previous session pushed. For the session-start path and no other caller.
+   *
+   * A session that starts BEHIND its own pushed branch is indistinguishable, from inside
+   * the worktree, from a session on a task nobody has touched — so it does the task again.
+   * GH-96 did exactly that: sessions 2-3 pushed 18 commits, session 7 started on `main`,
+   * re-implemented the whole task, and found out only when `git push` was refused as
+   * non-fast-forward. Two independent implementations of one task reached the remote and a
+   * human had to pick one.
+   *
+   * Nothing else in this class can prevent it, and both halves of the reason are
+   * deliberate decisions documented above:
+   *
+   *   - `MIRROR_REFSPECS` excludes `^refs/heads/agent/*` from every fetch, because a fetch
+   *     onto a head a worktree holds is refused outright and took the whole mirror down
+   *     with it. So a runner that has never seen this task's branch never learns of it,
+   *     and `addWorktreeLocked` creates the branch from the mirror's default branch.
+   *   - `addWorktreeLocked` skips the fetch entirely when the worktree already exists,
+   *     because the post-session callers run after `clearActive()` and cannot authenticate.
+   *     So a local ref that has fallen behind is never corrected from the remote either.
+   *
+   * Separate from `ensureTaskCheckout` rather than folded into it, because the difference
+   * is the network: the progress probe, the verifier, the review council and the plan
+   * maintainer all check out the same task AFTER the session, where the credential service
+   * refuses to answer by design (§9.2) and a fetch fails. A fetch there would take down
+   * verification for every private repo. This entry point exists precisely while the
+   * session's credential lease is live.
+   */
+  async ensureSessionCheckout(
+    repos: readonly RepoRef[],
+    task: TaskId,
+  ): Promise<TaskCheckout> {
+    const checkout = await this.ensureTaskCheckout(repos, task);
+
+    // By index rather than by identity, matching how `ensureTaskCheckout` splits the list:
+    // `repos[0]` is the workspace repo at `checkout.root` and the rest are its siblings.
+    for (const [index, repo] of repos.entries()) {
+      const path =
+        index === 0 ? checkout.root : checkout.siblings.get(`${repo.owner}/${repo.name}`);
+      // `ensureTaskCheckout` put every declared sibling in the map it returned, so a miss
+      // is this class disagreeing with itself rather than anything about the task. Throwing
+      // beats reconciling whichever repos happened to be found: a session that starts with
+      // one repo silently un-reconciled is the failure this function exists to remove.
+      if (path === undefined) {
+        throw new Error(`task ${task} has no checkout for ${repo.owner}/${repo.name}`);
+      }
+      // Under this repo's mirror lock, like every other mirror-mutating operation here
+      // (DESIGN.md §6.4): the fetch below writes objects and `FETCH_HEAD` into the mirror's
+      // COMMON directory, which two tasks on the same repo share. `FETCH_HEAD` is a single
+      // file that is not per-worktree, so an unsynchronised fetch could hand this task the
+      // other one's remote tip — and being handed the wrong branch's tip is precisely the
+      // failure this function exists to prevent.
+      await this.onMirror(mirrorPath(this.options.mirrorsDir, repo), () =>
+        this.adoptPushedBranchLocked(repo, task, path),
+      );
+    }
+
+    return checkout;
+  }
+
+  /**
+   * Move one worktree onto `origin/agent/<task>`, or throw rather than start behind it.
+   *
+   * The remote tip is fetched into `FETCH_HEAD` and onto no local ref at all. That is not
+   * tidiness: writing it to `refs/heads/agent/<task>` is the fetch git refuses when a
+   * worktree holds that head — the failure `MIRROR_REFSPECS` exists to avoid — and only
+   * the reachability questions below need the objects, which `FETCH_HEAD` supplies.
+   *
+   * `--refmap=` is load-bearing and was found the hard way. Omitting the destination half
+   * of the refspec is NOT enough in a mirror: git still applies the configured
+   * `remote.origin.fetch = +refs/*:refs/*` as an opportunistic update, resolves the
+   * destination to `refs/heads/agent/<task>`, and dies with the exact refusal above —
+   *
+   *   fatal: refusing to fetch into branch 'refs/heads/agent/<task>' checked out at ...
+   *
+   * which `tryRun` would then read as "no such remote branch" and this function would
+   * report as a task nobody had touched. The empty refmap disables opportunistic updates
+   * entirely, so the only thing the fetch writes is `FETCH_HEAD`.
+   *
+   * Four cases, and the last one is the point:
+   *
+   *   - no remote branch: a genuinely untouched task. Nothing to adopt.
+   *   - local already contains the remote tip: either equal, or a previous session
+   *     committed without pushing. Left alone — its commits are the newer work.
+   *   - local is an ancestor of the remote tip: fast-forward onto it. This is both
+   *     reported failures, GH-96's fresh checkout at the base and GH-95's reset worktree.
+   *   - anything else: the two have diverged, and no ref move keeps both. Throws, naming
+   *     both tips so a human can reconcile them by hand. Picking a side here would either
+   *     re-create GH-96 (discard the remote) or destroy a session's unpushed commits
+   *     (discard the local), and a silent choice between those is worse than a refusal.
+   *
+   * `merge --ff-only` rather than `reset --hard`: a fast-forward refuses when it would
+   * overwrite a modified file, so an interrupted session's uncommitted work makes the
+   * session refuse to start instead of vanishing. `recoverInterrupted` in the agent runner
+   * commits that work, but it runs after this — and the ordering is not something this
+   * function should have to rely on to avoid destroying anything.
+   *
+   * The caller must already hold this repo's mirror lock — hence the suffix, as with
+   * `syncMirrorLocked` and `addWorktreeLocked`.
+   */
+  private async adoptPushedBranchLocked(
+    repo: RepoRef,
+    task: TaskId,
+    path: string,
+  ): Promise<void> {
+    const branch = `agent/${task}`;
+    const git = this.git.at(path);
+
+    const fetched = await git.tryRun("fetch", "--refmap=", "origin", `refs/heads/${branch}`);
+    // A remote with no such branch exits non-zero on a ref it cannot find, which is the
+    // ordinary first-session case and not a failure. A fetch that failed for any other
+    // reason — no network, no credential — is indistinguishable from it here, and the safe
+    // reading is the one that does not block the session: `revParse` below then finds no
+    // FETCH_HEAD and there is nothing to adopt. The invariant this protects is about a
+    // branch we could SEE; a fetch that saw nothing cannot be silently behind anything.
+    if (fetched.code !== 0) return;
+
+    const remote = await git.revParse("FETCH_HEAD");
+    if (remote === undefined) return;
+
+    const local = await git.revParse("HEAD");
+    if (local === undefined) {
+      throw new Error(`worktree ${path} has no HEAD to reconcile with ${branch}`);
+    }
+    if (local === remote) return;
+
+    const contains = await git.tryRun("merge-base", "--is-ancestor", remote, local);
+    if (contains.code === 0) return;
+
+    const behind = await git.tryRun("merge-base", "--is-ancestor", local, remote);
+    if (behind.code !== 0) {
+      throw new Error(
+        `${repo.owner}/${repo.name} worktree ${path} has diverged from origin/${branch}: ` +
+          `local ${local}, remote ${remote}. Neither contains the other, so no session ` +
+          `may start here until a human reconciles them.`,
+      );
+    }
+
+    const advanced = await git.tryRun("merge", "--ff-only", remote);
+    if (advanced.code !== 0) {
+      throw new Error(
+        `could not fast-forward ${path} from ${local} to origin/${branch} at ${remote}: ` +
+          `${advanced.stderr.trim()}`,
+      );
+    }
+  }
+
+  /**
    * Append a pattern to the repository's local exclude file, idempotently.
    *
    * git only reads `info/exclude` from the common directory (see `commonDir`), so
