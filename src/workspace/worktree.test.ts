@@ -1273,3 +1273,30 @@ test("a worktree that has diverged from its remote branch refuses to start a ses
     "a refusal must leave the local work exactly where it was",
   );
 });
+
+test("a remote that cannot be reached refuses the session rather than starting on the base", async () => {
+  // The hole a tolerant fetch leaves, and it is GH-96's outcome exactly. If "could not ask
+  // the remote" is read the same way as "the remote has no such branch", then one network
+  // blip or one expired credential starts a session on the base with 18 commits sitting
+  // upstream — which is the state this whole function exists to make unreachable. The
+  // issue's wording is the requirement: at the tip, or refuse.
+  //
+  // Distinguishable, and that is why the check is `ls-remote --exit-code`: it exits 2 for a
+  // ref that is absent and 128 for a remote it could not talk to. A bare `git fetch`
+  // reports both as non-zero.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+  const task = asTaskId("GH-UNREACHABLE");
+  const subject = manager(root);
+
+  // A worktree from a previous session, then the origin taken away under it — a stand-in
+  // for the credential and network failures that produce the same exit code.
+  await subject.ensureTaskCheckout([REPO], task);
+  await rm(join(root, `${REPO.name}-origin.git`), { recursive: true, force: true });
+
+  await assert.rejects(
+    () => subject.ensureSessionCheckout([REPO], task),
+    (error: unknown) => error instanceof Error && error.message.includes(`agent/${task}`),
+    "a session must not start when whether it is behind cannot be established",
+  );
+});
