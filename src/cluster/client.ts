@@ -31,7 +31,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
-import { MAX_OUTPUT_LINES } from "../agent/budget.ts";
+import { outputCeiling } from "../agent/budget.ts";
 import { assertNamespaceAllowed } from "./guard.ts";
 import { isPodPattern, validateKind, validateName, validatePodPattern } from "./names.ts";
 import { assertKindDescribable, redactObject, renderObject } from "./redact.ts";
@@ -49,18 +49,17 @@ export const CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 export const DEFAULT_KUBE_API_URL = "https://kubernetes.default.svc";
 export const DEFAULT_LOKI_URL = "http://loki.monitoring.svc.cluster.local:3100";
 
-/** Ceilings the tool layer also advertises, kept here so the client cannot be talked past them. */
-export const MAX_SINCE_MINUTES = 24 * 60;
 /**
- * Lines one `cluster_logs` call may return.
+ * Ceilings the tool layer also advertises, kept here so the client cannot be talked past them.
  *
- * `MAX_OUTPUT_LINES`, not a 2000 of its own: this was the codebase's only output bound for
- * a while, and §6.4 makes it one configured case of the general rule instead of a special
- * one. Two independent constants for the same quantity is how they come to disagree, and
- * the disagreement would be invisible — a remediation session getting a different ceiling
- * from Loki than from its own shell, with nothing to say why.
+ * There is deliberately no `MAX_LOG_LINES` beside them. Lines from `cluster_logs` are
+ * bounded by `MAX_OUTPUT_LINES` — the general one (§6.4) — because this used to be the only
+ * output bound in the codebase and had a private copy of every rule. Two constants for one
+ * quantity is how they come to disagree, and the disagreement would be invisible: a
+ * remediation session getting a different ceiling from Loki than from its own shell, with
+ * nothing anywhere to say why.
  */
-export const MAX_LOG_LINES = MAX_OUTPUT_LINES;
+export const MAX_SINCE_MINUTES = 24 * 60;
 export const MAX_EVENTS = 200;
 
 export interface LogsRequest {
@@ -336,7 +335,11 @@ export class ClusterClient implements ClusterReader {
     this.readCredentials = options.readCredentials ?? readServiceAccount;
     this.kubeApiUrl = (options.kubeApiUrl ?? DEFAULT_KUBE_API_URL).replace(/\/+$/, "");
     this.lokiUrl = (options.lokiUrl ?? DEFAULT_LOKI_URL).replace(/\/+$/, "");
-    this.maxLogLines = Math.min(options.maxLogLines ?? MAX_LOG_LINES, MAX_LOG_LINES);
+    // Through `outputCeiling` rather than a `Math.min` of its own: the default-and-clamp
+    // rule is one rule (§6.4), and this used to be the only place that had it.
+    this.maxLogLines = outputCeiling({
+      ...(options.maxLogLines === undefined ? {} : { maxLines: options.maxLogLines }),
+    }).maxLines;
   }
 
   /** The allowlist, for the startup log line an operator debugging a denial goes looking for. */

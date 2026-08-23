@@ -18,7 +18,7 @@ import type { LogLevel } from "../obs/log.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts";
 import { DEFAULT_REAP_CONFIG as REAP_DEFAULTS } from "../workspace/worktree.ts";
 import { DEFAULT_USAGE_CONFIG as USAGE_DEFAULTS, defaultWorkRoot } from "../workspace/usage.ts";
-import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
+import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL } from "../cluster/client.ts";
 import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "../agent/budget.ts";
 import type {
   ClusterConfig,
@@ -423,11 +423,10 @@ const clusterConfig = (cluster: Record<string, unknown>): ClusterConfig => ({
   namespaces: strings(cluster["namespaces"], "cluster.namespaces"),
   lokiUrl: str(cluster["lokiUrl"], "cluster.lokiUrl", DEFAULT_LOKI_URL),
   kubeApiUrl: str(cluster["kubeApiUrl"], "cluster.kubeApiUrl", DEFAULT_KUBE_API_URL),
-  // Through the same helper as `limits.commandOutput*`, and capped by `MAX_LOG_LINES`,
-  // which is now `MAX_OUTPUT_LINES` itself (§6.4). This used to be the codebase's only
-  // output bound and had its own copy of every rule; it is one configured case of the
-  // general one now.
-  maxLogLines: outputBound(cluster["maxLogLines"], "cluster.maxLogLines", MAX_LOG_LINES),
+  // Through the same helper and against the same cap as `limits.commandOutput*` (§6.4).
+  // This used to be the codebase's only output bound and had its own copy of every rule;
+  // it is one configured case of the general one now.
+  maxLogLines: outputBound(cluster["maxLogLines"], "cluster.maxLogLines", MAX_OUTPUT_LINES),
 });
 
 /**

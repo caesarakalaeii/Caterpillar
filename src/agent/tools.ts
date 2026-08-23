@@ -31,6 +31,7 @@ import {
   type TaskKind,
   type TaskPullRequest,
 } from "../domain/task.ts";
+import { MAX_OUTPUT_LINES } from "./budget.ts";
 import type { ClusterReader } from "../cluster/client.ts";
 import { NamespaceNotAllowedError } from "../cluster/guard.ts";
 import { DESCRIBABLE_KINDS } from "../cluster/redact.ts";
@@ -408,7 +409,13 @@ const ClusterLogsParams = Type.Object({
     Type.Number({ description: "How far back to look. Default 30, maximum 1440 (24h)." }),
   ),
   limit: Type.Optional(
-    Type.Number({ description: "Maximum lines returned. Default 200, maximum 2000." }),
+    Type.Number({
+      // Derived from the constant rather than written out, so raising the general output
+      // ceiling cannot leave this sentence claiming the old one (§6.4). An operator who
+      // LOWERS it in config is not reflected here — the client clamps regardless, and the
+      // description is a schema built once per process rather than per session.
+      description: `Maximum lines returned. Default 200, maximum ${MAX_OUTPUT_LINES}.`,
+    }),
   ),
 });
 
