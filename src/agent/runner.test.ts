@@ -33,6 +33,7 @@ import {
   type TaskId,
   type TaskSpec,
   type TaskState,
+  type TrackerRef,
 } from "../domain/task.ts";
 import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type {
@@ -54,6 +55,7 @@ import {
 } from "../workspace/worktree.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
+import type { Tracker, TrackerItem } from "../tracker/types.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
 import { TEST_FIRST_STANDARD } from "./standards.ts";
 import type { RunnerConfig } from "../config/types.ts";
@@ -297,11 +299,19 @@ const state = (overrides: Partial<TaskState> = {}): TaskState => ({
 });
 
 
+/**
+ * Substituted by the two tests that need something other than the real collaborators
+ * these tests are built around: one observes HOW the checkout was asked for, the other
+ * counts what the tracker saw. Named rather than positional because they are unrelated.
+ */
+interface RunnerParts {
+  readonly checkouts?: WorktreeManager;
+  readonly tracker?: Tracker;
+}
+
 const buildRunner = (
   contextWindow: number,
-  // Substituted only by the test that has to observe HOW the checkout was asked for.
-  // Everything else wants the real manager these tests are built around.
-  checkouts: WorktreeManager = worktrees,
+  parts: RunnerParts = {},
 ): {
   runner: AgentSessionRunner;
   faux: ReturnType<typeof fauxProvider>;
@@ -342,14 +352,17 @@ const buildRunner = (
 
   const bindings: WorkspaceBindings = {
     forges: new Map([[asWorkspaceName("test"), forgeFactory]]),
-    trackers: new Map(),
+    trackers:
+      parts.tracker === undefined
+        ? new Map()
+        : new Map([[asWorkspaceName("test"), parts.tracker]]),
   };
 
   const runner = new AgentSessionRunner({
     config,
     store,
     logger: SILENT_LOGGER,
-    worktrees: checkouts,
+    worktrees: parts.checkouts ?? worktrees,
     credentials,
     llm: { models, model },
     bindings,
@@ -425,9 +438,8 @@ test("a session's checkout insists the remote can be asked about its branch", as
     }
   }
 
-  const { runner, faux } = buildRunner(
-    200_000,
-    new RecordingWorktrees({
+  const { runner, faux } = buildRunner(200_000, {
+    checkouts: new RecordingWorktrees({
       git,
       mirrorsDir: mirrors,
       tasksDir: tasks,
@@ -435,7 +447,7 @@ test("a session's checkout insists the remote can be asked about its branch", as
       socketDir: join(root, "cred"),
       identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
     }),
-  );
+  });
 
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("done", { summary: "nothing to do" }), {
@@ -742,6 +754,50 @@ test("a task with no pull request asks the forge nothing", async () => {
   assert.equal(outcome.reason, "done-claimed");
   assert.deepEqual(forge.reviewLookups, []);
   assert.equal(outcome.reviewComment, undefined);
+});
+
+/**
+ * A tracker that counts the comments it was asked for (DESIGN.md §9.5).
+ *
+ * Only `comment` is reachable from a session — `task_note` is the one tracker capability
+ * the agent has — so the rest answers emptily.
+ */
+class CountingTracker implements Tracker {
+  readonly kind = "github-issues";
+  readonly comments: string[] = [];
+
+  async listAgentItems(): Promise<readonly TrackerItem[]> {
+    return [];
+  }
+  async comment(_ref: TrackerRef, text: string): Promise<void> {
+    this.comments.push(text);
+  }
+  async transition(): Promise<void> {}
+}
+
+test("the same task_note twice in one session reaches the tracker once", async () => {
+  // End to end through the real runner and the real StateStore: the ledger the runner
+  // supplies is what makes the second call a replay, and the only way to prove the runner
+  // supplies one at all is to make the call twice and count what the tracker saw (§4.4).
+  const tracker = new CountingTracker();
+  const { runner, faux } = buildRunner(200_000, { tracker });
+  const note = { text: "rebased onto main" };
+
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("task_note", note), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("task_note", note), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("done", { summary: "noted" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const tracked: TaskSpec = { ...spec, tracker: { kind: "github-issues", id: "98" } };
+  const outcome = await runner.run(tracked, state({ sessions: 7 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  assert.deepEqual(tracker.comments, ["rebased onto main"]);
+  // And the record is in the state repo, where a LATER session will find it.
+  const effects = join(stateRepo, "tasks", TASK, "effects");
+  assert.ok(existsSync(effects), "the runner must record its effects in the state repo");
 });
 
 test("a forge that cannot be reached does not fail the session", async () => {
