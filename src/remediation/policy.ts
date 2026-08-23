@@ -15,6 +15,7 @@
  * an entry in a file the alert path consults should be able to widen for itself.
  */
 import { parse as parseYaml } from "yaml";
+import { MAX_SETTLE_SECONDS } from "./verify.ts";
 import {
   asWorkspaceName,
   isTaskId,
@@ -52,6 +53,16 @@ export interface AlertPolicyEntry {
    * the same thing.
    */
   readonly maxOpenTasks: number;
+  /**
+   * Seconds a merged fix for this alert gets to take effect before the supervisor decides
+   * whether it worked (DESIGN.md §20). Absent means the supervisor's default.
+   *
+   * Per-alert because the right number is a property of the alert and nothing else: a
+   * crash loop stops within a scrape of the fix landing, and an alert on a disk that a
+   * nightly job cleans up does not. A single fleet-wide window would have to be the
+   * slowest of them, which would hold every fast task open for hours.
+   */
+  readonly settleSeconds?: number;
 }
 
 export interface AlertPolicy {
@@ -98,6 +109,7 @@ const ENTRY_KEYS = [
   "goalPrefix",
   "runbook",
   "maxOpenTasks",
+  "settleSeconds",
 ] as const;
 
 /**
@@ -234,6 +246,25 @@ const parseEntry = (raw: unknown, index: number): AlertPolicyEntry => {
     );
   }
 
+  // Refused rather than clamped, unlike `verify.ts`'s own guard on the same number. That
+  // guard exists because a supervisor default reaches it too and something has to be
+  // returned; here there is a human to tell, and an operator who wrote a day and was
+  // quietly given six hours would read the feature as ignoring the file.
+  const settleSecondsRaw = value["settleSeconds"];
+  if (
+    settleSecondsRaw !== undefined &&
+    (typeof settleSecondsRaw !== "number" ||
+      !Number.isInteger(settleSecondsRaw) ||
+      settleSecondsRaw < 1 ||
+      settleSecondsRaw > MAX_SETTLE_SECONDS)
+  ) {
+    throw new PolicyParseError(
+      `${context}: \`settleSeconds\` must be a positive integer no larger than ` +
+        `${MAX_SETTLE_SECONDS} (got ${JSON.stringify(settleSecondsRaw)}) — the task stays ` +
+        `open for this long, so an unbounded window is a task nothing ever closes`,
+    );
+  }
+
   const goalPrefix = optionalString(value["goalPrefix"], "goalPrefix", context);
   const runbook = optionalString(value["runbook"], "runbook", context);
 
@@ -246,6 +277,7 @@ const parseEntry = (raw: unknown, index: number): AlertPolicyEntry => {
     ...(goalPrefix === undefined ? {} : { goalPrefix }),
     ...(runbook === undefined ? {} : { runbook }),
     maxOpenTasks: maxOpenTasksRaw ?? 1,
+    ...(settleSecondsRaw === undefined ? {} : { settleSeconds: settleSecondsRaw }),
   };
 };
 
