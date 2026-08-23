@@ -27,7 +27,7 @@ import type { ClusterReader } from "../cluster/client.ts";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
-import { repoSlug } from "../domain/task.ts";
+import { repoSlug, taskPullRequests } from "../domain/task.ts";
 import type {
   RepoRef,
   SessionOutcome,
@@ -35,7 +35,7 @@ import type {
   TaskState,
   WorkspaceName,
 } from "../domain/task.ts";
-import type { ForgeFactory } from "../forge/types.ts";
+import type { Forge, ForgeFactory, ReviewComment } from "../forge/types.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import type { Logger } from "../obs/log.ts";
@@ -48,6 +48,7 @@ import type { ToolchainResolver } from "../workspace/toolchain.ts";
 import { journalBudgetChars, journalForPrompt } from "./journal.ts";
 import { ContextBudget } from "./limits.ts";
 import { buildPrompt, systemPromptFor } from "./prompt.ts";
+import { newestHumanComment, renderReviewGuidance } from "./review-guidance.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
 import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
@@ -239,11 +240,19 @@ export class AgentSessionRunner {
         thresholdFraction: this.options.config.handoff.thresholdFraction,
       });
 
+      // Fetched here, where the task's scoped forge already exists and the credential is
+      // already leased. The supervisor cannot do it: `SupervisorDeps.forges` is deliberately
+      // narrowed to `RepoReach` so the loop cannot mint, and the agent must not — it never
+      // holds a credential (§9.2). What the supervisor gets back is `reviewComment` on the
+      // outcome, which is all it needs to forgive a review round.
+      const review = await this.reviewGuidance(forge, spec, state);
+
       const prompt = buildPrompt({
         spec,
         state,
         ...(await this.promptContext(spec, recoveryNote)),
         ...(await this.stagedSection(spec, state)),
+        ...(review.section === undefined ? {} : { reviewGuidance: review.section }),
       });
 
       // The last line is not decoration. `open_pr` defaults to the primary repo, so an agent
@@ -333,6 +342,11 @@ export class AgentSessionRunner {
         ...result.outcome,
         ...(prs.length > 0 ? { prs } : {}),
         ...(primary !== undefined ? { pr: { number: primary.number, url: primary.url } } : {}),
+        // What the agent was SHOWN, not what it acted on — `steering.ts`'s `arrived()` makes
+        // the same choice for the same reason. A session can be cut off by the context budget
+        // a turn after reading this, and forgiving the round anyway leaves the objection in
+        // front of the next session; the other way round loses it between two sessions.
+        ...(review.newest === undefined ? {} : { reviewComment: review.newest }),
       };
     } finally {
       // Cleared on every exit, including a throw: the transcript is on disk by now, and a
@@ -342,6 +356,53 @@ export class AgentSessionRunner {
       await lease.close().catch(() => undefined);
       await forge.revoke().catch(() => undefined);
     }
+  }
+
+  /**
+   * Unresolved review comments on this task's pull requests, as a prompt section
+   * (DESIGN.md §7.3).
+   *
+   * Every pull request the task has open, not the primary one: a multi-repo task opens one
+   * per repo (§9.4.1), and a reviewer objecting in the sibling is objecting to the same
+   * change. `taskPullRequests` is what the completion gate reads, so this asks about exactly
+   * the pull requests the gate will grade.
+   *
+   * **A forge that cannot be reached must not fail the task** (invariant 6, the rule tracker
+   * mirroring follows). The review is not the work: a 500 from GitHub costing a session would
+   * be a strictly worse failure than a session that ran without seeing a comment. So the
+   * failure is logged, the task continues, and `newest` stays undefined — which forgives no
+   * round, because nothing was read and therefore nothing new entered the loop.
+   */
+  private async reviewGuidance(
+    forge: Forge,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<{ readonly section?: string; readonly newest?: string }> {
+    const prs = taskPullRequests(spec.repos, state);
+    if (prs.length === 0) return {};
+
+    const comments: ReviewComment[] = [];
+    for (const pr of prs) {
+      try {
+        comments.push(...(await forge.listReviewComments(pr.repo, pr.number)));
+      } catch (error) {
+        // Per pull request rather than around the whole loop: one unreachable sibling must
+        // not discard the comments already read from the primary.
+        this.options.logger.warn("review.comments-unread", {
+          task: spec.id,
+          repo: repoSlug(pr.repo),
+          pr: pr.number,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const section = renderReviewGuidance(comments);
+    const newest = newestHumanComment(comments);
+    return {
+      ...(section === undefined ? {} : { section }),
+      ...(newest === undefined ? {} : { newest }),
+    };
   }
 
   /**

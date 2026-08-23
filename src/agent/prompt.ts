@@ -27,6 +27,8 @@ export interface PromptParts {
   readonly recoveryNote?: string;
   /** Files left by the tasks this one is blocked by (DESIGN.md §17). */
   readonly artifacts?: string;
+  /** Unresolved review comments on the task's pull requests (DESIGN.md §7.3). */
+  readonly reviewGuidance?: string;
 }
 
 export const SYSTEM_PROMPT = `You are a long-running autonomous coding agent.
@@ -223,6 +225,11 @@ export const buildPrompt = (parts: PromptParts): string => {
     section("Answer from the operator", parts.answer),
     section("Journal so far", parts.journal),
     section("Handoff from the previous session", parts.handoff),
+    // LAST, and after the handoff, because the order here is "most actionable closest to
+    // the model's most recent attention" and a human objecting on the pull request is the
+    // most actionable thing in the prompt — it is the one instruction that came from
+    // outside the loop the task is already in.
+    section("Review comments on your pull request", parts.reviewGuidance),
   ].join("");
 
   const first = parts.handoff === undefined && parts.journal === undefined;

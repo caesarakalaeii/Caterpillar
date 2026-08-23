@@ -273,3 +273,152 @@ test("a token that may not list falls back to the repos it was configured for", 
 
   assert.deepEqual(await factory.reachable(), ["Acme/acme-api"]);
 });
+
+/* ─────────────────────── review comments as task guidance ─────────────────────── */
+
+/**
+ * Forgejo needs no GraphQL for this (DESIGN.md §7.3): Gitea's `PullReviewComment` carries
+ * `resolver` — the account that closed the thread — so resolution comes back over REST,
+ * one request per review.
+ */
+const served = (handler: (route: string) => unknown): ForgejoForgeFactory =>
+  new ForgejoForgeFactory(
+    {
+      apiBase: "https://codeberg.org/api/v1",
+      username: "bot",
+      tokensByOwner: new Map([["Acme", "tok"]]),
+      fetch: (input) => {
+        const body = handler(input.replace("https://codeberg.org/api/v1", ""));
+        return Promise.resolve(
+          body instanceof Response ? body : new Response(JSON.stringify(body), { status: 200 }),
+        );
+      },
+    },
+    { host: "codeberg.org" },
+  );
+
+const reviewComment = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: 1,
+  body: "this swallows the error",
+  path: "src/index.ts",
+  position: 12,
+  user: { login: "a-human" },
+  created_at: "2026-08-13T10:00:00.000Z",
+  html_url: "https://codeberg.org/Acme/acme-api/pulls/7#issuecomment-1",
+  ...over,
+});
+
+test("review comments come back with their file, line and resolution", async () => {
+  const forge = await served((route) => {
+    if (route === "/repos/Acme/acme-api/pulls/7/reviews") {
+      return [{ id: 10 }, { id: 11 }];
+    }
+    if (route === "/repos/Acme/acme-api/pulls/7/reviews/10/comments") {
+      return [reviewComment()];
+    }
+    if (route === "/repos/Acme/acme-api/pulls/7/reviews/11/comments") {
+      // `resolver` is the account that closed the thread. Its presence IS the resolved flag.
+      return [reviewComment({ id: 2, body: "dealt with", resolver: { login: "a-human" } })];
+    }
+    throw new Error(`unexpected route ${route}`);
+  }).forTask(spec([REPO]));
+
+  const comments = await forge.listReviewComments(REPO, 7);
+
+  assert.equal(comments.length, 2, "resolved comments are returned, not filtered");
+  assert.deepEqual(
+    comments.map((c) => [c.body, c.resolved]),
+    [["this swallows the error", false], ["dealt with", true]],
+  );
+  const first = comments[0];
+  assert.equal(first?.path, "src/index.ts");
+  assert.equal(first?.line, 12);
+  assert.equal(first?.author, "a-human");
+  assert.equal(first?.fromFleet, false);
+  assert.deepEqual(first?.repo, REPO);
+  assert.equal(first?.pr, 7);
+});
+
+test("a comment from the account the tokens belong to is the fleet's own", async () => {
+  // Forgejo has no bot flag: the fleet is an ordinary account, and the only thing that
+  // tells it apart from a human is that it is the one the tokens were issued for.
+  const forge = await served((route) => {
+    if (route.endsWith("/reviews")) return [{ id: 10 }];
+    return [reviewComment({ user: { login: "bot" } })];
+  }).forTask(spec([REPO]));
+
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments[0]?.fromFleet, true);
+});
+
+test("a comment whose line has moved is reported as outdated, without a line", async () => {
+  // Forgejo answers `position: null` for a comment whose diff hunk no longer exists, and
+  // keeps `original_position`. That is the same thing GitHub calls outdated, and a null
+  // carried through as a number renders as `src/index.ts:null`.
+  const forge = await served((route) => {
+    if (route.endsWith("/reviews")) return [{ id: 10 }];
+    return [reviewComment({ position: null, original_position: 12 })];
+  }).forTask(spec([REPO]));
+
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments[0]?.outdated, true);
+  assert.equal(comments[0]?.line, undefined);
+});
+
+test("the review body itself is guidance, even though it is attached to no file", async () => {
+  // "this is the wrong approach" is written in the review, not against a line. Reading only
+  // the per-line comments would drop the objection that is about the change as a whole.
+  const forge = await served((route) => {
+    if (route.endsWith("/reviews")) {
+      return [
+        {
+          id: 10,
+          body: "this is the wrong approach",
+          user: { login: "a-human" },
+          submitted_at: "2026-08-13T10:00:00.000Z",
+          html_url: "https://codeberg.org/Acme/acme-api/pulls/7#review-10",
+        },
+      ];
+    }
+    return [];
+  }).forTask(spec([REPO]));
+
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0]?.body, "this is the wrong approach");
+  assert.equal(comments[0]?.path, undefined);
+});
+
+test("an empty review body is not a comment at all", async () => {
+  // An APPROVED review with no prose is the ordinary way to approve, and rendering it as a
+  // blank quote in the prompt would say a human had objected to nothing.
+  const forge = await served((route) => {
+    if (route.endsWith("/reviews")) return [{ id: 10, body: "", user: { login: "a-human" } }];
+    return [];
+  }).forTask(spec([REPO]));
+
+  assert.deepEqual(await forge.listReviewComments(REPO, 7), []);
+});
+
+test("Forgejo returning null instead of an empty array is not a crash", async () => {
+  // Verified against codeberg.org for commit statuses, and the same is true here: a `.map`
+  // over the absence of a list is how that was discovered the first time.
+  const forge = await served(() => null).forTask(spec([REPO]));
+  assert.deepEqual(await forge.listReviewComments(REPO, 7), []);
+});
+
+test("a forge that cannot be asked throws, so an empty list never means 'could not ask'", async () => {
+  const forge = await served(() => new Response("boom", { status: 500 })).forTask(spec([REPO]));
+  await assert.rejects(() => forge.listReviewComments(REPO, 7), /500/);
+});
+
+test("review comments are refused for a repo outside the task's scope", async () => {
+  const forge = await served(() => {
+    throw new Error("no request should be made for an out-of-scope repo");
+  }).forTask(spec([REPO]));
+
+  await assert.rejects(
+    () => forge.listReviewComments({ host: "codeberg.org", owner: "Acme", name: "other" }, 1),
+    RepoOutOfScopeError,
+  );
+});

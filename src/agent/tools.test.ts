@@ -22,6 +22,7 @@ import type {
   GitCredential,
   PrRequest,
   PrResult,
+  ReviewComment,
 } from "../forge/types.ts";
 import {
   brainstormTools,
@@ -51,6 +52,9 @@ class StubForge implements Forge {
   }
   async checks(): Promise<CheckStatus> {
     return { conclusion: "success", summary: "ok" };
+  }
+  async listReviewComments(): Promise<readonly ReviewComment[]> {
+    return [];
   }
   async approve(): Promise<void> {}
   async merge(): Promise<void> {}

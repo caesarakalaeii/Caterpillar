@@ -1780,11 +1780,85 @@ later.
 the record of what the council said, and a human resuming wants to see what they are
 answering.
 
+#### A review left in the forge is guidance too
+
+Everything above gives a human one place to talk: the task's Discord thread. The place they
+actually are is the pull request. §12.1 let the review council block a change with a verdict
+and left a human unable to do the same thing without switching surfaces — so a reviewer who
+read the diff, found the swallowed error, and wrote it on the line it was on was **talking
+into a void**. Nothing read it, and the next session opened with no idea it existed.
+
+So unresolved review comments are a guidance source, fetched at session start and spliced
+into the prompt after the handoff — last, because the prompt orders itself most-actionable
+closest to the model's attention, and an objection from outside the loop is the most
+actionable thing in it.
+
+**The supervisor fetches, and it is the SESSION RUNNER that does it.** Not the loop: the
+loop's forge dependency is narrowed to `RepoReach` on purpose (§9.1.1) — it answers whether a
+repo can be reached and cannot mint a token — and widening it to a minting factory to read
+some comments would trade that bound for a convenience. The runner already holds the task's
+scoped forge and its credential lease for exactly the length of the session, so the read costs
+no new credential and no new plumbing. The agent still never holds anything (§9.2): what it
+gets is rendered text.
+
+**A forge that cannot be reached does not fail the task**, per invariant 6 and exactly as
+tracker mirroring behaves. The review is not the work, and a 500 from GitHub costing a task
+its session would be a worse failure than a session that ran without seeing a comment. The
+failure is logged per pull request, so one unreachable sibling does not discard what the
+primary already answered.
+
+**Which comments count** is decided in one pure place, `agent/review-guidance.ts`, and the
+answer is narrower than "all of them" in two ways that matter:
+
+- **A closed thread is not an instruction.** A resolved comment was accepted and an outdated
+  one was written against a line that no longer exists. Quoted in full they send the agent to
+  redo work that already landed, and on an old pull request they are most of what there is to
+  read. So they are counted rather than quoted, and the count appears only BESIDE something
+  still open — it says "part of this review is already answered", which is worth knowing next
+  to the part that is not and is a sentence about finished work on its own. A pull request
+  whose every thread is resolved renders no section at all.
+- **The fleet's own voice is not guidance.** The agent replies to reviews and the reviewer
+  identity posts approvals, both onto the pull request being graded. Read back, they are a
+  loop with no human in it. On GitHub the discriminator is GraphQL's `author.__typename`,
+  which reports `Bot` for any App; on Forgejo the fleet is an ordinary account, so it is the
+  account the tokens were issued for.
+
+GitHub's read is the one GraphQL call in `forge/github-app.ts`, and it has to be: thread
+resolution is exposed nowhere but `pullRequest.reviewThreads`. On REST alone every comment a
+human ever accepted would arrive as an open instruction forever. Forgejo needs no such thing —
+Gitea's `PullReviewComment` carries `resolver`, the account that closed the thread — but it
+does need two levels, because a review's own BODY is where "this is the wrong approach" gets
+written and reading only per-line comments drops every objection about the change as a whole.
+
+**A comment resets the review round count**, for §12.1's reason word for word: the cap detects
+a loop with nothing new entering it, and a human objection is precisely something new. Left
+unforgiven the whole feature does not work — a task already at the cap parks on the very next
+rejection, so the objection is never tested and the human concludes, correctly, that
+commenting had no effect.
+
+It is forgiven **once per objection**, which is the other half. `review.commentSeen` records
+the newest comment already acted on, and forgiving without it would delete the cap rather
+than inform it: one comment would buy a round on every session for the rest of the task's
+life. The reset is written in `recordSession` rather than in `convene` because of the
+ordering — `recordSession` runs first, and a round forgiven after the council has spoken has
+already been spent. `review.last` and `review.reason` are untouched, as they are for typed
+guidance: a human who commented wants to see what they are answering.
+
 #### What is deliberately absent
 
 **No `/steer` command.** Every message in a task's thread already is one, and a command
 language in the one place §7.1 removed it would be the same friction arriving under a new
 name.
+
+**No replying to a review comment, and no resolving one.** The agent answers a review in the
+code, which is where an answer belongs; a thread the fleet closed itself would be a thread the
+human never agreed was finished. Marking one resolved is a human's act on both forges and
+stays one.
+
+**Nothing polls the forge between sessions.** A comment left mid-session is read by the next
+one, not delivered into the running one. Steering already exists for the case where somebody
+wants to interrupt, it costs no forge requests, and a review comment is written to be read
+against the whole change rather than mid-turn.
 
 **Steering is not offered to the council, the plan maintainer or the digest summariser.**
 They all call `runSession` and all pass nothing. They are not the agent, they run for minutes
@@ -3400,6 +3474,12 @@ unforgiven it made the park unrecoverable rather than terminal: a resume bought 
 more round, so `BS-1539374658363854934` reached 13 rounds against a cap of 3 by being resumed
 ten times with nothing to say. `sessions` is still never forgiven, for this paragraph's
 original reason — that one is a budget, and raising it is a decision.
+
+**An unresolved review comment on the pull request resets it too (§7.3)**, and for this
+paragraph's argument rather than a new one: what the cap is measuring is the absence of new
+information, not the surface the information arrived on. It is forgiven once per objection,
+against the `review.commentSeen` watermark — forgiven per session instead, a single comment
+would delete the cap rather than inform it.
 
 **A task spanning several repos merges all of its pull requests, in `spec.repos` order, and
 stops at the first failure** (§9.4.1). The order is the closest thing to a dependency order the
