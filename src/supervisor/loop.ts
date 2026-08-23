@@ -2194,9 +2194,17 @@ export class Supervisor {
         // that answers this question is the same task on the same branch, and it will be
         // claimed by this runner as often as not. Deleting the checkout while a human
         // types would buy disk for exactly as long as it takes them to answer.
-        logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
+        // The option TEXT is not logged either, for the same reason as the question, and it
+        // goes to the state repo rather than into the Discord button: a `custom_id` holds 100
+        // characters, so the button can only carry an index into this list.
+        const options = outcome.questionOptions;
+        logger.info("task.awaiting-human", {
+          task: spec.id,
+          questionIndex: index,
+          ...(options === undefined ? {} : { options: options.length }),
+        });
         await this.unit(async () => {
-          await store.writeQuestion(spec.id, index, question);
+          await store.writeQuestion(spec.id, index, question, options);
           await this.transition(lease, state, "awaiting-human");
           await this.push(lease, `chore(${spec.id}): awaiting human input`);
         });
@@ -2204,7 +2212,13 @@ export class Supervisor {
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
         await this.mirror(spec, { kind: "question", question });
-        await this.notifyTask(state, { kind: "question", task: spec.id, question, phase: state.phase });
+        await this.notifyTask(state, {
+          kind: "question",
+          task: spec.id,
+          question,
+          phase: state.phase,
+          ...(options === undefined ? {} : { options }),
+        });
         return true;
       }
 
@@ -3279,6 +3293,8 @@ export class Supervisor {
     switch (request.kind) {
       case "answer":
         return this.applyAnswer(request);
+      case "answer-option":
+        return this.applyAnswerOption(request);
       case "park":
         return this.applyPark(request);
       case "resume":
@@ -3414,6 +3430,49 @@ export class Supervisor {
       repos: spec.repos.map(repoSlug).join(", "),
     });
     return { kind: "started", task: id };
+  }
+
+  /**
+   * One of the question's own options, pressed as a button (§7).
+   *
+   * This method does exactly one thing: turn an index into the text the agent offered. It
+   * then hands that text to `applyAnswer`, which is what writes the answer file, the journal
+   * entry and the streak reset. There is deliberately no second answer path — the two would
+   * agree on the day they were written and drift apart afterwards, and the divergence would
+   * show up as a session reading an answer nobody remembers giving.
+   *
+   * A refusal rather than a guess when the index is out of range. A button stays in the
+   * Discord channel forever, so a press can arrive against a question that has since been
+   * answered and superseded, or against one that never had options. Writing option 1 of a
+   * different question would put a choice the human did not make where the next session
+   * reads it as theirs.
+   */
+  private async applyAnswerOption(
+    request: ChatRequest & { readonly kind: "answer-option" },
+  ): Promise<ChatOutcome> {
+    const { store, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+
+    const pending =
+      state.status === "awaiting-human" ? await store.pendingQuestion(request.task) : undefined;
+    const chosen = pending?.options?.[request.option];
+    if (chosen === undefined) {
+      logger.info("answer.option-stale", {
+        task: request.task,
+        option: request.option,
+        ...(pending === undefined ? {} : { questionIndex: pending.index }),
+      });
+      return {
+        kind: "refused",
+        reason:
+          `**${request.task}** does not offer that option any more — the question it belonged ` +
+          `to has moved on. Read the current one and answer it in prose.`,
+      };
+    }
+
+    return this.applyAnswer({ kind: "answer", task: request.task, text: chosen, settle: request.settle });
   }
 
   /**

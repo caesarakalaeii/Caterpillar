@@ -95,6 +95,16 @@ export type ChatOutcome =
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
 export type ChatIntent =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
+  /**
+   * One of the enumerated choices the open question offered, pressed as a button (§7).
+   *
+   * Carries the option's INDEX and not its text, and that is not an economy — it is the
+   * only thing it can carry. The button's `custom_id` holds 100 characters and the task id
+   * has spent most of them, so the text is stored beside the question and looked up by the
+   * loop, which is also what lets a press against a superseded question be REFUSED rather
+   * than write a choice the agent never offered.
+   */
+  | { readonly kind: "answer-option"; readonly task: TaskId; readonly option: number }
   | { readonly kind: "park"; readonly task: TaskId }
   /**
    * Put a parked task back in the queue — `/resume`.
