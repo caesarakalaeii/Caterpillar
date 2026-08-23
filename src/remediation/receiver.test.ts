@@ -20,19 +20,34 @@ import {
   parseAlert,
   sanitizeLabels,
   type AlertRequest,
+  type AlertResolution,
   type FiringAlert,
 } from "./receiver.ts";
 
 const TOKEN = "correct-horse-battery-staple";
 
 /** A sink that remembers, and can be told to refuse — the queue-full case. */
-const sink = (full = false): { readonly submit: (alert: FiringAlert) => boolean; readonly taken: FiringAlert[] } => {
+const sink = (
+  full = false,
+): {
+  readonly submit: (alert: FiringAlert) => boolean;
+  readonly resolve: (resolution: AlertResolution) => boolean;
+  readonly taken: FiringAlert[];
+  readonly resolutions: AlertResolution[];
+} => {
   const taken: FiringAlert[] = [];
+  const resolutions: AlertResolution[] = [];
   return {
     taken,
+    resolutions,
     submit: (alert) => {
       if (full) return false;
       taken.push(alert);
+      return true;
+    },
+    resolve: (resolution) => {
+      if (full) return false;
+      resolutions.push(resolution);
       return true;
     },
   };
@@ -157,18 +172,52 @@ test("a payload with no `alerts` list is 400", () => {
   assert.equal(out.reply.status, 400);
 });
 
-test("a batch of resolved alerts is accepted and dropped", () => {
+test("a resolved alert creates no task but is recorded as the alert stopping", () => {
   const target = sink();
   const out = handleAlertRequest(
-    post(payload(firing({ status: "resolved" }), firing({ status: "resolved" }))),
+    post(payload(firing({ status: "resolved", endsAt: "2026-08-17T17:40:00.000Z" }))),
     { token: TOKEN, sink: target },
   );
 
-  // 202, not 400: the delivery WAS handled, there is simply nothing to remediate, and
-  // anything else makes Alertmanager retry a payload it would send again identically.
+  // 202, not 400: the delivery WAS handled, and anything else makes Alertmanager retry a
+  // payload it would send again identically.
   assert.equal(out.reply.status, 202);
+  // Still nothing to remediate. A resolution never becomes a task.
   assert.equal(target.taken.length, 0);
-  assert.deepEqual([...out.skipped], ["resolved", "resolved"]);
+  // But it is the ONLY positive evidence that an alert stopped, which is what a post-merge
+  // re-verification needs (§20). Dropping it — which this receiver used to do — is what
+  // left the fleet inferring a clear from silence, and silence is also what a dead
+  // Alertmanager looks like.
+  assert.deepEqual(
+    [...target.resolutions],
+    [
+      {
+        alertname: "CaterpillarNoProgress",
+        fingerprint: "a1b2c3d4e5f60789",
+        endsAt: "2026-08-17T17:40:00.000Z",
+      },
+    ],
+  );
+  assert.deepEqual([...out.resolved], [...target.resolutions]);
+});
+
+test("a resolution with no usable fingerprint or alertname is skipped, not filed", () => {
+  // The same guard the firing path has, for the same reason: the fingerprint becomes a
+  // file name under `alerts/refusals/`, and this is a body from the network.
+  const target = sink();
+  const out = handleAlertRequest(
+    post(
+      payload(
+        firing({ status: "resolved", fingerprint: "../../etc/passwd" }),
+        firing({ status: "resolved", labels: { severity: "warning" } }),
+      ),
+    ),
+    { token: TOKEN, sink: target },
+  );
+
+  assert.equal(out.reply.status, 202);
+  assert.equal(target.resolutions.length, 0);
+  assert.equal(out.skipped.length, 2);
 });
 
 test("one malformed member does not cost the rest of the batch", () => {
@@ -309,8 +358,11 @@ test("a delivery carrying hundreds of alerts is capped and says how many it left
   assert.ok(out.skipped.some((reason) => reason.includes("25 member(s) past")));
 });
 
-test("a member with no explicit `firing` status is skipped rather than assumed", () => {
-  for (const status of [undefined, "", "FIRING", "pending"]) {
+test("a member whose status is neither firing nor resolved is acted on in neither way", () => {
+  // An absent status from a sender that is not Alertmanager must not be read as either.
+  // Both halves matter now that `resolved` is no longer discarded: a member read as a
+  // resolution by accident would record an alert as having stopped when nothing said so.
+  for (const status of [undefined, "", "FIRING", "pending", "RESOLVED", 1]) {
     const parsed = parseAlert(firing({ status }));
     assert.ok("skipped" in parsed, `expected ${JSON.stringify(status)} to be skipped`);
   }
