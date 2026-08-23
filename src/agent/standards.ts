@@ -361,6 +361,10 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
     // zero, above every `##` section of the prompt this body is spliced into — turning the
     // code-block carve-out into the way around the guard it sits next to.
     const bodyLines = lines.slice(heading.index + 1, end);
+    // An underline on the FIRST body line is correctly allowed through: `bodyLines` starts
+    // after the section's own `##`, so there is no preceding line here and CommonMark has
+    // no paragraph for it to title either — the `##` closes the block. The slice boundary
+    // is doing that work, which is why this looks only at `bodyLines` and never at `lines`.
     const setext = bodyLines.findIndex(
       (line, at) => SETEXT_UNDERLINE.test(line) && (bodyLines[at - 1] ?? "").trim() !== "",
     );

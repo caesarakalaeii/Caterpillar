@@ -479,6 +479,15 @@ test("a setext underline in a body is refused like the `#` it means", () => {
   }
 });
 
+test("an `===` as the first line of a body is not a setext underline", () => {
+  // The line above it is the section's own `##`, which closes the block, so CommonMark has
+  // no paragraph here for the underline to title. Looking past the start of the body would
+  // find that heading and refuse a file that is doing nothing wrong.
+  assert.deepEqual(parseRepoStandards("acme/web", "## tests: Rule\n===\n\nBody.\n"), [
+    { repo: "acme/web", lens: "tests", title: "Rule", body: "===\n\nBody." },
+  ]);
+});
+
 test("a table and a horizontal rule are not mistaken for a setext underline", () => {
   // The counter-cases that stop the setext guard being widened into `/^[-=]+$/` over any
   // line. A `---` with no paragraph directly above it is a thematic break, and a `|---|`
