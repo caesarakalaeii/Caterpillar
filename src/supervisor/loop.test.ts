@@ -5185,3 +5185,79 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
   await retire(WAITING);
   await retire(RUNNING);
 });
+
+test("a rejected claim still pushes the evidence its gate published", async () => {
+  // The gate writes an artifact OUTSIDE any of the loop's write-then-commit units
+  // (`Supervisor.unit`), and inside a unit `StateStore` stages only the paths that unit
+  // wrote — not the whole writable tree. So whether a screenshot ever reaches the remote
+  // depends on the rejection unit happening to touch `tasks/<id>`, which it does because
+  // it journals the rejection under the same id.
+  //
+  // That is load-bearing and entirely invisible from either file. A future change that
+  // journals a rejection somewhere else, or narrows staging further, leaves the evidence
+  // on one runner's disk with nothing to say it was dropped — and a screenshot that never
+  // leaves the machine that produced it is the whole feature not working.
+  const EVIDENCE = asTaskId("SMOKE-EV-1");
+  await seedTask(EVIDENCE);
+
+  const store = new StateStore(statePath, stateGit);
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    // What `AcceptanceVerifier.collectEvidence` does, in the one respect this test is
+    // about: the artifact is on disk before the verdict is returned, and it is returned
+    // as a FAILURE — the case where the image matters most and where nothing else in the
+    // loop would have reason to commit it.
+    verifier: {
+      verify: async () => {
+        await store.writeArtifact(EVIDENCE, "shot.png", Buffer.from("pretend png"));
+        return { passed: false, detail: "the header still overlaps the nav" };
+      },
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.reject(new Error("the council must not run on a failed gate")),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const rejected = await waitForCommit(
+    `chore(${EVIDENCE}): completion claim rejected`,
+    30_000,
+  );
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(rejected !== undefined, "the rejection was never pushed");
+  assert.equal(
+    await blobAt(rejected, `tasks/${EVIDENCE}/artifacts/shot.png`),
+    "pretend png",
+    "the evidence must travel with the rejection that explains it",
+  );
+
+  await retire(EVIDENCE);
+});
