@@ -2114,10 +2114,20 @@ Two details worth keeping:
   deliberately *not* ranked, which is where it parts company with `rankRepos`:
   `lua51Packages` contains the whole query and is a set of lua modules rather than the
   interpreter the author meant.
-- **A name that is not a bare attribute is refused rather than escaped.** The name is
-  interpolated into a nix expression this process then evaluates. `.` is excluded with the
-  rest: `pkgs ? ${a.b}` asks about a *nested* attribute, so a dotted name does not mean what
-  it looks like it means. No top-level attribute in the shipped pin contains one.
+- **A name that is not a bare attribute is skipped, not refused.** The name is interpolated
+  into a nix expression this process then evaluates, so only `[A-Za-z0-9_+-]+` is ever put
+  there. `.` is excluded with the rest, because `pkgs ? ${a.b}` asks about a *nested*
+  attribute and the answer would not mean what it is read as meaning.
+
+  But unaskable is not invalid, and an earlier version got this wrong: it *refused* a dotted
+  path on the stated reasoning that "nix would reject it too". Nix does not.
+  `generatedFlake` interpolates declared names into `with pkgs; [ … ]`, where
+  `python3Packages.requests` is legal and builds today — so intake was refusing toolchains
+  the resolver handles. Such a name is now skipped and the rest of the list is still
+  checked, which is the same fail-open rule the section above applies to a missing nix: no
+  evidence, no refusal. Validating per segment with `builtins.hasAttrByPath` was considered
+  and rejected — it would commit the doctor to reasoning about nested attribute sets to
+  catch a typo inside a package set, rarer than the false refusal it replaced.
 
 `mode: inherit` declares no packages and is a no-op, not a refusal — as is `mode: nix` with
 no `packages`, where the repo's own nix expression decides and the repo is not checked out
