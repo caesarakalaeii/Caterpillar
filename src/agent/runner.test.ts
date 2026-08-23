@@ -631,3 +631,60 @@ test("a forge that cannot be reached does not fail the session", async () => {
   assert.equal(outcome.reason, "done-claimed");
   assert.equal(outcome.reviewComment, undefined);
 });
+
+test("a session resumes on the branch a previous session pushed", async () => {
+  // GH-96's failure, at the surface that produced it. Sessions 2-3 pushed 18 commits;
+  // sessions 4-7 started with the worktree on `main`, and session 7 — unable to tell that
+  // from a task nobody had touched — re-implemented the whole task. Two independent
+  // implementations of one task reached the remote and a human had to pick one.
+  //
+  // `WorktreeManager` cannot prevent this on its own: the reconciliation needs the network
+  // and its other callers all run after `clearActive()`, so it is a distinct entry point
+  // and this is the test that the session-start path uses it.
+  const resumeTask = asTaskId("TASK-6");
+  await mkdir(join(stateRepo, "tasks", resumeTask), { recursive: true });
+  await writeFile(
+    join(stateRepo, "tasks", resumeTask, "spec.md"),
+    [
+      "---",
+      "workspace: test",
+      "repos:",
+      "  - github.com/acme/widget",
+      "acceptance:",
+      '  - "true"',
+      "---",
+      "",
+      "Create a file called generated.txt.",
+      "",
+    ].join("\n"),
+  );
+
+  // The previous session's pushed work, in the upstream repo and nowhere on this runner:
+  // the mirror's fetch refspec excludes `^refs/heads/agent/*`, so no fetch brings it here.
+  await sh(`git checkout -q -B agent/${resumeTask} main`, source);
+  await writeFile(join(source, "half-done.txt"), "work from session 2\n");
+  await sh("git add -A && git commit -qm 'first half of the task'", source);
+  const pushed = await new Git(source).run("rev-parse", "HEAD");
+  await sh("git checkout -q main", source);
+
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("handoff", { summary: "carried on" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  await runner.run(await store.readSpec(resumeTask), state({ id: resumeTask, sessions: 3 }));
+
+  const worktree = join(tasks, resumeTask, REPO.name);
+  assert.equal(
+    await new Git(worktree).run("rev-parse", "HEAD"),
+    pushed,
+    "the session must start at the tip of its own pushed branch, never behind it",
+  );
+  assert.ok(
+    existsSync(join(worktree, "half-done.txt")),
+    "the previous session's files must be in the worktree the agent is given",
+  );
+});
