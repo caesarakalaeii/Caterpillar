@@ -31,6 +31,7 @@
 import type { TaskId, TrackerRef } from "../domain/task.ts";
 import {
   type Tracker,
+  type TrackerCreateRequest,
   type TrackerItem,
   TrackerScopeError,
   type TrackerTransition,
@@ -213,6 +214,43 @@ export class GitHubIssuesTracker implements Tracker {
     await this.call<unknown>("POST", `repos/${slug}/issues/${number}/comments`, "issues", {
       body: text,
     });
+  }
+
+  /**
+   * File a new issue. Supervisor-only — see tracker/types.ts.
+   *
+   * Labels ride along in the create body rather than through `addLabel`, so the issue
+   * arrives already labelled and there is no window in which it exists unlabelled.
+   * Unknown labels are dropped rather than refused: `addLabel`'s
+   * UnknownGitHubLabelError guards a transition, which still has an issue to fall back
+   * to, whereas here the alternative to a dropped label is a lost report.
+   */
+  async create(request: TrackerCreateRequest): Promise<TrackerRef> {
+    const slug = request.container;
+    if (!slug.includes("/")) {
+      throw new Error(
+        `'${slug}' is not an 'owner/name' repo slug — GitHub issues are filed per repo`,
+      );
+    }
+
+    const known = await this.labelIndex(slug);
+    const applied = request.labels.filter((name) => known.has(name.toLowerCase()));
+    const omitted = request.labels.filter((name) => !known.has(name.toLowerCase()));
+    if (omitted.length > 0) request.onLabelsOmitted?.(omitted);
+
+    // Markdown, verbatim — GitHub renders it natively.
+    const filed = await this.call<{ readonly number?: number }>(
+      "POST",
+      `repos/${slug}/issues`,
+      "issues",
+      { title: request.title, body: request.body, labels: applied },
+    );
+
+    const number = filed?.number;
+    if (number === undefined) {
+      throw new Error(`GitHub accepted a new issue on ${slug} but returned no number`);
+    }
+    return { kind: "github-issues", id: String(number), container: slug };
   }
 
   /**

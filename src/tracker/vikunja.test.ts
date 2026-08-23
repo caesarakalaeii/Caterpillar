@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TrackerRef } from "../domain/task.ts";
-import { TrackerScopeError } from "./types.ts";
+import { DEFAULT_CANDIDATE_LABEL, TrackerScopeError } from "./types.ts";
 import {
   stripHtml,
   toCommentHtml,
@@ -310,6 +310,136 @@ test("the label index is fetched once, not per transition", async () => {
   await subject.transition(REF, { kind: "claimed", runner: "r" }, TASK);
 
   assert.equal(paths(calls).filter((p) => p.startsWith("GET labels")).length, 1);
+});
+
+test("create PUTs to the project's tasks route, with an HTML description", async () => {
+  // Vikunja creates with PUT, and the description is rich text — markdown would
+  // render as literal asterisks, exactly as it would in a comment.
+  const { fetch, calls } = stub((_method, path) => {
+    if (path.startsWith("labels?")) return [{ id: 8, title: DEFAULT_CANDIDATE_LABEL }];
+    if (path === "projects/3/tasks") return { id: 77 };
+    return null;
+  });
+
+  const ref = await tracker(fetch).create({
+    title: "Crash on empty spec",
+    body: "Steps to reproduce…",
+    container: "3",
+    labels: [DEFAULT_CANDIDATE_LABEL],
+  });
+
+  assert.deepEqual(paths(calls), [
+    "GET labels?per_page=50&page=1",
+    "PUT projects/3/tasks",
+    "PUT tasks/77/labels",
+  ]);
+  assert.deepEqual(calls[1]?.body, {
+    title: "Crash on empty spec",
+    description: "<p>Steps to reproduce…</p>",
+  });
+  assert.deepEqual(calls[2]?.body, { label_id: 8 });
+  assert.deepEqual(ref, { kind: "vikunja", id: "77", container: "3" });
+});
+
+test("a filed task never carries the ingest label that would mint it as a task", async () => {
+  // Self-amplifying if it did: intake would turn the report into a running task on the
+  // next pass, which could file another report.
+  const { fetch, calls } = stub((_method, path) => {
+    if (path.startsWith("labels?")) {
+      return [
+        { id: 1, title: "agent" },
+        { id: 8, title: DEFAULT_CANDIDATE_LABEL },
+      ];
+    }
+    if (path === "projects/3/tasks") return { id: 77 };
+    return null;
+  });
+
+  await tracker(fetch).create({
+    title: "t",
+    body: "b",
+    container: "3",
+    labels: [DEFAULT_CANDIDATE_LABEL],
+  });
+
+  const applied = calls.filter((call) => call.path === "tasks/77/labels");
+  assert.deepEqual(
+    applied.map((call) => call.body),
+    [{ label_id: 8 }],
+  );
+});
+
+test("the ref create returns round-trips back through comment", async () => {
+  // A ref that cannot address the item afterwards makes the report unreachable.
+  const { fetch, calls } = stub((_method, path) =>
+    path === "projects/3/tasks" ? { id: 77 } : null,
+  );
+  const subject = tracker(fetch);
+
+  const ref = await subject.create({ title: "t", body: "b", container: "3", labels: [] });
+  await subject.comment(ref, "a follow-up");
+
+  assert.equal(paths(calls).at(-1), "PUT tasks/77/comments");
+});
+
+test("a label the instance lacks is dropped and reported, and the task is still filed", async () => {
+  // A dropped label is recoverable by hand; a lost report is not. Unlike a transition,
+  // which fails loudly, there is nothing to fail back to here.
+  const { fetch, calls } = stub((_method, path) => {
+    if (path.startsWith("labels?")) return [{ id: 9, title: "bug" }];
+    if (path === "projects/3/tasks") return { id: 77 };
+    return null;
+  });
+  const omitted: string[][] = [];
+
+  const ref = await tracker(fetch).create({
+    title: "t",
+    body: "b",
+    container: "3",
+    labels: [DEFAULT_CANDIDATE_LABEL, "bug"],
+    onLabelsOmitted: (labels) => omitted.push([...labels]),
+  });
+
+  assert.deepEqual(ref, { kind: "vikunja", id: "77", container: "3" });
+  assert.deepEqual(omitted, [["agent-candidate"]]);
+  // Only the label that exists is attached; nothing tries to create the other.
+  assert.deepEqual(
+    calls.filter((call) => call.path === "tasks/77/labels").map((call) => call.body),
+    [{ label_id: 9 }],
+  );
+  assert.ok(!paths(calls).includes("PUT labels"));
+});
+
+test("create surfaces a 401 as a scope error naming tasks:create", async () => {
+  // Vikunja answers a missing scope with the same 401 as an invalid token, and
+  // retrying never fixes it.
+  const { fetch } = stub((_method, path) =>
+    path.startsWith("labels?")
+      ? []
+      : new Response('{"message":"missing scope"}', { status: 401 }),
+  );
+
+  await assert.rejects(
+    () => tracker(fetch).create({ title: "t", body: "b", container: "3", labels: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof TrackerScopeError);
+      assert.equal(error.route, "projects/3/tasks");
+      assert.equal(error.requiredScope, "tasks:create");
+      assert.match(error.message, /do not retry/);
+      return true;
+    },
+  );
+});
+
+test("create refuses a non-numeric project container before any request", async () => {
+  const { fetch, calls } = stub(() => null);
+
+  await assert.rejects(
+    () =>
+      tracker(fetch).create({ title: "t", body: "b", container: "inbox", labels: [] }),
+    /not a Vikunja project id/,
+  );
+  assert.equal(calls.length, 0);
 });
 
 test("comment HTML escapes markup rather than emitting it", () => {
