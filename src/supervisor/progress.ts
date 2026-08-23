@@ -12,6 +12,7 @@
 import type {
   ProgressRecord,
   SessionExitReason,
+  TaskId,
   TaskLimits,
   TaskState,
 } from "../domain/task.ts";
@@ -37,6 +38,52 @@ export interface ProgressEvidence {
 
 export const madeProgress = (evidence: ProgressEvidence): boolean =>
   evidence.committed || evidence.acceptanceImproved || evidence.stepCompleted;
+
+/**
+ * How many characters of an oid the journal shows. Git's own default abbreviation, so the
+ * line can be pasted straight into a `git show` and matches the `git log` a human runs.
+ */
+ const ABBREVIATED_OID = 7;
+
+/**
+ * The journal's sentence about what a session left on the task branch — zero lines or one,
+ * shaped for spreading into the entry `Supervisor.recordSession` builds.
+ *
+ * GH-96 is why this exists. Sessions 2 and 3 of that task committed eighteen changes and
+ * pushed them; sessions 4 to 7 each ended without calling a control-plane verb, so the
+ * supervisor filled in "session ended without a control-plane decision" and that sentence
+ * was the whole journal entry. A branch carrying eighteen commits was therefore
+ * indistinguishable, in the only record the next session reads, from a task nobody had
+ * touched — and session 7 re-implemented all of it, discovering the duplicate only when its
+ * push was refused as non-fast-forward.
+ *
+ * Built from the PROBE, never from the agent's summary. The case this exists for is exactly
+ * the one where the agent said nothing, so a line derived from its prose would be absent
+ * precisely when it is needed.
+ *
+ * It says "committed" and not "pushed", and the distinction is deliberate. Nothing in the
+ * supervisor pushes a task branch — the agent does, with its own `git push` — and by the
+ * time the probe runs, `clearActive()` has closed the credential service (§9.2), so no
+ * network check is available to confirm it. What is provable is the local branch, which is
+ * also what the next session on this runner starts from. A reader who needs to know whether
+ * the remote has it compares this oid against `origin/agent/<task>`, which is a question the
+ * line makes ASKABLE rather than answering falsely.
+ *
+ * Nothing is emitted when the branch did not move, and nothing when the probe resolved no
+ * head at all — a repo-less spec, or a worktree it could not open. An unfalsifiable "a
+ * commit landed" is worse for the reader than silence.
+ */
+export const committedLine = (task: TaskId, evidence: ProgressEvidence): readonly string[] => {
+  const head = evidence.headOid;
+  if (!evidence.committed || head === undefined) return [];
+
+  const tip = head.slice(0, ABBREVIATED_OID);
+  const from = evidence.baselineOid?.slice(0, ABBREVIATED_OID);
+  // The baseline is dropped when it abbreviates to the same prefix as the tip, which two
+  // distinct oids can. "is at `abc1234`, was `abc1234`" reads as a bug in the journal.
+  const was = from === undefined || from === tip ? "" : `, was \`${from}\``;
+  return [`**Committed:** \`agent/${task}\` is at \`${tip}\`${was}`];
+};
 
 /**
  * Exit reasons that are neither progress nor a stall, so the streak is left alone.

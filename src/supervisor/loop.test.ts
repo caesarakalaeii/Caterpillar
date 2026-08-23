@@ -1501,7 +1501,7 @@ test("a session interrupted mid-work keeps its tokens and its history", async ()
   await retire(WORKED);
 });
 
-test("a session that only committed still has its commits named in the journal", async () => {
+test("a session that ended silently still has its branch tip named in the journal", async () => {
   // GH-96. Sessions 2 and 3 committed eighteen changes to `agent/GH-…-96` and pushed
   // them. Sessions 4 to 7 each ended without calling a control-plane verb, so every one
   // of their journal entries read "session ended without a control-plane decision" and
