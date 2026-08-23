@@ -509,6 +509,7 @@ export class DiscordBridge {
     const what = ((): string => {
       switch (command.kind) {
         case "answer":
+        case "answer-option":
           return `Answering ${command.task}`;
         case "merge":
           return `Merging ${command.task}`;
@@ -561,6 +562,13 @@ export class DiscordBridge {
         return describeOutcome(
           command.task,
           await inbox.submit({ kind: "answer", task: command.task, text: command.text }),
+        );
+      // The option TEXT is not here to submit: it lives beside the question in the state
+      // repo, which the bridge deliberately cannot read (see the note at the top).
+      case "answer-option":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({ kind: "answer-option", task: command.task, option: command.option }),
         );
       case "park":
         return describeOutcome(
