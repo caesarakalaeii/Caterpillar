@@ -57,6 +57,10 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       );
     case "not-forceable":
       return `Could not force **${task}** done: ${outcome.reason}`;
+    case "amended":
+      return amendedReply(task, outcome);
+    case "not-amendable":
+      return `Could not amend **${task}**: ${outcome.reason}`;
     case "unknown-task":
       return `No task **${task}** in the state repo. Check the id from its notification.`;
     case "guided":
@@ -118,6 +122,39 @@ const guidedReply = (
     : " The next session reads it before it starts.";
 
   return `${noted}.${cleared}${next}`;
+};
+
+/**
+ * What an amendment actually changed, and how to change it again.
+ *
+ * Both ends of the diff, spelled out, because an amendment can be as broken as the criterion
+ * it replaced — the real case was a criterion written as an escaped regex for a matcher that
+ * compares with `includes()`. Re-amending is the only correction path, deliberately, so the
+ * reply has to make the mistake visible without anybody opening the state repo, and has to
+ * name the way to fix it.
+ *
+ * A side of the diff that is empty is left out rather than rendered as "Removed: none": on a
+ * first amendment that adds a criterion, a line saying nothing was removed is a line that
+ * exists to be skipped.
+ */
+const amendedReply = (
+  task: TaskId,
+  outcome: ChatOutcome & { readonly kind: "amended" },
+): string => {
+  const listed = (entries: readonly string[]): string =>
+    entries.map((entry) => `\`${entry}\``).join(", ");
+
+  return take(
+    [
+      `Amended **${task}** — \`amendments/${String(outcome.index).padStart(3, "0")}.yaml\`. ` +
+        `\`spec.md\` is untouched.`,
+      ...(outcome.removed.length === 0 ? [] : [`Removed: ${listed(outcome.removed)}`]),
+      ...(outcome.added.length === 0 ? [] : [`Added: ${listed(outcome.added)}`]),
+      `That list is the gate now. If it is still wrong, run \`/amend\` again — the highest ` +
+        `amendment wins, so a second one corrects the first.`,
+    ].join("\n"),
+    CONTENT_LIMIT,
+  );
 };
 
 /** Statuses in the order the header counts them — the arc a task travels. */

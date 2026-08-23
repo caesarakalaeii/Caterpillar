@@ -30,10 +30,29 @@ export interface TaskSummary {
    * interaction has no time to do.
    */
   readonly review?: ReviewRecord;
+  /**
+   * The task's EFFECTIVE acceptance criteria — what it currently has to satisfy (§12.3).
+   *
+   * Here because the `/amend` modal is PRE-FILLED with them, and a Discord interaction has
+   * three seconds to be answered: reading `spec.md` and its amendments per press is exactly
+   * what this snapshot exists to avoid. With Redis configured the process opening that modal
+   * is the standalone bot, which holds no state repo at all, so this is the only route.
+   *
+   * Absent when the spec could not be read, which is a task nothing can amend rather than a
+   * task with no criteria — the surface refuses instead of offering an empty box.
+   */
+  readonly acceptance?: readonly string[];
   readonly updatedAt: string;
 }
 
-export const summarise = (state: TaskState): TaskSummary => ({
+/**
+ * One summary. `acceptance` is passed in rather than read here because this function is
+ * pure over a `TaskState`, and the criteria live in `spec.md` with its amendments overlaid.
+ */
+export const summarise = (
+  state: TaskState,
+  acceptance?: readonly string[],
+): TaskSummary => ({
   id: state.id,
   status: state.status,
   phase: state.phase,
@@ -41,6 +60,7 @@ export const summarise = (state: TaskState): TaskSummary => ({
   costUsd: state.usage.costUsd,
   ...(state.pr === undefined ? {} : { prUrl: state.pr.url }),
   ...(state.review === undefined ? {} : { review: state.review }),
+  ...(acceptance === undefined ? {} : { acceptance: [...acceptance] }),
   updatedAt: state.updatedAt,
 });
 

@@ -1414,10 +1414,22 @@ export class Supervisor {
     const { store, snapshot } = this.deps;
 
     const records: TaskRecord[] = [];
+    /**
+     * The effective acceptance criteria per task, for the `/amend` modal's pre-fill.
+     *
+     * Read here because this is the only pass that already walks every task, and because the
+     * bot cannot read a spec at all when it runs as its own process. An unreadable spec is
+     * skipped rather than fatal, exactly as an unreadable state is: it costs one task its
+     * amend button, and the surface says so rather than offering an empty box.
+     */
+    const criteria = new Map<TaskId, readonly string[]>();
+
     for (const id of await store.listTasks()) {
       const state = await store.readState(id).catch(() => undefined);
       if (state === undefined) continue;
       records.push({ id, state });
+      const spec = await store.readSpec(id).catch(() => undefined);
+      if (spec !== undefined) criteria.set(id, spec.acceptance);
       // A streak this replica published for a task that has since finished ANYWHERE.
       //
       // `transition` drops the series too, and that stays the fast path — but it only
@@ -1441,7 +1453,9 @@ export class Supervisor {
     // Awaited: with Redis configured this is a write over the network, and a floating
     // promise here would let the poll finish before the bot could see the new list.
     // Never throws — `RedisSnapshotStore` degrades — so it cannot fail the survey.
-    await snapshot?.replace(records.map((record) => summarise(record.state)));
+    await snapshot?.replace(
+      records.map((record) => summarise(record.state, criteria.get(record.id))),
+    );
     // `done` tasks drop out and nothing else does. A message in a bound thread is acted on
     // whatever the task's status, so a `parked` or `failed` task stays bound — that is where
     // guidance goes (§7.3), and unbinding it was what made a stalled brainstorm unreachable

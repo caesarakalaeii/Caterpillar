@@ -27,7 +27,17 @@ import type { SnapshotReader } from "../redis/snapshot.ts";
 import type { ChatOutcome } from "../supervisor/inbox.ts";
 import type { DiscordBot } from "./bot.ts";
 import { parseCommand, type Command } from "./commands.ts";
-import { answerModal, button, BUTTON_STYLE, disableAll, doneModal, row, rows, type ActionRow } from "./components.ts";
+import {
+  amendModal,
+  answerModal,
+  button,
+  BUTTON_STYLE,
+  disableAll,
+  doneModal,
+  row,
+  rows,
+  type ActionRow,
+} from "./components.ts";
 import type { FetchLike } from "./http.ts";
 import {
   autocomplete,
@@ -42,7 +52,14 @@ import {
   type InteractionResponse,
 } from "./interactions.ts";
 import { describeList, describeOutcome, describeTask, queued } from "./replies.ts";
-import { ANSWER_FIELD, DONE_REASON_FIELD, parseInteraction, repoChoices } from "./slash.ts";
+import {
+  AMEND_CRITERIA_FIELD,
+  AMEND_WHY_FIELD,
+  ANSWER_FIELD,
+  DONE_REASON_FIELD,
+  parseInteraction,
+  repoChoices,
+} from "./slash.ts";
 import type { ThreadIndex } from "./threads.ts";
 
 export interface BridgeDeps {
@@ -487,10 +504,56 @@ export class DiscordBridge {
         return;
       }
 
+      case "open-amend-modal":
+        await this.answer(interaction, await this.amendModalFor(intent.task));
+        return;
+
       case "run":
         await this.run(interaction, intent.command, who);
         return;
     }
+  }
+
+  /**
+   * The amend modal for one task, or the refusal that replaces it (DESIGN.md §12.3).
+   *
+   * The pre-fill has to come from the SNAPSHOT and not from the state repo: this may be the
+   * standalone bot, which holds no state repo at all, and an interaction has three seconds to
+   * be answered either way.
+   *
+   * Both refusals matter, and both are the same mistake avoided. What the modal submits is a
+   * WHOLE replacement acceptance list, so a box that opened empty — because the task is not in
+   * the snapshot, or its spec would not read — would delete every criterion the task has, and
+   * nothing on the screen would say so. Likewise a list too long for Discord's 4000-character
+   * input: `amendModal` returns undefined rather than clipping it, for the same reason.
+   */
+  private async amendModalFor(task: TaskId): Promise<InteractionResponse> {
+    const summary = await this.deps.snapshot.find(task);
+    const acceptance = summary?.acceptance;
+    if (acceptance === undefined || acceptance.length === 0) {
+      return reply(
+        `I cannot read the acceptance criteria for \`${task}\`, so there is nothing to ` +
+          `pre-fill and an empty box would replace the whole list with nothing. Check the id, ` +
+          `or give the supervisor a moment to publish the task.`,
+        { ephemeral: true },
+      );
+    }
+
+    const modal = amendModal({
+      task,
+      acceptance,
+      criteriaFieldId: AMEND_CRITERIA_FIELD,
+      whyFieldId: AMEND_WHY_FIELD,
+    });
+    return modal === undefined
+      ? reply(
+          `\`${task}\` has more acceptance criteria than a Discord modal can hold, so they ` +
+            `cannot be pre-filled — and an amendment submitted from a truncated list would ` +
+            `delete the rest. Amend it by committing \`tasks/${task}/amendments/\` in the ` +
+            `state repo instead.`,
+          { ephemeral: true },
+        )
+      : openModal(modal);
   }
 
   /**
@@ -533,6 +596,8 @@ export class DiscordBridge {
           return `Cancelling ${command.task}`;
         case "force-done":
           return `Marking ${command.task} done`;
+        case "amend":
+          return `Amending ${command.task}`;
       }
     })();
     await this.answer(interaction, this.acknowledge(interaction, queued(what, who)));
@@ -611,6 +676,19 @@ export class DiscordBridge {
             kind: "force-done",
             task: command.task,
             reason: command.reason,
+            author,
+          }),
+        );
+      // Carries `author` for the same reason: it goes into the amendment record and into the
+      // journal, and the loop never sees Discord.
+      case "amend":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({
+            kind: "amend",
+            task: command.task,
+            acceptance: command.acceptance,
+            why: command.why,
             author,
           }),
         );

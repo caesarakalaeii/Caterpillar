@@ -5943,13 +5943,15 @@ test("an option index the stored question does not have is refused, and writes n
 });
 
 /**
- * `/done` — a human marking a task done by hand, with both §12 gates bypassed.
+ * A supervisor that serves the chat inbox and runs nothing else.
  *
- * The property every test here defends is the same one: the record must never read as
- * though the task was verified. A task can be OBSOLETE rather than finished, and the only
- * honest way to say so is to write `done` and say in the journal that nothing was checked.
+ * For the two commands a human aims at a task's RECORD rather than at its work: `/done`,
+ * which writes `done` with both §12 gates bypassed, and `/amend`, which replaces the gate
+ * itself (§12.3). Neither runs a session and neither may run a verification, so both stubs
+ * REJECT instead of resolving — a gate that ran under either of these would be a result
+ * nobody asked for, and a stub that answered quietly would hide it.
  */
-const forceDoneSupervisor = (options: {
+const chatOnlySupervisor = (options: {
   readonly inbox: InMemoryChatQueue;
   readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
   readonly reviewers?: SupervisorDeps["reviewers"];
@@ -5965,7 +5967,7 @@ const forceDoneSupervisor = (options: {
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
     verifier: {
-      verify: () => Promise.reject(new Error("forcing a task done must not run gate 1")),
+      verify: () => Promise.reject(new Error("no acceptance gate under test")),
     },
     progress: {
       probe: () =>
@@ -5999,7 +6001,7 @@ test("/done on a parked task writes done, and journals who forced it and why", a
   await seedTask(FORCED, { status: "parked", sessions: 2 });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: FORCED,
     reason: "the feature was dropped from the roadmap",
@@ -6022,7 +6024,7 @@ test("forcing a task done records no gate as passed, anywhere", async () => {
   await seedTask(UNVERIFIED, { status: "failed" });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: UNVERIFIED,
     reason: "superseded by SMOKE-FORCE-1",
@@ -6077,7 +6079,7 @@ test("/done needs no PR and merges nothing", async () => {
 
   const inbox = new InMemoryChatQueue();
   const outcome = await applyOne(
-    forceDoneSupervisor({
+    chatOnlySupervisor({
       inbox,
       reviewers: new Map([
         [
@@ -6106,7 +6108,7 @@ test("/done on a running task refuses and writes nothing at all", async () => {
   await seedTask(RUNNING, { status: "running" });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: RUNNING,
     reason: "obsolete",
@@ -6129,7 +6131,7 @@ test("/done is accepted on failed and on awaiting-human", async () => {
     await seedTask(task, { status });
 
     const inbox = new InMemoryChatQueue();
-    const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
       kind: "force-done",
       task,
       reason: "obsolete",
@@ -6169,7 +6171,7 @@ test("the tracker is told, with a reason naming it a forced completion", async (
 
   const inbox = new InMemoryChatQueue();
   const outcome = await applyOne(
-    forceDoneSupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
+    chatOnlySupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
     inbox,
     { kind: "force-done", task: MIRRORED, reason: "obsolete", author: "ada" },
   );
@@ -6193,7 +6195,7 @@ test("an amendment on a parked task is appended, journalled and reported back", 
 
   const store = new StateStore(statePath, stateGit);
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "amend",
     task: AMENDED,
     acceptance: ["npm run check", "npm test"],
@@ -6239,7 +6241,7 @@ test("a second amendment appends 002 and leaves 001 exactly as it was", async ()
   const store = new StateStore(statePath, stateGit);
   const inbox = new InMemoryChatQueue();
 
-  const first = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const first = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "amend",
     task: TWICE,
     acceptance: ["npx vitest run src\\/widget\\/.*"],
@@ -6253,7 +6255,7 @@ test("a second amendment appends 002 and leaves 001 exactly as it was", async ()
     "utf8",
   );
 
-  const second = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const second = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "amend",
     task: TWICE,
     acceptance: ["npx vitest run src/widget"],
@@ -6287,7 +6289,7 @@ test("amending a running task writes nothing at all", async () => {
 
   const store = new StateStore(statePath, stateGit);
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "amend",
     task: BUSY,
     acceptance: ["npm test"],
@@ -6313,7 +6315,7 @@ test("amending a running task writes nothing at all", async () => {
 
 test("amending a task that is not in the state repo says so", async () => {
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "amend",
     task: asTaskId("SMOKE-AMEND-NONE"),
     acceptance: ["npm test"],
