@@ -2641,6 +2641,15 @@ Parking rather than failing is also what makes the recovery cheap: `park` keeps 
 fresh clone and a full dependency install. The park reason is `merge.note`, so the forge's own
 words reach Discord — and on a partial multi-repo merge it still names which repos DID land.
 
+**And the false `done` is what CAUSED those conflicts.** `isClaimable` holds a task until every
+entry in `plan.blockedBy` reads `done` — `parked` does not satisfy it. The four abandoned PRs were
+one plan: `BS-1540288291008684052-01` was wave 0, and `-02` through `-05` were wave 1, each
+`blockedBy: ["-01"]`. `-01`'s merge was refused at 12:22:49, it was marked `done` anyway, and that
+released the whole of wave 1 to run and land — which moved the base underneath `-01` and turned
+its one refused merge into three more. So this is not only a fix for losing work after a failed
+merge; it closes the loop that manufactures the failures. A wave gate that accepts a task whose
+change never landed is not a gate.
+
 **The system prompt says so.** A tool that can do a thing an agent does not know about is a tool
 that does not exist: the sibling-layout paragraph now says to call `open_pr` once per repo, and
 that completion checks CI in every repo a PR was opened in — so a repo changed without one will
