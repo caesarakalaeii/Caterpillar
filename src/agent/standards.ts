@@ -262,14 +262,27 @@ export class RepoStandardsError extends Error {
  * markdown for a payload. Matched here and refused in the parse, so the failure is loud
  * rather than a heading that quietly went missing.
  *
- * `###` and below are left alone: they nest UNDER the `###` a section is rendered with, so
- * a repo structuring its own rule is doing nothing a prompt has to be protected from.
+ * `###` and below are left alone: they sit below the `##` the prompt's own sections use, so
+ * a repo structuring its own rule cannot pose as one of them.
  *
  * Up to three leading spaces, because CommonMark reads those as a heading too and a guard
  * anchored at column zero is one an attacker walks around with a space. Four is an indented
  * code block, which renders as code inside the repo's own section and needs no guarding.
  */
 const HEADING = /^ {0,3}(#{1,2}) +(.*)$/;
+
+/**
+ * A setext underline: `=` for an H1, `-` for an H2, under the paragraph it titles.
+ *
+ * The same override as `HEADING`, spelled without a `#`. `Test-first, without exception`
+ * followed by `=====` is a heading at the fleet's own level or above, so a body containing
+ * one is refused for the same reason — it needs no indent and reads as ordinary prose.
+ *
+ * Only meaningful directly below a non-blank line, which is what keeps `---` as a thematic
+ * break and `| --- |` as a table delimiter. Both are markdown a repo writes innocently, so
+ * the emptiness of the line above is the whole test and this must not become `/^[-=]+$/`.
+ */
+const SETEXT_UNDERLINE = /^ {0,3}(=+|-+) *$/;
 
 /** A well-formed section heading, after the `##`: `<lens>: <title>`. */
 const OWNED = /^([A-Za-z-]+) *: *(.+?) *$/;
@@ -347,7 +360,18 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
     // would strip the indent off the first line and re-emit `# Attribution` at column
     // zero, above every `##` section of the prompt this body is spliced into — turning the
     // code-block carve-out into the way around the guard it sits next to.
-    const body = trimBlankLines(lines.slice(heading.index + 1, end));
+    const bodyLines = lines.slice(heading.index + 1, end);
+    const setext = bodyLines.findIndex(
+      (line, at) => SETEXT_UNDERLINE.test(line) && (bodyLines[at - 1] ?? "").trim() !== "",
+    );
+    if (setext !== -1) {
+      throw refuse(
+        `section "${heading.title}" underlines "${(bodyLines[setext - 1] ?? "").trim().slice(0, 40)}" ` +
+          `with "${bodyLines[setext]?.trim()}", which is a heading at or above the level of the ` +
+          `prompt's own sections. Use \`###\` or below inside a section.`,
+      );
+    }
+    const body = trimBlankLines(bodyLines);
     if (body === "") {
       throw refuse(
         `section "${heading.title}" is empty. A heading with no rule under it reads as a ` +

@@ -3776,11 +3776,24 @@ is a valid one; `###` and below nest harmlessly and are left alone, because refu
 would make the format hostile to a repo structuring its own rule. "At `##` or above"
 includes up to three leading spaces, which CommonMark also reads as a heading: a guard
 anchored at column zero is one a repo walks around by typing a space. Four spaces is an
-indented code block, renders as code inside the repo's own section, and needs no guard.
+indented code block, renders as code inside the repo's own section, and needs no guard —
+which holds only because the parse **preserves a body's leading whitespace**. Trimming it
+would re-emit the first content line at column zero, so `    # Attribution` would reach the
+prompt as a real heading above every `##` the fleet's own standards use, and the code-block
+carve-out would become the way around the guard beside it. Only wholly blank lines are
+trimmed, from each end.
 
-A file this system cannot use **fails the session** rather than being skipped. The throw
-reaches `SupervisorLoop.parkFailed`, so the task parks with a reason naming the repo and the
-file. Skipping it would hold the author to a rule the council cannot see, or the reverse, and
+The same rule covers **setext** headings, which spell the override without a `#` at all: a
+line of `=` or `-` directly under a paragraph is an H1 or H2 in CommonMark, so a body
+containing one is refused too. "Directly under a paragraph" is the whole test — it is what
+keeps a `---` thematic break and a `| --- |` table delimiter, both ordinary markdown, from
+being refused along with it.
+
+A file this system cannot use **fails the session** rather than being skipped. On the runner
+path the throw reaches `SupervisorLoop.parkFailed`, so the task parks with a reason naming
+the repo and the file; on the council path it propagates out of `convene()` instead, a
+different route to the same class of outcome — and the runner reads the same files first, so
+a file that would break the council has almost always already stopped the session. Skipping it would hold the author to a rule the council cannot see, or the reverse, and
 neither is visible from outside — the whole class of bug this feature exists to remove.
 
 **Multi-repo (§9.4.1) is scoped per repo. Not merged, and not refused.** A task declaring

@@ -173,6 +173,11 @@ export class AgentSessionRunner {
       //
       // The council reads the same files from the same checkout when it convenes
       // (`review/council.ts`), so both sides are given identical text.
+      //
+      // Read for every task kind, including `brainstorm`, which `systemPromptFor` then
+      // gives none of the result to. Decided that way deliberately: a `.caterpillar` file
+      // this system cannot parse is a repo-level defect, and blocking all work on the repo
+      // until it is fixed beats parking only the sessions that would have been shown it.
       const repoStandards = await readRepoStandards(repoCheckoutsOf(spec.repos, checkout));
 
       const control: ControlSink = {};
