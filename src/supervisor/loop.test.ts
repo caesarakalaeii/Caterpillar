@@ -35,7 +35,7 @@ import type { Council } from "../review/council.ts";
 import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
-import { StateStore } from "../state/store.ts";
+import { StateStore, type AlertRefusal } from "../state/store.ts";
 import { removeTempTree } from "../testing/tempdir.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
@@ -153,6 +153,34 @@ const seedTask = async (
   await stateGit.run("add", "-A");
   await stateGit.run("commit", "-m", `seed ${id}`);
   await stateGit.run("push", "origin", "HEAD:main");
+};
+
+/**
+ * Write `alerts/refusals/<fingerprint>.json` on the remote, as the alert path would.
+ *
+ * Committed and pushed rather than left in the local checkout, because the supervisor pulls
+ * before every claim and would otherwise reset over it. Used to stand in for what
+ * Alertmanager delivered, which is the only evidence a post-merge re-verification has (§20).
+ */
+const writeAlertRecord = async (fingerprint: string, record: AlertRefusal): Promise<void> => {
+  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
+  await mkdir(join(statePath, "alerts", "refusals"), { recursive: true });
+  await writeFile(
+    join(statePath, "alerts", "refusals", `${fingerprint}.json`),
+    `${JSON.stringify(record, null, 2)}\n`,
+  );
+  await stateGit.run("add", "-A");
+  await stateGit.run("commit", "-m", `seed alert ${fingerprint}`);
+  await stateGit.run("push", "origin", "HEAD:main");
+};
+
+/** The same record as the remote has it, or undefined once a failed verdict deleted it. */
+const readAlertRecord = async (fingerprint: string): Promise<AlertRefusal | undefined> => {
+  const shown = await new Git(origin).tryRun(
+    "show",
+    `main:alerts/refusals/${fingerprint}.json`,
+  );
+  return shown.code === 0 ? (JSON.parse(shown.stdout) as AlertRefusal) : undefined;
 };
 
 await seedTask(TASK);
@@ -6102,4 +6130,256 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
+});
+
+test("a merged remediation fix is held for a verdict, and parked when the alert keeps firing", async () => {
+  // The closing edge of §20, end to end. Before this the merge went straight to `done`, so
+  // a patch that changed nothing and a patch that fixed the incident produced the same
+  // record — and because task ids on this path are `ALERT-<fingerprint>`, the re-fire was
+  // deduped against the very task that had failed to fix it. Nothing ever said so.
+  //
+  // Driven through a running supervisor rather than by calling the private methods, because
+  // the property is the SEQUENCE: merge, hold, verdict, park. Each step is one a later
+  // refactor can drop without any unit test noticing.
+  const FINGERPRINT = "6155db6f";
+  const HELD = asTaskId(`ALERT-${FINGERPRINT}`);
+  await seedTask(HELD, { pr: { number: 20, url: "https://example.invalid/pr/20" } });
+
+  // The alert record the queue writes when it creates a remediation task, and the evidence
+  // Alertmanager delivered afterwards: the alert is still firing well past the window.
+  const mergedAt = new Date(Date.now() - 60 * 60_000).toISOString();
+  await writeAlertRecord(FINGERPRINT, {
+    fingerprint: FINGERPRINT,
+    alertname: "CaterpillarNoProgress",
+    reason: "created",
+    task: HELD,
+  });
+
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
+    openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.resolve([]),
+    approve: () => Promise.resolve(),
+    merge: () => Promise.resolve(),
+    revoke: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: true,
+          detail: "acceptance passed",
+          prUrl: "https://example.invalid/pr/20",
+        }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () =>
+        Promise.resolve({
+          usage: EMPTY_USAGE,
+          verdict: decide([
+            {
+              lens: "correctness",
+              title: "Correctness",
+              decision: "pass",
+              blocking: false,
+              summary: "Reads correctly.",
+              findings: [],
+            },
+          ]),
+        }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // The hold, as the artifact it leaves behind. `done` is what this used to push here.
+  const heldAt = await waitForCommit(`chore(${HELD}): re-verifying`, 30_000);
+  assert.ok(heldAt !== undefined, "the merge never started a re-verification");
+
+  const settling = await stateAt(heldAt, HELD);
+  assert.notEqual(settling?.status, "done", "a merged fix must not be done before it is checked");
+
+  // Now stamp the evidence a still-firing alert leaves, and back-date the merge so the
+  // window has run out. Writing it here rather than seeding it is the point: the record has
+  // to be the thing the supervisor reads, and it did not exist before the merge.
+  const held = await readAlertRecord(FINGERPRINT);
+  await writeAlertRecord(FINGERPRINT, {
+    ...(held ?? { fingerprint: FINGERPRINT, alertname: "CaterpillarNoProgress", reason: "created", task: HELD }),
+    verify: { mergedAt, settleSeconds: 600, lastFiringAt: new Date().toISOString() },
+  });
+
+  const parkedAt = await waitForCommit(`chore(${HELD}): parked`, 30_000);
+  assert.ok(parkedAt !== undefined, "a fix that did not work never reached a verdict");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const parked = await stateAt(parkedAt, HELD);
+  assert.equal(parked?.status, "parked", "a fix that did not clear the alert is not done");
+
+  // The evidence, in the journal, because the next session starts from "the previous fix
+  // did not work" rather than from scratch — which is the whole reason this is not a `done`
+  // with a warning in a log line.
+  const journal = await journalAt(parkedAt, HELD);
+  assert.match(journal, /alert still firing/i);
+
+  // And the dedup record is GONE, so the next firing of this alert becomes work again.
+  // Without this the feature is worse than not having it: the fix that failed would go on
+  // suppressing its own alert forever.
+  assert.equal(await readAlertRecord(FINGERPRINT), undefined);
+});
+
+test("a merged remediation fix whose alert cleared reaches done, and says how long it took", async () => {
+  const FINGERPRINT = "6155dbaa";
+  const CLEARED = asTaskId(`ALERT-${FINGERPRINT}`);
+  await seedTask(CLEARED, { pr: { number: 21, url: "https://example.invalid/pr/21" } });
+  await writeAlertRecord(FINGERPRINT, {
+    fingerprint: FINGERPRINT,
+    alertname: "CaterpillarBudget",
+    reason: "created",
+    task: CLEARED,
+  });
+
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
+    openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.resolve([]),
+    approve: () => Promise.resolve(),
+    merge: () => Promise.resolve(),
+    revoke: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () =>
+        Promise.resolve({
+          usage: EMPTY_USAGE,
+          verdict: decide([
+            {
+              lens: "correctness",
+              title: "Correctness",
+              decision: "pass",
+              blocking: false,
+              summary: "Reads correctly.",
+              findings: [],
+            },
+          ]),
+        }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const heldAt = await waitForCommit(`chore(${CLEARED}): re-verifying`, 30_000);
+  assert.ok(heldAt !== undefined, "the merge never started a re-verification");
+
+  // Alertmanager says the alert stopped, four minutes after the merge this record carries.
+  const held = await readAlertRecord(FINGERPRINT);
+  const mergedAt = held?.verify?.mergedAt ?? new Date().toISOString();
+  await writeAlertRecord(FINGERPRINT, {
+    ...(held ?? { fingerprint: FINGERPRINT, alertname: "CaterpillarBudget", reason: "created", task: CLEARED }),
+    verify: {
+      mergedAt,
+      settleSeconds: 600,
+      resolvedAt: new Date(Date.parse(mergedAt) + 4 * 60_000).toISOString(),
+    },
+  });
+
+  const doneAt = await waitForCommit(`chore(${CLEARED}): done`, 30_000);
+  assert.ok(doneAt !== undefined, "an alert that cleared never let its task finish");
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal((await stateAt(doneAt, CLEARED))?.status, "done");
+  // A silent success and a silent failure must not look the same, so the clear is said out
+  // loud with the number that makes it checkable.
+  assert.match(await journalAt(doneAt, CLEARED), /alert cleared after 4m/);
+  // The record survives a clear, minus its `verify` block: it is what `countOpenAlertTasks`
+  // joins to `tasks/`, and dropping it here would free the alertname's slot early.
+  const after = await readAlertRecord(FINGERPRINT);
+  assert.equal(after?.alertname, "CaterpillarBudget");
+  assert.equal(after?.verify, undefined);
 });
