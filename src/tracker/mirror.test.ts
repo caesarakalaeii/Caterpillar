@@ -68,11 +68,13 @@ const mirror = (
   tracker: Tracker | undefined,
   transition: TrackerTransition,
   ledger?: MirrorLedger,
+  occurrence = 0,
 ): Promise<void> =>
   mirrorTransition({
     task: TASK,
     ref: REF,
     transition,
+    occurrence,
     logger: SILENT_LOGGER,
     ...(tracker === undefined ? {} : { tracker }),
     ...(ledger === undefined ? {} : { ledger }),
@@ -130,6 +132,24 @@ test("each lifecycle kind is its own effect", async () => {
     ledger.recorded.map((key) => key.split(":")[0]),
     ["tracker.claimed", "tracker.question", "tracker.parked", "tracker.completed"],
   );
+});
+
+test("the same transition in a later occurrence is mirrored again", async () => {
+  // The twin of the test above, and the more dangerous direction. A lifecycle transition
+  // RECURS with byte-identical arguments: `claimed` carries only the runner id, which is
+  // the pod name and so the same on every claim by that pod. Suppressing the second claim
+  // would leave `needs-human` on an issue whose question was answered — `claimed` is the
+  // only transition that removes it. The occurrence separates a replay of one attempt
+  // (same session) from a genuinely new event (a later session).
+  const tracker = new RecordingTracker();
+  const ledger = new FakeLedger();
+  const claimed: TrackerTransition = { kind: "claimed", runner: "pod-7f3a" };
+
+  await mirror(tracker, claimed, ledger, 1);
+  await mirror(tracker, claimed, ledger, 1);
+  await mirror(tracker, claimed, ledger, 2);
+
+  assert.deepEqual(tracker.transitions, [claimed, claimed]);
 });
 
 test("a tracker that cannot be reached does not throw, and is not recorded", async () => {
