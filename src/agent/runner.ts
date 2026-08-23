@@ -53,7 +53,8 @@ import { newestHumanComment, renderReviewGuidance } from "./review-guidance.ts";
 import { readRepoStandards, repoCheckoutsOf } from "./standards.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
-import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
+import { effectRequestId, type EffectVerb } from "../state/effects.ts";
+import { toolsForKind, type ControlSink, type EffectLedger, type ToolContext } from "./tools.ts";
 
 void _gzipSync;
 
@@ -207,6 +208,10 @@ export class AgentSessionRunner {
         repos: spec.repos,
         control,
         publish: (name, path, note) => this.publishArtifact(spec, worktree, name, path, note),
+        // Bound to THIS task, like `publish`: the record lives in the state repo, which no
+        // task credential can reach (§9.3), so it is the supervisor that reads and writes it
+        // and a tool is handed nothing that could name another task's record.
+        effects: this.effectLedger(spec),
         ...(tracker !== undefined ? { tracker } : {}),
         ...(spec.tracker !== undefined ? { trackerRef: spec.tracker } : {}),
         ...(cluster === undefined
@@ -447,6 +452,28 @@ export class AgentSessionRunner {
     return {
       ...(section === undefined ? {} : { section }),
       ...(newest === undefined ? {} : { newest }),
+    };
+  }
+
+  /**
+   * This task's effect record, as the control verbs may reach it (DESIGN.md §4.4).
+   *
+   * The request id is computed here rather than by the tool so the two halves cannot drift:
+   * `landed` and `record` derive it from the same task, verb and arguments, and an id
+   * computed differently at the two call sites would be an idempotency check that never
+   * matches — which looks exactly like one that is working.
+   */
+  private effectLedger(spec: TaskSpec): EffectLedger {
+    const { store } = this.options;
+    const idFor = (verb: EffectVerb, args: unknown): string =>
+      effectRequestId(spec.id, verb, args);
+
+    return {
+      landed: async <T>(verb: EffectVerb, args: unknown) => {
+        const record = await store.recordedEffect<T>(spec.id, idFor(verb, args));
+        return record === undefined ? undefined : { result: record.result };
+      },
+      record: (verb, args, result) => store.recordEffect(spec.id, idFor(verb, args), verb, result),
     };
   }
 
