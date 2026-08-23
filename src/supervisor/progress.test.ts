@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskState } from "../domain/task.ts";
-import { checkLimits, madeProgress, recordProgress } from "./progress.ts";
+import { checkLimits, commitNote, madeProgress, recordProgress } from "./progress.ts";
 
 const baseState = (overrides: Partial<TaskState> = {}): TaskState => ({
   id: asTaskId("TASK-1"),
@@ -135,4 +135,90 @@ test("the no-progress detector parks a thrashing task", () => {
 test("a healthy task continues", () => {
   const verdict = checkLimits(baseState(), { maxSessions: 20 }, { noProgressLimit: 3 });
   assert.equal(verdict.kind, "continue");
+});
+
+test("a session that committed gets a journal line naming the branch, count and tip", () => {
+  // GH-96's second defect. Sessions 2-3 committed 18 changes and pushed them; sessions
+  // 4-7 each journalled "without a control-plane decision" and nothing else, so the
+  // journal a later session read said that nothing had happened. Session 7 believed it
+  // and implemented the whole task a second time.
+  //
+  // Written from the probe's evidence rather than from the agent's summary on purpose:
+  // the summary is what a dying session fails to produce, and it is the only part of the
+  // entry that can be wrong about the repository.
+  assert.equal(
+    commitNote(asTaskId("GH-96"), {
+      committed: true,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      commits: 18,
+      headOid: "c320ff4a7d1e2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+      baselineOid: "e0de61f0000000000000000000000000000000aa",
+    }),
+    "**Work on the branch:** 18 commits on `agent/GH-96`, tip `c320ff4`. " +
+      "Read them before writing anything — they may already be the task.",
+  );
+});
+
+test("one commit is not described as one commits", () => {
+  // The line is read by a human as often as by an agent, and a journal that says
+  // "1 commits" reads as generated noise rather than as a fact about the branch.
+  const note = commitNote(asTaskId("T-1"), {
+    committed: true,
+    acceptanceImproved: false,
+    stepCompleted: false,
+    commits: 1,
+    headOid: "abcdef1234567890abcdef1234567890abcdef12",
+  });
+  assert.match(note ?? "", /\b1 commit on\b/);
+});
+
+test("a branch with no commits on it gets no journal line at all", () => {
+  // The entry must not claim work that does not exist, and "0 commits" in the journal
+  // of every session that read code and wrote nothing is noise that hides the case
+  // this line exists for.
+  assert.equal(
+    commitNote(asTaskId("T-1"), {
+      committed: false,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      commits: 0,
+      headOid: "abcdef1234567890abcdef1234567890abcdef12",
+    }),
+    undefined,
+  );
+});
+
+test("a session that committed nothing new still reports what is on the branch", () => {
+  // The case that cost GH-96 the duplicate implementation, and the reason this is not
+  // conditioned on `committed`. Sessions 4-7 each added no commit of their own — so
+  // `committed` was false for every one of them — while eighteen commits sat on the
+  // branch. It is the standing total that a resumed session needs, not this session's
+  // delta.
+  assert.equal(
+    commitNote(asTaskId("GH-96"), {
+      committed: false,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      commits: 18,
+      headOid: "c320ff4a7d1e2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+    }),
+    "**Work on the branch:** 18 commits on `agent/GH-96`, tip `c320ff4`. " +
+      "Read them before writing anything — they may already be the task.",
+  );
+});
+
+test("a probe that could not count commits produces no line rather than a guess", () => {
+  // `commitsSince` answers with nothing rather than throwing on a base this worktree does
+  // not carry, and a probe on a repo it cannot read reports no head at all. Neither is a
+  // branch with nothing on it, and saying so would be the sentence a resumed session
+  // trusts most being the one that is wrong.
+  assert.equal(
+    commitNote(asTaskId("T-1"), {
+      committed: false,
+      acceptanceImproved: false,
+      stepCompleted: false,
+    }),
+    undefined,
+  );
 });
