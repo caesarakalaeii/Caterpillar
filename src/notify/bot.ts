@@ -45,9 +45,10 @@ export interface BotOptions {
   /**
    * Where a task-scoped message this bot posts is remembered, for reply targeting (§7.3).
    *
-   * Injected rather than owned so the composition root can hand the same index to the
-   * bridge that reads it, and so a test can seed it. Absent means one is created here: the
-   * index is cheap, bounded, and a bot without it would silently lose the fast tier.
+   * Absent is the production shape: one is created here, and every reader goes through
+   * `taskForMessage` on this same instance — the notifier and the bridge share one
+   * `DiscordBot` (`index.ts:loadDiscord`), so they share the index without wiring. It is
+   * injectable only so a test can seed it and assert on what was recorded.
    */
   readonly messages?: MessageIndex;
 }
