@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -28,6 +28,7 @@ import {
   evidenceRoot,
   planPrompt,
   reviewLenses,
+  reviewLensesFor,
   reviewerPlan,
   reviewPrompt,
   sabotageAbstentionFor,
@@ -250,6 +251,32 @@ test("the council convenes its lenses carrying the repos' own standards", () => 
 
   assert.deepEqual(
     graded.map((lens) => lens.key),
+    ["tests"],
+  );
+});
+
+test("the council's lenses are read from the checkout it is reviewing", async () => {
+  // The one line `reviewLenses` cannot pin: that the standards `review()` READ are the ones
+  // it HANDS to the splice. Blanking that argument left the whole suite green while the
+  // council read every repo's file and then graded against none of it — the author held to
+  // all of it, the reviewers to nothing, which is the exact asymmetry §12.2 forbids.
+  //
+  // `reviewLensesFor` takes the checkout instead of a standards list, so there is no
+  // argument at the call site left to empty.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-council-"));
+  after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, ".caterpillar"), { recursive: true });
+  await writeFile(join(root, ".caterpillar/standards.md"), "## tests: Rule\n\nCover the retry.\n");
+
+  const lenses = await reviewLensesFor(
+    SPEC.repos,
+    { root, siblings: new Map() },
+    undefined,
+    false,
+  );
+
+  assert.deepEqual(
+    lenses.filter((lens) => lens.prompt.includes("Cover the retry.")).map((lens) => lens.key),
     ["tests"],
   );
 });
