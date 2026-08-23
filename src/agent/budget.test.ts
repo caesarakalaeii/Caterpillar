@@ -54,6 +54,28 @@ test("what was dropped is declared in the output, not left to be inferred", () =
   assert.match(bounded.text, /head and tail/, "it must say WHICH lines were kept");
 });
 
+test("the declared count is right when the output ends with a newline", () => {
+  // The COMMON case, and the one every other test here misses: `lines()` joins without a
+  // trailing newline, but a real command's output ends with one. `countLines` deliberately
+  // treats a trailing newline as not starting a line, so the total is right — but the
+  // budget was split over `text.split("\n")`, whose last element is the empty string, and
+  // that phantom element was taken as a tail line and counted as shown. The note then
+  // claimed one more line than it displayed, and `droppedLines` one fewer than was missing.
+  //
+  // A wrong number is not a cosmetic defect here: this module's whole thesis is that the
+  // elision states what it dropped, and a session acts on what the note says.
+  const bounded = boundOutput(`${lines(100)}\n`, outputCeiling({ maxLines: 11 }));
+
+  const shown = bounded.text.split("\n").filter((line) => /^line \d+$/.test(line)).length;
+  assert.match(
+    bounded.text,
+    new RegExp(`${shown} of 100 lines shown`),
+    `the note must count the lines it really showed (${shown}), got: ${bounded.text}`,
+  );
+  assert.equal(bounded.droppedLines, 100 - shown, "every line not shown must be counted");
+  assert.equal(bounded.totalLines, 100, "a trailing newline does not start a 101st line");
+});
+
 test("the kept lines are never more than the ceiling allows", () => {
   const bounded = boundOutput(lines(5_000), outputCeiling({ maxLines: 50 }));
 
