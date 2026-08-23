@@ -260,7 +260,7 @@ test("an amendment naming a forbidden key is refused rather than partly applied"
       join(dir, name),
       [
         "acceptance:",
-        "  - true",
+        "  - npm test",
         "why: unsatisfiable as filed",
         "author: operator",
         "at: 2026-08-19T00:00:00.000Z",
@@ -289,7 +289,7 @@ test("an amendment with no reason is refused", async () => {
   await mkdir(dir, { recursive: true });
   await writeFile(
     join(dir, "001.yaml"),
-    "acceptance:\n  - true\nauthor: operator\nat: 2026-08-19T00:00:00.000Z\n",
+    "acceptance:\n  - npm test\nauthor: operator\nat: 2026-08-19T00:00:00.000Z\n",
     "utf8",
   );
 
