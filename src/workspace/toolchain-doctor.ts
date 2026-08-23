@@ -53,16 +53,43 @@ export interface UnresolvedPackage {
  * the way — but a check that only holds while another check holds is a check that breaks
  * when that one moves.
  *
- * NO DOT, deliberately. A dot would make `pkgs.jq` and `stdenv.cc` pass, and `pkgs ? ${a.b}`
- * asks about a NESTED attribute — so a name with a dot in it does not mean what it looks
- * like it means, and `toolchain.ts` would later interpolate the same string into a
- * `with pkgs; [ … ]` list where it means something different again. Every top-level
- * attribute in the shipped pin was checked: none contains one.
+ * NO DOT, deliberately. `pkgs ? ${a.b}` asks about a NESTED attribute, so a dotted name
+ * does not mean what the answer is read as meaning. That makes such a name UNASKABLE by
+ * this expression — which is not the same as invalid: `python3Packages.requests` is a
+ * real package and `generatedFlake` in `toolchain.ts` builds it today from the
+ * `with pkgs; [ … ]` list it interpolates into. `checkablePackages` sorts the two apart,
+ * and a dotted name fails open rather than being refused.
  *
- * Refused rather than escaped. There is no legitimate nixpkgs attribute this rejects, so
- * escaping would add a quoting scheme to be subtly wrong about in exchange for nothing.
+ * Refused rather than escaped. There is no legitimate nixpkgs attribute name — as opposed
+ * to attribute PATH — that this rejects, so escaping would add a quoting scheme to be
+ * subtly wrong about in exchange for nothing.
  */
 const ATTRIBUTE = /^[A-Za-z0-9_+-]+$/;
+
+/**
+ * The declared names this check can actually evaluate, and the ones it cannot.
+ *
+ * Pure, and separate from the expression, because "cannot ask" and "must not interpolate"
+ * are two different judgements about a name and collapsing them produced a false refusal:
+ * a dotted path was reported as "not a nixpkgs attribute name" on the reasoning that nix
+ * would reject it too, which it does not.
+ *
+ * Everything that is not a bare attribute is skipped, without sorting the merely
+ * unaskable (`python3Packages.requests`) from the outright hostile (`jq"; x`). The
+ * outcome for both is the same — not evaluated, not refused — so a second pattern to
+ * tell them apart would be a distinction this function does not act on.
+ */
+export const checkablePackages = (
+  packages: readonly string[],
+): { readonly checkable: readonly string[]; readonly skipped: readonly string[] } => {
+  const checkable: string[] = [];
+  const skipped: string[] = [];
+  for (const name of packages) {
+    if (ATTRIBUTE.test(name)) checkable.push(name);
+    else skipped.push(name);
+  }
+  return { checkable, skipped };
+};
 
 /**
  * Everything a human might type differently for the same attribute, collapsed.
@@ -337,15 +364,26 @@ export class ToolchainDoctor {
     const packages = declared?.packages;
     if (packages === undefined || packages.length === 0) return undefined;
 
+    // A name this expression cannot ask about is not evidence of anything. A dotted path
+    // is the case that matters: `generatedFlake` builds it, so refusing it here would
+    // reject a toolchain that works. The rest of the list is still checked.
+    const { checkable, skipped } = checkablePackages(packages);
+    if (skipped.length > 0) {
+      this.logger?.debug("toolchain.doctor-unaskable", { packages: skipped.join(",") });
+    }
+    if (checkable.length === 0) return undefined;
+
     let expression: string;
     try {
-      expression = packageCheckExpression(this.config.nixpkgs, packages);
+      // Unreachable via `checkable`, which is filtered on the same whitelist the
+      // expression enforces. Kept because the expression owns that guard, and a caller
+      // reaching it another way must not get a half-built expression.
+      expression = packageCheckExpression(this.config.nixpkgs, checkable);
     } catch (error) {
-      // A name so malformed it cannot be put in an expression cannot resolve either, so
-      // this is a real refusal rather than a fail-open: nix would reject it too.
-      return `\`toolchain.packages\` contains something that is not a nixpkgs attribute name: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
+      this.logger?.debug("toolchain.doctor-skipped", {
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
     }
 
     const answer = await this.nix
