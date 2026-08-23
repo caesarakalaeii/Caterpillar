@@ -1228,6 +1228,41 @@ test("a worktree holding commits the remote has not seen keeps them", async () =
   assert.ok(existsSync(join(reused, "local-only")), "and the file only it carries with it");
 });
 
+test("a worktree an agent moved off its own branch is left alone, not merged into", async () => {
+  // `refspecs` already carries the evidence that this happens: an agent that ran
+  // `git checkout` reproduced the mirror-fetch refusal under a branch name no pattern
+  // could match, which is why the held set comes from `worktree list` rather than from a
+  // convention. So the catch-up cannot assume HEAD is on `agent/<task>`.
+  //
+  // Getting it wrong is not a missed opportunity, it is damage: `merge --ff-only` while the
+  // worktree stands on `main` would fast-forward MAIN onto the task branch, and the agent's
+  // next push — pinned to the current branch by `remote.origin.push = HEAD` — would deliver
+  // unreviewed task commits to the default branch.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("WANDERED-1");
+  const subject = manager(root);
+  const pushed = await pushAgentBranch(root, REPO, task, "work from another runner\n");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  // The mirror's default branch is behind the task branch here, which is exactly the shape
+  // that makes a stray `merge --ff-only` succeed and therefore be dangerous.
+  await git.run("checkout", "-B", "wandered", `${pushed}~1`);
+  const before = (await git.run("rev-parse", "HEAD")).trim();
+
+  const reused = await subject.ensureWorktree(REPO, task);
+  const after = new Git(String(reused), HERMETIC);
+
+  assert.equal(
+    (await after.run("rev-parse", "HEAD")).trim(),
+    before,
+    "a worktree standing on another branch must not be fast-forwarded onto the task branch",
+  );
+  assert.equal((await after.run("rev-parse", "--abbrev-ref", "HEAD")).trim(), "wandered");
+});
+
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
   // Feeds `review/tdd.ts`, whose whole subject is the ORDER — so oldest-first is the
   // contract, not a detail. `git log` defaults to newest-first, which would invert every
