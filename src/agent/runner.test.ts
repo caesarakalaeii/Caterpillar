@@ -800,6 +800,35 @@ test("the same task_note twice in one session reaches the tracker once", async (
   assert.ok(existsSync(effects), "the runner must record its effects in the state repo");
 });
 
+test("a refused publish_artifact stays retryable once the file exists", async () => {
+  // The runner PRODUCES the `stored` flag that decides whether a publish is recorded as a
+  // landed effect (§4.4); tools.test.ts covers only the consumer, with its own fake publish.
+  // A refusal wrongly reported as stored is recorded, and every later replay of the same
+  // arguments is handed the refusal back — the file can then never be stored at all.
+  const { runner, faux } = buildRunner(200_000);
+  const publish = { name: "scan.json", path: "scan.json", note: "the sublevel scan" };
+
+  faux.setResponses([
+    // Refused: nothing has written scan.json yet, so the runner cannot read it.
+    fauxAssistantMessage(fauxToolCall("publish_artifact", publish), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("bash", { command: "echo '{}' > scan.json" }), {
+      stopReason: "toolUse",
+    }),
+    // Same arguments, and now storable. A recorded refusal would replay instead.
+    fauxAssistantMessage(fauxToolCall("publish_artifact", publish), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("done", { summary: "published" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(spec, state({ sessions: 9 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  assert.deepEqual(await store.listArtifacts(TASK), ["scan.json"]);
+  assert.equal((await store.readArtifact(TASK, "scan.json"))?.toString().trim(), "{}");
+});
+
 test("a forge that cannot be reached does not fail the session", async () => {
   // Invariant 6, and the same rule tracker mirroring follows: log and continue. A GitHub
   // hiccup must not cost a task its session, and the review is not the work.
