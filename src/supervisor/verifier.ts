@@ -371,6 +371,20 @@ export class AcceptanceVerifier {
           case "failure":
             return { passed: false, detail: `CI is red — ${where}${status.summary}` };
           case "none":
+            if (status.refAbsent === true) {
+              // The branch is gone, and this loop only runs for a repo the task HAS a pull
+              // request in — so the work reached a pull request and the branch it came from
+              // was deleted afterwards, which is what merging through the GitHub UI does by
+              // default. Nothing in the fleet deletes a task branch, so a human did, and a
+              // human deletes it when the change has landed. That is a finished task, not a
+              // task with no CI: the warning below is about a repo that configured none, and
+              // it would send a reader looking for a workflow that was never missing.
+              notes.push(
+                `${where}the branch no longer exists, so nothing reported CI: ` +
+                  `pull request #${pr.number} was merged and its head branch deleted`,
+              );
+              break;
+            }
             // No CI configured is not the same as CI passing, but failing here would
             // make the task unfinishable in a repo without CI. Accept with a warning
             // recorded in the journal so the gap is visible rather than silent.

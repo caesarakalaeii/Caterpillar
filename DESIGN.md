@@ -3530,6 +3530,28 @@ Only then `status = done`, Discord gets the terminal message, and the supervisor
 tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
 
+> **A branch that is gone reads as no CI signal, and on a task with a pull request that
+> means the work landed.** Merging through the GitHub UI deletes the head branch by default,
+> and the checks endpoint then answers `422 No commit found for SHA: <ref>`. That was read as
+> a transport failure and thrown, which failed the whole *session* rather than the one
+> question being asked — so the task could not reach a verdict at all, in any session, ever.
+> `BS-1540288291008684052-04` landed as `caesarakalaeii/all-chat#748` and was still parked
+> nine sessions later with every acceptance criterion passing on the default branch.
+>
+> A ref that does not exist reports nothing, and `conclusion: "none"` is already the word for
+> that. Narrowly: only 404 and 422, and only when *both* check endpoints say they cannot find
+> the ref. A 500 genuinely is a broken API and must keep throwing, because gate 2 passes on
+> `none` — reading an outage as "nothing ran" would pass a task whose CI was never consulted.
+>
+> Gate 2 then distinguishes the two `none`s, because they are different events with the same
+> verdict. The gate's loop runs once per pull request the task *has*, so `refAbsent` inside it
+> means the work reached a pull request and the branch it came from was deleted afterwards.
+> Nothing in the fleet deletes a task branch — so a human did, and a human does that when the
+> change has landed. It passes, and it says so in those words. The standing "completion rests
+> on acceptance criteria alone where CI is absent" warning is *not* used here: that sentence
+> is true of a repo which configured no CI and false of a merged pull request whose CI ran, and
+> it would send a reader looking for a workflow that was never missing.
+
 > **A missing interpreter makes this gate unsatisfiable, not failed.** Acceptance commands
 > run in the runner's container, so a toolchain absent from it fails every task that needs
 > one no matter what the agent does. Observed: a repo whose tests run through `tools/test.py`
