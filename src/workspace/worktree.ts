@@ -534,6 +534,13 @@ export class WorktreeManager {
    * local modifications, and declines on a divergence, so the failure modes it does not fix
    * it reports: the throw below is the invariant's second half, and a session that refuses
    * to start leaves both histories intact for a human, which is what GH-95 did by hand.
+   *
+   * Only ever on `agent/<task>` itself, and that check is not a formality. An agent that ran
+   * `git checkout` is documented elsewhere in this file (§`refspecs`), and merging the task
+   * branch into whatever it is standing on would be worse than the bug: on `main` it
+   * fast-forwards the default branch, which `remote.origin.push = HEAD` then makes the
+   * agent's next push deliver. A wandered worktree is left exactly as it is — what the
+   * remote holds is not lost, and the branch is still there to check out.
    */
   private async catchUpWorktree(
     repo: RepoRef,
@@ -541,11 +548,14 @@ export class WorktreeManager {
     branch: string,
     path: string,
   ): Promise<void> {
+    const git = this.git.at(path);
+    const on = await git.tryRun("symbolic-ref", "--short", "--quiet", "HEAD");
+    if (on.code !== 0 || on.stdout.trim() !== branch) return;
+
     const mirror = await this.commonDir(path);
     const remote = await this.fetchAgentBranch(mirror, task, branch);
     if (remote === undefined) return;
 
-    const git = this.git.at(path);
     const head = await git.revParse("HEAD");
     if (head === remote) return;
 

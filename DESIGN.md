@@ -260,9 +260,12 @@ Both checkout paths enforce it:
   not gets a throw, because nothing in the runner can choose between two histories: forcing
   would discard commits that exist nowhere else, and starting on the local ref is the drift
   the rule exists to stop.
-- *Reusing* one runs `merge --ff-only` onto the remote tip. A worktree that is ahead is left
-  alone — those commits exist nowhere else — and a divergence or a dirty tree makes the merge
-  decline, which becomes the same refusal.
+- *Reusing* one runs `merge --ff-only` onto the remote tip, and only while HEAD is actually
+  on `agent/<task>`. A worktree that is ahead is left alone — those commits exist nowhere
+  else — and a divergence or a dirty tree makes the merge decline, which becomes the same
+  refusal. A worktree an agent moved off its own branch is left alone too: merging the task
+  branch into `main` would fast-forward the default branch, which `remote.origin.push = HEAD`
+  would then make the agent's next push deliver.
 
 The fetch names origin's **URL**, not the remote `origin`. A configured `+refs/*:refs/*` is
 applied opportunistically alongside an explicit refspec, so fetching by remote name also
