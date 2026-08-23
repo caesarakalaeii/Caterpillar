@@ -68,11 +68,7 @@ import type { IntakeStatus } from "../intake/status.ts";
 import { lookupPolicy } from "../remediation/policy.ts";
 import type { AlertDelivery, AlertPass } from "../remediation/queue.ts";
 import type { AlertResolution, FiringAlert } from "../remediation/receiver.ts";
-import {
-  describeVerdict,
-  settleWindowSeconds,
-  type ReverifyVerdict,
-} from "../remediation/verify.ts";
+import { describeVerdict, settleWindowSeconds } from "../remediation/verify.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -3188,21 +3184,19 @@ export class Supervisor {
         // unrelated bare commit happened to stage it. The reset that lets a re-fire become
         // work again has to land with the park that motivates it, or the two disagree in git.
         //
-        // `settled` is read back out because the decision is made inside the closure: `due`
-        // reached its verdict without a lease, and this is the one that is acted on.
-        let settled: ReverifyVerdict | undefined;
-        let line = "";
-
-        const cleared = await this.unit(async () => {
-          settled = await this.reverifier.settle(task);
+        // The verdict is reached INSIDE the unit — `due`'s was reached without a lease — and
+        // handed back out, so the notification below quotes the sentence that was journalled
+        // rather than a second rendering of it.
+        const outcome = await this.unit(async () => {
+          const settled = await this.reverifier.settle(task);
           if (settled === undefined) return undefined;
-          line = describeVerdict(settled);
+          const line = describeVerdict(settled);
 
           if (settled.kind === "cleared") {
             await store.appendJournal(state.id, state.sessions, `**Re-verified:** ${line}.`);
             await this.transition(handle, state, "done");
             await this.push(handle, `chore(${task}): done`);
-            return true;
+            return { cleared: true, line, kind: settled.kind };
           }
 
           // Parked, not `done` and not `failed`. The work merged and every gate passed, so
@@ -3221,11 +3215,12 @@ export class Supervisor {
           );
           await this.transition(handle, state, "parked");
           await this.push(handle, `chore(${task}): parked`);
-          return false;
+          return { cleared: false, line, kind: settled.kind };
         });
 
-        if (cleared === undefined || settled === undefined) continue;
-        logger.info("reverify.verdict", { task, alertname, verdict: settled.kind, detail: line });
+        if (outcome === undefined) continue;
+        const { cleared, line } = outcome;
+        logger.info("reverify.verdict", { task, alertname, verdict: outcome.kind, detail: line });
 
         // Outside the unit, both of them, exactly as every other outcome in this class does
         // it: the tracker and Discord are views of what git already says, and holding the
