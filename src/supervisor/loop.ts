@@ -65,8 +65,8 @@ import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
 import type { IntakeStatus } from "../intake/status.ts";
-import type { AlertPass } from "../remediation/queue.ts";
-import type { FiringAlert } from "../remediation/receiver.ts";
+import type { AlertDelivery, AlertPass } from "../remediation/queue.ts";
+import type { AlertResolution, FiringAlert } from "../remediation/receiver.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -180,7 +180,7 @@ export interface Intake {
 
 /** Whatever the webhook accepted since the last poll (§20). Implemented by `AlertQueue`. */
 export interface AlertSource {
-  drain(): readonly FiringAlert[];
+  drain(): AlertDelivery;
 }
 
 /** Firing alerts → remediation specs (DESIGN.md §20). Implemented by `AlertProcessor`. */
@@ -189,6 +189,7 @@ export interface AlertIngester {
     alerts: readonly FiringAlert[],
     remote: string,
     branch: string,
+    resolutions?: readonly AlertResolution[],
   ): Promise<AlertPass>;
 }
 
@@ -1151,11 +1152,16 @@ export class Supervisor {
     if (alerts === undefined) return;
 
     const queued = alerts.queue.drain();
-    if (queued.length === 0) return;
+    if (queued.alerts.length === 0 && queued.resolutions.length === 0) return;
 
     try {
       logger.info("alert.pass", {
-        ...(await alerts.ingester.process(queued, "origin", config.stateRepo.branch)),
+        ...(await alerts.ingester.process(
+          queued.alerts,
+          "origin",
+          config.stateRepo.branch,
+          queued.resolutions,
+        )),
       });
     } catch (error) {
       logger.warn("alert.pass-failed", errorFields(error));

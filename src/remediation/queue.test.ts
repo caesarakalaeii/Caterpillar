@@ -272,7 +272,7 @@ test("the happy path writes a spec carrying the policy's acceptance commands ver
 
   const pass = await processor(store, notifier).process([alert()], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 1, created: 1, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 1, created: 1, duplicate: 0, refused: 0, resolved: 0 });
 
   const spec = store.specs[0];
   assert.ok(spec !== undefined);
@@ -415,7 +415,7 @@ test("a policy that does not parse refuses nothing and records nothing", async (
     maxSessionsPerTask: 20,
   }).process([alert()], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 1, created: 0, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 1, created: 0, duplicate: 0, refused: 0, resolved: 0 });
   assert.equal(store.refusals.size, 0);
   assert.equal(store.specs.length, 0);
   assert.equal(store.commits.length, 0);
@@ -428,7 +428,7 @@ test("an empty drain reads no policy and pushes nothing", async () => {
 
   const pass = await processor(store, notifier).process([], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 0, created: 0, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 0, created: 0, duplicate: 0, refused: 0, resolved: 0 });
   assert.equal(store.commits.length, 0);
 });
 
@@ -443,7 +443,7 @@ test("the queue is bounded and drops rather than growing", () => {
   assert.equal(queue.submit(alert()), false);
   assert.equal(queue.size, 3);
 
-  assert.equal(queue.drain().length, 3);
+  assert.equal(queue.drain().alerts.length, 3);
   assert.equal(queue.size, 0);
   // Swapped rather than emptied in place, so room is available immediately after a drain.
   assert.equal(queue.submit(alert()), true);

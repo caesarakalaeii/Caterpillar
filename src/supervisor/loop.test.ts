@@ -2838,7 +2838,7 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
     toolchain: TEST_TOOLCHAIN,
     alerts: {
       queue: {
-        drain: () => alerts.splice(0, alerts.length),
+        drain: () => ({ alerts: alerts.splice(0, alerts.length), resolutions: [] }),
       },
       ingester: (() => {
         let first = true;
@@ -2852,7 +2852,13 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
               first = false;
               return Promise.reject(new Error("push rejected"));
             }
-            return Promise.resolve({ seen: queued.length, created: 0, duplicate: 0, refused: 0 });
+            return Promise.resolve({
+              seen: queued.length,
+              created: 0,
+              duplicate: 0,
+              refused: 0,
+              resolved: 0,
+            });
           },
         };
       })(),

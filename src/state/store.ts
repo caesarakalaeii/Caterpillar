@@ -80,6 +80,37 @@ export interface AlertRefusal {
   readonly task?: TaskId;
   /** Stamped by the writer, for an operator wondering how long this has been so. */
   readonly at?: string;
+  /**
+   * Set while a merged fix for this alert is being re-verified (DESIGN.md §20). Absent
+   * before the merge, and cleared once a verdict is reached.
+   */
+  readonly verify?: AlertVerification;
+}
+
+/**
+ * A merged remediation fix, and what Alertmanager has said since (DESIGN.md §20).
+ *
+ * Lives on the alert record rather than on `state.json` because the fingerprint is what
+ * the evidence is keyed by: the deliveries arrive at a receiver that knows a fingerprint
+ * and nothing about tasks, and `alerts/refusals/` is the one place this fleet already
+ * writes per-fingerprint facts. Putting it on the task's state would have made the alert
+ * path look up a task by fingerprint on every delivery, which is the join this record
+ * exists to avoid.
+ *
+ * A record here is also what makes the re-verification survive a deploy. Keel rolls the
+ * pod on every push to main and the settle window outlives that, so a window held in
+ * memory would be lost — and the task would go to `done` with nothing having checked, which
+ * is the exact silent success §20 closes.
+ */
+export interface AlertVerification {
+  /** When the pull request merged. Every other timestamp is compared against this. */
+  readonly mergedAt: string;
+  /** The window this fix gets, from the policy entry or the supervisor's default. */
+  readonly settleSeconds: number;
+  /** When Alertmanager last delivered this fingerprint as firing since the merge. */
+  readonly lastFiringAt?: string;
+  /** When Alertmanager delivered it as resolved. The only positive evidence of a clear. */
+  readonly resolvedAt?: string;
 }
 
 /** What became of one occurrence of one schedule. */
