@@ -258,6 +258,28 @@ test("the returned stdout is bounded too, for the callers that read it", async (
   }
 });
 
+test("a command cut off for time still gets its output, bounded", async () => {
+  // The two ceilings meet here, and this is the case that matters most: the runaway
+  // `npm test` this class exists for hits BOTH — it is killed for time AND it has already
+  // printed tens of thousands of lines. Both halves are asserted because both can break
+  // independently, and each break is silent:
+  //
+  //   - returning before the bound is applied streams the whole of a runaway's output to
+  //     the model, which is the context blowout the ceiling exists to stop;
+  //   - suppressing the view on failure hands the model nothing at all, and the partial
+  //     output is exactly what says how far the run got before it was cut off.
+  const { subject } = await env(2, SILENT_LOGGER, outputCeiling({ maxLines: 30 }));
+
+  const seen = await streamed(subject, "seq 1 200000; sleep 60");
+
+  assert.ok(seen.length > 0, "a cut-off command must still show what it managed to print");
+  assert.ok(
+    seen.split("\n").length <= 40,
+    `the model saw ${seen.split("\n").length} lines of a command that was killed`,
+  );
+  assert.match(seen, /lines shown/, "the elision must be stated on this path too");
+});
+
 test("a bounded command is logged, so an operator can see the window being spent", async () => {
   const { logger, lines } = recorder();
   const { subject } = await env(60, logger, outputCeiling({ maxLines: 25 }));
