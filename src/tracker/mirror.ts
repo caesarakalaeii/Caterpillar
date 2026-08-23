@@ -22,7 +22,8 @@ import type { Tracker, TrackerTransition } from "./types.ts";
 /**
  * The effect record, as mirroring needs it.
  *
- * Narrower than the agent's `EffectLedger`: a mirror has no result to replay, so the
+ * The same record as the agent's `EffectLedger` in `agent/tools.ts`, read through a
+ * narrower shape rather than a second mechanism: a mirror has no result to replay, so the
  * question is only "did this already land", and there is nothing to hand back.
  */
 export interface MirrorLedger {

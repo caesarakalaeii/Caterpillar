@@ -560,6 +560,23 @@ and the only way to be right. Which verbs skip on a replay is therefore decided 
 | `done`, `handoff`, `ask_human`, `submit_plan` | recorded, and they still signal: the sink is in memory and the record is not, so a resumed session that already claimed done must still stop |
 | `tracker.*` (§9.5) | skipped — a retried mirror already may not fail a task, and now may not double one either |
 
+**A recurring event needs an occurrence in its key.** A tool call inside one session is a
+one-shot: its arguments identify it, so hashing them is enough. A lifecycle transition is not.
+`{kind: "claimed", runner}` carries the pod name — `RUNNER_ID`, stable across restarts on a
+StatefulSet — so the second claim of a task by the same pod hashes to the first claim's id;
+`parked` reasons include fixed literals like `"cancelled from chat"`, and an agent may ask the
+same question twice. Keyed on arguments alone, those genuinely new events are all suppressed —
+and `claimed` is the only transition that removes `needs-human` and re-adds `agent-wip`, so the
+issue keeps advertising for help nobody needs. That is the regression §9.5 records as an
+amendment already made once.
+
+So `mirrorTransition` hashes the transition **and the task's session index**. That index is the
+window a replay lives in: `sessions` counts *completed* sessions, so a pod killed between the
+tracker comment and the state write is reclaimed at the same index and collapses, while a park
+a human answered opens a new session and mirrors normally. A discriminator per mirror *attempt*
+would be wrong in the other direction — it could never match, making the record dead weight.
+The index keys the record only; the tracker never sees it.
+
 Every read and write of the record swallows its own errors. A ledger failure means the state
 repo could not be reached, which says nothing about whether the effect landed, and failing a
 verb that has already happened is worse than performing it twice. For the same reason a mirror
@@ -2903,13 +2920,20 @@ done          → only after §12 gates pass: comment with PR link, unlabel agen
 parked        → comment with the reason, remove agent-wip
 ```
 
-Every one of those transitions is mirrored **at most once**, keyed on the transition and its
-arguments in the task's effect record (§4.4). A mirror happens after the authoritative git
-write, so a pod killed in between comes back and replays it — and a duplicate comment on a
-tracker item is permanent, reading to the human it is for as an agent that has lost track of
-what it has said. A mirror may not *fail* a task, and it may not *double* one. A mirror that
-threw is deliberately not recorded, so the next attempt still happens; two parks for two
-different reasons are two effects, because the key is the arguments and not the kind.
+Every one of those transitions is mirrored **at most once per occurrence**, keyed in the task's
+effect record (§4.4) on the transition, its arguments, and the session index it happened in. A
+mirror happens after the authoritative git write, so a pod killed in between comes back and
+replays it — and a duplicate comment on a tracker item is permanent, reading to the human it is
+for as an agent that has lost track of what it has said. A mirror may not *fail* a task, and it
+may not *double* one. A mirror that threw is deliberately not recorded, so the next attempt
+still happens; two parks for two different reasons are two effects, because the key is the
+arguments and not just the kind.
+
+The session index in that key is load-bearing, and §4.4 makes the case: these transitions
+*recur* with byte-identical arguments, unlike a tool call inside one session. `claimed` carries
+only the pod name, so without it the second claim of a task by the same pod is silently skipped
+— and a claim is the only thing that clears `needs-human`, which is the very failure the
+amendment below was made to fix.
 
 `needs-human` is cleared on claim and on done (**amended** after the first
 intake-sourced task finished `done`, closed, and still wearing it). A claim is the only
@@ -4311,7 +4335,7 @@ state transition is typed and auditable.
 
 **Every one of them is idempotent, and by the same mechanism.** Each verb takes an
 `EffectLedger` — two callbacks the supervisor binds to that task's effect record (§4.4) — and
-consults it before acting. `open_pr` was the only verb that survived being called twice; now
+consults or updates it before acting. `open_pr` was the only verb that survived being called twice; now
 `task_note` posted twice with the same text comments once, a replayed `publish_artifact` hands
 back what the first call stored, and `done`, `handoff`, `ask_human` and `submit_plan` still
 signal on a replay because their signal is in memory and the record is not. §4.4 has the table

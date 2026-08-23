@@ -340,9 +340,13 @@ export const askHumanTool = (ctx: ToolContext): AgentTool<typeof AskHumanParams,
     }
     // The signal is set whether or not this is a replay. It lives in memory and the record
     // does not, so a resumed session that already asked must still STOP — one that recorded
-    // the verb and then declined to signal would keep running with nothing left to do. What
-    // the record buys here is the tracker mirror: `mirrorTransition` keys the comment and
-    // the `needs-human` label on the same call, so the question is not posted twice (§9.5).
+    // the verb and then declined to signal would keep running with nothing left to do.
+    //
+    // So the record here is write-only: nothing reads it back, and it is kept for the audit
+    // trail — which verbs a session actually reached, when the transcript is gone. The
+    // tracker comment and the `needs-human` label are made idempotent separately, by
+    // `mirrorTransition`'s own `tracker.question` record (§9.5); it does not consult this
+    // one.
     ctx.control.signal = {
       reason: "ask-human",
       summary: `asked: ${params.question}`,
