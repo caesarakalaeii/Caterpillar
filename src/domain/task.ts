@@ -271,6 +271,23 @@ export interface PullRequestRef {
  */
 export interface TaskPullRequest extends PullRequestRef {
   readonly repo: RepoRef;
+  /**
+   * The branch the pull request was opened FROM, which is what makes two PRs in one repo
+   * distinguishable (DESIGN.md §9.4.1).
+   *
+   * `open_pr` replaces an entry rather than appending, so that a session retrying a failed
+   * call does not leave the completion gate two numbers for one repository. Keyed on the
+   * repo alone that rule also dropped pull requests that were never a retry: on
+   * `BS-1539685872142647429-04` the task opened its deliverable from its own agent branch,
+   * then opened a side-fix for a CI flake from `fix/discord-listener-reconnect-test-hang`,
+   * and the second replaced the first. The gate then merged only the side-fix, marked the
+   * task done and reaped the worktree; the deliverable (all-chat#758) stayed open with
+   * nothing left to ever merge it. A retry is the same repo AND the same branch.
+   *
+   * Absent on state written before this existed, which the replacement rule reads as the old
+   * repo-only key — a rolling deploy has both shapes in the state repo at once.
+   */
+  readonly head?: string;
 }
 
 /**

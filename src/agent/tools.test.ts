@@ -389,6 +389,28 @@ test("re-opening against the same repo replaces its entry rather than adding one
   assert.equal(control.prs?.[0]?.number, 2, "the newer PR wins");
 });
 
+test("a second PR from a DIFFERENT branch in the same repo is kept, not replaced", async () => {
+  // Observed on `BS-1539685872142647429-04` (all-chat#758). The task opened its deliverable
+  // from `agent/BS-1539685872142647429-04`, then opened a side-fix for a CI flake from
+  // `fix/discord-listener-reconnect-test-hang`. Same repo, so the replace-by-repo rule above
+  // dropped the FIRST one — and the completion gate then approved and merged only the side
+  // fix, marked the task done, and reaped the worktree. The deliverable sat open for good.
+  //
+  // The retry case the rule exists for is same repo AND same head; a different head is a
+  // different pull request, so the key has to be both.
+  const { ctx, control } = harness();
+  const tools = controlTools(ctx);
+
+  await call(tools, "open_pr", { title: "deliverable", body: "b", head: "agent/T-04", base: "main" });
+  await call(tools, "open_pr", { title: "side fix", body: "b", head: "fix/ci-flake", base: "main" });
+
+  assert.deepEqual(
+    control.prs?.map((pr) => pr.number),
+    [1, 2],
+    "both PRs must be gated — dropping either leaves it unmerged forever",
+  );
+});
+
 test("a repo the task does not have is refused in prose, and the refusal says what is allowed", async () => {
   // The failure this replaces was a raw 422 from a repository the agent never asked for. A
   // refusal it can read is one it can correct inside the same turn; it is also the SCOPE — the

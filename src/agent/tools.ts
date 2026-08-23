@@ -205,11 +205,24 @@ export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrR
     }
 
     const pr = await ctx.forge.openPr(repo, params);
-    const opened: TaskPullRequest = { ...pr, repo };
-    // Replaced rather than appended, keyed on the repo: a session that retries after a failed
-    // call must not leave the completion gate two numbers for one repository.
+    const opened: TaskPullRequest = { ...pr, repo, head: params.head };
+    // Replaced rather than appended, keyed on the repo AND the head branch: a session that
+    // retries after a failed call must not leave the completion gate two numbers for one
+    // repository. The head is half the key because without it this dropped PRs that were never
+    // retries — `BS-1539685872142647429-04` opened its deliverable from its agent branch and a
+    // CI-flake side-fix from `fix/discord-listener-reconnect-test-hang`, and the second evicted
+    // the first. Only the side-fix was gated and merged, the task went `done`, and the
+    // deliverable (all-chat#758) was left open with nothing that would ever merge it.
+    //
+    // An entry with no head is state written before the field existed, and the key it was
+    // stored under was the repo alone, so it keeps the old meaning and is still replaced.
     const existing = ctx.control.prs ?? [];
-    ctx.control.prs = [...existing.filter((p) => !sameRepo(p.repo, repo)), opened];
+    ctx.control.prs = [
+      ...existing.filter(
+        (p) => !sameRepo(p.repo, repo) || (p.head !== undefined && p.head !== params.head),
+      ),
+      opened,
+    ];
 
     return {
       content: [

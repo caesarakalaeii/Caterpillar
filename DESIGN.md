@@ -2588,6 +2588,18 @@ written together, and that is not redundancy — every reader that only wants so
 which is the only PR a session could open then; a rolling deploy has both shapes in the state
 repo at once, so that is a live path rather than a migration nicety.
 
+**An entry is keyed on the repo AND the head branch.** `open_pr` replaces rather than appends, so
+that a session retrying a failed call does not leave the gate two numbers for one repository —
+it would check the stale one and merge the stale one. Keyed on the repo alone, though, that rule
+also evicted pull requests that were never retries. `BS-1539685872142647429-04` opened its
+deliverable from its own agent branch, then opened a side-fix for a CI flake from
+`fix/discord-listener-reconnect-test-hang`; the second replaced the first, so the gate approved
+and merged only the side-fix, marked the task `done` and reaped the worktree. The deliverable
+(`all-chat#758`) stayed open with nothing left that would ever merge it, and the task's own
+`state.json` pointed at the wrong PR. A retry is the same repo *and* the same branch; a different
+branch is a different pull request. An entry with no `head` is state written before the field
+existed, stored under the repo-only key, so it keeps the old meaning and is still replaced.
+
 **The gate checks every repo and stops at the first red.** All of them, because the work is one
 change and half of it being green is not it passing; the first failure rather than a collected
 report, because a red suite in one repo is a full session's work whether or not the other is
@@ -2602,8 +2614,41 @@ Continuing past a failure would land exactly that broken intermediate.
 
 A **partial** merge names what did land. It is the one outcome where "could not merge" on its own
 is actively misleading — some of the change is on the default branch, and a human cannot decide
-what to do about the rest without knowing which half. `mergeReviewed` still never fails the
-task, for the reason it never did.
+what to do about the rest without knowing which half.
+
+**`mergeReviewed` answers with a kind, and a refused merge PARKS the task.** It never throws and
+it never marks the task `failed` — the work passed every gate, so nothing about it is wrong — but
+it no longer lets the task reach `done` either. The three kinds exist because `merged: false`
+was answering two unrelated questions at once:
+
+- `skipped` — no PR was recorded, or the workspace has no reviewer identity. Merging was never
+  this system's job here, so the task is no less complete for it. Treating this as a failure
+  would park every task on every runner that deliberately leaves landing to a human.
+- `failed` — the merge was attempted and the forge refused. The work is sound but the branch will
+  not land without a human, almost always a rebase.
+- `merged` — every PR landed.
+
+`done` is the one status `/resume` refuses and the one that reaps the checkout, so calling a
+refused merge `done` made the failure **permanent**: nothing automated would ever retry it, and
+the only trace was one `warn`-level `pr.merge-failed` line. That is not hypothetical. Between
+2026-08-21 and 2026-08-23 it abandoned four pull requests on `all-chat` — #744, #746, #747 and
+#757 — each approved by the reviewer identity, each green, each refused with
+`405 Pull Request has merge conflicts` because a sibling in the same plan had landed first and
+moved the base underneath it. All four sat open until a human went looking for them.
+
+Parking rather than failing is also what makes the recovery cheap: `park` keeps the worktree, and
+`/resume` puts the task back to `ready` on the same branch, so the rebase does not pay for a
+fresh clone and a full dependency install. The park reason is `merge.note`, so the forge's own
+words reach Discord — and on a partial multi-repo merge it still names which repos DID land.
+
+**And the false `done` is what CAUSED those conflicts.** `isClaimable` holds a task until every
+entry in `plan.blockedBy` reads `done` — `parked` does not satisfy it. The four abandoned PRs were
+one plan: `BS-1540288291008684052-01` was wave 0, and `-02` through `-05` were wave 1, each
+`blockedBy: ["-01"]`. `-01`'s merge was refused at 12:22:49, it was marked `done` anyway, and that
+released the whole of wave 1 to run and land — which moved the base underneath `-01` and turned
+its one refused merge into three more. So this is not only a fix for losing work after a failed
+merge; it closes the loop that manufactures the failures. A wave gate that accepts a task whose
+change never landed is not a gate.
 
 **The system prompt says so.** A tool that can do a thing an agent does not know about is a tool
 that does not exist: the sibling-layout paragraph now says to call `open_pr` once per repo, and
