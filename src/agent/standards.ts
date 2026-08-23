@@ -264,8 +264,12 @@ export class RepoStandardsError extends Error {
  *
  * `###` and below are left alone: they nest UNDER the `###` a section is rendered with, so
  * a repo structuring its own rule is doing nothing a prompt has to be protected from.
+ *
+ * Up to three leading spaces, because CommonMark reads those as a heading too and a guard
+ * anchored at column zero is one an attacker walks around with a space. Four is an indented
+ * code block, which renders as code inside the repo's own section and needs no guarding.
  */
-const HEADING = /^(#{1,2}) +(.*)$/;
+const HEADING = /^ {0,3}(#{1,2}) +(.*)$/;
 
 /** A well-formed section heading, after the `##`: `<lens>: <title>`. */
 const OWNED = /^([A-Za-z-]+) *: *(.+?) *$/;
@@ -295,7 +299,11 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
   }
   if (text.trim().length === 0) return [];
 
-  const lines = text.split("\n");
+  // Windows checkouts and web editors write `\r\n`, and a trailing `\r` on every line would
+  // stop `HEADING` matching at all — every line becomes stray text and a perfectly good file
+  // is refused for not having the heading it opens with. `\r?\n` is how the rest of this
+  // codebase reads user-authored markdown (`src/state/store.ts`, `src/intake/spec.ts`).
+  const lines = text.split(/\r?\n/);
   const headings = lines.flatMap((line, index) => {
     const heading = HEADING.exec(line);
     if (heading === null) return [];
