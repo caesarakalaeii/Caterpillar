@@ -54,7 +54,13 @@ const ROWS_PER_MESSAGE = 5;
 /** Discord's limits on the modal frame. Over either is a 400. */
 const MODAL_TITLE_LIMIT = 45;
 const LABEL_LIMIT = 45;
-const TEXT_INPUT_LIMIT = 4000;
+/**
+ * Discord's cap on a text input's `value` and `max_length`.
+ *
+ * Exported because a caller that PRE-FILLS a box has to bound what it puts in it, and the
+ * only honest answer above the cap is to refuse — see `amendModal`.
+ */
+export const TEXT_INPUT_LIMIT = 4000;
 
 export interface Button {
   readonly type: typeof COMPONENT.button;
@@ -97,8 +103,22 @@ export interface Modal {
  * `opt` is one enumerated answer to a question, and its `arg` is the option's INDEX rather
  * than its text — the text is stored beside the question in the state repo, because an
  * option long enough to be worth a button is long enough to break the 100.
+ *
+ * `amd` is `/amend`: replace a task's acceptance criteria (§12.3). Abbreviated for the same
+ * reason the rest are — the criteria themselves never travel in a `custom_id`, they are
+ * pre-filled into the modal the press opens.
  */
-export type Verb = "ans" | "opt" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no" | "done";
+export type Verb =
+  | "ans"
+  | "opt"
+  | "park"
+  | "merge"
+  | "res"
+  | "back"
+  | "plan-ok"
+  | "plan-no"
+  | "done"
+  | "amd";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -148,7 +168,18 @@ export const decodeCustomId = (raw: string): ButtonAction | undefined => {
 // Parallel to `Verb` by hand, and it has to stay that way: `isVerb` is a runtime check and
 // the union is erased, so a verb added to one and not the other type-checks and then decodes
 // as "unrecognised button" in front of whoever pressed it.
-const VERBS: readonly string[] = ["ans", "opt", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
+const VERBS: readonly string[] = [
+  "ans",
+  "opt",
+  "park",
+  "merge",
+  "res",
+  "back",
+  "plan-ok",
+  "plan-no",
+  "done",
+  "amd",
+];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
 
@@ -240,7 +271,69 @@ export const doneModal = (task: TaskId, fieldId: string): Modal | undefined =>
   });
 
 /**
- * The shape both modals share: one required paragraph box, keyed to a verb and a task.
+ * The two-field modal behind `/amend` and the Amend criteria button (DESIGN.md §12.3).
+ *
+ * The PRE-FILL is the feature. The three hand-edits that motivated amendments were one bad
+ * glob and two repo-wide gates, and in each case the other criteria were working commands
+ * nobody would retype to fix the broken one. So the box arrives holding the task's current
+ * EFFECTIVE criteria, one per line, and what comes back is the whole replacement list.
+ *
+ * Undefined rather than clipped when the criteria do not fit Discord's 4000-character
+ * input, and that is the one refusal worth spelling out: this box is submitted as a WHOLE
+ * replacement, so a truncated pre-fill would delete every criterion the box could not hold,
+ * on behalf of a human who never saw them. `/amend` cannot serve a list that long, and
+ * saying so is the only honest answer.
+ */
+export const amendModal = (options: {
+  readonly task: TaskId;
+  readonly acceptance: readonly string[];
+  readonly criteriaFieldId: string;
+  readonly whyFieldId: string;
+}): Modal | undefined => {
+  const customId = encodeCustomId({ verb: "amd", task: options.task });
+  if (customId === undefined) return undefined;
+
+  const prefill = options.acceptance.join("\n");
+  if ([...prefill].length > TEXT_INPUT_LIMIT) return undefined;
+
+  return {
+    custom_id: customId,
+    title: clamp(`Amend ${options.task}`, MODAL_TITLE_LIMIT),
+    components: [
+      {
+        type: COMPONENT.actionRow,
+        components: [
+          {
+            type: COMPONENT.textInput,
+            custom_id: options.criteriaFieldId,
+            label: clamp("Acceptance criteria, one per line", LABEL_LIMIT),
+            style: TEXT_INPUT_STYLE.paragraph,
+            required: true,
+            max_length: TEXT_INPUT_LIMIT,
+            value: prefill,
+          },
+        ],
+      },
+      {
+        type: COMPONENT.actionRow,
+        components: [
+          {
+            type: COMPONENT.textInput,
+            custom_id: options.whyFieldId,
+            label: clamp("Why the filed criteria cannot stand", LABEL_LIMIT),
+            style: TEXT_INPUT_STYLE.paragraph,
+            required: true,
+            max_length: TEXT_INPUT_LIMIT,
+          },
+        ],
+      },
+    ],
+  };
+};
+
+/**
+ * The shape both single-field modals share: one required paragraph box, keyed to a verb and
+ * a task.
  *
  * Factored out when the second one arrived rather than copied, because the part worth not
  * duplicating is not the literal — it is `required: true` and the `custom_id` round trip.
