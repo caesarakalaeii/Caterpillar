@@ -3769,7 +3769,10 @@ as a *peer* of the fleet's standards rather than as a rule inside a repository's
 That is the override the paragraph above forbids, with markdown for a payload. Every heading
 at `##` or above is therefore a section boundary and only a well-formed `## <lens>: <title>`
 is a valid one; `###` and below nest harmlessly and are left alone, because refusing them
-would make the format hostile to a repo structuring its own rule.
+would make the format hostile to a repo structuring its own rule. "At `##` or above"
+includes up to three leading spaces, which CommonMark also reads as a heading: a guard
+anchored at column zero is one a repo walks around by typing a space. Four spaces is an
+indented code block, renders as code inside the repo's own section, and needs no guard.
 
 A file this system cannot use **fails the session** rather than being skipped. The throw
 reaches `SupervisorLoop.parkFailed`, so the task parks with a reason naming the repo and the
