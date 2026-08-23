@@ -299,6 +299,81 @@ test("a repo with no CI still passes, and says so once per repo", async () => {
   assert.match(result.detail, /acceptance criteria alone/);
 });
 
+/* ─────────────────── the branch is gone because the work landed ─────────────────── */
+
+/**
+ * A forge whose ref does not exist — the shape both forges report for a deleted branch.
+ *
+ * `BS-1540288291008684052-04`'s work was merged by hand through the GitHub UI, which
+ * deletes the head branch by default. Nine sessions later the task was still parked, with
+ * every acceptance criterion passing on the default branch, because the gate could not be
+ * run at all: `checks` threw and the session died before it could reach a verdict.
+ */
+const absentRefForge = (): WorkspaceBindings => {
+  const forge = {
+    kind: "stub",
+    checks: (_repo: RepoRef, ref: string) =>
+      Promise.resolve({
+        conclusion: "none" as const,
+        summary: `ref '${ref}' does not exist`,
+        refAbsent: true,
+      }),
+    revoke: () => Promise.resolve(),
+  } as unknown as Forge;
+
+  return {
+    forges: new Map([
+      [asWorkspaceName("test"), { forTask: () => Promise.resolve(forge) }],
+    ]) as never,
+    trackers: new Map(),
+  };
+};
+
+test("a task whose branch is gone reaches a verdict instead of crashing", async () => {
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings: absentRefForge(),
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, true, result.detail);
+  assert.notEqual(result.pending, true);
+});
+
+test("a gone branch is reported as work that landed, not as a repo without CI", async () => {
+  // The two are both `none` and they are not the same event. "Completion rests on
+  // acceptance criteria alone where CI is absent" is a true sentence about a repo that
+  // configured no CI and a false one about a merged pull request whose CI ran and passed
+  // — it sends a reader looking for a missing workflow that was never missing.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings: absentRefForge(),
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.match(result.detail, /branch no longer exists/);
+  assert.match(result.detail, /merged/, "the reader has to be told why it is gone");
+  assert.doesNotMatch(
+    result.detail,
+    /acceptance criteria alone/,
+    "that warning is about a repo with no CI, which this is not",
+  );
+});
+
+test("an existing ref that simply reported nothing keeps the no-CI warning", async () => {
+  // The other half of the distinction, and the reason it needs a flag rather than a
+  // conclusion: a repo with no CI must not start reading as a landed change.
+  const worktree = await scratch();
+  const { bindings } = ciForge({ "o/r": "none" });
+  const result = await ciVerifier(worktree, bindings).verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, true, result.detail);
+  assert.match(result.detail, /acceptance criteria alone/);
+  assert.doesNotMatch(result.detail, /branch no longer exists/);
+});
+
 /**
  * The pending-CI regression. BS-...-07 was parked with a green branch and an open PR
  * because a CI run that had not finished was reported as a failed gate, the completion

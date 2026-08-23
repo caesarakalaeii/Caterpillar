@@ -616,6 +616,93 @@ test("the ordinary path still opens one PR and looks nothing up", async () => {
   assert.equal(routes.filter((r) => r.includes("/pulls?")).length, 0, "no lookup on the happy path");
 });
 
+/* ───────────────── a ref that no longer exists reports no CI, not a crash ───────────────── */
+
+/**
+ * Merging a pull request through the GitHub UI deletes the head branch by default, and
+ * `BS-1540288291008684052-04` was merged that way as `caesarakalaeii/all-chat#748`. Every
+ * session after it died on
+ *
+ *   422 {"message":"No commit found for SHA: agent/BS-1540288291008684052-04"}
+ *
+ * from the check-runs endpoint, so the task could never reach a verdict at all — it was not
+ * a task that failed the gate, it was a task no gate could be run on.
+ */
+test("a ref that does not exist reports no CI signal rather than throwing", async () => {
+  const { factory } = github(
+    withToken((route) => {
+      if (route.includes("/check-runs") || route.endsWith("/status")) {
+        return new Response(
+          JSON.stringify({ message: "No commit found for SHA: agent/GH-caesarakalaeii-all-chat-543" }),
+          { status: 422 },
+        );
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const status = await forge.checks(REPO, "agent/GH-caesarakalaeii-all-chat-543");
+
+  assert.equal(status.conclusion, "none");
+  assert.match(status.summary, /does not exist/, "the reason must survive into the journal");
+});
+
+test("a 404 for the ref is read the same way as the 422", async () => {
+  // GitHub is not consistent about which of the two an unknown ref gets, and a deleted
+  // branch is the same fact either way.
+  const { factory } = github(
+    withToken((route) => {
+      if (route.includes("/check-runs") || route.endsWith("/status")) {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  assert.equal((await forge.checks(REPO, "agent/gone")).conclusion, "none");
+});
+
+test("a 500 from the checks endpoints still throws — that is not 'no CI'", async () => {
+  // The whole point of narrowing this. A broken API read as "nothing ran" would let the
+  // §12 gate pass a task whose CI was never consulted.
+  const { factory } = github(
+    withToken((route) => {
+      if (route.includes("/check-runs") || route.endsWith("/status")) {
+        return new Response("upstream is having a moment", { status: 500 });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.checks(REPO, "agent/whatever"), /500/);
+});
+
+test("a live ref whose statuses 422 for another reason is not called 'no CI'", async () => {
+  // Only the ref's own absence is benign. A 422 while the check-runs half answered
+  // normally is a statement about the request, not about a missing branch, and reading it
+  // as "nothing ran" would drop half the CI signal silently.
+  const { factory } = github(
+    withToken((route) => {
+      if (route.includes("/check-runs")) {
+        return {
+          total_count: 1,
+          check_runs: [{ status: "completed", conclusion: "success", name: "build" }],
+        };
+      }
+      if (route.endsWith("/status")) {
+        return new Response(JSON.stringify({ message: "Validation Failed" }), { status: 422 });
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.checks(REPO, "agent/live"), /422/);
+});
+
 /* ─────────────────────── review comments as task guidance ─────────────────────── */
 
 /**
