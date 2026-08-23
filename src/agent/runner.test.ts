@@ -30,6 +30,7 @@ import {
   asTaskId,
   asWorkspaceName,
   type RepoRef,
+  type TaskId,
   type TaskSpec,
   type TaskState,
 } from "../domain/task.ts";
@@ -45,7 +46,11 @@ import type {
 import { AgentMetrics } from "../metrics/registry.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
-import { WorktreeManager } from "../workspace/worktree.ts";
+import {
+  WorktreeManager,
+  type CheckoutOptions,
+  type TaskCheckout,
+} from "../workspace/worktree.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
@@ -287,6 +292,9 @@ const state = (overrides: Partial<TaskState> = {}): TaskState => ({
 
 const buildRunner = (
   contextWindow: number,
+  // Substituted only by the test that has to observe HOW the checkout was asked for.
+  // Everything else wants the real manager these tests are built around.
+  checkouts: WorktreeManager = worktrees,
 ): {
   runner: AgentSessionRunner;
   faux: ReturnType<typeof fauxProvider>;
@@ -334,7 +342,7 @@ const buildRunner = (
     config,
     store,
     logger: SILENT_LOGGER,
-    worktrees,
+    worktrees: checkouts,
     credentials,
     llm: { models, model },
     bindings,
@@ -379,6 +387,63 @@ test("runs a session, executes tools in the worktree, and records a done claim",
 
   // The transcript is persisted even though the session ended via a control tool.
   assert.ok(existsSync(join(stateRepo, "tasks", TASK, "sessions", "001.jsonl.gz")));
+});
+
+test("a session's checkout insists the remote can be asked about its branch", async () => {
+  // The session runner is the only caller of `ensureTaskCheckout` that runs inside the
+  // task's credential lease — the progress probe, the verifier, the review council and the
+  // plan maintainer all run after `clearActive()` has closed the service (§9.2), where a
+  // fetch cannot succeed at all.
+  //
+  // That makes it the only caller for which "origin did not answer" is a fault rather than
+  // the expected state, and therefore the only one that may demand an answer. It has to say
+  // so: `mustReachRemote` defaults off precisely so the post-session callers keep working,
+  // so a runner that forgets to pass it gets the tolerant behaviour and GH-96 stays
+  // reachable through one expired credential.
+  //
+  // Asserted on the option the runner passes rather than on a failure, because "the session
+  // failed" is true with or without it — the fixture's origin is a local path that is always
+  // reachable, and rigging it unreachable would prove the manager's behaviour a second time
+  // instead of the runner's.
+  const asked: (CheckoutOptions | undefined)[] = [];
+
+  class RecordingWorktrees extends WorktreeManager {
+    override ensureTaskCheckout(
+      repos: readonly RepoRef[],
+      task: TaskId,
+      options?: CheckoutOptions,
+    ): Promise<TaskCheckout> {
+      asked.push(options);
+      return super.ensureTaskCheckout(repos, task, options);
+    }
+  }
+
+  const { runner, faux } = buildRunner(
+    200_000,
+    new RecordingWorktrees({
+      git,
+      mirrorsDir: mirrors,
+      tasksDir: tasks,
+      helperPath: "/nonexistent/caterpillar-cred",
+      socketDir: join(root, "cred"),
+      identity: { name: "caterpillar", email: "caterpillar@example.invalid" },
+    }),
+  );
+
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "nothing to do" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  await runner.run(spec, state());
+
+  assert.deepEqual(
+    asked,
+    [{ mustReachRemote: true }],
+    "the session's checkout must refuse a remote it cannot reach, not start on the base",
+  );
 });
 
 test("a retry storm's journal reaches the model collapsed, not in full", async () => {

@@ -161,7 +161,18 @@ export class AgentSessionRunner {
 
     try {
       // repos[0] is the workspace repo and becomes cwd; the rest land under repos/.
-      const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id);
+      //
+      // `mustReachRemote` because the `activate` above is what makes it answerable: this is
+      // the only checkout taken inside the task's credential lease, so a remote that will
+      // not say whether `agent/<task>` exists is a fault here and merely the expected state
+      // everywhere else (§9.2). Without it, one expired credential starts the session on
+      // the base with the previous sessions' pushed commits still upstream — which on GH-96
+      // cost a complete duplicate implementation of the task. The throw reaches
+      // `SupervisorLoop.parkFailed`, so the task parks with the reason in its journal
+      // instead of quietly redoing work.
+      const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id, {
+        mustReachRemote: true,
+      });
       const worktree = checkout.root;
       const recoveryNote = await this.recoverInterrupted(worktree);
 

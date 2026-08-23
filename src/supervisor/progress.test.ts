@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TaskState } from "../domain/task.ts";
-import { checkLimits, madeProgress, recordProgress } from "./progress.ts";
+import { checkLimits, committedLine, madeProgress, recordProgress } from "./progress.ts";
 
 const baseState = (overrides: Partial<TaskState> = {}): TaskState => ({
   id: asTaskId("TASK-1"),
@@ -135,4 +135,63 @@ test("the no-progress detector parks a thrashing task", () => {
 test("a healthy task continues", () => {
   const verdict = checkLimits(baseState(), { maxSessions: 20 }, { noProgressLimit: 3 });
   assert.equal(verdict.kind, "continue");
+});
+
+test("the committed line names the branch and the tip a session left behind", () => {
+  // GH-96: the sentence that would have stopped session 7 re-implementing the task.
+  // It has to be readable on its own, because the next session reads the journal
+  // without the state file open beside it.
+  assert.deepEqual(
+    committedLine(asTaskId("GH-96"), {
+      committed: true,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      headOid: "6a5db6f0000000000000000000000000000000ab",
+      baselineOid: "c320ff40000000000000000000000000000000cd",
+    }),
+    ["**Committed:** `agent/GH-96` is at `6a5db6f`, was `c320ff4`"],
+  );
+});
+
+test("the committed line is omitted when the branch did not move", () => {
+  // Nothing to say beats a line saying nothing: an entry that mentions the branch on
+  // every session teaches the reader to skip it, which costs exactly the sessions this
+  // line exists for.
+  assert.deepEqual(
+    committedLine(asTaskId("GH-96"), {
+      committed: false,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      headOid: "6a5db6f0000000000000000000000000000000ab",
+      baselineOid: "6a5db6f0000000000000000000000000000000ab",
+    }),
+    [],
+  );
+});
+
+test("the committed line still names the tip when there is no baseline to compare", () => {
+  // A first session, or a probe that could not resolve the fork point. The tip is the
+  // half that matters — it is what the next session checks its own HEAD against.
+  assert.deepEqual(
+    committedLine(asTaskId("GH-96"), {
+      committed: true,
+      acceptanceImproved: false,
+      stepCompleted: false,
+      headOid: "6a5db6f0000000000000000000000000000000ab",
+    }),
+    ["**Committed:** `agent/GH-96` is at `6a5db6f`"],
+  );
+});
+
+test("the committed line is omitted when the probe could not read a head at all", () => {
+  // A repo-less spec, or a worktree the probe could not open. Claiming a commit with no
+  // oid to check would be worse than silence: it is unfalsifiable by the next session.
+  assert.deepEqual(
+    committedLine(asTaskId("GH-96"), {
+      committed: true,
+      acceptanceImproved: false,
+      stepCompleted: false,
+    }),
+    [],
+  );
 });

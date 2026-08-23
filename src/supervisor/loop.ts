@@ -86,7 +86,7 @@ import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
 import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
-import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
+import { checkLimits, committedLine, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
 
 /**
@@ -2122,6 +2122,7 @@ export class Supervisor {
         [
           `**Exit:** ${outcome.reason}`,
           `**Context at exit:** ${outcome.contextTokens} tokens`,
+          ...committedLine(spec.id, evidence),
           "",
           outcome.summary,
         ].join("\n"),

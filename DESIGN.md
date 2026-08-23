@@ -236,6 +236,70 @@ property of every task on the repo, not of one invocation — and because `confi
 every worktree create *and* reuse, mirrors already on a PVC are healed the next time a task
 touches them.
 
+#### A session never starts behind `origin/agent/<task>`
+
+The exclusion above is load-bearing and it has a cost that took two tasks to find. Because
+the mirror never fetches `refs/heads/agent/*`, a mirror that does not already have a task's
+branch will **never learn one from the remote**. `addWorktreeLocked` used to decide a task's
+start point from that local ref alone, so every route to a missing or stale one — a runner
+that never worked this task, a reaped worktree, a mirror re-cloned after a failed fetch, or
+the branch reset GH-95 reported — looked identical to a task nobody had ever pushed, and the
+session started on the base.
+
+That is indistinguishable, to the agent, from a fresh task. On GH-96 sessions 2 and 3 pushed
+eighteen commits; session 7 started on `main`, re-implemented the entire task, and found out
+only when its push was refused as non-fast-forward. Two complete independent implementations
+of one task reached the remote and a human had to pick one.
+
+Rule: **if `origin/agent/<task>` exists, the session's worktree is at its tip or the session
+does not start.** Starting silently behind it is the one outcome that is not available.
+Both checkout paths enforce it:
+
+- *Creating* a worktree fetches the remote branch into `refs/remotes/origin/agent/<task>` and
+  starts there, fast-forwarding the local ref. A local ref that already *contains* the remote
+  tip is the start point instead — a session killed between a commit and a push leaves the
+  branch exactly there, routinely, and nothing on the remote is lost by resuming on it. Only
+  a true divergence gets a throw, because nothing in the runner can choose between two
+  histories: forcing would discard commits that exist nowhere else, and starting on the local
+  ref is the drift the rule exists to stop.
+- *Reusing* one runs `merge --ff-only` onto the remote tip, and only while HEAD is actually
+  on `agent/<task>`. A worktree that is ahead is left alone — those commits exist nowhere
+  else — and a divergence or a dirty tree makes the merge decline, which becomes the same
+  refusal. A worktree an agent moved off its own branch is left alone too: merging the task
+  branch into `main` would fast-forward the default branch, which `remote.origin.push = HEAD`
+  would then make the agent's next push deliver.
+
+The fetch names origin's **URL**, not the remote `origin`. A configured `+refs/*:refs/*` is
+applied opportunistically alongside an explicit refspec, so fetching by remote name also
+force-updates the local `refs/heads/agent/<task>` — reviving the refusal above and clobbering
+a divergent local branch before anything could look at it. `^refs/heads/agent/<task>` does
+not suppress that, because a negative refspec matches the *source* side and so cancels the
+mapping we asked for too. With a URL there is no configured remote to apply.
+
+**"The remote has no such branch" and "the remote could not be asked" are different
+answers.** A fetch reports both as a plain non-zero, so code that decides existence from a
+fetch tolerates a network fault exactly as much as it tolerates a first session — and one
+expired credential then starts a session on the base with the pushed work upstream, which is
+the same defect with every local ref correct. Existence is therefore settled by `git ls-remote
+--exit-code`, which exits 2 for a ref the remote does not have and 128 for a remote it could
+not read.
+
+What an unreachable remote *means* is the caller's to say, because it differs by caller:
+
+- The **agent session runner** holds the task's credential lease, so it passes
+  `mustReachRemote` and gets a throw. The task parks through `parkFailed` with git's own
+  message in its journal, where a human fixes a credential — instead of a session silently
+  starting from scratch.
+- The **progress probe, verifier, review council and plan maintainer** all check out the same
+  task *after* `clearActive()` has closed the credential service (§9.2), where a fetch on a
+  private repo cannot succeed. They keep the tolerant reading: a silent remote has nothing to
+  say, and the checkout proceeds on what is on disk. Being strict there would take
+  verification down on every private repo.
+
+The flag is passed explicitly rather than inferred from the environment — say, from the task's
+credential socket existing — so that the strictness is something one caller asks for in code a
+reader can grep for, not a property that changes underneath it.
+
 #### Worktrees are reaped, because they are what actually grows
 
 A mirror is fetched incrementally and its size tracks the repository's history. A worktree
@@ -371,6 +435,25 @@ rounding error on one model and a quarter of the budget on another.
 
 The collapse is deliberately CONSECUTIVE-only: parking, working, then parking again for
 the same reason is real history, and the second park means something the first does not.
+
+**An entry states what the branch did, not only what the agent said it did.** A session
+that commits and then dies — context exhaustion, a kill, a crash — never calls a
+control-plane verb, so its summary is the one the supervisor fills in: "session ended
+without a control-plane decision". On GH-96 that sentence was the entire entry for sessions
+4 through 7, over a branch already carrying eighteen commits. Session 7 read that history,
+concluded the task was untouched, and re-implemented all of it.
+
+So `recordSession` adds `**Committed:** \`agent/<task>\` is at \`<tip>\`, was \`<baseline>\``
+whenever the progress probe saw the branch move. It is built from the probe and from
+`progress.lastHeadOid` in `state.json`, never from the summary — which is the point, because
+the case that matters is the one where the agent said nothing.
+
+It says *committed* and not *pushed*. Nothing in the supervisor pushes a task branch; the
+agent does, and by the time the probe runs `clearActive()` has closed the credential service
+(§9.2), so no network check is available. The local branch is what is provable and what the
+next session on this runner starts from (§3.1). Naming the oid makes "is this on the remote?"
+a question the reader answers with one `git rev-parse`, rather than one the journal answers
+wrongly.
 
 ### 4.2 `state.json`
 
@@ -596,6 +679,11 @@ On reclaim, the new session:
 
 1. Commits any uncommitted worktree changes to the task branch as `wip: recovered from
    interrupted session`, rather than discarding them.
+   This step is conditional on the catch-up above succeeding, and cannot be moved ahead of
+   it: the worktree path comes from `ensureTaskCheckout`. So if the remote moved while the
+   session was dead and the fast-forward touches a file the dirty tree also touches, the
+   checkout refuses and the WIP stays uncommitted for a human. Nothing is lost — the changes
+   are still on disk — but the recovery is not automatic in that case.
 2. Appends a journal entry recording the interruption.
 3. Replays context from `spec.md` + the journal + `handoff.md`.
 

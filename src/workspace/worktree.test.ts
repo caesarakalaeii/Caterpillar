@@ -4,13 +4,13 @@
  * mirror path was broken.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { Git, type GitResult } from "../state/git.ts";
-import { asTaskId, type RepoRef } from "../domain/task.ts";
+import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
 import { assertInside, WorktreeManager } from "./worktree.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
@@ -1081,6 +1081,402 @@ test("two concurrent checkouts against one mirror do not corrupt it", async () =
     assert.equal((await git.run("config", "remote.origin.push")).trim(), "HEAD");
     assert.match(await git.run("config", "credential.helper"), new RegExp(task));
   }
+});
+
+/**
+ * Push a commit onto the remote's `agent/<task>` branch, as a session on another runner
+ * would have. Answers with the oid the remote branch now points at.
+ *
+ * Goes through the seed clone `seedMirror` left behind rather than through the mirror,
+ * because the mirror is the thing under test: the point is that the remote moved without
+ * this runner's mirror hearing about it.
+ */
+const pushAgentBranch = async (
+  root: string,
+  repo: RepoRef,
+  task: TaskId,
+  content: string,
+): Promise<string> => {
+  const seed = join(root, `${repo.name}-seed`);
+  const git = new Git(seed, HERMETIC);
+  const branch = `agent/${task}`;
+
+  const existing = await git.tryRun("rev-parse", "--verify", "--quiet", branch);
+  await git.run(...(existing.code === 0 ? ["checkout", branch] : ["checkout", "-b", branch]));
+  await writeFile(join(seed, "pushed"), content);
+  await git.run("add", "-A");
+  await git.run("commit", "-m", `work from another runner: ${content.trim()}`);
+  await git.run("push", "origin", `HEAD:refs/heads/${branch}`);
+  return (await git.run("rev-parse", "HEAD")).trim();
+};
+
+test("a session starts on the remote tip of its own branch, never behind it", async () => {
+  // GH-96: eighteen commits went missing between sessions of one task, and session 7
+  // re-implemented the whole thing from scratch because its worktree started on `main`.
+  //
+  // The mechanism is `MIRROR_REFSPECS`. `^refs/heads/agent/*` stops the mirror refresh
+  // writing a branch a worktree holds, and it does that by never fetching agent refs at
+  // all — so a mirror that has no local `refs/heads/agent/<task>` will never learn one
+  // from the remote. `addWorktreeLocked` then finds no branch, creates one from the
+  // mirror's default branch, and the session begins on the base with no way to tell that
+  // apart from a task nobody has ever touched.
+  //
+  // Reachable whenever the local ref is missing or stale where the remote's is not: a
+  // runner that never worked this task, a reaped worktree, a mirror re-cloned after a
+  // failed fetch, or the branch reset GH-95 reported. In every one of those the remote
+  // has the work and the invariant is the same — the worktree is at the remote tip, or
+  // the session does not start.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("GH-96");
+  const pushed = await pushAgentBranch(root, REPO, task, "eighteen commits\n");
+
+  const worktree = await manager(root).ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "a fresh worktree must start at the remote tip of agent/<task>, not at the base",
+  );
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "--abbrev-ref", "HEAD")).trim(),
+    `agent/${task}`,
+  );
+  // And the file the earlier session wrote is actually in the tree, so the agent can see
+  // its own previous work rather than merely being on a ref that mentions it.
+  assert.ok(
+    existsSync(join(worktree, "pushed")),
+    "the previous session's committed files must be checked out",
+  );
+});
+
+/**
+ * Put the mirror in the state a reaped worktree leaves behind: a local
+ * `refs/heads/agent/<task>` at whatever the last session committed, and no worktree
+ * holding it. That is the create path with an EXISTING local ref — the branch of
+ * `startPoint` the reuse path never reaches, and the shape GH-95 reported.
+ *
+ * Answers with the oid the orphaned local branch points at.
+ */
+const reapWorktreeKeepingBranch = async (
+  subject: WorktreeManager,
+  root: string,
+  repo: RepoRef,
+  task: TaskId,
+): Promise<string> => {
+  const local = (
+    await new Git(mirrorDir(root), HERMETIC).run("rev-parse", `refs/heads/agent/${task}`)
+  ).trim();
+  await subject.removeTaskWorktrees(task, [repo]);
+  assert.equal(
+    existsSync(join(root, "tasks", task, repo.name)),
+    false,
+    "fixture is wrong: the worktree must be gone",
+  );
+  assert.equal(
+    (
+      await new Git(mirrorDir(root), HERMETIC).run("rev-parse", `refs/heads/agent/${task}`)
+    ).trim(),
+    local,
+    "fixture is wrong: the mirror must keep the local branch a reap leaves behind",
+  );
+  return local;
+};
+
+test("a fresh worktree starts at the remote tip even when a stale local branch survives", async () => {
+  // The create path with an existing local ref, which the fresh-worktree test above never
+  // reaches: it starts with no `refs/heads/agent/<task>` at all, so it only pins the
+  // `local === undefined` corner.
+  //
+  // Reaching this one takes nothing exotic. A session works the task and its worktree is
+  // reaped — a lease handoff, or the 72h sweep over a task parked awaiting a human — which
+  // leaves the mirror's local branch behind with no worktree on it. Another runner pushes.
+  // The next session takes the create path and finds a local ref that is real, valid, and
+  // BEHIND. Trusting it is GH-95 exactly: a checkout at a commit before the branch's work,
+  // indistinguishable to the agent from a task nobody has pushed.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("STALE-LOCAL-1");
+  const subject = manager(root);
+
+  await subject.ensureWorktree(REPO, task);
+  const stale = await reapWorktreeKeepingBranch(subject, root, REPO, task);
+  const pushed = await pushAgentBranch(root, REPO, task, "pushed after the reap\n");
+  assert.notEqual(pushed, stale, "fixture is wrong: the remote must be ahead of the local ref");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "a stale local agent/<task> must not be preferred to the remote tip",
+  );
+  assert.ok(
+    existsSync(join(worktree, "pushed")),
+    "and the pushed session's files must be in the tree",
+  );
+});
+
+test("a fresh worktree refuses to start when the local branch has diverged from the remote", async () => {
+  // What makes the `branch -f` in `startPoint` safe, and the only guard in this module
+  // whose failure destroys commits rather than hiding them: force-moving a local
+  // `agent/<task>` that carries unpushed work discards it from the only place it exists.
+  //
+  // Same reap as above, plus a commit made after the last push, plus a push from elsewhere
+  // — so neither ref contains the other and nothing here can choose. Refusing leaves both
+  // histories for a human, which is what GH-95's session did by hand.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("DIVERGED-1");
+  const subject = manager(root);
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  await writeFile(join(worktree, "local-only"), "committed here, pushed nowhere\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "work that exists only on this runner");
+  const local = await reapWorktreeKeepingBranch(subject, root, REPO, task);
+  const pushed = await pushAgentBranch(root, REPO, task, "work from another runner\n");
+
+  await assert.rejects(
+    () => subject.ensureWorktree(REPO, task),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message.includes(local) &&
+      error.message.includes(pushed),
+    "a divergence must be refused, naming both oids so a human can reconcile them",
+  );
+  assert.equal(
+    (
+      await new Git(mirrorDir(root), HERMETIC).run("rev-parse", `refs/heads/agent/${task}`)
+    ).trim(),
+    local,
+    "and the refusal must leave the unpushed commits where they are",
+  );
+});
+
+test("a fresh worktree starts on a local branch that is merely ahead of the remote", async () => {
+  // The state the prompt's own instructions produce: many small commits, pushed once. A
+  // session that commits and is killed before it pushes leaves the local ref ahead, and the
+  // reap then leaves it ahead with no worktree.
+  //
+  // `merge-base --is-ancestor local remote` fails here just as it does on a divergence, so
+  // reading only that answer parks the task permanently — on a state where there is nothing
+  // to reconcile, because the local ref already contains everything the remote has. The
+  // reuse path gets this right (`merge --ff-only` against an ancestor is a no-op, pinned by
+  // AHEAD-1); the create path must agree with it.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("AHEAD-REAPED-1");
+  const subject = manager(root);
+
+  const first = await subject.ensureWorktree(REPO, task);
+  const git = new Git(first, HERMETIC);
+  await writeFile(join(first, "pushed"), "the session's first push\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "work this session pushed");
+  await git.run("push", "origin", `HEAD:refs/heads/agent/${task}`);
+  const pushed = (await git.run("rev-parse", "HEAD")).trim();
+  await writeFile(join(first, "local-only"), "committed, not pushed before the kill\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "work the kill caught before the push");
+
+  const local = await reapWorktreeKeepingBranch(subject, root, REPO, task);
+  assert.notEqual(local, pushed, "fixture is wrong: the local ref must be ahead");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    local,
+    "a local branch that contains the remote tip is the right start point, not a refusal",
+  );
+  assert.ok(
+    existsSync(join(worktree, "local-only")),
+    "and the commit made before the kill must be in the tree",
+  );
+});
+
+test("a worktree reset behind its remote branch is not handed to a session as-is", async () => {
+  // GH-95, the other half of GH-96. That session found its EXISTING worktree reset to a
+  // commit before its own work, with the branch's commits reachable only from
+  // `refs/pull/111/head`, and recovered them by hand.
+  //
+  // `addWorktreeLocked` returns early when the directory is already there, and the
+  // comment says why: the probe and the verifier both call `ensureWorktree` after
+  // `clearActive()` has closed the credential service (§9.2), so a fetch on that path
+  // fails on a private repo and takes the post-session work down with it. That reasoning
+  // holds for the READ paths. It does not license handing a session a checkout that is
+  // behind the branch it is about to commit on: the next `git push` is refused as
+  // non-fast-forward at the earliest, and at worst the agent concludes the task is
+  // untouched and starts again.
+  //
+  // So the invariant is the same as the fresh-worktree one, minus the part this path
+  // cannot promise: the session is at the remote tip, or it does not start. Refusing is
+  // the acceptable outcome here — a human reconciles two histories, which is what GH-95
+  // did — and it is strictly better than silence.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("GH-95");
+  const subject = manager(root);
+
+  // A worktree that exists and is BEHIND: created first, then another runner pushes.
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const base = (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim();
+  const pushed = await pushAgentBranch(root, REPO, task, "the commits GH-95 recovered\n");
+  assert.notEqual(pushed, base, "fixture is wrong: the remote must be ahead");
+
+  const reused = await subject.ensureWorktree(REPO, task).catch((error: unknown) => error);
+
+  if (reused instanceof Error) {
+    assert.match(reused.message, /GH-95/, "a refusal must name the task a human has to look at");
+    return;
+  }
+  assert.equal(
+    (await new Git(String(reused), HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "a reused worktree must be moved to the remote tip, or the call must throw",
+  );
+});
+
+test("a worktree holding commits the remote has not seen keeps them", async () => {
+  // The regression `catchUpWorktree` could most easily introduce. A session commits and has
+  // not pushed yet — the state this very task's own branch was found in — and the reuse path
+  // now consults the remote. Anything that RESET the worktree to the remote tip would delete
+  // work that exists nowhere else, which is strictly worse than the bug being fixed: a stale
+  // start costs a duplicate implementation, a reset costs the implementation itself.
+  //
+  // So a fast-forward and only a fast-forward. `merge --ff-only` against an ancestor is a
+  // no-op, which is the whole reason it is the verb there.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("AHEAD-1");
+  const subject = manager(root);
+  const pushed = await pushAgentBranch(root, REPO, task, "work from another runner\n");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  await writeFile(join(worktree, "local-only"), "not pushed anywhere\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "committed here, never pushed");
+  const local = (await git.run("rev-parse", "HEAD")).trim();
+  assert.notEqual(local, pushed, "fixture is wrong: the worktree must be ahead");
+
+  const reused = await subject.ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(reused, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    local,
+    "a worktree ahead of the remote must be left exactly where it is",
+  );
+  assert.ok(existsSync(join(reused, "local-only")), "and the file only it carries with it");
+});
+
+test("a worktree an agent moved off its own branch is left alone, not merged into", async () => {
+  // `refspecs` already carries the evidence that this happens: an agent that ran
+  // `git checkout` reproduced the mirror-fetch refusal under a branch name no pattern
+  // could match, which is why the held set comes from `worktree list` rather than from a
+  // convention. So the catch-up cannot assume HEAD is on `agent/<task>`.
+  //
+  // Getting it wrong is not a missed opportunity, it is damage: `merge --ff-only` while the
+  // worktree stands on `main` would fast-forward MAIN onto the task branch, and the agent's
+  // next push — pinned to the current branch by `remote.origin.push = HEAD` — would deliver
+  // unreviewed task commits to the default branch.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("WANDERED-1");
+  const subject = manager(root);
+  const pushed = await pushAgentBranch(root, REPO, task, "work from another runner\n");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  // The mirror's default branch is behind the task branch here, which is exactly the shape
+  // that makes a stray `merge --ff-only` succeed and therefore be dangerous.
+  await git.run("checkout", "-B", "wandered", `${pushed}~1`);
+  const before = (await git.run("rev-parse", "HEAD")).trim();
+
+  const reused = await subject.ensureWorktree(REPO, task);
+  const after = new Git(String(reused), HERMETIC);
+
+  assert.equal(
+    (await after.run("rev-parse", "HEAD")).trim(),
+    before,
+    "a worktree standing on another branch must not be fast-forwarded onto the task branch",
+  );
+  assert.equal((await after.run("rev-parse", "--abbrev-ref", "HEAD")).trim(), "wandered");
+});
+
+test("a session refuses to start when origin cannot be asked about its branch", async () => {
+  // The hole the rest of this fix leaves open, and it is GH-96 by another route. Every
+  // question this module asks about `origin/agent/<task>` is asked with a fetch, and a fetch
+  // reports "the remote has no such branch" and "I could not reach the remote at all" as the
+  // same plain non-zero. `fetchAgentBranch` therefore answers `undefined` to both, and the
+  // reuse path reads that as "nothing pushed" and hands the worktree over as it found it.
+  //
+  // So one expired credential, one DNS blip, one throttled forge is enough to start a
+  // session on the base with eighteen commits sitting upstream — the exact outcome the
+  // invariant says must be impossible, reached without any local ref being wrong.
+  //
+  // Tolerating it is not an option a caller inside a live credential lease needs. The
+  // reason `fetchAgentBranch` cannot throw is the POST-session callers, which run after
+  // `clearActive()` (§9.2) and must not fail verification over a fetch they never needed.
+  // The session-start caller is the opposite case: it holds the lease, so a remote it
+  // cannot reach is a fault to report, not a silence to read as an answer.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("UNREACHABLE-1");
+  const subject = manager(root);
+
+  // A worktree that exists, so the reuse path runs and the mirror is not synced. Then
+  // another runner pushes, and only then does origin become unreachable — the pushed work
+  // is real and the remote is the only place that knows about it.
+  await subject.ensureWorktree(REPO, task);
+  await pushAgentBranch(root, REPO, task, "work this runner cannot see\n");
+  await rename(join(root, `${REPO.name}-origin.git`), join(root, "origin-moved-away.git"));
+
+  await assert.rejects(
+    () => subject.ensureTaskCheckout([REPO], task, { mustReachRemote: true }),
+    (error: unknown) =>
+      error instanceof Error && new RegExp(`agent/${task}`).test(error.message),
+    "a session-start checkout must refuse rather than guess that nothing was pushed",
+  );
+});
+
+test("a checkout that did not ask for a reachable remote still gets one when origin is down", async () => {
+  // The other side of the test above, and the regression that strictness most easily
+  // causes. `ensureWorktree` is called by the progress probe, the verifier, the review
+  // council and the plan maintainer, all AFTER `clearActive()` has closed the credential
+  // service (§9.2) — so on a private repo their fetch cannot succeed, and a manager that
+  // threw would take verification down for every one of them. A task could then never
+  // complete, which is worse than the bug the strictness fixes.
+  //
+  // The default therefore has to be tolerance, and this pins it: same unreachable origin as
+  // the previous test, no `mustReachRemote`, and the checkout must still hand back the
+  // worktree with the local branch intact.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("TOLERANT-1");
+  const subject = manager(root);
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const before = (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim();
+  await rename(join(root, `${REPO.name}-origin.git`), join(root, "origin-moved-away.git"));
+
+  assert.equal(await subject.ensureWorktree(REPO, task), worktree);
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    before,
+    "a tolerant checkout must proceed on what is on disk, not fail on a silent remote",
+  );
 });
 
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
