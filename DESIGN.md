@@ -3562,6 +3562,80 @@ review spend. That buys the one defect class both earlier gates are blind to *by
 construction*: a test weakened until the suite goes green passes acceptance and passes CI,
 because the suite is green precisely because the test stopped asking.
 
+### 12.3 A merge queue is enqueued, and a conflict is said out loud early
+
+Two holes on the merge path, both of which turned an ordinary situation into a
+terminal-looking failure at the very end of a task.
+
+**A merge queue is a gate the repo's owners chose.** On a base branch protected by one, a
+direct `PUT /pulls/{n}/merge` either fails or *bypasses the queue* — and bypassing is the
+worse outcome, because it defeats the protection rather than reporting it. So the council
+asks (`Forge.mergeQueue`) and enqueues instead (`Forge.enqueue`) where there is a queue.
+
+The question is asked about the **pull request**, not about a branch name. Nothing in
+`state.json` records what a pull request targets — only its number and url — so a caller
+taking a base branch would have to guess it from the repository default, which is wrong for
+any task based on anything else. GitHub's `pullRequest.mergeQueue` answers directly, and it
+is asked rather than `branchProtectionRule.requiresMergeQueue` because a queue can be
+required by a **repository ruleset** as well as by a classic protection rule and only the
+former sees both.
+
+**"In queue" is its own state.** Not success, not failure. This is §11.1's lesson about CI
+`pending` pointed at the other end of the path: an unfinished answer returned as a failed
+gate cost three whole sessions. A queued pull request has not landed and the queue's own
+checks can still reject it, so a human told "merged" stops watching something that is not
+finished. `mergeNote` in `forge/mergeability.ts` always names a queued pull request as
+queued, and the `merged` chat outcome carries that note rather than gaining a fourth kind —
+the request succeeded either way, and every caller that branches on it behaves identically.
+
+**A forge that cannot answer must not block the merge.** `mergeQueue` returns
+`"required" | "absent" | "unknown"`, and `landingFor` merges on `unknown`. That is not
+optimism: the merge itself is the authority, since GitHub refuses a direct merge into a
+queue-protected base with a 405. Guessing wrong costs a reported failure; refusing on an
+unanswered question costs every repo whose forge cannot answer, which is all of Forgejo.
+Forgejo has no merge queue at all, so it answers `"absent"` — a fact about the forge, not a
+failure to look — and its `enqueue` throws, because reaching it means the state machine
+broke and a silent no-op would report a queued merge on a forge with no queue to hold it.
+
+**A queued merge is not a completed one, so it stops the sequence.** §12.1's ordering rule —
+merge in `spec.repos` order, stop at the first failure — now stops on a queued pull request
+too (`stopsTheSequence`). A queue runs the change's checks against a speculative base and
+can still reject it, so landing the sibling now risks exactly the half-landed state the
+ordering rule exists to prevent. The remaining pull requests are left open and the note
+names them.
+
+**A conflict is ordinary drift, and it is reported twice.** A task that ran for several
+sessions can end on a branch its base has moved past. That used to surface as a merge
+failure after every gate had passed, which reads as terminal and is nothing of the kind. So:
+
+  - **At session start**, `agent/runner.ts` computes a conflict summary — which files, how
+    many hunks — and puts it in the prompt, so the agent rebases as ordinary work. It
+    refreshes the mirror first, and that is load-bearing: `addWorktreeLocked` deliberately
+    does not fetch for a worktree that already exists, so without the refresh every session
+    after the first would compare against the commit it forked from and report "merges
+    cleanly" for every drift there is. It is safe there and nowhere else on that path,
+    because it runs inside `credentials.activate` — the verifier and the progress probe run
+    after `clearActive()` and cannot authorise a fetch (§9.2).
+  - **At the completion gate**, `supervisor/verifier.ts` rejects the claim with the same file
+    list. Rejecting costs a session and gets the rebase done; passing costs the same session
+    plus a failed merge at the point where nothing is left to fix it.
+
+The summary is computed with `git merge-tree --write-tree`, which touches neither the index
+nor the working tree — safe to run in a worktree the agent is about to work in — and writes
+a real tree carrying the conflict markers. That tree is where the hunk counts come from:
+`--name-only` names the files and counts nothing, and "three files conflict" is a very
+different instruction to hand a session than "three files conflict, one line each".
+
+All three outcomes are distinct, and the third is why: **clean**, **conflicted**, and
+**unknown** — a base git could not resolve, which happens whenever a worktree's mirror has
+been re-pointed. Folding `unknown` into `clean` would tell a session its branch was fine
+because nobody could check. It never fails anything; the primary repo only, because every
+extra repo costs a `merge-tree` and a `git show` per conflicting file before the first
+token.
+
+The state machine and the summary shape are pure, in `forge/mergeability.ts`: no forge
+calls, no git calls, no clock, so every decision above is testable without a network.
+
 ---
 
 ## 13. Agent tools
