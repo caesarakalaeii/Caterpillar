@@ -449,6 +449,21 @@ test("an over-long option is cut in the LABEL only", () => {
   assert.ok(long.startsWith(label), "the label must be a prefix of the option, not a summary");
 });
 
+test("more options than fit a row costs the extras, never the notification", () => {
+  // `ask_human` refuses a sixth option, but these come back from a file in the state repo
+  // that a human can edit, and `row` throws above five. A throw here would lose the whole
+  // message — on the one path where silence means nobody learns the task is waiting.
+  const attached = componentsFor({
+    kind: "question",
+    task: TASK,
+    phase: "implementing",
+    question: "Which one?",
+    options: ["a", "b", "c", "d", "e", "f"],
+  });
+
+  assert.deepEqual(labelsOf(attached), ["a", "b", "c", "d", "e", "Answer…"]);
+});
+
 test("a question in its own thread offers no buttons even when it has options", () => {
   // In the thread the next message IS the answer, so a button is friction. Unchanged by
   // options: pressing one there would be no faster than typing, and the modal is worse.
