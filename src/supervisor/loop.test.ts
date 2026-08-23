@@ -1833,6 +1833,80 @@ test("a task that reaches a terminal status stops reporting a no-progress streak
   );
 });
 
+test("a replica drops a streak for a task another replica finished", async () => {
+  // The other half of the stale-gauge failure, and the half `transition` cannot reach.
+  //
+  // `transition` removes the series when THIS process takes a task terminal. But the
+  // gauge is per-process and in memory, while a task migrates between replicas across
+  // sessions — in the fleet's own state repo 19 tasks carry journal shards written by two
+  // to four different runners. So the pod that published the streak is routinely not the
+  // pod that finishes the task:
+  //
+  //   pod A runs session N, publishes streak 2, hands off, releases the lease
+  //   pod B claims session N+1, the task finishes, pod B removes the series from its OWN
+  //     registry — where nothing ever set it
+  //   pod A reports 2 for the life of the process
+  //
+  // `caterpillar_no_progress_streak >= 2` does not aggregate over `pod`, so pod A's orphan
+  // series fires CaterpillarTaskThrashing indefinitely. That is what kept the alert up for
+  // 36 hours on BS-1540288291008684052-02, whose three sessions all ran on caterpillar-1
+  // and whose streak of 2 was entirely truthful — the task went `done` at streak 2.
+  //
+  // Modelled as the state repo already holding the terminal status, because that is
+  // precisely what pod A sees: it never runs another session on the task and never calls
+  // `transition` for it, so `survey` — the one pass that reads every task's committed
+  // state on every poll in every replica — is the only place the truth arrives.
+  const ELSEWHERE = asTaskId("ELSEWHERE-1");
+  await seedTask(ELSEWHERE, {
+    status: "done",
+    sessions: 3,
+    progress: { lastProgressSession: 1, noProgressStreak: 2 },
+  });
+
+  const metrics = new AgentMetrics();
+  // What this replica's last session on the task left behind before handing it off.
+  metrics.noProgress.set({ task: ELSEWHERE }, 2);
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Nothing may claim a `done` task, so no session should run at all.
+    runner: { run: () => Promise.reject(new Error("a finished task must not be claimed")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const orphaned = /caterpillar_no_progress_streak\{[^}]*task="ELSEWHERE-1"/;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && orphaned.test(metrics.render())) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.doesNotMatch(
+    metrics.render(),
+    orphaned,
+    "a replica must stop reporting a streak for a task it can see has finished, or the " +
+      "alert outlives the work on whichever pod ran the second-to-last session",
+  );
+});
+
 test("a git failure in the poll loop is logged and retried, not fatal", async () => {
   // `store.pull`, `applyChatRequests`, `maybeIngest`, `survey` and `claimNext` all sat
   // OUTSIDE any try — only `workTask` was wrapped. `Git.run` throws on every non-zero
