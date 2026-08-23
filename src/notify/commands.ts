@@ -33,6 +33,15 @@ export type Command =
   /** Approve and merge a task's PR despite the council (DESIGN.md §12.1). */
   | { readonly kind: "merge"; readonly task: TaskId }
   /**
+   * Mark a task `done` by hand, with both §12 gates bypassed — `/done`.
+   *
+   * Not a variant of `merge`: nothing is merged and no PR need exist, because the case it
+   * serves is a task that is OBSOLETE rather than finished. `reason` is required for that
+   * same reason — the only thing standing between this and an unauditable `done` is a
+   * human saying why.
+   */
+  | { readonly kind: "force-done"; readonly task: TaskId; readonly reason: string }
+  /**
    * Open a refinement conversation (DESIGN.md §14.3).
    *
    * Carries no task id: it CREATES one, in a thread that does not exist until the bridge

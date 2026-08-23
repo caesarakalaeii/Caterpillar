@@ -5367,9 +5367,12 @@ test("forcing a task done records no gate as passed, anywhere", async () => {
   assert.equal(state?.status, "done");
   assert.equal(state?.review?.last, undefined, "the council never ran, so it recorded nothing");
 
+  // `\b` on both sides deliberately: the entry says the gates were BYPASSED, and a
+  // substring match on "passed" would reject the very wording that makes it honest.
   const journal = await pushedJournal(UNVERIFIED);
-  assert.doesNotMatch(journal, /gates? passed/i, "nothing may read as a gate that passed");
-  assert.doesNotMatch(journal, /acceptance .*passed/i);
+  assert.doesNotMatch(journal, /\bgates? \bpassed\b/i, "nothing may read as a gate that passed");
+  assert.doesNotMatch(journal, /criteria and CI verified/i, "the wording a real completion uses");
+  assert.match(journal, /BYPASSED/);
 });
 
 test("/done needs no PR and merges nothing", async () => {

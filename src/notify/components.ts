@@ -93,7 +93,7 @@ export interface Modal {
  * task id needs most of them. `res` is `/resume`: a park notification is the one message
  * whose entire content is "a human has to act", and the act is always the same one.
  */
-export type Verb = "ans" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no";
+export type Verb = "ans" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no" | "done";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -140,7 +140,10 @@ export const decodeCustomId = (raw: string): ButtonAction | undefined => {
   return { verb, task, ...(arg === undefined ? {} : { arg }) };
 };
 
-const VERBS: readonly string[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no"];
+// Parallel to `Verb` by hand, and it has to stay that way: `isVerb` is a runtime check and
+// the union is erased, so a verb added to one and not the other type-checks and then decodes
+// as "unrecognised button" in front of whoever pressed it.
+const VERBS: readonly string[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
 
@@ -207,20 +210,50 @@ export const disableAll = (attached: readonly ActionRow[]): readonly ActionRow[]
   }));
 
 /** The single-field modal behind the Answer button. */
-export const answerModal = (task: TaskId, fieldId: string): Modal | undefined => {
-  const customId = encodeCustomId({ verb: "ans", task });
+export const answerModal = (task: TaskId, fieldId: string): Modal | undefined =>
+  singleFieldModal({
+    verb: "ans",
+    task,
+    fieldId,
+    title: `Answer ${task}`,
+    label: "Your answer",
+  });
+
+/**
+ * The modal behind the Mark done button.
+ *
+ * A button cannot carry prose and the reason is REQUIRED — a forced completion with no
+ * stated cause is unauditable — so the click has to ask for one before anything is written.
+ */
+export const doneModal = (task: TaskId, fieldId: string): Modal | undefined =>
+  singleFieldModal({
+    verb: "done",
+    task,
+    fieldId,
+    title: `Mark ${task} done`,
+    label: "Why (the gates are skipped)",
+  });
+
+const singleFieldModal = (options: {
+  readonly verb: Verb;
+  readonly task: TaskId;
+  readonly fieldId: string;
+  readonly title: string;
+  readonly label: string;
+}): Modal | undefined => {
+  const customId = encodeCustomId({ verb: options.verb, task: options.task });
   if (customId === undefined) return undefined;
   return {
     custom_id: customId,
-    title: clamp(`Answer ${task}`, MODAL_TITLE_LIMIT),
+    title: clamp(options.title, MODAL_TITLE_LIMIT),
     components: [
       {
         type: COMPONENT.actionRow,
         components: [
           {
             type: COMPONENT.textInput,
-            custom_id: fieldId,
-            label: "Your answer",
+            custom_id: options.fieldId,
+            label: clamp(options.label, LABEL_LIMIT),
             style: TEXT_INPUT_STYLE.paragraph,
             required: true,
             max_length: TEXT_INPUT_LIMIT,

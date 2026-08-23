@@ -3285,6 +3285,8 @@ export class Supervisor {
         return this.applyResume(request);
       case "merge":
         return this.applyMerge(request);
+      case "force-done":
+        return this.applyForceDone(request);
       case "brainstorm":
         return this.applyBrainstorm(request);
     }
@@ -3837,6 +3839,104 @@ export class Supervisor {
       // repo when there was more than one, so the count is not lost.
       const primary = state.pr ?? taskPullRequests(spec.repos, state)[0];
       return { kind: "merged", prUrl: primary?.url ?? "(merged)" };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Mark a task `done` by human decision, both §12 gates BYPASSED — `/done`.
+   *
+   * Not a variant of `applyMerge`, and the difference is the point. `/merge` is an override
+   * of the COUNCIL: it merges through the reviewer identity, so it refuses without a PR and
+   * without a reviewer identity, and the gates before it have already passed. This is an
+   * override of the whole of §12, for the case where the task is OBSOLETE rather than
+   * finished — there is nothing to verify, often nothing on a branch at all, and no honest
+   * way to record it as verified. So nothing is merged, no PR is required, and the journal
+   * says who decided and why.
+   *
+   * What it must never do is leave a record that reads as a verified `done`. Hence the
+   * journal entry rather than a bare status write, and hence `parked` for the tracker
+   * (`mirror` below): `completed` carries a `prUrl` this command may not have, and it is the
+   * transition that means the gates passed.
+   *
+   * `running` is refused rather than raced. The session holds the lease, so the write would
+   * either lose its compare-and-swap or land under an agent still working the task — and
+   * `/cancel` already exists to stop one, at a turn boundary, without either.
+   */
+  private async applyForceDone(
+    request: ChatRequest & { readonly kind: "force-done" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.status === "running") {
+      return {
+        kind: "not-forceable",
+        reason:
+          "it is running right now — `/cancel` it first, then force it done once it has " +
+          "parked. Writing over a live session would race the lease it holds.",
+      };
+    }
+    if (state.status === "done") return { kind: "finished" };
+
+    const lease = await leases.claim(request.task);
+    // Unclaimable means another runner holds it, which is what `running` looks like from
+    // here — the stored status can be stale, and this is the one case where it matters.
+    if (lease === undefined) {
+      return {
+        kind: "not-forceable",
+        reason:
+          "another runner is working it right now — `/cancel` it first, then force it done " +
+          "once it has parked.",
+      };
+    }
+
+    try {
+      const handle = heldLease(lease);
+      await this.unit(async () => {
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          [
+            `**Forced done** by ${request.author}, from \`${state.status}\`.`,
+            "",
+            `Reason: ${request.reason}`,
+            "",
+            "The §12 acceptance gates were **BYPASSED**: no acceptance command was run, no " +
+              "CI result was read, and no pull request was merged. This task is done by " +
+              "human decision, not by verification.",
+          ].join("\n"),
+        );
+        await this.transition(handle, state, "done");
+        await this.push(handle, `chore(${request.task}): forced done from chat`);
+      });
+      logger.warn("task.forced-done", {
+        task: request.task,
+        previous: state.status,
+        author: request.author,
+        reason: request.reason,
+      });
+
+      // After the push, never before: the tracker is a VIEW and git wins when they
+      // disagree. `parked` rather than `completed` — see the note above. Both adapters
+      // answer it with a comment and by dropping the wip label, so the item is released
+      // and the reason is on it; neither CLOSES it, because closing is reserved for
+      // `completed` and §12 (`tracker/github-issues.ts`). A task forced done did not pass
+      // §12, so an item left open with the reason on it is the honest view — and closing it
+      // needs a transition of its own, which is a change to `Tracker` and not to this.
+      const spec = await store.readSpec(request.task).catch(() => undefined);
+      if (spec !== undefined) {
+        await this.mirror(spec, {
+          kind: "parked",
+          reason:
+            `Forced done by ${request.author} without verification — the acceptance gates ` +
+            `were bypassed. Reason: ${request.reason}`,
+        });
+      }
+
+      return { kind: "forced-done" };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

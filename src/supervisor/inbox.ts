@@ -90,6 +90,16 @@ export type ChatOutcome =
   | { readonly kind: "cancelling" }
   /** Merging was possible in principle but refused — no PR, or no reviewer identity. */
   | { readonly kind: "not-mergeable"; readonly reason: string }
+  /**
+   * A task was marked `done` by hand, with both §12 gates bypassed — `/done`.
+   *
+   * Deliberately not `merged`: nothing was merged and no PR need have existed, and a reply
+   * that said "merged" about a task nobody verified is the one reading this command must
+   * never produce.
+   */
+  | { readonly kind: "forced-done" }
+  /** Forcing was refused — a `running` task, which has to be cancelled first. */
+  | { readonly kind: "not-forceable"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
 
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
@@ -108,6 +118,19 @@ export type ChatIntent =
    */
   | { readonly kind: "resume"; readonly task: TaskId }
   | { readonly kind: "merge"; readonly task: TaskId }
+  /**
+   * Mark a task `done` by hand — `/done`.
+   *
+   * `author` and `reason` are both carried because both go in the journal, and the journal
+   * is the only record that this `done` was a decision rather than a verification. Nothing
+   * downstream can reconstruct either: the loop never sees Discord.
+   */
+  | {
+      readonly kind: "force-done";
+      readonly task: TaskId;
+      readonly reason: string;
+      readonly author: string;
+    }
   /**
    * Create a brainstorm task (DESIGN.md §14.3).
    *
