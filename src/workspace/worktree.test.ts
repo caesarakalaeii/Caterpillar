@@ -1150,3 +1150,126 @@ test("commitsSince answers with nothing rather than throwing on a bad base", asy
 
   assert.deepEqual(await manager(root).commitsSince(repo, "0000000000000000000000000000000000000000"), []);
 });
+
+/**
+ * A previous session's pushed work: `n` commits on `agent/<task>` in the remote, and
+ * nothing about them anywhere on this runner's disk.
+ *
+ * Pushed from the seed clone rather than from a worktree of the mirror, because that is
+ * what the situation actually is — the commits were made by a session on ANOTHER replica,
+ * or by one on this replica whose worktree has since been reaped. Returns the tip so a
+ * test can assert against it by oid rather than by counting.
+ */
+const pushAgentBranch = async (
+  root: string,
+  repo: RepoRef,
+  task: string,
+  commits: readonly string[],
+): Promise<string> => {
+  const seed = join(root, `${repo.name}-seed`);
+  const seedGit = new Git(seed, HERMETIC);
+
+  await seedGit.run("checkout", "-B", `agent/${task}`, "main");
+  for (const [index, subject] of commits.entries()) {
+    await writeFile(join(seed, `pushed-${index}`), `${subject}\n`);
+    await seedGit.run("add", "-A");
+    await seedGit.run("commit", "-m", subject);
+  }
+  await seedGit.run("push", "origin", `HEAD:refs/heads/agent/${task}`);
+
+  const tip = (await seedGit.run("rev-parse", "HEAD")).trim();
+  // Back to main, so the branch is not left checked out in the fixture — a later
+  // `pushAgentBranch` for another task would otherwise fork from this task's work.
+  await seedGit.run("checkout", "main");
+  return tip;
+};
+
+test("a session with work pushed to origin starts on that work, not on the base", async () => {
+  // GH-96's failure, and the expensive one. Sessions 2-3 pushed 18 commits to
+  // `agent/GH-...-96`; session 7 started with its worktree on `main`, could not tell that
+  // from a task nobody had touched, and re-implemented the whole task. It found out only
+  // when `git push` was refused as non-fast-forward, leaving two independent
+  // implementations on the remote for a human to choose between.
+  //
+  // The mechanism: the mirror's fetch refspec excludes `^refs/heads/agent/*` (see
+  // MIRROR_REFSPECS), so no fetch ever brings the remote agent branch onto this runner.
+  // With no local `refs/heads/agent/<task>`, `addWorktreeLocked` creates the branch from
+  // the mirror's default branch — silently, and indistinguishably from a first session.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+  const task = asTaskId("GH-96");
+  const pushed = await pushAgentBranch(root, REPO, task, ["first half", "second half"]);
+
+  const checkout = await manager(root).ensureSessionCheckout([REPO], task);
+
+  const head = (await new Git(checkout.root, HERMETIC).run("rev-parse", "HEAD")).trim();
+  assert.equal(
+    head,
+    pushed,
+    "a session must start at the tip of its own pushed branch, never behind it",
+  );
+});
+
+test("a resumed session on a worktree left behind the remote is moved up to it", async () => {
+  // GH-95's failure, which is the same invariant reached from the other side. That session
+  // found its EXISTING worktree reset to a commit from before its own work, with its
+  // commits recoverable only from `refs/pull/111/head`.
+  //
+  // `addWorktreeLocked` skips the mirror fetch whenever the worktree already exists — for
+  // a good reason (the post-session probe runs with no credential, § the comment there) —
+  // so nothing else in this class can correct a local ref that has fallen behind.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+  const task = asTaskId("GH-95");
+  const subject = manager(root);
+
+  // A worktree as a previous session on this runner left it: on `agent/<task>`, at the
+  // base, with the remote since moved ahead.
+  await subject.ensureTaskCheckout([REPO], task);
+  const pushed = await pushAgentBranch(root, REPO, task, ["work this runner never saw"]);
+
+  const checkout = await subject.ensureSessionCheckout([REPO], task);
+
+  assert.equal(
+    (await new Git(checkout.root, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "an existing worktree behind its remote branch must be brought up to the tip",
+  );
+});
+
+test("a worktree that has diverged from its remote branch refuses to start a session", async () => {
+  // The one outcome that must never be silent. Local commits the remote does not have AND
+  // remote commits the local branch does not have cannot both be kept by moving a ref, and
+  // guessing either way destroys a session's work — so the session refuses and a human
+  // reconciles. Starting behind the remote is what cost GH-96 a duplicate implementation;
+  // starting on a rewritten local branch would cost the pushed work instead.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+  const task = asTaskId("GH-DIVERGED");
+  const subject = manager(root);
+
+  const local = await subject.ensureTaskCheckout([REPO], task);
+  const git = new Git(local.root, HERMETIC);
+  await writeFile(join(local.root, "local-only"), "unpushed\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "local work that was never pushed");
+  const localTip = (await git.run("rev-parse", "HEAD")).trim();
+
+  const pushed = await pushAgentBranch(root, REPO, task, ["work pushed from elsewhere"]);
+
+  await assert.rejects(
+    () => subject.ensureSessionCheckout([REPO], task),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message.includes(`agent/${task}`) &&
+      error.message.includes(pushed) &&
+      error.message.includes(localTip),
+    "the refusal must name the branch and both tips, so a human can reconcile them",
+  );
+
+  assert.equal(
+    (await git.run("rev-parse", "HEAD")).trim(),
+    localTip,
+    "a refusal must leave the local work exactly where it was",
+  );
+});
