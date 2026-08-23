@@ -133,13 +133,12 @@ export interface MergeTreeResult {
  * report", but only one means "this branch merges", and folding them together would tell
  * a session its branch was fine because nobody could check.
  *
- * `markerCounts` maps path to `<<<<<<<` count and is the caller's to supply: counting
- * needs the merged blobs, which needs git. Absent, files are still named — a file to
- * rebase is worth reporting without its size.
+ * `hunks` is never set here. Counting `<<<<<<<` markers means reading the blobs of the
+ * tree this wrote, which needs git — so the caller fills them in. `tree` is returned for
+ * exactly that: it is the handle those blobs are read through.
  */
 export const parseConflicts = (
   result: MergeTreeResult,
-  markerCounts?: ReadonlyMap<string, number>,
 ): ConflictSummary | "unknown" | undefined => {
   if (result.code === 0) return undefined;
   if (result.code > 1) return "unknown";
@@ -162,12 +161,7 @@ export const parseConflicts = (
 
   if (paths.size === 0) return "unknown";
 
-  const files = [...paths].sort().map((path) => {
-    const hunks = markerCounts?.get(path);
-    return hunks === undefined ? { path } : { path, hunks };
-  });
-
-  return { tree, files };
+  return { tree, files: [...paths].sort().map((path) => ({ path })) };
 };
 
 /**
