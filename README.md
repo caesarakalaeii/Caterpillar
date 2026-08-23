@@ -153,8 +153,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/llm/credential-client.ts` | A runner's read-only view of it. Never writes (§9.6). |
 | `src/llm/outage.ts` | Provider outage vs. the task's own error. Pure, no IO (§6.3). |
 | `src/supervisor/cooldown.ts` | The runner's back-off after a refusal. Pure, clock injected (§6.3). |
-| `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
-| `src/agent/exec.ts` | The agent's shell with a per-command ceiling — the hang detector (§6.4). |
+| `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1), and what one tool result may cost against it (§6.4). |
+| `src/agent/budget.ts` | Bounded view of one tool's output, with the elision stated. Pure, no IO (§6.4). |
+| `src/agent/exec.ts` | The agent's shell with a per-command time *and* output ceiling (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/review-guidance.ts` | Unresolved pull request review comments → a prompt section. Pure, no IO (§7.3). |
 | `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2). |
@@ -301,6 +302,17 @@ awkward, the change is probably wrong.
     the review council's — it was the council's that wedged, for 2h42m, on an `npm test`
     whose subprocess never exited. `limits.maxSessionSeconds` is the backstop, not the
     fix: four hours is an outage, not a hang detector (§6.4).
+
+    **And no command returns without one either.** A 40,000-line `grep` succeeds in a
+    second and spends a large share of the window the handoff threshold exists to protect,
+    after which the task hands off early and the journal cannot say why.
+    `limits.commandOutputMaxLines` (2,000) and `limits.commandOutputMaxBytes` (50KiB)
+    default and clamp the same way, in the same two shells, capped again by what the
+    model's window can afford so **no single tool call can cross the handoff threshold by
+    itself**. Head *and* tail are kept, because a test runner puts its failure summary
+    last; the elision is stated, never silent; and the overflow goes to
+    `<tasks>/<task>/.caterpillar/output/` so the session can read it in slices.
+    `cluster.maxLogLines` is one configured case of this rule, not a special one (§6.4).
 13. **Cluster access is read-only, supervisor-held, and bound to one task kind.** The
     ServiceAccount token never leaves the supervisor — `kubectl` in the agent's shell was
     rejected precisely because the credential would then belong to the pod and every task

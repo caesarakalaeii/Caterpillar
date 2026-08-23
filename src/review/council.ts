@@ -593,11 +593,33 @@ export class ReviewCouncil implements Council {
         ...(sabotageCopy === undefined ? {} : { sabotageCopy }),
         maxCommands: config.limits.sabotageMaxCommands,
       });
+      // One budget for the reviewer's session and for its shell's output ceiling: the
+      // ceiling is measured against this threshold (§6.4), so two of them could disagree.
+      const budget = new ContextBudget({
+        contextWindow: llm.model.contextWindow,
+        thresholdFraction: config.handoff.thresholdFraction,
+      });
       const envOptions = {
         cwd: plan.cwd,
         shellPath: toolchain.shell,
         shellEnv: toolchain.env,
         timeoutSeconds: config.limits.commandTimeoutSeconds,
+        // The output ceiling too, and for the same reason as the timeout: a reviewer runs
+        // the same `npm test` in the same worktree with the same window to spend, and it is
+        // this shell that has already demonstrated it will do so (§6.4).
+        //
+        // Through the budget rather than `budget.ts`'s bare `outputCeiling`, so the window
+        // caps the configured number a second time. The rule is the same one the agent's
+        // shell follows, and it is pinned there — runner.test.ts's "bounded by the WINDOW,
+        // not just by config". Keep the two call sites the same shape.
+        output: budget.outputCeiling({
+          maxLines: config.limits.commandOutputMaxLines,
+          maxBytes: config.limits.commandOutputMaxBytes,
+        }),
+        // Keyed by the TASK, not by `plan.cwd`: the sabotage reviewer works in a private
+        // copy that is deleted when the round ends, and a spill written inside it would go
+        // with it while the note in the transcript still pointed there.
+        overflowDir: join(config.paths.tasks, spec.id, ".caterpillar", "output"),
         logger,
         task: spec.id,
       };
@@ -635,10 +657,7 @@ export class ReviewCouncil implements Council {
         systemPrompt: `${lens.prompt}\n\nYour working directory is ${plan.cwd}.`,
         initialPrompt: prompt,
         tools,
-        budget: new ContextBudget({
-          contextWindow: llm.model.contextWindow,
-          thresholdFraction: config.handoff.thresholdFraction,
-        }),
+        budget,
         control,
         // A reviewer cut off by the council deadline reaches the `sink.decision ===
         // undefined` branch below and is recorded as an ABSTENTION, which is the honest

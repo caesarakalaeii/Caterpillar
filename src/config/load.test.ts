@@ -15,6 +15,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "../agent/budget.ts";
 import { ConfigError, loadConfig } from "./load.ts";
 
 const roots: string[] = [];
@@ -515,6 +516,62 @@ test("a negative disk floor is refused, but zero is a legitimate no-floor", asyn
   // machine with one replica and no volume to fill.
   const config = await load({ limits: { sabotageMinFreeGb: 0 } });
   assert.equal(config.limits.sabotageMinFreeGb, 0);
+});
+
+/**
+ * The output ceiling in `limits` (DESIGN.md §6.4, README invariant 12).
+ *
+ * Same shape as `limits.commandTimeoutSeconds` beside it, and for the same reason: the
+ * agent can edit config in its own worktree, so a knob it could raise is not a bound.
+ */
+test("a config that says nothing about output ceilings takes the built-in ones", async () => {
+  const config = await load({});
+
+  assert.equal(config.limits.commandOutputMaxLines, MAX_OUTPUT_LINES);
+  assert.equal(config.limits.commandOutputMaxBytes, MAX_OUTPUT_BYTES);
+});
+
+test("output ceilings can be lowered but never raised", async () => {
+  const tight = await load({
+    limits: { commandOutputMaxLines: 400, commandOutputMaxBytes: 8_000 },
+  });
+  assert.equal(tight.limits.commandOutputMaxLines, 400);
+  assert.equal(tight.limits.commandOutputMaxBytes, 8_000);
+
+  const generous = await load({
+    limits: { commandOutputMaxLines: 5_000_000, commandOutputMaxBytes: 5_000_000_000 },
+  });
+  assert.equal(
+    generous.limits.commandOutputMaxLines,
+    MAX_OUTPUT_LINES,
+    "a config cannot raise the built-in cap",
+  );
+  assert.equal(generous.limits.commandOutputMaxBytes, MAX_OUTPUT_BYTES);
+});
+
+test("an output ceiling that would show nothing is refused at boot", async () => {
+  // Zero is not a tight budget, it is a shell whose every command returns an elision note.
+  // Named in the error, like the sabotage budgets, so an operator can find the line.
+  const names = async (over: Record<string, unknown>, field: string): Promise<void> => {
+    await assert.rejects(
+      () => load(over),
+      (error: unknown) => error instanceof ConfigError && new RegExp(field).test(error.message),
+    );
+  };
+
+  await names({ limits: { commandOutputMaxLines: 0 } }, "limits\\.commandOutputMaxLines");
+  await names({ limits: { commandOutputMaxLines: -1 } }, "limits\\.commandOutputMaxLines");
+  await names({ limits: { commandOutputMaxLines: 2.5 } }, "limits\\.commandOutputMaxLines");
+  await names({ limits: { commandOutputMaxBytes: 0 } }, "limits\\.commandOutputMaxBytes");
+  await names({ limits: { commandOutputMaxBytes: 1.5 } }, "limits\\.commandOutputMaxBytes");
+});
+
+test("cluster.maxLogLines is capped by the general output ceiling, not its own constant", async () => {
+  // §6.4: one rule for every tool's output, with `cluster.maxLogLines` as one configured
+  // case of it. Two independent 2000s in two files is how they come to disagree.
+  const config = await load({ cluster: { enabled: true, maxLogLines: 100_000 } });
+
+  assert.equal(config.cluster.maxLogLines, MAX_OUTPUT_LINES);
 });
 
 test("a config that says nothing about schedules fires none", async () => {

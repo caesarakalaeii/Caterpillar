@@ -785,6 +785,105 @@ reviewers the suite has passed and not to run it again. The reviewer ran it anyw
 the argument for the ceiling living in the harness rather than in a prompt: a prompt is a
 request, and an unattended fleet needs a limit.
 
+#### The other half: a ceiling on what a command RETURNS
+
+The ceiling above bounds how long a command runs. Nothing bounded how much it hands back,
+and the two failures look nothing alike. A hung command holds a slot until something kills
+it. A 40,000-line `grep` **succeeds, in a second**, and spends a large share of the context
+window that §6.1's handoff threshold exists to protect — after which the task hands off
+early with a journal that can only say it ran out of room. One `cat` of a lockfile does the
+same. For a while `cluster.maxLogLines` was the only output bound in the codebase, and it
+covered three tools.
+
+So the rule is general, and it is the same rule as the timeout: **`limits.commandOutputMaxLines`
+(2,000) and `limits.commandOutputMaxBytes` (50KiB) both default AND clamp**, applied in
+`BoundedExecutionEnv` — so in the agent's shell and the council's, since both go through it.
+A config can only lower them. That matters more here than it looks: the agent edits config
+in its own worktree, so a knob it could raise is not a bound.
+
+Five things about it are load-bearing.
+
+**Head AND tail, and the split is 1:3.** A test runner prints its failure summary last, so
+head-only truncation loses the verdict and makes a bounded failure look like a pass. A
+compiler prints the first error first, so tail-only loses what started it. Both ends are
+kept, the tail gets the larger share, and the note says which — `budget.ts` is pure and
+decides only this.
+
+**Lines and bytes, whichever bites first.** A line ceiling alone lets one minified lockfile
+through as three lines and half a megabyte. A byte ceiling alone lets 40,000 short lines
+through. The one unavoidable case — a single line longer than the whole byte budget — cuts
+the line and *says out loud that it did*, because a truncated line that looks complete is
+how a model comes to believe a file ends where it does not.
+
+**The elision is declared, never silent.** "1,284 of 40,112 lines shown", the way
+`journal.ts` declares its own. Silent truncation is worse than a short answer, because the
+model acts on it.
+
+The note is charged against both halves of the ceiling — a line of the line budget and a few
+hundred bytes of the byte budget — because it is text the model reads, so `maxLines` of
+content plus a note is over the ceiling it declares. The line matters more than it sounds:
+pi bounds its own capture at exactly 2,000 lines, tail-only, so at the shipped default a
+view one line over gets cut a second time and the line that goes is the first head line.
+That is the compiler's first error — the only reason the head is kept. Do not spend that
+line on content; the "pi's truncation is a no-op" claim below depends on it.
+
+**The overflow is written, not discarded.** `<tasks>/<task>/.caterpillar/output/<uuid>.log`,
+named in the note, so a session that needs the middle can read it in slices. That directory
+is the scratch directory the toolchain cache already uses: beside the checkout, so a spill
+is never committable, and reaped with the task rather than accumulating on the work volume.
+A failed spill does not fail the command — the bounded view is still correct, and the note
+says plainly that the rest is gone.
+
+Known limitation: one file per bounded command accumulates for the LIFE of the task, and
+`removeTaskWorktrees` deliberately does not reap on handoff or `awaiting-human` — so a
+long-lived task that greps widely every session grows the directory without a cap. Usage
+accounting does see it, since it measures `paths.tasks`, so this shows up as disk pressure
+rather than as a silent leak. Left alone here because capping the directory means changing
+when the reaper runs, which is the supervisor's concern and not this ceiling's.
+
+**It is applied to the STREAM, not to the return value.** This is the part that would have
+been got wrong. pi's bash tool reads `env.exec`'s `onStdout`/`onStderr` callbacks and
+ignores the `stdout` it returns, so bounding the return value alone leaves the model's own
+view unbounded while every test passes. `BoundedExecutionEnv` therefore withholds the
+caller's callbacks for the duration of the command and hands over one bounded chunk just
+before `exec` resolves — and bounds the return value too, so the ceiling does not depend on
+which half of `ExecutionEnv`'s contract a caller reads. Two consequences, both accepted: pi's own truncation
+becomes a no-op (a constant 2,000 no config could lower, tail-only, spilled to a `tmpdir`
+file outside the worktree), and progress updates arrive when a command ends rather than
+while it runs, which nothing in this codebase consumes.
+
+**And it is counted in the accounting that decides handoff.** Lines and bytes are what a
+command produces; they say nothing about what they cost. 50KiB is a rounding error in a 1M
+window and a large share of a 32k one. So `ContextBudget.outputCeiling()` caps the
+configured number a second time, at a tenth of the handoff threshold — the same move
+`journalBudgetChars` makes for journal history, and made in `limits.ts` because that is the
+class that knows the window. The guarantee is that **no single tool call can cross the
+handoff threshold by itself**, which is the failure the whole thing exists to prevent: a
+session that hands off having run one `grep`.
+
+`cluster.maxLogLines` is now one configured case of this rule rather than a special one —
+same validation helper in `load.ts`, and its cap is `MAX_OUTPUT_LINES` itself. Two
+independent 2,000s in two files is how they come to disagree, and the disagreement would be
+invisible.
+
+**What is deliberately left alone.** pi's `read` tool never goes through `exec` — it calls
+`readTextLines` — and it already bounds itself at the same 2,000 lines / 50KiB, declares the
+elision, and tells the model the `offset` to continue from. Head-only is the right choice
+there, unlike for a command: a file is read forwards. So it is left as it is, and the
+asymmetry is recorded here rather than "fixed" into a second mechanism. The knob it would
+need does not exist, which is the honest limitation: an operator who lowers
+`limits.commandOutputMaxLines` for a small window does not thereby lower what one `read`
+costs.
+
+There is a third shell, and it gets neither ceiling: `PlanMaintainer` (`src/plan/maintain.ts`)
+builds a bare `NodeExecutionEnv`, so its `bash` tool has no output bound and — this part
+predates the output ceiling — no `limits.commandTimeoutSeconds` either. Invariant 12's
+"no command returns without one either" is therefore true of the agent's shell and the
+council's, which is where a wide `grep` actually happens, and not of the plan maintainer's.
+It is left alone here because wrapping it is a change to the maintainer's behaviour rather
+than to the budget, and it belongs in the change that also gives it the timeout: one
+`BoundedExecutionEnv` for both ceilings, not a second knob for one of them.
+
 An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
 session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and
 deliberately distinct from it: no provider misbehaved, so no cooldown starts. Charging a

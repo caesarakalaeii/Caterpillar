@@ -14,6 +14,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
+import { outputCeiling } from "../agent/budget.ts";
 import type { LogFields, Logger } from "../obs/log.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { prepareSabotageCopy, SabotageExecutionEnv } from "./sabotage.ts";
@@ -199,6 +200,8 @@ test("the command cap stops the shell running a third command, not merely report
   const subject = new SabotageExecutionEnv({
     cwd: root,
     timeoutSeconds: 30,
+    output: outputCeiling({}),
+    overflowDir: join(root, ".caterpillar", "output"),
     logger,
     task: "TASK-1",
     maxCommands: 2,
@@ -230,6 +233,8 @@ test("a generous command cap runs commands normally and counts them", async () =
   const subject = new SabotageExecutionEnv({
     cwd: root,
     timeoutSeconds: 30,
+    output: outputCeiling({}),
+    overflowDir: join(root, ".caterpillar", "output"),
     logger: SILENT_LOGGER,
     task: "TASK-1",
     maxCommands: 50,

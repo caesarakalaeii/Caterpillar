@@ -16,6 +16,11 @@ import {
   type AgentMessage,
   type CompactionSettings,
 } from "@earendil-works/pi-agent-core";
+import {
+  outputCeiling as clampedCeiling,
+  type OutputCeiling,
+  type OutputCeilingRequest,
+} from "./budget.ts";
 
 export class HandoffThresholdError extends Error {
   constructor(thresholdTokens: number, compactionTokens: number) {
@@ -91,4 +96,40 @@ export class ContextBudget {
   utilisation(messages: readonly AgentMessage[]): number {
     return this.tokensUsed(messages) / this.contextWindow;
   }
+
+  /**
+   * What ONE tool result may cost, in the accounting this class already uses (§6.4).
+   *
+   * `budget.ts` bounds output in lines and bytes, which are the units a command produces
+   * but say nothing about what they cost: 2,000 lines is a rounding error in a 1M window
+   * and a third of a 32k one. So the configured ceiling is capped a second time here,
+   * against the window — the same move `journalBudgetChars` makes, for the same reason, and
+   * made here because this is the class that knows the window and the threshold.
+   *
+   * The guarantee is the one worth stating: no single tool call can cross the handoff
+   * threshold by itself. Without it the worst case is a session that hands off having done
+   * one `grep`, and whose journal cannot explain why — which is the failure §6.1's
+   * threshold exists to make orderly rather than to cause.
+   */
+  outputCeiling(request: OutputCeilingRequest = {}): OutputCeiling {
+    const configured = clampedCeiling(request);
+    // Bytes only. A line is not a unit of cost — 40,000 words and 40,000 empty lines are
+    // the same line count and nothing like the same context — so the window has nothing to
+    // say about the line ceiling, and the byte ceiling bounds both in the end.
+    const affordable = Math.max(1, Math.floor(this.thresholdTokens * OUTPUT_SHARE * CHARS_PER_TOKEN));
+    return { maxLines: configured.maxLines, maxBytes: Math.min(configured.maxBytes, affordable) };
+  }
 }
+
+/**
+ * Share of the HANDOFF budget — not of the whole window — one tool result may take.
+ *
+ * Measured against the threshold because that is the budget a session actually has: the
+ * tokens above it are the ones it will never get to use. A tenth leaves a session at the
+ * default 0.7 of a 200k window around ten full-size tool results before output alone would
+ * end it, which is generous for the honest case and finite for the pathological one.
+ */
+const OUTPUT_SHARE = 0.1;
+
+/** Rough chars-per-token, matching `journal.ts`'s own conversion. */
+const CHARS_PER_TOKEN = 4;
