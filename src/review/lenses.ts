@@ -16,12 +16,17 @@
  * a change is graded against and the standard its author was handed cannot drift apart —
  * and a rejection over a rule nobody was told is the most demoralising round trip this
  * system can produce, because the next session is given no way to see what it missed.
+ *
+ * `repoLenses` at the foot of the file extends that to the standards a REPOSITORY ships
+ * (§12.2). Same parse, same rendering, both sides.
  */
 import {
   CODE_HEALTH_STANDARD,
   REVIEW_STANDARD,
   TEST_FIRST_STANDARD,
   WRITING_STANDARD,
+  lensRepoStandards,
+  type RepoStandard,
 } from "../agent/standards.ts";
 
 export interface Lens {
@@ -380,3 +385,26 @@ whole goal.
  */
 export const prLenses = (touchesSource: boolean): readonly Lens[] =>
   touchesSource ? [...PR_LENSES, SABOTAGE_LENS] : PR_LENSES;
+
+/**
+ * The same lenses, each carrying whatever the task's repos routed to it (DESIGN.md §12.2).
+ *
+ * The routing is the repo's own: every section of `.caterpillar/standards.md` names its
+ * owning lens in its heading, and `parseRepoStandards` refuses a section that names one
+ * that cannot own it. So a rule reaches exactly one reviewer here — the one-owning-lens
+ * property, holding for text this system did not write.
+ *
+ * Returns the input array UNCHANGED when nothing was supplied, which is the ordinary case:
+ * a fleet pointed at repos that never opt in pays nothing and has no second code path.
+ */
+export const repoLenses = (
+  lenses: readonly Lens[],
+  standards: readonly RepoStandard[],
+): readonly Lens[] => {
+  if (standards.length === 0) return lenses;
+
+  return lenses.map((entry) => {
+    const block = lensRepoStandards(standards, entry.key);
+    return block === "" ? entry : { ...entry, prompt: `${entry.prompt}\n\n${block}` };
+  });
+};

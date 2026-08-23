@@ -3,7 +3,7 @@
  *
  * Auth: personal API token, `Authorization: Bearer`. Token scopes are per ROUTE,
  * ticked at creation in Settings → API Tokens. Grant the agent token exactly:
- *   projects:read, tasks:read, tasks:update, comments:create,
+ *   projects:read, tasks:read, tasks:create, tasks:update, comments:create,
  *   labels:read, tasksLabels:create
  * and deliberately NOT tasks:delete or anything admin.
  *
@@ -28,6 +28,7 @@
 import type { TaskId, TrackerRef } from "../domain/task.ts";
 import {
   type Tracker,
+  type TrackerCreateRequest,
   type TrackerItem,
   TrackerScopeError,
   type TrackerTransition,
@@ -257,6 +258,57 @@ export class VikunjaTracker implements Tracker {
       "comments:create",
       { comment: toCommentHtml(text) },
     );
+  }
+
+  /**
+   * File a new task in a project. Supervisor-only — see tracker/types.ts.
+   *
+   * Two requests, unavoidably: Vikunja's create route takes no labels, so they go on
+   * afterwards through the same `tasksLabels:create` route `addLabel` uses. A label the
+   * instance does not have is dropped rather than refused — UnknownVikunjaLabelError
+   * guards a transition, which still has a task to fall back to, whereas here the
+   * alternative to a dropped label is a lost report.
+   */
+  async create(request: TrackerCreateRequest): Promise<TrackerRef> {
+    const project = Number.parseInt(request.container, 10);
+    if (!Number.isInteger(project) || project <= 0) {
+      throw new Error(`'${request.container}' is not a Vikunja project id`);
+    }
+
+    const index = await this.labelIndex();
+    const applied: number[] = [];
+    const omitted: string[] = [];
+    for (const name of request.labels) {
+      const id = index.get(name.toLowerCase());
+      if (id === undefined) omitted.push(name);
+      else applied.push(id);
+    }
+    if (omitted.length > 0) request.onLabelsOmitted?.(omitted);
+
+    // PUT, not POST: Vikunja creates with PUT, as it does for comments. The description
+    // is rich text, so markdown would render as literal asterisks.
+    const filed = await this.call<{ readonly id?: number }>(
+      "PUT",
+      `projects/${project}/tasks`,
+      "tasks:create",
+      { title: request.title, description: toCommentHtml(request.body) },
+    );
+
+    const id = filed?.id;
+    if (id === undefined) {
+      throw new Error(
+        `Vikunja accepted a new task in project ${project} but returned no id`,
+      );
+    }
+
+    // After the id exists, so a label failure leaves a findable task rather than an
+    // orphan nobody can address.
+    for (const label of applied) {
+      await this.call<unknown>("PUT", `tasks/${id}/labels`, "tasksLabels:create", {
+        label_id: label,
+      });
+    }
+    return { kind: "vikunja", id: String(id), container: String(project) };
   }
 
   /**

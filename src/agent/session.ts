@@ -300,6 +300,7 @@ const buildOutcome = (input: OutcomeInput): SessionOutcome => {
       reason: signal.reason,
       summary: signal.summary,
       ...(signal.question !== undefined ? { question: signal.question } : {}),
+      ...(signal.questionOptions === undefined ? {} : { questionOptions: signal.questionOptions }),
       ...(signal.requires !== undefined ? { requires: signal.requires } : {}),
       ...(input.control.plan !== undefined ? { plan: input.control.plan } : {}),
     };

@@ -40,6 +40,7 @@ import type {
   GitCredential,
   PrRequest,
   PrResult,
+  ReviewComment,
 } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { Git } from "../state/git.ts";
@@ -48,6 +49,7 @@ import { WorktreeManager } from "../workspace/worktree.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
+import { TEST_FIRST_STANDARD } from "./standards.ts";
 import type { RunnerConfig } from "../config/types.ts";
 
 const sh = (command: string, cwd: string): Promise<void> =>
@@ -59,13 +61,24 @@ const sh = (command: string, cwd: string): Promise<void> =>
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
 const TASK = asTaskId("TASK-1");
+/** The pull request a review comment would be left on. */
+const PR = { number: 7, url: "https://example.invalid/pr/7" } as const;
 
 class FakeForge implements Forge {
   readonly kind = "fake";
   prs: PrRequest[] = [];
+  /** What `listReviewComments` answers — or throws, when it is an Error. */
+  reviewComments: readonly ReviewComment[] | Error = [];
+  /** Every `(repo, pr)` it was asked about, so "asked nothing" is assertable. */
+  readonly reviewLookups: [RepoRef, number][] = [];
 
   async credential(): Promise<GitCredential> {
     return { username: "x-access-token", password: "fake" };
+  }
+  async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
+    this.reviewLookups.push([repo, pr]);
+    if (this.reviewComments instanceof Error) throw this.reviewComments;
+    return this.reviewComments;
   }
   async openPr(_repo: RepoRef, request: PrRequest): Promise<PrResult> {
     this.prs.push(request);
@@ -195,6 +208,44 @@ for (let i = 0; i < JOURNAL_REPEATS; i += 1) {
     `## Session 2 — 2026-08-12T10:${minute}:00.000Z\n\n**Parked:** lease lost\n`,
   );
 }
+
+// A fifth task, on a repo of its OWN that ships `.caterpillar/standards.md` (§12.2). Its
+// own repo rather than `source`, so every other test in this file keeps a prompt with no
+// repo standards in it and the two cases stay distinguishable.
+const STANDARDS_TASK = asTaskId("TASK-5");
+const STANDARDS_REPO: RepoRef = { host: "github.com", owner: "acme", name: "housestyle" };
+const standardsSource = join(root, "housestyle-source");
+await mkdir(join(standardsSource, ".caterpillar"), { recursive: true });
+await sh(
+  "git init -q -b main && git config user.email t@t && git config user.name t && git config commit.gpgsign false",
+  standardsSource,
+);
+await writeFile(
+  join(standardsSource, ".caterpillar", "standards.md"),
+  "## design: Changelog\n\nNever merge without a changelog entry.\n",
+);
+await sh("git add -A && git commit -qm init", standardsSource);
+await mkdir(join(mirrors, STANDARDS_REPO.host, STANDARDS_REPO.owner), { recursive: true });
+await sh(
+  `git clone -q --mirror ${standardsSource} ${join(mirrors, STANDARDS_REPO.host, STANDARDS_REPO.owner, `${STANDARDS_REPO.name}.git`)}`,
+  root,
+);
+await mkdir(join(stateRepo, "tasks", STANDARDS_TASK), { recursive: true });
+await writeFile(
+  join(stateRepo, "tasks", STANDARDS_TASK, "spec.md"),
+  [
+    "---",
+    "workspace: test",
+    "repos:",
+    "  - github.com/acme/housestyle",
+    "acceptance:",
+    '  - "true"',
+    "---",
+    "",
+    "Add a changelog entry.",
+    "",
+  ].join("\n"),
+);
 
 // Started, not merely constructed: the runner opens this task's socket in it. One
 // service for the file, because the runner closes only the lease it opened.
@@ -427,4 +478,156 @@ test("an open_pr call is surfaced on the outcome for the completion gate", async
   assert.equal(outcome.reason, "done-claimed");
   assert.deepEqual(outcome.pr, { number: 7, url: "https://example.invalid/pr/7" });
   assert.equal(forge.prs.at(-1)?.head, "agent/TASK-1");
+});
+
+test("the repo's own standards reach the session's system prompt", async () => {
+  // End to end: the file is committed on the branch the worktree comes from, so this is
+  // the real read, the real parse and the real splice (DESIGN.md §12.2). The council
+  // splices the same sections into the owning lens; `review/lenses.test.ts` pins that half.
+  const { runner, faux } = buildRunner(200_000);
+
+  let systemPrompt = "";
+  faux.setResponses([
+    (context) => {
+      systemPrompt = context.systemPrompt ?? "";
+      return fauxAssistantMessage(fauxToolCall("done", { summary: "read the standards" }), {
+        stopReason: "toolUse",
+      });
+    },
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const standardsSpec = await store.readSpec(STANDARDS_TASK);
+  await runner.run(standardsSpec, state({ id: STANDARDS_TASK }));
+
+  assert.match(systemPrompt, /Never merge without a changelog entry\./);
+  // Headed with the repo that supplied it — the per-repo scoping a multi-repo task needs.
+  assert.match(systemPrompt, /acme\/housestyle/);
+});
+
+test("a session is told its repo's standards cannot switch the fleet's own off", async () => {
+  // The file is untrusted text authored outside this system and it lands next to
+  // test-first in the same prompt. A repo must not be able to turn that off by writing
+  // a section that says so.
+  const { runner, faux } = buildRunner(200_000);
+
+  let systemPrompt = "";
+  faux.setResponses([
+    (context) => {
+      systemPrompt = context.systemPrompt ?? "";
+      return fauxAssistantMessage(fauxToolCall("done", { summary: "read the standards" }), {
+        stopReason: "toolUse",
+      });
+    },
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const standardsSpec = await store.readSpec(STANDARDS_TASK);
+  await runner.run(standardsSpec, state({ id: STANDARDS_TASK }));
+
+  assert.ok(systemPrompt.includes(TEST_FIRST_STANDARD));
+  assert.match(systemPrompt, /cannot switch any of it off/);
+});
+
+/**
+ * Review comments reach the prompt (DESIGN.md §7.3).
+ *
+ * Asserted on the TRANSCRIPT — the bytes actually sent to the model — for the same reason
+ * the journal test is: the renderer has its own unit tests, and what those cannot prove is
+ * that the section was fetched, rendered and spliced in at all.
+ */
+const commentOn = (over: Partial<ReviewComment> = {}): ReviewComment => ({
+  id: "1",
+  repo: REPO,
+  pr: 7,
+  author: "a-human",
+  fromFleet: false,
+  body: "this swallows the error",
+  path: "src/index.ts",
+  line: 12,
+  createdAt: "2026-08-13T10:00:00.000Z",
+  resolved: false,
+  outdated: false,
+  ...over,
+});
+
+const promptOf = async (task: string, session: number): Promise<string> =>
+  gunzipSync(
+    await readFile(
+      join(stateRepo, "tasks", task, "sessions", `${String(session).padStart(3, "0")}.jsonl.gz`),
+    ),
+  ).toString("utf8");
+
+test("an unresolved review comment reaches the model, with its file and line", async () => {
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "addressed the review" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  forge.reviewComments = [commentOn()];
+  forge.reviewLookups.length = 0;
+  const outcome = await runner.run(spec, state({ sessions: 3, pr: PR }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(TASK, 4);
+  assert.match(transcript, /this swallows the error/);
+  assert.match(transcript, /src\/index\.ts:12/);
+  // Every PR the task has open is asked about, not the primary alone (§9.4.1).
+  assert.deepEqual(forge.reviewLookups, [[REPO, 7]]);
+});
+
+test("the newest human comment is reported so the supervisor can forgive a round", async () => {
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "addressed the review" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  forge.reviewComments = [
+    commentOn({ createdAt: "2026-08-13T10:00:00.000Z" }),
+    commentOn({ id: "2", createdAt: "2026-08-14T10:00:00.000Z" }),
+  ];
+  const outcome = await runner.run(spec, state({ sessions: 4, pr: PR }));
+
+  assert.equal(outcome.reviewComment, "2026-08-14T10:00:00.000Z");
+});
+
+test("a task with no pull request asks the forge nothing", async () => {
+  // Nothing to comment on, and a session that has not opened a PR yet is the common case.
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "no PR yet" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  forge.reviewComments = [commentOn()];
+  forge.reviewLookups.length = 0;
+  const outcome = await runner.run(spec, state({ sessions: 5 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  assert.deepEqual(forge.reviewLookups, []);
+  assert.equal(outcome.reviewComment, undefined);
+});
+
+test("a forge that cannot be reached does not fail the session", async () => {
+  // Invariant 6, and the same rule tracker mirroring follows: log and continue. A GitHub
+  // hiccup must not cost a task its session, and the review is not the work.
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "worked anyway" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  forge.reviewComments = new Error("GitHub /graphql failed with 500");
+  const outcome = await runner.run(spec, state({ sessions: 6, pr: PR }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  assert.equal(outcome.reviewComment, undefined);
 });

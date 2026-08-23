@@ -59,12 +59,19 @@ export interface GatewayOptions {
   /**
    * A message for us. `messageId` is what a reaction needs (§7.3) — the acknowledgement for a
    * steer is put on the human's own message rather than as a new line in the thread.
+   *
+   * `replyTo` is the message this one is a REPLY to, when it is one. It is the only thing in
+   * the payload that says which task a human meant: a plan's children inherit their
+   * brainstorm's thread, so the thread alone names several tasks and `threadBindings` has to
+   * pick between them by rank. Undefined for an ordinary message, and undefined for a
+   * reference carrying no message id — a forward, or a reply to a deleted message.
    */
   readonly onMessage: (
     content: string,
     author: string,
     channelId: string,
     messageId: string,
+    replyTo?: string,
   ) => Promise<void>;
   /**
    * Slash commands, buttons and modal submissions.
@@ -136,6 +143,14 @@ interface MessageCreate {
   readonly content?: string;
   readonly webhook_id?: string;
   readonly author?: { readonly id?: string; readonly username?: string; readonly bot?: boolean };
+  /**
+   * What this message replies to, forwards, or was crossposted from.
+   *
+   * Only `message_id` is read, and it is OPTIONAL on the wire: Discord sends a reference
+   * with no message id for a forward and for a reply whose target has been deleted. Both
+   * have to read as "not a reply" rather than as a reply to nothing.
+   */
+  readonly message_reference?: { readonly message_id?: string };
 }
 
 /** Backoff between reconnects, so a hard outage does not become a reconnect storm. */
@@ -415,14 +430,20 @@ export class DiscordGateway {
     const content = message.content ?? "";
     if (content.length === 0) return;
 
+    const replyTo = message.message_reference?.message_id;
+
     const deliver = (): void => {
-      void onMessage(content, message.author?.username ?? "someone", from, message.id ?? "").catch(
-        (error: unknown) => {
-          logger.error("gateway.handler-failed", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        },
-      );
+      void onMessage(
+        content,
+        message.author?.username ?? "someone",
+        from,
+        message.id ?? "",
+        replyTo,
+      ).catch((error: unknown) => {
+        logger.error("gateway.handler-failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     };
 
     // The synchronous answer first: the main channel and every bound thread take no await,

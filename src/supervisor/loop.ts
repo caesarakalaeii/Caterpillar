@@ -30,6 +30,7 @@ import {
   type ProposedPlan,
   type RepoRef,
   type ProviderOutage,
+  type ReviewRecord,
   type SessionOutcome,
   type TaskId,
   type TaskPhase,
@@ -77,13 +78,14 @@ import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
+import { isNewerComment } from "../agent/review-guidance.ts";
 import { SlotSteering, type SteeringFeed } from "../agent/steering.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
 import type { ChatDrainer } from "../redis/inbox.ts";
 import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
-import type { ChatOutcome, ChatRequest } from "./inbox.ts";
+import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
 
@@ -1341,6 +1343,24 @@ export class Supervisor {
       const state = await store.readState(id).catch(() => undefined);
       if (state === undefined) continue;
       records.push({ id, state });
+      // A streak this replica published for a task that has since finished ANYWHERE.
+      //
+      // `transition` drops the series too, and that stays the fast path — but it only
+      // reaches the process that performed the terminal transition. The gauge is
+      // per-process and in memory while a task migrates between replicas across sessions,
+      // so the pod that published the streak is routinely not the pod that finishes the
+      // task: pod A hands off at streak 2, pod B takes it `done` and removes the series
+      // from its own registry where nothing ever set it, and pod A keeps reporting 2 for
+      // the life of the process. `caterpillar_no_progress_streak >= 2` does not aggregate
+      // over `pod`, so that orphan alerts about settled work until someone restarts the
+      // pod.
+      //
+      // Here because this is the only pass that reads every task's COMMITTED state on
+      // every poll in every replica — the same property that makes the presence below
+      // fleet-wide rather than a report on this one. `Metric.remove` is silent on a label
+      // set that was never reported, so this costs a map lookup per terminal task and says
+      // nothing about tasks this replica never touched.
+      if (isTerminal(state.status)) this.deps.metrics.noProgress.remove({ task: id });
     }
 
     // Awaited: with Redis configured this is a write over the network, and a floating
@@ -2045,11 +2065,11 @@ export class Supervisor {
     outcome: SessionOutcome,
     steering?: SlotSteering,
   ): Promise<TaskState> {
-    const { store, config, metrics, logger } = this.deps;
+    const { store, config, logger } = this.deps;
 
     const session = state.sessions + 1;
     const evidence = await this.deps.progress.probe(spec, state);
-    const progress = recordProgress(state.progress, session, evidence);
+    const progress = recordProgress(state.progress, session, evidence, outcome.reason);
 
     // The evidence, not just the resulting streak: a task parked for "no progress" is
     // otherwise indistinguishable from a probe that failed to SEE the progress, which
@@ -2065,10 +2085,14 @@ export class Supervisor {
       // Distinguishes the fork-point fallback from a recorded head, which is what makes
       // a first-session verdict readable at all.
       firstSession: state.progress.lastHeadOid === undefined,
+      // Logged alongside the evidence because it can now change the verdict: an
+      // `ask-human` exit leaves the streak alone (`neutralExit`), so a reader comparing
+      // the evidence against the streak needs to see why they disagree.
+      reason: outcome.reason,
       noProgressStreak: progress.noProgressStreak,
     });
 
-    metrics.noProgress.set({ task: spec.id }, progress.noProgressStreak);
+    this.publishNoProgress(spec.id, progress.noProgressStreak);
 
     const next: TaskState = {
       ...state,
@@ -2081,6 +2105,7 @@ export class Supervisor {
       // display reader already reads.
       ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
       ...(outcome.prs !== undefined ? { prs: outcome.prs } : {}),
+      ...this.forgiveReviewRounds(spec, state, outcome),
     };
 
     // Three files and a commit as ONE unit — the journal shard, the handoff and the state.
@@ -2136,6 +2161,43 @@ export class Supervisor {
   }
 
   /**
+   * Clear the council's round count when a human commented on the pull request (§7.3, §12.1).
+   *
+   * The same departure typed guidance makes, for the same surface-independent reason: the cap
+   * exists to detect a loop with nothing new entering it, and a human objection is precisely
+   * something new. Left unforgiven, a task already at the cap parks on the very next
+   * rejection — so the objection is never tested, and the human concludes, correctly, that
+   * commenting on the pull request had no effect.
+   *
+   * Written HERE rather than in `convene` because of the ordering: `recordSession` runs
+   * before `applyOutcome`, which is what convenes the council. Forgiven afterwards, the round
+   * has already been counted and the task has already parked.
+   *
+   * The watermark moves whether or not there was anything to forgive, so one comment buys one
+   * round rather than a round on every session for the rest of the task's life. `last` and
+   * `reason` stay put, exactly as `applyGuidance` leaves them: a human who commented wants to
+   * see what they are answering.
+   */
+  private forgiveReviewRounds(
+    spec: TaskSpec,
+    state: TaskState,
+    outcome: SessionOutcome,
+  ): { readonly review?: ReviewRecord } {
+    const comment = outcome.reviewComment;
+    if (comment === undefined) return {};
+
+    const review = state.review ?? { rounds: 0 };
+    if (!isNewerComment(comment, review.commentSeen)) return {};
+
+    this.deps.logger.info("review.rounds-forgiven", {
+      task: spec.id,
+      rounds: review.rounds,
+      commentAt: comment,
+    });
+    return { review: { ...review, rounds: 0, commentSeen: comment } };
+  }
+
+  /**
    * Act on why the session stopped. Returns true when the task is finished with
    * this runner (parked, done, or failed).
    */
@@ -2174,9 +2236,17 @@ export class Supervisor {
         // that answers this question is the same task on the same branch, and it will be
         // claimed by this runner as often as not. Deleting the checkout while a human
         // types would buy disk for exactly as long as it takes them to answer.
-        logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
+        // The option TEXT is not logged either, for the same reason as the question, and it
+        // goes to the state repo rather than into the Discord button: a `custom_id` holds 100
+        // characters, so the button can only carry an index into this list.
+        const options = outcome.questionOptions;
+        logger.info("task.awaiting-human", {
+          task: spec.id,
+          questionIndex: index,
+          ...(options === undefined ? {} : { options: options.length }),
+        });
         await this.unit(async () => {
-          await store.writeQuestion(spec.id, index, question);
+          await store.writeQuestion(spec.id, index, question, options);
           await this.transition(lease, state, "awaiting-human");
           await this.push(lease, `chore(${spec.id}): awaiting human input`);
         });
@@ -2184,7 +2254,13 @@ export class Supervisor {
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
         await this.mirror(spec, { kind: "question", question });
-        await this.notifyTask(state, { kind: "question", task: spec.id, question, phase: state.phase });
+        await this.notifyTask(state, {
+          kind: "question",
+          task: spec.id,
+          question,
+          phase: state.phase,
+          ...(options === undefined ? {} : { options }),
+        });
         return true;
       }
 
@@ -2437,6 +2513,12 @@ export class Supervisor {
         // (§snapshot). Cleared on acceptance so a passing task does not keep quoting the
         // objection it has already answered.
         ...(cut.kind === "rejected" ? { reason: recordedReason(cut.reason) } : {}),
+        // Carried forward, unlike everything else here. It is not a fact about this round:
+        // it records which review comment has already been forgiven a round, and dropping
+        // it would let the same comment forgive one again on the next session (§7.3).
+        ...(state.review?.commentSeen === undefined
+          ? {}
+          : { commentSeen: state.review.commentSeen }),
       },
     };
 
@@ -2592,6 +2674,11 @@ export class Supervisor {
         last: verdict.decision,
         // See `applyPlan`: the objections have to be in state to be reachable from `/task`.
         ...(verdict.decision === "changes" ? { reason: recordedReason(detail) } : {}),
+        // See `applyPlan` again: the review-comment watermark is not a fact about this
+        // round and must survive it, or the same comment forgives a round twice (§7.3).
+        ...(state.review?.commentSeen === undefined
+          ? {}
+          : { commentSeen: state.review.commentSeen }),
       },
     };
 
@@ -3248,6 +3335,8 @@ export class Supervisor {
     switch (request.kind) {
       case "answer":
         return this.applyAnswer(request);
+      case "answer-option":
+        return this.applyAnswerOption(request);
       case "park":
         return this.applyPark(request);
       case "resume":
@@ -3386,6 +3475,51 @@ export class Supervisor {
   }
 
   /**
+   * One of the question's own options, pressed as a button (§7).
+   *
+   * This method does exactly one thing: turn an index into the text the agent offered. It
+   * then hands that text to `applyAnswer`, which is what writes the answer file, the journal
+   * entry and the streak reset. There is deliberately no second answer path — the two would
+   * agree on the day they were written and drift apart afterwards, and the divergence would
+   * show up as a session reading an answer nobody remembers giving.
+   *
+   * A refusal rather than a guess when the index is out of range. A button stays in the
+   * Discord channel forever, so a press can arrive against a question that has since been
+   * answered and superseded, or against one that never had options. Writing option 1 of a
+   * different question would put a choice the human did not make where the next session
+   * reads it as theirs.
+   */
+  private async applyAnswerOption(
+    request: ChatRequest & { readonly kind: "answer-option" },
+  ): Promise<ChatOutcome> {
+    const { store, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+
+    const pending =
+      state.status === "awaiting-human" ? await store.pendingQuestion(request.task) : undefined;
+    const chosen = pending?.options?.[request.option];
+    if (chosen === undefined) {
+      logger.info("answer.option-stale", {
+        task: request.task,
+        option: request.option,
+        ...(pending === undefined ? {} : { questionIndex: pending.index }),
+      });
+      return {
+        kind: "refused",
+        reason:
+          `**${request.task}** no longer offers that option — the question it belonged to has ` +
+          `moved on. Read the current one and answer it in prose.`,
+      };
+    }
+
+    // The INTENT, without the request's `settle`: this method's caller settles what is
+    // returned, and an answer path that could settle a second time would report twice.
+    return this.applyAnswer({ kind: "answer", task: request.task, text: chosen });
+  }
+
+  /**
    * Everything a human types at a task, routed by what the task is currently doing.
    *
    * One entry point deliberately: in a task's own thread every message is this request
@@ -3403,7 +3537,7 @@ export class Supervisor {
    * notification, a verdict notification and `/task` were all telling the human to "say what
    * to change in this thread". Three surfaces documented a path that ended in a `return`.
    */
-  private async applyAnswer(request: ChatRequest & { readonly kind: "answer" }): Promise<ChatOutcome> {
+  private async applyAnswer(request: ChatIntent & { readonly kind: "answer" }): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
     const state = await store.tryReadState(request.task);
@@ -3448,6 +3582,9 @@ export class Supervisor {
       );
     });
 
+    // After the push, like every other observation in this method: a gauge that ran ahead
+    // of the state repo would report a forgiveness that never landed.
+    this.publishNoProgress(request.task, 0);
     logger.info("answer.applied", { task: request.task, questionIndex: pending.index });
     return { kind: "applied", index: pending.index };
   }
@@ -3486,7 +3623,7 @@ export class Supervisor {
    *   says which of the two happened rather than letting a human find out by watching.
    */
   private async applyGuidance(
-    request: ChatRequest & { readonly kind: "answer" },
+    request: ChatIntent & { readonly kind: "answer" },
     state: TaskState,
   ): Promise<ChatOutcome> {
     const { store, leases, logger } = this.deps;
@@ -3553,6 +3690,7 @@ export class Supervisor {
       await leases.release(lease).catch(() => undefined);
     }
 
+    this.publishNoProgress(request.task, 0);
     logger.info("guidance.recorded", {
       task: request.task,
       status: state.status,
@@ -3712,6 +3850,7 @@ export class Supervisor {
         );
         await this.push(handle, `chore(${request.task}): resumed from chat`);
       });
+      this.publishNoProgress(request.task, 0);
       logger.info("task.resumed", {
         task: request.task,
         sessions: state.sessions,
@@ -3920,6 +4059,30 @@ export class Supervisor {
     }
   }
 
+  /**
+   * Publish a task's no-progress streak to the gauge Prometheus scrapes.
+   *
+   * `recordSession` used to be the only caller, which made the gauge a snapshot of the
+   * last session this runner happened to record, with nothing to correct it afterwards.
+   * Three other sites forgive the streak in state — an answer, guidance, a resume — so
+   * the series reported a number the state no longer held for as long as the process
+   * lived. It exists so that each of those has one obvious thing to call, next to the
+   * log line it already writes.
+   *
+   * `caterpillar_no_progress_streak >= 2` is an alerting rule, so a stale sample is not
+   * cosmetic: it pages somebody about a task that is fine. Dropping the series when a
+   * task ENDS is the other half, and it takes two places rather than one:
+   *
+   *   - `transition`, the funnel every status change goes through, for the process that
+   *     takes the task terminal itself;
+   *   - `survey`, for every OTHER replica, because the gauge is per-process while a task
+   *     migrates between replicas across sessions — so the pod holding the streak is
+   *     routinely not the pod that finishes the task.
+   */
+  private publishNoProgress(task: TaskId, streak: number): void {
+    this.deps.metrics.noProgress.set({ task }, streak);
+  }
+
   private async transition(
     lease: LeaseHandle,
     state: TaskState,
@@ -3937,6 +4100,10 @@ export class Supervisor {
     };
     await this.deps.store.writeState(next);
     this.deps.metrics.taskStatus.set({ task: state.id, status }, 1);
+    // A terminal task has no next session, so its streak stops being a measurement of
+    // anything. The STATE keeps it — it is the record of why the task parked — but the
+    // gauge is a claim about right now, and nothing expires it (`Metric.remove`).
+    if (isTerminal(status)) this.deps.metrics.noProgress.remove({ task: state.id });
     return next;
   }
 

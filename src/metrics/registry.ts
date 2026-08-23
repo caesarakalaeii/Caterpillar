@@ -5,6 +5,7 @@
  * and this keeps the dependency surface (and therefore the supply-chain review
  * burden) down. Scraped by a ServiceMonitor.
  */
+import type { AttributionReport } from "../digest/attribution.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
 export type LabelValues = Readonly<Record<string, string>>;
 
@@ -68,6 +69,28 @@ class Metric {
    */
   clear(): void {
     this.samples.clear();
+  }
+
+  /**
+   * Forget ONE label set, leaving the rest reporting.
+   *
+   * For the same absence of expiry `clear` exists for, where the dead label set is one
+   * among many live ones rather than a whole breakdown being replaced:
+   * `caterpillar_no_progress_streak{task=...}` is per-task, tasks end, and a task that
+   * parked or finished never gets another `set`. `clear` cannot be used for it because it
+   * would drop every other task's live streak too.
+   *
+   * Removing rather than zeroing, deliberately. A no-progress streak of 0 is a real and
+   * meaningful reading — a task that is making progress — so publishing it for a task
+   * that has stopped running would be a claim about a session that does not exist. Absent
+   * is the honest answer, and it is the one `absent()` and staleness handling in
+   * Prometheus are built for.
+   *
+   * Silent on a label set that was never reported: the caller is a status transition,
+   * which fires for tasks that never published a streak at all.
+   */
+  remove(labels: LabelValues): void {
+    this.samples.delete(this.key(labels));
   }
 
   inc(labels: LabelValues, delta = 1): void {
@@ -371,6 +394,52 @@ export class AgentMetrics {
   );
 
   /**
+   * Lines the fleet and the humans wrote, by repo (DESIGN.md §19).
+   *
+   * The digest states the share in prose and nothing can graph prose. This is the same
+   * measurement as a number, so a dashboard divides the two `author` series itself and gets
+   * the trend from `rate()` over a fortnight rather than from one day's arrow.
+   *
+   * A COUNTER, so it accumulates over days. Publishing a gauge of one window's share would
+   * be a series that goes back to zero on every quiet day and is invisible to any scrape
+   * that did not land inside the window.
+   *
+   * `author` is `fleet|human` and nothing else. The interesting question is the split, not
+   * who each person was, and a series per contributor would put an email address into
+   * label cardinality that never expires.
+   */
+  readonly authoredLines = this.registry.counter(
+    "caterpillar_digest_authored_lines_total",
+    "lines written in a digest window by the fleet and by humans, per repo",
+  );
+
+  /**
+   * The same split at commit level, same labels.
+   *
+   * Both, because they disagree in ways that matter: a fleet that rewrites a file moves
+   * many lines in one commit, and a person fixing a typo moves one line in one commit. A
+   * dashboard showing only lines would report a fleet that reformatted something as having
+   * written the repository.
+   */
+  readonly authoredCommits = this.registry.counter(
+    "caterpillar_digest_authored_commits_total",
+    "commits made in a digest window by the fleet and by humans, per repo",
+  );
+
+  /**
+   * Digest windows in which a repo's history could not be read at all (§19).
+   *
+   * Its own series, because the alternative is the failure this whole rule exists to stop:
+   * a repo with no mirror on the publishing runner would otherwise report zero fleet lines
+   * a day, which on a graph is indistinguishable from a repo the fleet genuinely stopped
+   * working on. One is a mirror to go and look for; the other is nothing to do.
+   */
+  readonly authorshipUnreadable = this.registry.counter(
+    "caterpillar_digest_authorship_unreadable_total",
+    "digest windows in which a repo's history could not be read on this runner",
+  );
+
+  /**
    * Bytes on the work volume, by what is using them (`workspace/usage.ts`).
    *
    * The series the complaint that started this asked for: "the scaling mechanisms use so
@@ -461,6 +530,32 @@ export class AgentMetrics {
 
     this.workPartial.set({ runner }, usage.partial ? 1 : 0);
     this.workMeasuredAt.set({ runner }, Math.floor(Date.parse(usage.measuredAt) / 1000));
+  }
+
+  /**
+   * Publish one window's authorship. Called from the digest's publish path, nowhere else.
+   *
+   * Here rather than at the call site for the same reason as `recordUsage`: `author` and
+   * the metric names are strings a dashboard hard-codes, and two call sites spelling them
+   * differently is a dashboard that silently shows half the fleet.
+   *
+   * Incremented, never set. These are counters and the report describes one window; adding
+   * each window's figures is what makes `rate()` over them mean anything.
+   *
+   * A repo the runner could not read contributes to `authorshipUnreadable` and to NOTHING
+   * else — not even a zero — because a zero-line series is a claim that the fleet wrote
+   * none of it.
+   */
+  recordAttribution(runner: string, report: AttributionReport): void {
+    for (const entry of report.repos) {
+      const labels = { runner, repo: entry.repo };
+      this.authoredLines.inc({ ...labels, author: "fleet" }, entry.fleet.lines);
+      this.authoredLines.inc({ ...labels, author: "human" }, entry.human.lines);
+      this.authoredCommits.inc({ ...labels, author: "fleet" }, entry.fleet.commits);
+      this.authoredCommits.inc({ ...labels, author: "human" }, entry.human.commits);
+    }
+
+    for (const repo of report.unavailable) this.authorshipUnreadable.inc({ runner, repo });
   }
 
   render(): string {

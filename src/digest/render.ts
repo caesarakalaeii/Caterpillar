@@ -17,6 +17,12 @@
  *     finished today or was already finished yesterday.
  */
 import type { TaskStatus } from "../domain/task.ts";
+import type {
+  AttributionReport,
+  AttributionTrend,
+  AuthorSplit,
+  RepoAttribution,
+} from "./attribution.ts";
 import type { DayDigest, OpenTask, RepoChange, TaskChange } from "./collect.ts";
 
 export interface RenderOptions {
@@ -43,6 +49,7 @@ export const renderDigest = (options: RenderOptions): string => {
     "",
     ...narrative(options),
     ...moved(digest),
+    ...authorship(digest.attribution),
     ...open(digest.open, timeZone),
     ...unreadable(digest),
     "---",
@@ -150,6 +157,113 @@ const unavailable = (change: TaskChange): readonly string[] => {
     "",
   ];
 };
+
+/**
+ * Who wrote the code, and which way that is going.
+ *
+ * After "Moved today" and before "Still open", because it is a claim about the whole window
+ * rather than about any one task, and because the tasks above it are the evidence for it.
+ *
+ * Nothing here prints a share that was not measured. A percentage always looks like a
+ * measurement — that is the whole risk of this section — so a window with no commits says
+ * no commit was made, and a repo with no readable history is named rather than shown at 0%.
+ */
+const authorship = (report: AttributionReport | undefined): readonly string[] => {
+  if (report === undefined) return [];
+
+  if (!report.measured) {
+    return [
+      "## Authorship",
+      "",
+      "No commit was made in any repo this window's tasks name, so there is no authorship " +
+        "to split.",
+      "",
+      ...unreadableRepos(report),
+    ];
+  }
+
+  return [
+    "## Authorship",
+    "",
+    ...shareLine(report),
+    "",
+    ...report.repos.map(repoShare),
+    "",
+    ...unreadableRepos(report),
+  ];
+};
+
+/**
+ * The fleet's share of the window, and the same share yesterday.
+ *
+ * Both numbers, not just the arrow. A direction with no baseline is one the reader cannot
+ * check, and this is a figure an owner will quote at somebody.
+ */
+const shareLine = (report: AttributionReport): readonly string[] => {
+  const { fleetLineShare, fleetCommitShare } = report.total;
+  const before = report.previousFleetLineShare;
+
+  // Both shares or neither. A window with a line share has lines, so it has commits, so it
+  // has a commit share too — checking both is what says that in code rather than in prose.
+  const now =
+    fleetLineShare === undefined || fleetCommitShare === undefined
+      ? `**${plural(commits(report.total), "commit")}** and no line changed — nothing to ` +
+        "split at line level"
+      : `The fleet wrote **${percent(fleetLineShare)}** of ` +
+        `${plural(lines(report.total), "line")} and ${percent(fleetCommitShare)} of ` +
+        `${plural(commits(report.total), "commit")}`;
+
+  const trend =
+    before === undefined || report.trend === undefined
+      ? "No earlier window was measured, so there is nothing to compare it against."
+      : `${TREND[report.trend]} from ${percent(before)} of lines in the previous window.`;
+
+  return [`${now}. ${trend}`];
+};
+
+/** How a direction reads. A word, because Discord renders no icon a reader can rely on. */
+const TREND: Readonly<Record<AttributionTrend, string>> = {
+  up: "Up",
+  down: "Down",
+  flat: "Unchanged",
+};
+
+const repoShare = (entry: RepoAttribution): string => {
+  const share = entry.fleetLineShare;
+  const of =
+    share === undefined
+      ? "no line changed"
+      : `fleet ${percent(share)} of ${plural(lines(entry), "line")}`;
+
+  return (
+    `- \`${entry.repo}\` · ${of} · ` +
+    `${plural(commits(entry), "commit")} (${entry.fleet.commits} fleet, ${entry.human.commits} human)`
+  );
+};
+
+/**
+ * Repos with no readable history here.
+ *
+ * The same declaration `unavailable` makes for a task's diff, for the same reason: a task
+ * branch lives in the mirror of the runner that worked it, so another runner has no history
+ * for that repo at all. Leaving it out of the section would make the shares above look like
+ * they covered everything.
+ */
+const unreadableRepos = (report: AttributionReport): readonly string[] => {
+  if (report.unavailable.length === 0) return [];
+
+  return [
+    `_Not counted: ${report.unavailable.map((slug) => `\`${slug}\``).join(", ")} — no mirror ` +
+      `of it on this runner, so its history cannot be read from here._`,
+    "",
+  ];
+};
+
+const lines = (split: AuthorSplit): number => split.fleet.lines + split.human.lines;
+const commits = (split: AuthorSplit): number => split.fleet.commits + split.human.commits;
+
+/** A share as whole percent. Tenths of a percent of one day's commits are noise. */
+const percent = (share: number): string => `${Math.round(share * 100)}%`;
 
 const open = (tasks: readonly OpenTask[], timeZone: string): readonly string[] => {
   if (tasks.length === 0) return [];

@@ -15,7 +15,14 @@ import { join } from "node:path";
 import { after, afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
-import type { CheckStatus, Forge, GitCredential, PrRequest, PrResult } from "../forge/types.ts";
+import type {
+  CheckStatus,
+  Forge,
+  GitCredential,
+  PrRequest,
+  PrResult,
+  ReviewComment,
+} from "../forge/types.ts";
 import { assertInScope } from "../forge/types.ts";
 import { CredentialService, taskSocketPath, type ActiveCredential } from "./service.ts";
 
@@ -50,6 +57,9 @@ class FakeForge implements Forge {
     throw new Error("unused");
   }
   async checks(_repo: RepoRef, _ref: string): Promise<CheckStatus> {
+    throw new Error("unused");
+  }
+  async listReviewComments(): Promise<readonly ReviewComment[]> {
     throw new Error("unused");
   }
   async approve(): Promise<void> {

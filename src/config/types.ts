@@ -22,6 +22,20 @@ import type { LogLevel } from "../obs/log.ts";
 export interface CommitIdentity {
   readonly name: string;
   readonly email: string;
+  /**
+   * Addresses this deployment used to commit as, if any. READ ONLY — nothing commits as one.
+   *
+   * The digest's authorship split (§19) decides fleet-versus-human by address, and this
+   * identity is deployment configuration: a deployment that reinstalled its App has commits
+   * under the retired address in the same window as the current one. Without this, that
+   * window reports the retired half as a person's work — a contributor who does not exist,
+   * and a fleet share halved on the one day it changed.
+   *
+   * Optional, unlike `email`, because a deployment that has never changed identity has no
+   * honest value to give: an empty list is the truth, and requiring it would make every
+   * caller that constructs an identity state a fact it does not have.
+   */
+  readonly pastEmails?: readonly string[];
 }
 
 export interface ForgeConfig {

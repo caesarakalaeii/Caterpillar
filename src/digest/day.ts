@@ -33,6 +33,14 @@ export interface DigestWindow {
   readonly end: Date;
   /** When this digest becomes publishable. The same instant as `end`. */
   readonly dueAt: Date;
+  /**
+   * The boundary this window was computed with.
+   *
+   * Carried rather than left to the caller to remember, because `previousWindow` needs it
+   * and a caller that supplied a different one would produce a baseline shifted by hours
+   * with nothing to show that it had.
+   */
+  readonly boundary: DayBoundary;
 }
 
 /**
@@ -215,8 +223,20 @@ export const windowFor = (date: string, boundary: DayBoundary): DigestWindow => 
     start: instantOf(minusDays(date, 1), boundary.hour, boundary.timeZone),
     end,
     dueAt: end,
+    boundary,
   };
 };
+
+/**
+ * The window immediately before `window` — the baseline a trend is measured against.
+ *
+ * Recomputed from the calendar date rather than by subtracting the window's own length.
+ * Consecutive windows meet exactly but are not equal in length: 18:00 to 18:00 across a
+ * spring-forward is 23 hours, and a baseline built by subtraction would silently compare a
+ * 23-hour day against a 24-hour one on exactly the day the clocks moved.
+ */
+export const previousWindow = (window: DigestWindow): DigestWindow =>
+  windowFor(minusDays(window.date, 1), window.boundary);
 
 /**
  * Every window that is publishable at `now`, oldest first.

@@ -24,8 +24,13 @@ import type { RepoReach } from "../forge/reach.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
-import type { Tracker, TrackerItem, TrackerTransition } from "../tracker/types.ts";
-import { Ingester, intakeDue, intakeRef } from "./ingest.ts";
+import type {
+  Tracker,
+  TrackerCreateRequest,
+  TrackerItem,
+  TrackerTransition,
+} from "../tracker/types.ts";
+import { Ingester, intakeDue, intakeRef, type ToolchainCheck } from "./ingest.ts";
 
 const WORKSPACE = asWorkspaceName("primary");
 const roots: string[] = [];
@@ -90,6 +95,11 @@ class FakeTracker implements Tracker {
     return Promise.resolve();
   }
 
+  create(_request: TrackerCreateRequest): Promise<TrackerRef> {
+    // Intake only ever READS from a tracker; filing is a supervisor path elsewhere.
+    return Promise.reject(new Error("FakeTracker does not file items"));
+  }
+
   transition(_ref: TrackerRef, _t: TrackerTransition, _task: TaskId): Promise<void> {
     return Promise.resolve();
   }
@@ -109,6 +119,7 @@ const ingesterFor = (
   store: StateStore,
   trackers: ReadonlyMap<WorkspaceName, Tracker>,
   forges?: ReadonlyMap<WorkspaceName, RepoReach>,
+  toolchainDoctor?: ToolchainCheck,
 ): Ingester =>
   new Ingester({
     store,
@@ -119,6 +130,7 @@ const ingesterFor = (
     logger: SILENT_LOGGER,
     maxSessionsPerTask: 20,
     ...(forges === undefined ? {} : { forges }),
+    ...(toolchainDoctor === undefined ? {} : { toolchainDoctor }),
   });
 
 /** A forge that can reach everything except the repos it is told about. */
@@ -584,4 +596,79 @@ test("a malformed schedule is refused on the intake pass, not at 09:00", async (
   );
   assert.equal(warnings[0]?.fields["schedule"], "broken");
   assert.match(String(warnings[0]?.fields["reason"]), /unknown key/);
+});
+
+/* ------------------------------------------------------ the toolchain doctor */
+
+/** An item declaring a nix toolchain with one named package. */
+const withToolchain = (packages: readonly string[]): string =>
+  [
+    "```agent",
+    "toolchain:",
+    "  mode: nix",
+    "  packages:",
+    ...packages.map((name) => `    - ${name}`),
+    "acceptance:",
+    '  - "npm test"',
+    "```",
+  ].join("\n");
+
+test("an item whose toolchain names an unresolvable package is refused once", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: async () => "`lua51` — did you mean `lua5_1`?",
+  });
+
+  const pass = await subject.ingest("origin", "main");
+  assert.equal(pass.created, 0);
+  assert.equal(pass.rejected, 1);
+  assert.deepEqual(await store.listTasks(), []);
+  assert.match(tracker.comments[0]?.text ?? "", /lua5_1/);
+
+  // Suppressed like every other refusal (§14.2), or the item collects a comment per poll.
+  await subject.ingest("origin", "main");
+  assert.equal(tracker.comments.length, 1, "one comment, however many passes run");
+});
+
+test("a doctor that cannot evaluate lets the item through", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  // A runner with no nix, or an evaluation that timed out. Not evidence of a bad name.
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: async () => undefined,
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "fail open, as everywhere");
+  assert.equal(tracker.comments.length, 0);
+});
+
+test("a doctor that throws lets the item through", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: () => Promise.reject(new Error("nix exploded")),
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "a throw refuses nothing");
+  assert.equal(tracker.comments.length, 0);
+});
+
+test("an item declaring no toolchain is never handed to the doctor", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID)]);
+  // Counted rather than `assert.fail()`ed. A throw from inside the doctor lands in
+  // `toolchainReason`'s catch, which fails open by design and swallows it — so the
+  // obvious version of this test passed even with the `declared === undefined` guard
+  // deleted, which is the one thing it exists to detect.
+  let calls = 0;
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: () => {
+      calls += 1;
+      return Promise.resolve(undefined);
+    },
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1);
+  assert.equal(calls, 0, "an item with no toolchain must not reach the doctor");
 });

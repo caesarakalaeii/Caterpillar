@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
+import type { ActionRow } from "./components.ts";
 import { componentsFor, CONTENT_LIMIT, DiscordNotifier, type Notification, render } from "./discord.ts";
 
 const TASK = asTaskId("SMOKE-1");
@@ -394,6 +395,96 @@ test("every park a human is expected to act on carries the way back twice", () =
     const labels = (attached ?? []).flatMap((r) => r.components.map((c) => ("label" in c ? c.label : "")));
     assert.ok(labels.includes("Resume"), `${park.kind} should offer a Resume button`);
   }
+});
+
+/** Every button label a notification would attach, row by row flattened. */
+const labelsOf = (attached: readonly ActionRow[] | undefined): readonly string[] =>
+  (attached ?? []).flatMap((r) => r.components.map((c) => ("label" in c ? c.label : "")));
+
+/** Every `custom_id` a notification would attach. */
+const idsOf = (attached: readonly ActionRow[] | undefined): readonly string[] =>
+  (attached ?? []).flatMap((r) =>
+    r.components.flatMap((c) => ("custom_id" in c && c.custom_id !== undefined ? [c.custom_id] : [])),
+  );
+
+test("a question with options offers one button per option AND the free-text one", () => {
+  // The whole point: fourteen tasks waiting on a human one morning, most of them ending in
+  // an enumerated list. Typing the choice back is the cost this removes — but never at the
+  // price of the free-text path, because "none of these" is always a possible answer.
+  const attached = componentsFor({
+    kind: "question",
+    task: TASK,
+    phase: "implementing",
+    question: "Which migration path?",
+    options: ["Use the existing one", "Write a new one"],
+  });
+
+  assert.deepEqual(labelsOf(attached), ["Use the existing one", "Write a new one", "Answer…"]);
+  // The option's INDEX, never its text: a `custom_id` holds 100 characters and the task id
+  // has already spent most of them.
+  assert.deepEqual(idsOf(attached), [`c1:opt:${TASK}:0`, `c1:opt:${TASK}:1`, `c1:ans:${TASK}`]);
+});
+
+test("a question without options renders exactly the one button it always did", () => {
+  const attached = componentsFor({
+    kind: "question",
+    task: TASK,
+    phase: "implementing",
+    question: "What is the retention policy?",
+  });
+
+  assert.deepEqual(labelsOf(attached), ["Answer"]);
+  assert.deepEqual(idsOf(attached), [`c1:ans:${TASK}`]);
+});
+
+test("an over-long option is cut in the LABEL only", () => {
+  // Discord caps a label at 45 code points. The answer that gets written is the stored text,
+  // not the label — asserted here on the label, and in the loop tests on the answer file.
+  const long = `Rewrite the migration path from scratch ${"x".repeat(60)}`;
+  const attached = componentsFor({
+    kind: "question",
+    task: TASK,
+    phase: "implementing",
+    question: "Which migration path?",
+    options: [long],
+  });
+
+  const label = labelsOf(attached)[0];
+  assert.ok(label !== undefined);
+  assert.equal([...label].length, 45);
+  assert.ok(long.startsWith(label), "the label must be a prefix of the option, not a summary");
+});
+
+test("more options than fit a row costs the extras, never the notification", () => {
+  // `ask_human` refuses a sixth option, but these come back from a file in the state repo
+  // that a human can edit, and `row` throws above five. A throw here would lose the whole
+  // message — on the one path where silence means nobody learns the task is waiting.
+  const attached = componentsFor({
+    kind: "question",
+    task: TASK,
+    phase: "implementing",
+    question: "Which one?",
+    options: ["a", "b", "c", "d", "e", "f"],
+  });
+
+  assert.deepEqual(labelsOf(attached), ["a", "b", "c", "d", "e", "Answer…"]);
+});
+
+test("a question in its own thread offers no buttons even when it has options", () => {
+  // In the thread the next message IS the answer, so a button is friction. Unchanged by
+  // options: pressing one there would be no faster than typing, and the modal is worse.
+  const attached = componentsFor(
+    {
+      kind: "question",
+      task: TASK,
+      phase: "implementing",
+      question: "Which migration path?",
+      options: ["a", "b"],
+    },
+    { inThread: true },
+  );
+
+  assert.equal(attached, undefined);
 });
 
 test("a resume button refuses to encode rather than address the wrong task", () => {

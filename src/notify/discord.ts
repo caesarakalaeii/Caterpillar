@@ -28,11 +28,34 @@
  *     message, because the supervisor logs those verbatim.
  */
 import type { TaskId } from "../domain/task.ts";
-import { button, BUTTON_STYLE, linkButton, row, rows, type ActionRow, type Button } from "./components.ts";
+import {
+  button,
+  BUTTON_STYLE,
+  BUTTONS_PER_ROW,
+  linkButton,
+  row,
+  rows,
+  type ActionRow,
+  type Button,
+} from "./components.ts";
 import { type FetchLike, postJson } from "./http.ts";
 
 export type Notification =
-  | { readonly kind: "question"; readonly task: TaskId; readonly question: string; readonly phase: string }
+  | {
+      readonly kind: "question";
+      readonly task: TaskId;
+      readonly question: string;
+      readonly phase: string;
+      /**
+       * The enumerated choices the agent offered, each of which becomes a button (§7).
+       *
+       * Absent for an open-ended question, which is the ordinary case and renders exactly
+       * as it always has. The prose is unaffected either way: the options are already in
+       * the question text, written by the agent, and repeating them under it would say the
+       * same thing twice on the surface where space is scarcest.
+       */
+      readonly options?: readonly string[];
+    }
   | { readonly kind: "parked"; readonly task: TaskId; readonly reason: string }
   | {
       readonly kind: "done";
@@ -567,18 +590,42 @@ export const componentsFor = (
   options: { readonly inThread?: boolean } = {},
 ): readonly ActionRow[] | undefined => {
   switch (notification.kind) {
-    case "question":
-      return options.inThread === true
-        ? undefined
-        : rows(
-            row(
-              button({
-                action: { verb: "ans", task: notification.task },
-                label: "Answer",
-                style: BUTTON_STYLE.primary,
-              }),
+    case "question": {
+      if (options.inThread === true) return undefined;
+      // Sliced rather than trusted. `ask_human` refuses a sixth option, but these arrive
+      // from a file in the state repo that a human can edit, and `row` THROWS above five —
+      // which would cost the whole notification, on the one path where silence means a
+      // human never learns the task is waiting.
+      const choices = (notification.options ?? []).slice(0, BUTTONS_PER_ROW);
+      // The free-text button keeps its own row, and keeps its label when there is nothing
+      // beside it: a question with no options must render exactly what it rendered before
+      // options existed. With options it becomes "Answer…", because next to two named
+      // choices a bare "Answer" reads as a third one.
+      return rows(
+        choices.length === 0
+          ? undefined
+          : row(
+              ...choices.map((choice, at) =>
+                button({
+                  // The INDEX, not the text: `custom_id` holds 100 characters. The text is
+                  // looked up from the question record when the press arrives.
+                  action: { verb: "opt", task: notification.task, arg: String(at) },
+                  // `button` clamps the label to Discord's 45; the stored option is what
+                  // gets written as the answer, so nothing is lost by cutting it here.
+                  label: choice,
+                  style: BUTTON_STYLE.primary,
+                }),
+              ),
             ),
-          );
+        row(
+          button({
+            action: { verb: "ans", task: notification.task },
+            label: choices.length === 0 ? "Answer" : "Answer…",
+            style: choices.length === 0 ? BUTTON_STYLE.primary : BUTTON_STYLE.secondary,
+          }),
+        ),
+      );
+    }
     case "done":
       return rows(row(linkButton("View PR", notification.prUrl)));
     case "verdict":

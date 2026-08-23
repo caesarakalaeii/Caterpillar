@@ -144,3 +144,46 @@ test("a name that is not a string is refused", async () => {
     },
   );
 });
+
+test("addresses the fleet used to commit as are loaded, so a window can straddle a change", async () => {
+  // The digest's authorship split (§19) matches on the address. A deployment that
+  // reinstalled its App has commits under the retired address in the same window as the
+  // current one, and reading those as a person's work invents a contributor and halves the
+  // fleet's reported share on exactly the day the operator is most likely to look.
+  //
+  // Retired addresses only ever READ. Nothing commits as one, so `identityFault` is not
+  // asked of them: refusing a bare noreply address here would make a deployment that
+  // already made that mistake unable to describe its own history.
+  const config = await load({
+    identity: {
+      name: "caterpillar-agent[bot]",
+      email: "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+      pastEmails: ["11111111+old-agent[bot]@users.noreply.github.com"],
+    },
+  });
+
+  assert.deepEqual(config.identity.pastEmails, [
+    "11111111+old-agent[bot]@users.noreply.github.com",
+  ]);
+});
+
+test("a config with no past addresses has none, rather than an implied one", async () => {
+  const config = await load({});
+
+  assert.deepEqual(config.identity.pastEmails, []);
+});
+
+test("a past address that is not a string is refused rather than silently dropped", async () => {
+  // Dropped, it would read as "the fleet never used that address" and the window in
+  // question would be mis-attributed with nothing anywhere saying why.
+  await assert.rejects(
+    load({
+      identity: { name: "bot", email: "bot@example.invalid", pastEmails: ["ok@x.invalid", 42] },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError);
+      assert.match(error.message, /identity\.pastEmails/);
+      return true;
+    },
+  );
+});

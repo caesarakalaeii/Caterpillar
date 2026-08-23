@@ -156,7 +156,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/limits.ts` | Context budget and the handoff trigger (§6.1). |
 | `src/agent/exec.ts` | The agent's shell with a per-command ceiling — the hang detector (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
-| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against (§12.2). |
+| `src/agent/review-guidance.ts` | Unresolved pull request review comments → a prompt section. Pure, no IO (§7.3). |
+| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
@@ -202,7 +203,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
-| `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
+| `src/digest/changes.ts` | Diffstat, commit subjects and authorship from local mirrors. No network (§19). |
+| `src/digest/attribution.ts` | Fleet-versus-human authorship and its trend. Pure, no IO (§19). |
 | `src/digest/render.ts` | The one document Discord, git and the web view all get (§19). |
 | `src/digest/summarise.ts` | The prose paragraph. No tools, and never fails a digest (§19). |
 | `src/digest/publish.ts` | Claim the day, publish it, release the claim if that failed (§19). |
@@ -329,7 +331,13 @@ awkward, the change is probably wrong.
     trees, so `git diff` cannot tell them apart and only `git log` can. The supervisor
     reads that order and states it; `src/review/tdd.ts` reaches no verdict, and the one
     lens that does is told the carve-out — documentation, comments, formatting and pure
-    config have no behaviour to test (§12.2).
+    config have no behaviour to test (§12.2). **That holds for a repository's own rules
+    too.** A repo may ship `.caterpillar/standards.md`, and every section of it names the
+    lens that grades it in its own heading (`## <lens>: <title>`); a section naming no lens,
+    or one no council convenes, parks the task rather than becoming a rule nobody grades.
+    The text is untrusted — capped at 4 KiB, and it adds to code health, test-first and
+    attribution without being able to switch any of them off. A task spanning several repos
+    scopes each file to its own repo, so two repos disagreeing is not a conflict.
 16. **A session that cannot possibly succeed must not be started, and the environment the
     gate grades in must be one the acceptance list can satisfy.** Both halves come from a
     single park: `BS-…-07` hit the no-progress limit with a green branch and an open PR.
@@ -346,6 +354,18 @@ awkward, the change is probably wrong.
     inside the repo. `ToolchainResolver` strips that one value at the single point every
     task environment is built. Neither was a defect in the detector, and raising its
     threshold would have hidden both (§11.1).
+17. **The no-progress streak measures whether the AGENT is circling, so a session that
+    stopped to ask a human is neither progress nor a stall — and the gauge that reports it
+    must stop reporting when the task stops running.** `BS-…279100223127564-01` fired
+    `CaterpillarTaskThrashing` with one honestly stalled session followed by one that
+    correctly established its acceptance list could not be satisfied from inside its own
+    scope and asked. §7 had already conceded the point by clearing the streak when the
+    *answer* arrives — but the wait for an answer is the whole of the problem, and the
+    alert fired across it. Separately, `caterpillar_no_progress_streak{task=...}` had one
+    writer and no expiry, so a task that parked or merged went on reporting its last
+    streak for the life of the pod: an alerting rule reading a sample nothing held. Both
+    fixed at the meaning rather than the threshold — the exemption loses no information a
+    thrash detector could use, whereas widening the limit would have (§11.1).
 
 ## The web view
 
@@ -451,14 +471,27 @@ others find it taken. A pod that was rolled through the cutoff still publishes w
 comes back — catch-up reaches back one day, so a runner returning after a week does not
 post seven digests at once.
 
-Two things it will tell you about itself rather than fake:
+**It also says how much of the change is yours.** One section splits the window's commits
+and lines into fleet and human, per repo, and shows the fleet's share against the previous
+window — because a single day's share says almost nothing and a direction says a lot. The
+split is by commit ADDRESS, never by display name, and the addresses come from `identity`
+(§9.7). If your deployment has changed identity, list the retired addresses in
+`identity.pastEmails` or the window that straddles the change reports the fleet's own work
+as a stranger's. The same numbers are counters —
+`caterpillar_digest_authored_lines_total{runner,repo,author}` and its commit-level twin —
+so the trend is graphable without parsing prose.
+
+Three things it will tell you about itself rather than fake:
 
 - **a missing paragraph says why** — a provider outage prints a line where the prose would
   have been, because a digest that silently lost it looks exactly like one that never had
   a summariser;
 - **a diff it cannot see says so** — a task branch lives in the mirror of the runner that
   worked it, so on another runner the digest names the repo it cannot read instead of
-  printing `0 files changed` about a merged pull request.
+  printing `0 files changed` about a merged pull request;
+- **a share it cannot measure is absent, not 0%** — same rule, and this is where breaking it
+  would be least visible, because a percentage always looks like a measurement. A repo with
+  no mirror here is named; a window with no commits says so.
 
 Enabling it needs nothing else: no new secret, no port, no Deployment. It runs on the
 existing poll loop and uses the notifier that is already configured.
@@ -816,7 +849,8 @@ task worktree carries one configured identity:
 ```json
 "identity": {
   "name": "caterpillar-agent[bot]",
-  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com"
+  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+  "pastEmails": []
 }
 ```
 
@@ -836,6 +870,13 @@ gh api users/<slug>%5Bbot%5D --jq .id
 
 which is a **different** number from the App id in the secret: the App id names the
 application, this names the account it commits as.
+
+**`pastEmails` is read-only history.** Nothing ever commits as one of them; they are there
+so the daily digest's authorship split (§19) recognises the fleet's own past work after you
+reinstall the App, rather than reporting it as a contributor who does not exist. The
+bare-noreply refusal above is deliberately not applied to them — it exists to stop an
+address *authoring* anything, and a deployment that already made that mistake still has to
+be able to describe the history it has.
 
 **And nothing it writes carries a second name.** No `Co-Authored-By` trailer, no "Generated
 with" footer, no 🤖, no model or tool name — in commit messages, PR titles and bodies,
