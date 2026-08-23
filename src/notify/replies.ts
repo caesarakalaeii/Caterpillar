@@ -36,7 +36,11 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
         `Nothing was written.`
       );
     case "merged":
-      return `Merged **${task}** — ${outcome.prUrl}`;
+      // `note` when there is one, because on a repo with a merge queue the pull request is
+      // queued rather than merged and the difference is what the human is watching for.
+      return outcome.note === undefined
+        ? `Merged **${task}** — ${outcome.prUrl}`
+        : `**${task}** — ${outcome.note} ${outcome.prUrl}`;
     case "started":
       return `Started **${outcome.task}**. It will read the repo and come back with its first question here.`;
     case "refused":

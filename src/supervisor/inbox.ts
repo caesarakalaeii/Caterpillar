@@ -39,7 +39,17 @@ export type ChatOutcome =
    * would have to be vague about which.
    */
   | { readonly kind: "not-resumable"; readonly status: string }
-  | { readonly kind: "merged"; readonly prUrl: string }
+  /**
+   * The merge was carried out — which on a repo with a merge queue means ENQUEUED.
+   *
+   * `note` is what actually happened, in words, and it is what the reply renders when it
+   * is there. A queued pull request has not landed and can still be rejected by the
+   * queue's own checks, so calling it "merged" would stop a human watching something that
+   * is not finished. Not a separate outcome kind: the request succeeded, and every caller
+   * that branches on `merged` — the transition to `done`, the journal entry — does the
+   * same thing either way.
+   */
+  | { readonly kind: "merged"; readonly prUrl: string; readonly note?: string }
   | { readonly kind: "started"; readonly task: TaskId }
   | { readonly kind: "unknown-task" }
   /** The request was well-formed but could not be acted on — a repo nothing owns, say. */
