@@ -143,6 +143,159 @@ test("writeSpec refuses to overwrite an existing spec", async () => {
   assert.deepEqual((await subject.readSpec(SPEC.id)).acceptance, SPEC.acceptance);
 });
 
+test("readSpec on a task with no amendments returns the spec as filed", async () => {
+  // The no-amendment path is the overwhelmingly common one, and the overlay must be
+  // invisible on it: every existing caller reads `readSpec` and none of them knows
+  // amendments exist.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  assert.deepEqual(await subject.readSpec(SPEC.id), SPEC);
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+  assert.deepEqual(await subject.listAmendments(SPEC.id), []);
+});
+
+test("readSpec applies an amendment's acceptance list and changes nothing else", async () => {
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  await subject.writeAmendment(SPEC.id, {
+    acceptance: ["npm test -- src/widget"],
+    why: "a repo-wide lint on a 42-line branch is not this task's gate",
+    author: "operator",
+  });
+
+  assert.deepEqual(await subject.readSpec(SPEC.id), {
+    ...SPEC,
+    acceptance: ["npm test -- src/widget"],
+  });
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+});
+
+test("readSpec takes the highest-numbered amendment wholesale, not a merge", async () => {
+  // Whole-list replacement is the contract. A merge across amendments would resurrect a
+  // criterion an earlier amendment removed, which is the failure the feature exists to
+  // prevent.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  for (const acceptance of [["first"], ["second", "second-b"], ["third"]]) {
+    await subject.writeAmendment(SPEC.id, { acceptance, why: "because", author: "operator" });
+  }
+
+  assert.deepEqual((await subject.readSpec(SPEC.id)).acceptance, ["third"]);
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+});
+
+test("writeAmendment allocates 001, 002, 003 and overwrites none of them", async () => {
+  // The file list IS the audit trail (§12), so a reused number would erase the reasoning
+  // a human recorded for an earlier decision.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  for (const why of ["first reason", "second reason", "third reason"]) {
+    await subject.writeAmendment(SPEC.id, { acceptance: ["true"], why, author: "operator" });
+  }
+
+  assert.deepEqual(
+    (await readdir(join(subject.taskDir(SPEC.id), "amendments"))).sort(),
+    ["001.yaml", "002.yaml", "003.yaml"],
+  );
+  assert.deepEqual(
+    (await subject.listAmendments(SPEC.id)).map((a) => ({ index: a.index, why: a.why })),
+    [
+      { index: 1, why: "first reason" },
+      { index: 2, why: "second reason" },
+      { index: 3, why: "third reason" },
+    ],
+  );
+});
+
+test("an amendment records its author and an ISO timestamp", async () => {
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  const written = await subject.writeAmendment(SPEC.id, {
+    acceptance: ["npm test"],
+    why: "the glob could never match",
+    author: "operator#4242",
+  });
+
+  assert.equal(written.author, "operator#4242");
+  assert.match(written.at, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+  assert.deepEqual(await subject.listAmendments(SPEC.id), [written]);
+});
+
+test("writing an amendment leaves spec.md byte-identical", async () => {
+  // The whole point: the immutable file is never touched, so `readBaseSpec` and the git
+  // history keep saying what was actually filed.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const path = join(subject.taskDir(SPEC.id), "spec.md");
+  const before = await readFile(path);
+
+  await subject.writeAmendment(SPEC.id, {
+    acceptance: ["true"],
+    why: "unsatisfiable as filed",
+    author: "operator",
+  });
+
+  assert.deepEqual(await readFile(path), before);
+});
+
+test("an amendment naming a forbidden key is refused rather than partly applied", async () => {
+  // `repos` is a credential scope (§9.1) and the goal is the task's identity. Neither is a
+  // chat command, so a file carrying one is rejected loudly — including its `acceptance`,
+  // which is what "not partly applied" means.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const dir = join(subject.taskDir(SPEC.id), "amendments");
+  await mkdir(dir, { recursive: true });
+
+  for (const [name, forbidden] of [
+    ["001.yaml", "repos:\n  - github.com/acme/other"],
+    ["002.yaml", "goal: something else entirely"],
+  ] as const) {
+    await writeFile(
+      join(dir, name),
+      [
+        "acceptance:",
+        "  - true",
+        "why: unsatisfiable as filed",
+        "author: operator",
+        "at: 2026-08-19T00:00:00.000Z",
+        forbidden,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await assert.rejects(subject.listAmendments(SPEC.id), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, new RegExp(forbidden.split(":")[0] as string));
+      return true;
+    });
+    await assert.rejects(subject.readSpec(SPEC.id), /amendment/);
+    await rm(join(dir, name));
+  }
+});
+
+test("an amendment with no reason is refused", async () => {
+  // `why` is the whole audit value of the record. An amendment nobody explained is a
+  // hand-edited spec.md with extra steps.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const dir = join(subject.taskDir(SPEC.id), "amendments");
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, "001.yaml"),
+    "acceptance:\n  - true\nauthor: operator\nat: 2026-08-19T00:00:00.000Z\n",
+    "utf8",
+  );
+
+  await assert.rejects(subject.listAmendments(SPEC.id), /why/);
+});
+
 test("hasTask reports what listTasks would claim", async () => {
   const subject = await store();
   assert.equal(await subject.hasTask(SPEC.id), false);
