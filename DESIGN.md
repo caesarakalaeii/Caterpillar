@@ -236,6 +236,46 @@ property of every task on the repo, not of one invocation — and because `confi
 every worktree create *and* reuse, mirrors already on a PVC are healed the next time a task
 touches them.
 
+#### A session never starts behind `origin/agent/<task>`
+
+The exclusion above is load-bearing and it has a cost that took two tasks to find. Because
+the mirror never fetches `refs/heads/agent/*`, a mirror that does not already have a task's
+branch will **never learn one from the remote**. `addWorktreeLocked` used to decide a task's
+start point from that local ref alone, so every route to a missing or stale one — a runner
+that never worked this task, a reaped worktree, a mirror re-cloned after a failed fetch, or
+the branch reset GH-95 reported — looked identical to a task nobody had ever pushed, and the
+session started on the base.
+
+That is indistinguishable, to the agent, from a fresh task. On GH-96 sessions 2 and 3 pushed
+eighteen commits; session 7 started on `main`, re-implemented the entire task, and found out
+only when its push was refused as non-fast-forward. Two complete independent implementations
+of one task reached the remote and a human had to pick one.
+
+Rule: **if `origin/agent/<task>` exists, the session's worktree is at its tip or the session
+does not start.** Starting silently behind it is the one outcome that is not available.
+Both checkout paths enforce it:
+
+- *Creating* a worktree fetches the remote branch into `refs/remotes/origin/agent/<task>` and
+  starts there, fast-forwarding the local ref. A local ref carrying commits the remote does
+  not gets a throw, because nothing in the runner can choose between two histories: forcing
+  would discard commits that exist nowhere else, and starting on the local ref is the drift
+  the rule exists to stop.
+- *Reusing* one runs `merge --ff-only` onto the remote tip. A worktree that is ahead is left
+  alone — those commits exist nowhere else — and a divergence or a dirty tree makes the merge
+  decline, which becomes the same refusal.
+
+The fetch names origin's **URL**, not the remote `origin`. A configured `+refs/*:refs/*` is
+applied opportunistically alongside an explicit refspec, so fetching by remote name also
+force-updates the local `refs/heads/agent/<task>` — reviving the refusal above and clobbering
+a divergent local branch before anything could look at it. `^refs/heads/agent/<task>` does
+not suppress that, because a negative refspec matches the *source* side and so cancels the
+mapping we asked for too. With a URL there is no configured remote to apply.
+
+The fetch never throws. `ensureWorktree` is also called by the progress probe and the
+verifier, which run after `clearActive()` has closed the credential service (§9.2); a fetch
+that cannot be made means the remote has nothing to say, which leaves the previous behaviour
+rather than failing a session that could have run.
+
 #### Worktrees are reaped, because they are what actually grows
 
 A mirror is fetched incrementally and its size tracks the repository's history. A worktree
@@ -371,6 +411,25 @@ rounding error on one model and a quarter of the budget on another.
 
 The collapse is deliberately CONSECUTIVE-only: parking, working, then parking again for
 the same reason is real history, and the second park means something the first does not.
+
+**An entry states what the branch did, not only what the agent said it did.** A session
+that commits and then dies — context exhaustion, a kill, a crash — never calls a
+control-plane verb, so its summary is the one the supervisor fills in: "session ended
+without a control-plane decision". On GH-96 that sentence was the entire entry for sessions
+4 through 7, over a branch already carrying eighteen commits. Session 7 read that history,
+concluded the task was untouched, and re-implemented all of it.
+
+So `recordSession` adds `**Committed:** \`agent/<task>\` is at \`<tip>\`, was \`<baseline>\``
+whenever the progress probe saw the branch move. It is built from the probe and from
+`progress.lastHeadOid` in `state.json`, never from the summary — which is the point, because
+the case that matters is the one where the agent said nothing.
+
+It says *committed* and not *pushed*. Nothing in the supervisor pushes a task branch; the
+agent does, and by the time the probe runs `clearActive()` has closed the credential service
+(§9.2), so no network check is available. The local branch is what is provable and what the
+next session on this runner starts from (§3.1). Naming the oid makes "is this on the remote?"
+a question the reader answers with one `git rev-parse`, rather than one the journal answers
+wrongly.
 
 ### 4.2 `state.json`
 
