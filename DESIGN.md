@@ -2067,6 +2067,75 @@ the toolchain of the session that triggered it.
   through to the inherited environment would hand the agent a shell missing the exact tool
   the task is about, and it would spend a session and a few dollars discovering that.
 
+#### A declared toolchain is checked before the task exists
+
+Parking on nix's own error is the right answer once a task exists, and it is an expensive
+way to learn about a typo. `toolchain.packages` is free text: §14.1 checks that the block
+is *shaped* right — `mode` is one of two words, `packages` is a non-empty list of strings —
+and nothing checked that the names in it resolve. So `lua51` (the attribute is **`lua5_1`**)
+passed intake, became a task, was claimed, and failed inside the session in
+`nix print-dev-env`. A session spent on a missing underscore.
+
+This is §9.1.1 with a different exit code, so it gets the same answer: ask at the door.
+`workspace/toolchain-doctor.ts` evaluates `pkgs ? <attr>` against the configured pin for
+each declared name and, **only when one is missing**, a prefix-filtered `attrNames` for the
+near miss — one evaluation, because the candidate list is wanted only when the answer is
+bad. It **evaluates and does not build**: nothing is substituted or compiled. Measured
+against the shipped pin on a warm store, ~0.5s.
+
+**The ceiling is 30s and is a bound on intake, not on nix.** Not
+`toolchain.timeoutSeconds`, which is 900 because it bounds a devShell build that may
+compile from source. Intake runs on the supervisor's own thread of control, once per
+interval, over every labelled item — so an item whose evaluation hangs stalls every item
+behind it, and at 900s one cold nixpkgs fetch would hold up a pass for fifteen minutes. A
+cold fetch was measured at ~45s and therefore exceeds the ceiling: it fails open and is
+checked on a later pass once the store is warm, which is the right trade, because the worst
+case is an unchecked item and that is precisely the behaviour that existed before.
+
+**It fails open, and that is the load-bearing half.** Every answer that is not "nix ran and
+said no" lets the item through: no nix on the runner, an evaluation that timed out, a pin
+that could not be fetched, output that would not parse. A nix evaluation that times out is
+not evidence that an attribute is wrong, exactly as a 500 from GitHub is not evidence that
+an App was uninstalled (§9.1.1). Getting this backwards would be worse than having no check
+at all: on a runner without nix *every* declared toolchain is unevaluable, so a strict
+check would refuse every item that had bothered to declare one — and suppress each refusal
+durably (§14.2).
+
+A missing attribute is reported by an evaluation that **succeeds**, which is what makes the
+distinction clean: a non-zero exit from `nix eval` always means the question could not be
+answered, never that the answer was no.
+
+Two details worth keeping:
+
+- **The near miss is ranked by a squashed comparison first**, then by bounded edit distance —
+  the same idea as §9.1.1, tuned for attributes rather than slugs. `_`, `-` and `.` are
+  separators nixpkgs uses inconsistently (`nodejs_22`, `lua5_1`, `gcc-unwrapped`) and nobody
+  remembers which, so squashing is what finds `lua5_1` for `lua51`. Prefix matches are
+  deliberately *not* ranked, which is where it parts company with `rankRepos`:
+  `lua51Packages` contains the whole query and is a set of lua modules rather than the
+  interpreter the author meant.
+- **A name that is not a bare attribute is skipped, not refused.** The name is interpolated
+  into a nix expression this process then evaluates, so only `[A-Za-z0-9_+-]+` is ever put
+  there. `.` is excluded with the rest, because `pkgs ? ${a.b}` asks about a *nested*
+  attribute and the answer would not mean what it is read as meaning.
+
+  But unaskable is not invalid, and an earlier version got this wrong: it *refused* a dotted
+  path on the stated reasoning that "nix would reject it too". Nix does not.
+  `generatedFlake` interpolates declared names into `with pkgs; [ … ]`, where
+  `python3Packages.requests` is legal and builds today — so intake was refusing toolchains
+  the resolver handles. Such a name is now skipped and the rest of the list is still
+  checked, which is the same fail-open rule the section above applies to a missing nix: no
+  evidence, no refusal. Validating per segment with `builtins.hasAttrByPath` was considered
+  and rejected — it would commit the doctor to reasoning about nested attribute sets to
+  catch a typo inside a package set, rarer than the false refusal it replaced.
+
+`mode: inherit` declares no packages and is a no-op, not a refusal — as is `mode: nix` with
+no `packages`, where the repo's own nix expression decides and the repo is not checked out
+at intake.
+
+Provenance: `orca vm recipe doctor`, which validates a per-workspace environment recipe
+without provisioning it.
+
 ---
 
 ## 9. Credentials & security
@@ -3039,6 +3108,31 @@ the streak, because it is the record of why the task parked, but the gauge stops
 there is a session to measure. Removed rather than zeroed: 0 is a real reading, meaning a
 task that is making progress.
 
+**And removing it in `transition` alone was not enough, because the gauge is per-process
+and tasks are not.** `transition` runs in whichever process performed the terminal
+transition; the sample lives in that process's registry. A task migrates between replicas
+across sessions — 19 tasks in the state repo carry journal shards written by two to four
+different runners — so the pod that published the streak is routinely not the pod that
+finishes the task. Pod A hands off at streak 2, pod B takes the task `done` and removes the
+series from its own registry where nothing ever set it, and pod A goes on reporting 2 until
+somebody restarts it. The rule does not aggregate over `pod`, so one orphan is enough to
+keep `CaterpillarTaskThrashing` firing about merged work. `survey` therefore drops the
+series for every task it reads as terminal: it is the one pass that reads every task's
+committed state on every poll in **every** replica, which is the same property that makes
+the fleet presence it publishes fleet-wide. `transition`'s removal is kept as the fast path
+for the common case, where the pod that finishes a task is the pod that was running it.
+
+This is what fired on `BS-1540288291008684052-02` on 2026-08-21, and the task itself was
+fine: session 1 committed all three commits, sessions 2 and 3 committed nothing because
+there was nothing left to commit, and session 3's completion claim passed the gate and the
+council and merged. The streak of 2 was truthful, the task never parked, and §11.1 scored
+all three sessions correctly. The alert nevertheless fired for 36 hours, on pods whose
+image predated the `transition` fix, because CI was billing-blocked and the image carrying
+that fix was never built. That is the other lesson, and it is not a code one: a fix to an
+in-memory gauge changes nothing until a new image is built AND rolled out, so an alert on a
+stale gauge keeps creating remediation tasks in the meantime. Check the running image's
+digest against the commit you believe fixes it before reading the metric as a live defect.
+
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
 exists — the point the task branch forked from. Both halves are load-bearing:
@@ -3409,6 +3503,53 @@ tracker item (§9.5). The agent participates in none of these three steps — it
 > and ships no `nix`, so flake-provided acceptance commands cannot run there until it does.
 > That is the prerequisite for this approach, and it is not yet met.
 
+**A gate can leave evidence, and the exit code still decides.** "A shell command that exits
+0" is the right primitive and it cannot express what a change *renders*. A task that alters
+a page, a component or a layout can pass every gate — acceptance green, CI green, council
+satisfied reading the diff — and be visibly wrong, because nothing in the pipeline ever
+looked at it. That is also the honest answer to "why can't you write an end-to-end test for
+this": until now, because a gate could not produce or return an image.
+
+So gate 1 creates an empty directory, names it in **`CATERPILLAR_EVIDENCE_DIR`**, runs the
+commands, and publishes whatever they left there as §17 artifacts — **whether the gate
+passed or failed.** A repo whose `flake.nix` provides Playwright writes
+`acceptance: ["npx playwright test"]` and the fleet gates on rendered output, with no new
+subsystem in the supervisor.
+
+Five properties, and each is a decision rather than an accident:
+
+- **Failure is when the image matters most.** Publishing only on success would discard the
+  evidence in the one case that needs explaining. The failure text names what it collected.
+- **It is never the pass condition.** Nothing in the collection path returns a verdict. An
+  image is evidence for a human and for the council; the command's exit code is the whole
+  gate. A green gate that wrote a 4 MB screenshot has passed; a red one that wrote a tidy
+  small one has not.
+- **The directory is emptied first, and lives outside the checkout.** The per-task scratch
+  survives between sessions by design (§6.2), so a screenshot from three sessions ago would
+  otherwise be published as evidence about a diff it predates — worse than none, because it
+  looks current. And a file inside the worktree is a file in `git status`: the next session
+  to run `git add -A` would commit a screenshot into the pull request.
+- **Over the cap is refused, and legibly.** See §17 — the bytes do not land, but the size
+  and the limit are reported, because "too big to commit" and "the gate wrote nothing" must
+  not read the same way in a journal.
+- **The browser environment is decided once, in `workspace/toolchain.ts`.** A browser needs
+  a writable cache directory and it needs a sandbox decision, and neither is something a
+  task should discover for itself. `XDG_CACHE_HOME` points at `<paths.tasks>/.cache`,
+  created before the first task command runs, shared across tasks and reserved against a
+  devShell the same way `HOME` is: that is the variable Playwright resolves its browser
+  registry from on Linux when `PLAYWRIGHT_BROWSERS_PATH` is unset, and npm, pip and nix
+  honour it too. Shared rather than per-task because a browser bundle is a few hundred
+  megabytes and the per-task directory is reaped when the task finishes, so a per-task cache
+  would never amortise one download. An operator's own value wins; the container sets none.
+
+  **No privileges are asked for and no sandbox is disabled.** Worth stating because the
+  obvious next step — `--privileged`, or `CAP_SYS_ADMIN` in the pod's securityContext — is a
+  large permission for a small reason. `playwright-core` launches the `chromium` channel
+  with `--no-sandbox` on Linux of its own accord, so the browser a flake provides runs as
+  is. A repo that genuinely wants the real sandbox needs a runner configured for it, and
+  that is a machine property — which makes it `requires` (§8), not something the resolver
+  can grant.
+
 ### 12.1 The review council
 
 A third gate, after those two and never instead of them. Both of the first pair measure
@@ -3499,6 +3640,26 @@ That degradation is deliberate, and it is also why the `Merge anyway` button on 
 review only appears when a reviewer identity exists: from the authoring App the merge would
 be refused by branch protection every time, and a button that always fails is worse than no
 button.
+
+**The reviewers are shown the gate's evidence, read-only.** An artifact the gate produced
+(§12) is staged into `<taskDir>/evidence-in/` before the round starts and the paths are
+named in every lens's prompt — which is the whole difference between an artifact being
+*stored* and it being *evidence*: a reviewer told "there are screenshots" and not where has
+been told nothing it can act on. No new tool; `read` handles text and `bash` handles the
+rest.
+
+Three things about it, for the same reasons the gate side has them. It is the task's **own**
+artifacts, not its blockers' — along a `blockedBy` edge an artifact is input to the next
+task's work (§17), here it is evidence about the change under review. The files are written
+**read-only** (`0o444`): four reviewers hold no writable tool but `sabotage` holds `write`
+and `edit`, and all five run concurrently, so a reviewer that edited the screenshot it was
+shown would change what the others are looking at mid-round. And it is staged **beside** the
+checkout, never inside it, so evidence never shows up as an uncommitted change in the shared
+worktree or in the sabotage copy of it. A round with nothing to show gets no directory and no
+section — "Evidence: none" would be carried by every task that renders nothing, and it reads
+as a finding about the change rather than a fact about the pipeline. Staging that fails is
+logged and the round proceeds on the diff alone, which is what every round did before this
+existed.
 
 Verdicts are written to `tasks/<id>/reviews/NNN-verdict.md`, numbered by session and never
 overwritten, and appended to the journal — the journal is what the next session actually
@@ -3946,6 +4107,21 @@ A claim that *errors* is not a claim someone else won, and is treated as a win: 
 state-repo blip must not stop intake fleet-wide and silently. A duplicated pass is
 idempotent (`hasTask`); a skipped one is work nobody sees.
 
+**What gets refused.** Four questions are asked of an item, each one the first moment the
+answer is cheap, and all four refuse through the one path above — recorded, suppressed,
+commented once, visible on `/intake` (§14.5):
+
+- the body does not parse into a spec, or names no `acceptance` (§14.1);
+- its author does not have write access, so the body is not run as shell (§9.1);
+- it names a repo the workspace's credential cannot reach (§9.1.1);
+- its `toolchain.packages` names an attribute that does not exist in the pinned nixpkgs
+  (§8.1).
+
+The last two are *usability* checks and not security boundaries — `assertWorkspaceScope` is
+that — and both fail open: a forge that cannot be asked and a nix that cannot evaluate are
+the absence of evidence, and a refusal needs evidence. A repo or an attribute that is
+genuinely wrong is refused on the next pass instead.
+
 Ordering inside a single ingest is load-bearing: `state.json` is written first and
 `spec.md` last, because `spec.md` is the existence marker. A crash between the two leaves
 a task the claim loop skips and the next pass recreates cleanly; the reverse order would
@@ -4101,6 +4277,32 @@ can read them, and says so in the prompt. No new tool to read one — `read` and
 already work on a file. This reuses the dependency graph a plan already carries (§14.3),
 which means the plan agent controls artifact flow by declaring dependencies, and there is
 no second, parallel notion of "which task feeds which".
+
+**A second producer: the acceptance gate.** `publish_artifact` is not the only way in.
+Anything a §12 gate leaves in `CATERPILLAR_EVIDENCE_DIR` is committed here too, and it lands
+in the same directory under the same caps — one place a reader looks, one set of limits, one
+route serving it. The two differ only in audience: an agent's artifact is *input* for the
+tasks that declare this one as a blocker, and a gate's is *evidence* about this task's own
+change, read by a human on the web view and by the review council (§12.1).
+
+**Over the cap, a gate is refused in words rather than truncated.** A screenshot is not
+small, so this is the common case rather than the corner one, and it is where the caps stop
+being theoretical. The bytes do not land: every runner clones this repo and git keeps
+whatever reaches it forever, so a 4 MB PNG per failed session is paid for by every machine
+in the fleet in perpetuity. Truncating was rejected — half a PNG is not a smaller PNG, and a
+truncated trace is not a shorter trace, so the reader would be handed something that looks
+like evidence and is not. Instead the verdict's detail names the file, its size and the
+limit, so the journal distinguishes "too big to commit" from "the gate wrote nothing", and
+says what a repo can do about it: a lower resolution, a JPEG rather than a PNG, one
+screenshot rather than Playwright's whole output tree. An agent that hits the cap through
+`publish_artifact` is told to summarise; a gate that hits it is told to render less. The
+same refusal, aimed at what the caller can actually change.
+
+**On the web view an artifact is a download, never a document** — `application/octet-stream`
+as an attachment, with the link carrying `download` to agree with the header. That rule
+predates images and does not bend for them: these are agent-authored bytes on the origin
+that serves every transcript (§18, invariant 8). A screenshot is not exempt for being
+something a browser could render; being renderable is the hazard.
 
 ### 17.1 Large artifacts — designed, not built
 

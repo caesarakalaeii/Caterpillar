@@ -9,6 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { ARTIFACT_BYTES } from "../state/store.ts";
 import {
   AUTHOR_STANDARDS,
   TEST_FIRST_STANDARD,
@@ -16,7 +17,14 @@ import {
   parseRepoStandards,
 } from "./standards.ts";
 import {
+  asTaskId,
+  asWorkspaceName,
+  type TaskSpec,
+  type TaskState,
+} from "../domain/task.ts";
+import {
   BRAINSTORM_SYSTEM_PROMPT,
+  buildPrompt,
   REMEDIATION_SYSTEM_PROMPT,
   SYSTEM_PROMPT,
   systemPromptFor,
@@ -95,4 +103,50 @@ test("a remediation session is held to its repos' standards too", () => {
   const standards = parseRepoStandards("acme/web", "## design: Rule\n\nNo new dependencies.\n");
 
   assert.ok(systemPromptFor("remediation", standards).includes("No new dependencies."));
+});
+
+/**
+ * The evidence directory, which is worth a line in the prompt only because it is
+ * otherwise unreachable: a session whose task is a UI change cannot use a convention it
+ * has never been told about, and the gate cannot infer one from the exit code.
+ */
+const SPEC: TaskSpec = {
+  id: asTaskId("TASK-1"),
+  workspace: asWorkspaceName("acme"),
+  goal: "Make the header not overlap the nav.",
+  repos: [{ host: "github.com", owner: "acme", name: "widget" }],
+  requires: [],
+  acceptance: ["npm test"],
+};
+
+const STATE: TaskState = {
+  id: asTaskId("TASK-1"),
+  status: "running",
+  phase: "implementing",
+  requires: [],
+  sessions: 0,
+  limits: { maxSessions: 20 },
+  usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+  progress: { lastProgressSession: 0, noProgressStreak: 0 },
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+};
+
+test("a session is told where a gate may leave evidence", () => {
+  const prompt = buildPrompt({ spec: SPEC, state: STATE });
+
+  assert.match(prompt, /CATERPILLAR_EVIDENCE_DIR/);
+  // Beside the criteria it belongs to, not in some later section: an agent reading about
+  // the gate is the one moment this is relevant.
+  assert.ok(prompt.indexOf("npm test") < prompt.indexOf("CATERPILLAR_EVIDENCE_DIR"));
+  // From the cap the store enforces, not from prose beside it. A number transcribed here
+  // and changed there sends every agent hunting for a limit that does not exist.
+  assert.match(prompt, new RegExp(`${ARTIFACT_BYTES / 1024 ** 2} MiB`));
+});
+
+test("a brainstorm gets no evidence line, because it declares no acceptance criteria", () => {
+  // Its own output is a plan. A brainstorm has no gate of its own to leave anything for.
+  const prompt = buildPrompt({ spec: { ...SPEC, kind: "brainstorm" }, state: STATE });
+
+  assert.doesNotMatch(prompt, /CATERPILLAR_EVIDENCE_DIR/);
 });

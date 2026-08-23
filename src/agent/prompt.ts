@@ -14,6 +14,9 @@
  * never given (DESIGN.md §12.2).
  */
 import type { TaskKind, TaskSpec, TaskState } from "../domain/task.ts";
+// The cap itself, not a transcription of it: a prompt that names a number the store no
+// longer enforces sends every agent hunting for a limit that does not exist.
+import { ARTIFACT_BYTES } from "../state/store.ts";
 import { AUTHOR_STANDARDS, authorRepoStandards, type RepoStandard } from "./standards.ts";
 
 export interface PromptParts {
@@ -235,6 +238,18 @@ export const buildPrompt = (parts: PromptParts): string => {
           "These are run by the supervisor, not by you. All must exit 0 before the task is done:",
           "",
           ...spec.acceptance.map((command) => `- \`${command}\``),
+          "",
+          // Said here rather than in a section of its own because this is the one moment it
+          // is relevant, and because a convention nobody is told about cannot be used: a
+          // task whose change is a rendered page is exactly the task that would reach for
+          // this, and it has no other way to learn the variable exists.
+          "A command may write a file into `$CATERPILLAR_EVIDENCE_DIR` — a screenshot, a " +
+            "trace, a report. The supervisor commits whatever is there as an artifact of " +
+            "this task, whether the command passed or failed, and shows it to the review " +
+            "council. It does not change the verdict: the exit code is still the whole " +
+            `gate. Keep it under ${ARTIFACT_BYTES / 1024 ** 2} MiB — over the cap it is ` +
+            "refused with its size in the failure text rather than truncated, because " +
+            "half an image is not a smaller image.",
         ]),
   ].join("\n");
 

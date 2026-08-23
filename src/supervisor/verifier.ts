@@ -7,16 +7,27 @@
  *
  * The agent cannot influence this: it does not choose the commands, does not run
  * them, and does not report the result. `done` only triggers this check.
+ *
+ * Gate 1 also COLLECTS. A command's exit code cannot say what a change renders, so a gate
+ * that writes a screenshot, a trace or a report into `CATERPILLAR_EVIDENCE_DIR` has it
+ * published as a task artifact (§17) whether the gate passed or failed. That is evidence for
+ * a human and for the review council; it never decides the verdict. See `collectEvidence`.
  */
 import { execFile } from "node:child_process";
-import { repoSlug, taskPullRequests, type RepoRef, type TaskSpec, type TaskState } from "../domain/task.ts";
+import { mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { isArtifactName } from "../state/store.ts";
+import {
+  repoSlug,
+  taskPullRequests,
+  type RepoRef,
+  type TaskId,
+  type TaskSpec,
+  type TaskState,
+} from "../domain/task.ts";
 import type { CheckStatus, Forge, ForgeFactory } from "../forge/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
-import {
-  TASK_SHELL_ARGS,
-  type ResolvedEnv,
-  type ToolchainResolver,
-} from "../workspace/toolchain.ts";
+import { TASK_SHELL_ARGS, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { WorkspaceBindings } from "../agent/runner.ts";
 
 export interface VerificationResult {
@@ -48,16 +59,25 @@ export interface CommandResult {
 /** Timeout per acceptance command. A hung test must not wedge the supervisor. */
 const COMMAND_TIMEOUT_MS = 15 * 60 * 1000;
 
+/**
+ * One acceptance command.
+ *
+ * `env` is passed alongside the shell rather than taken from a `ResolvedEnv` because gate 1
+ * adds one variable of its own to it — `CATERPILLAR_EVIDENCE_DIR`. The shell still comes
+ * from the resolver, which is the half that must not drift from the agent's own
+ * (`workspace/toolchain.ts`).
+ */
 const runCommand = (
   command: string,
   cwd: string,
-  toolchain: ResolvedEnv,
+  shell: string,
+  env: NodeJS.ProcessEnv,
 ): Promise<CommandResult> =>
   new Promise((resolve) => {
     execFile(
-      toolchain.shell,
+      shell,
       [...TASK_SHELL_ARGS, command],
-      { cwd, env: toolchain.env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
+      { cwd, env, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => {
         const code = error && typeof error.code === "number" ? error.code : error ? 1 : 0;
         resolve({ command, code, output: `${stdout}\n${stderr}`.trim() });
@@ -80,6 +100,51 @@ export interface AcceptanceVerifierOptions {
    * what the unit tests want.
    */
   readonly ci?: CiWaitOptions;
+  /**
+   * Where a gate may leave evidence, and where that evidence goes afterwards.
+   *
+   * Optional so a verifier can still be built without a state repo — which most of this
+   * module's own tests do, and which is why `CATERPILLAR_EVIDENCE_DIR` is absent rather
+   * than empty when this is omitted. A gate testing `-d "$CATERPILLAR_EVIDENCE_DIR"`
+   * should get a truthful no.
+   */
+  readonly evidence?: EvidenceOptions;
+}
+
+/**
+ * The artifact side of the state repo, and nothing else.
+ *
+ * `StateStore` satisfies this structurally. Narrow on purpose: the gate has no business
+ * with the state repo's mutex, its git, or its journal, and a test of what the gate does
+ * with a refusal should not need a clone to express it.
+ */
+export interface EvidenceStore {
+  writeArtifact(task: TaskId, name: string, contents: Buffer): Promise<void>;
+}
+
+export interface EvidenceOptions {
+  readonly store: EvidenceStore;
+  /**
+   * The directory this task's gate writes into. A function of the task because the
+   * per-task scratch is where it belongs (see `runAcceptance`), and injected because a
+   * test must be able to put it somewhere it can inspect.
+   */
+  readonly dir: (task: TaskId) => string;
+}
+
+/** The variable a gate reads to find out where to leave a screenshot, trace or report. */
+export const EVIDENCE_DIR_VAR = "CATERPILLAR_EVIDENCE_DIR";
+
+/**
+ * Gate 1's verdict, plus the evidence note as its own field.
+ *
+ * The note is already inside `detail`, and it is repeated here because gate 2 REPLACES
+ * `detail` on the passing path. Carrying it separately is what lets `verify` append it to
+ * whichever detail the caller ends up reading, rather than only to the one nobody sees.
+ */
+interface AcceptanceResult extends VerificationResult {
+  /** Empty when nothing was collected. Always a string, so a caller can concatenate it. */
+  readonly evidence: string;
 }
 
 export interface CiWaitOptions {
@@ -112,29 +177,148 @@ export class AcceptanceVerifier {
     const acceptance = await this.runAcceptance(spec, repo);
     if (!acceptance.passed) return acceptance;
 
-    return this.checkCi(spec, state);
+    // Gate 2's detail is what a passing claim reports, and gate 1's is thrown away — so
+    // the evidence note has to be carried across, or a green UI gate would publish a
+    // screenshot and mention it nowhere.
+    const ci = await this.checkCi(spec, state);
+    return { ...ci, detail: `${ci.detail}${acceptance.evidence}` };
   }
 
-  /** Gate 1 — the declared commands, run by us in the task's worktree. */
-  private async runAcceptance(spec: TaskSpec, repo: RepoRef): Promise<VerificationResult> {
+  /**
+   * Gate 1 — the declared commands, run by us in the task's worktree.
+   *
+   * Evidence is collected AFTER every command has run and BEFORE the verdict is returned,
+   * on both paths. A failed UI gate is exactly when the image matters most, so publishing
+   * only on success would throw away the evidence in the one case it explains something.
+   */
+  private async runAcceptance(spec: TaskSpec, repo: RepoRef): Promise<AcceptanceResult> {
     const worktree = await this.options.worktrees.ensureWorktree(repo, spec.id);
     const toolchain = await this.options.toolchain.resolve(spec, worktree);
+    const evidenceDir = await this.prepareEvidenceDir(spec);
+    const env =
+      evidenceDir === undefined
+        ? toolchain.env
+        : { ...toolchain.env, [EVIDENCE_DIR_VAR]: evidenceDir };
     const failures: CommandResult[] = [];
 
     for (const command of spec.acceptance) {
-      const result = await runCommand(command, worktree, toolchain);
+      const result = await runCommand(command, worktree, toolchain.shell, env);
       if (result.code !== 0) failures.push(result);
     }
 
+    const evidence = await this.collectEvidence(spec, evidenceDir);
+
     if (failures.length === 0) {
-      return { passed: true, detail: `${spec.acceptance.length} acceptance command(s) passed` };
+      return {
+        passed: true,
+        detail: `${spec.acceptance.length} acceptance command(s) passed${evidence}`,
+        evidence,
+      };
     }
 
     const detail = failures
       .map((f) => `\`${f.command}\` exited ${f.code}:\n\n\`\`\`\n${f.output.slice(-2000)}\n\`\`\``)
       .join("\n\n");
     const note = missingInstallNote(spec.acceptance, failures);
-    return { passed: false, detail: `Acceptance criteria failed.\n\n${detail}${note}` };
+    return {
+      passed: false,
+      detail: `Acceptance criteria failed.\n\n${detail}${note}${evidence}`,
+      evidence,
+    };
+  }
+
+  /**
+   * An empty directory for this gate's output, or `undefined` when nothing collects.
+   *
+   * Emptied rather than merely created, and that is the load-bearing part. The directory
+   * lives in the per-task scratch on the work volume, which survives between sessions by
+   * design (§6.2) — so a screenshot from three sessions ago would otherwise be published
+   * as evidence about a diff it predates, which is worse than no evidence at all.
+   *
+   * Outside the checkout, for the same reason `runner.ts` stages upstream artifacts
+   * outside it: a file in the worktree is a file in `git status`, and the next session to
+   * run `git add -A` commits a screenshot into the pull request.
+   */
+  private async prepareEvidenceDir(spec: TaskSpec): Promise<string | undefined> {
+    const evidence = this.options.evidence;
+    if (evidence === undefined) return undefined;
+
+    const dir = evidence.dir(spec.id);
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  /**
+   * Publish whatever the gate left behind, and say what happened in words.
+   *
+   * Returns a suffix for the verdict's detail, so the journal and Discord carry it — this
+   * is a §17 artifact either way, but a reader looking at a red gate should not have to
+   * guess whether the missing screenshot was never written or was too big to keep.
+   *
+   * **Over the cap the bytes do not land, and the refusal is named.** The caps are the
+   * design (§17): every runner clones the state repo and git keeps whatever reaches it
+   * forever, and a 4 MB screenshot per failed session would be paid for by every machine
+   * in the fleet in perpetuity. Truncating is not an option a reader could use — half a
+   * PNG is not a smaller PNG — so the file is refused with its size and the limit beside
+   * it, which is enough for a repo to lower its own resolution or write a JPEG instead.
+   *
+   * **It never changes the verdict.** Nothing in here returns `passed`. An image is
+   * evidence for a human and for the council; the exit code is still the whole gate.
+   */
+  private async collectEvidence(
+    spec: TaskSpec,
+    dir: string | undefined,
+  ): Promise<string> {
+    const evidence = this.options.evidence;
+    if (evidence === undefined || dir === undefined) return "";
+
+    const names = await readdir(dir).catch(() => [] as string[]);
+    if (names.length === 0) return "";
+
+    const published: string[] = [];
+    const refused: string[] = [];
+
+    for (const name of names.sort()) {
+      if (!isArtifactName(name)) {
+        refused.push(
+          `\`${name}\` — not a usable artifact name (letters, digits, dot, dash, underscore)`,
+        );
+        continue;
+      }
+
+      const contents = await readFile(join(dir, name)).catch(() => undefined);
+      if (contents === undefined) {
+        // A directory, a dangling symlink, or a file the gate deleted between the readdir
+        // and here. Reported rather than skipped: `playwright test` writes its output as a
+        // TREE by default, and a repo that hits this needs to be told why its trace never
+        // appeared, not left wondering.
+        refused.push(`\`${name}\` — could not be read as a file`);
+        continue;
+      }
+
+      try {
+        await evidence.store.writeArtifact(spec.id, name, contents);
+        published.push(`\`${name}\` (${contents.byteLength} bytes)`);
+      } catch (error) {
+        refused.push(`\`${name}\` — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    const lines: string[] = [];
+    if (published.length > 0) {
+      lines.push(`Evidence published as artifacts: ${published.join(", ")}.`);
+    }
+    if (refused.length > 0) {
+      lines.push(
+        `Evidence NOT published:\n${refused.map((r) => `- ${r}`).join("\n")}\n` +
+          `The caps on \`artifacts/\` are deliberate (DESIGN.md §17) — every runner clones ` +
+          `the state repo and git keeps what lands there forever. Write a smaller file: ` +
+          `a lower resolution, a JPEG rather than a PNG, one screenshot rather than a tree.`,
+      );
+    }
+
+    return lines.length === 0 ? "" : `\n\n${lines.join("\n\n")}`;
   }
 
   /**

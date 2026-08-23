@@ -711,10 +711,16 @@ export const taskPage = (detail: TaskDetail): Html => {
         ? raw("")
         : html`<section>
             <h2>Artifacts</h2>
+            <p class="sub">
+              What this task published for the tasks after it, and what its acceptance gate
+              rendered while it ran — a screenshot, a trace, a report. Each one downloads;
+              nothing here is shown on this page, because these are bytes an agent wrote
+              and this is the origin that serves every transcript.
+            </p>
             <div class="chips">
               ${detail.artifacts.map(
                 (name) =>
-                  html`<a class="chip" href="/tasks/${detail.id}/artifacts/${name}">${name}</a>`,
+                  html`<a class="chip" download href="/tasks/${detail.id}/artifacts/${name}">${name}</a>`,
               )}
             </div>
           </section>`

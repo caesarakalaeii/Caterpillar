@@ -6,7 +6,7 @@
  * repo, so recovery is "fetch and reclaim".
  */
 import { createServer } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
@@ -65,6 +65,7 @@ import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
 import { ToolchainResolver } from "./workspace/toolchain.ts";
+import { NixCommandEval, ToolchainDoctor } from "./workspace/toolchain-doctor.ts";
 import { nixStoreDir, UsageMonitor } from "./workspace/usage.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
@@ -399,10 +400,17 @@ const main = async (): Promise<void> => {
         settleMs: config.limits.ciSettleSeconds * 1000,
         pollMs: config.limits.ciPollSeconds * 1000,
       },
+      // A gate that renders something writes it here and the supervisor commits it as a
+      // §17 artifact. Beside the task's worktree rather than inside it: a file in the
+      // checkout is a file in `git status`, and the next `git add -A` would put a
+      // screenshot in the pull request.
+      evidence: { store, dir: (task) => join(config.paths.tasks, task, "evidence") },
     }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
-    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
+    // `artifacts: store` is what lets the reviewers see what the gate rendered, not just
+    // what the diff says (§12.1). Read-only, staged beside the checkout.
+    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain, artifacts: store }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
     // The workspaces' forge factories, for the one question the loop asks of them: can this
@@ -445,6 +453,15 @@ const main = async (): Promise<void> => {
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
+      // The same idea as `forges` above, for the environment rather than the repos: a
+      // `toolchain.packages` list with a typo'd nixpkgs attribute is refused here instead
+      // of parking a claimed task in `nix print-dev-env` a session later (§8.1). On a
+      // runner without nix it evaluates nothing and refuses nothing.
+      toolchainDoctor: new ToolchainDoctor({
+        config: loaded.toolchain,
+        nix: new NixCommandEval(),
+        logger,
+      }),
     }),
     intakeStatus,
     // The fifth intake path (§20). Present whether or not the receiver is listening: the

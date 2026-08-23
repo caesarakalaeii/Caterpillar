@@ -1833,6 +1833,80 @@ test("a task that reaches a terminal status stops reporting a no-progress streak
   );
 });
 
+test("a replica drops a streak for a task another replica finished", async () => {
+  // The other half of the stale-gauge failure, and the half `transition` cannot reach.
+  //
+  // `transition` removes the series when THIS process takes a task terminal. But the
+  // gauge is per-process and in memory, while a task migrates between replicas across
+  // sessions — in the fleet's own state repo 19 tasks carry journal shards written by two
+  // to four different runners. So the pod that published the streak is routinely not the
+  // pod that finishes the task:
+  //
+  //   pod A runs session N, publishes streak 2, hands off, releases the lease
+  //   pod B claims session N+1, the task finishes, pod B removes the series from its OWN
+  //     registry — where nothing ever set it
+  //   pod A reports 2 for the life of the process
+  //
+  // `caterpillar_no_progress_streak >= 2` does not aggregate over `pod`, so pod A's orphan
+  // series fires CaterpillarTaskThrashing indefinitely. That is what kept the alert up for
+  // 36 hours on BS-1540288291008684052-02, whose three sessions all ran on caterpillar-1
+  // and whose streak of 2 was entirely truthful — the task went `done` at streak 2.
+  //
+  // Modelled as the state repo already holding the terminal status, because that is
+  // precisely what pod A sees: it never runs another session on the task and never calls
+  // `transition` for it, so `survey` — the one pass that reads every task's committed
+  // state on every poll in every replica — is the only place the truth arrives.
+  const ELSEWHERE = asTaskId("ELSEWHERE-1");
+  await seedTask(ELSEWHERE, {
+    status: "done",
+    sessions: 3,
+    progress: { lastProgressSession: 1, noProgressStreak: 2 },
+  });
+
+  const metrics = new AgentMetrics();
+  // What this replica's last session on the task left behind before handing it off.
+  metrics.noProgress.set({ task: ELSEWHERE }, 2);
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Nothing may claim a `done` task, so no session should run at all.
+    runner: { run: () => Promise.reject(new Error("a finished task must not be claimed")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const orphaned = /caterpillar_no_progress_streak\{[^}]*task="ELSEWHERE-1"/;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && orphaned.test(metrics.render())) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.doesNotMatch(
+    metrics.render(),
+    orphaned,
+    "a replica must stop reporting a streak for a task it can see has finished, or the " +
+      "alert outlives the work on whichever pod ran the second-to-last session",
+  );
+});
+
 test("a git failure in the poll loop is logged and retried, not fatal", async () => {
   // `store.pull`, `applyChatRequests`, `maybeIngest`, `survey` and `claimNext` all sat
   // OUTSIDE any try — only `workTask` was wrapped. `Git.run` throws on every non-zero
@@ -5110,4 +5184,80 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
 
   await retire(WAITING);
   await retire(RUNNING);
+});
+
+test("a rejected claim still pushes the evidence its gate published", async () => {
+  // The gate writes an artifact OUTSIDE any of the loop's write-then-commit units
+  // (`Supervisor.unit`), and inside a unit `StateStore` stages only the paths that unit
+  // wrote — not the whole writable tree. So whether a screenshot ever reaches the remote
+  // depends on the rejection unit happening to touch `tasks/<id>`, which it does because
+  // it journals the rejection under the same id.
+  //
+  // That is load-bearing and entirely invisible from either file. A future change that
+  // journals a rejection somewhere else, or narrows staging further, leaves the evidence
+  // on one runner's disk with nothing to say it was dropped — and a screenshot that never
+  // leaves the machine that produced it is the whole feature not working.
+  const EVIDENCE = asTaskId("SMOKE-EV-1");
+  await seedTask(EVIDENCE);
+
+  const store = new StateStore(statePath, stateGit);
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    // What `AcceptanceVerifier.collectEvidence` does, in the one respect this test is
+    // about: the artifact is on disk before the verdict is returned, and it is returned
+    // as a FAILURE — the case where the image matters most and where nothing else in the
+    // loop would have reason to commit it.
+    verifier: {
+      verify: async () => {
+        await store.writeArtifact(EVIDENCE, "shot.png", Buffer.from("pretend png"));
+        return { passed: false, detail: "the header still overlaps the nav" };
+      },
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.reject(new Error("the council must not run on a failed gate")),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const rejected = await waitForCommit(
+    `chore(${EVIDENCE}): completion claim rejected`,
+    30_000,
+  );
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(rejected !== undefined, "the rejection was never pushed");
+  assert.equal(
+    await blobAt(rejected, `tasks/${EVIDENCE}/artifacts/shot.png`),
+    "pretend png",
+    "the evidence must travel with the rejection that explains it",
+  );
+
+  await retire(EVIDENCE);
 });

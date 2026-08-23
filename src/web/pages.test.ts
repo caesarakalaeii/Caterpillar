@@ -9,8 +9,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { render } from "./html.ts";
-import { bytes, fleetPage, intakePage, runnerPage } from "./pages.ts";
-import type { DiskView, FleetView, IntakeView, RunnerExport } from "./view.ts";
+import { bytes, fleetPage, intakePage, runnerPage, taskPage } from "./pages.ts";
+import type { DiskView, FleetView, IntakeView, RunnerExport, TaskDetail } from "./view.ts";
 import { asTaskId, asWorkspaceName } from "../domain/task.ts";
 
 const EXPORT: RunnerExport = {
@@ -275,4 +275,54 @@ test("the fleet page carries one line saying when intake last ran", async () => 
     }),
   );
   assert.match(skipped, /another runner served this interval/);
+});
+
+/**
+ * The artifacts section, now that a gate's rendered output arrives through it.
+ *
+ * `web/server.test.ts` already pins the response — `application/octet-stream`, as an
+ * attachment, because agent-authored bytes rendered as a document on the origin that also
+ * serves every transcript would be script (invariant 8). What is pinned here is the other
+ * end of the same rule: the LINK must not invite a browser to navigate to those bytes.
+ */
+const detailWith = (artifacts: readonly string[]): TaskDetail => ({
+  id: asTaskId("TASK-9"),
+  title: "TASK-9",
+  state: {
+    id: asTaskId("TASK-9"),
+    status: "done",
+    phase: "verifying",
+    requires: [],
+    sessions: 1,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 1, noProgressStreak: 0 },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  },
+  questions: [],
+  verdicts: [],
+  artifacts,
+  sessions: [1],
+});
+
+test("an artifact link downloads rather than navigating to agent-authored bytes", () => {
+  const rendered = render(taskPage(detailWith(["shot.png"])));
+
+  assert.match(rendered, /href="\/tasks\/TASK-9\/artifacts\/shot\.png"/);
+  assert.match(rendered, /download/, "a browser must save it, not open it on this origin");
+});
+
+test("the artifacts section says these are downloads and where they came from", () => {
+  // An operator looking at `shot.png` in a list of chips has no way to know whether
+  // clicking it renders a page. The answer is no, deliberately, and the page should say
+  // so rather than leave the reader to find out by clicking.
+  const rendered = render(taskPage(detailWith(["shot.png"])));
+
+  assert.match(rendered, /acceptance gate/i);
+  assert.match(rendered, /download/i);
+});
+
+test("a task with no artifacts gets no artifacts section", () => {
+  assert.doesNotMatch(render(taskPage(detailWith([]))), /Artifacts/);
 });
