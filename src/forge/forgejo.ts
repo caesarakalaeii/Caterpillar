@@ -29,6 +29,7 @@ import {
   type MergeOptions,
   type PrRequest,
   type PrResult,
+  type ReviewComment,
   type WorkspaceScope,
 } from "./types.ts";
 
@@ -106,6 +107,33 @@ interface CombinedStatusResponse {
 interface PullRequestResponse {
   readonly number: number;
   readonly html_url: string;
+}
+
+/** Gitea's `PullReview`. `body` is the prose a reviewer wrote about the change as a whole. */
+interface PullReviewResponse {
+  readonly id: number;
+  readonly body?: string;
+  readonly user?: { readonly login?: string } | null;
+  readonly submitted_at?: string;
+  readonly html_url?: string;
+}
+
+/**
+ * Gitea's `PullReviewComment`.
+ *
+ * `resolver` is the account that closed the thread — its presence IS the resolved flag, and
+ * it is why this side needs no GraphQL where GitHub does. `position` goes null when the diff
+ * hunk the comment was written against no longer exists, which is what GitHub calls outdated.
+ */
+interface PullReviewCommentResponse {
+  readonly id: number;
+  readonly body?: string;
+  readonly path?: string | null;
+  readonly position?: number | null;
+  readonly resolver?: { readonly login?: string } | null;
+  readonly user?: { readonly login?: string } | null;
+  readonly created_at?: string;
+  readonly html_url?: string;
 }
 
 /**
@@ -279,6 +307,92 @@ class ForgejoForge implements Forge {
     );
 
     return summariseCombinedStatus(body);
+  }
+
+  /**
+   * Every review comment on a pull request (DESIGN.md §7.3).
+   *
+   * Two levels, because Forgejo has two. A review carries a BODY — the prose about the
+   * change as a whole, which is where "this is the wrong approach" gets written — and it
+   * carries per-line comments, one request each. Reading only the second drops every
+   * objection that is not about a particular line.
+   *
+   * Resolved comments are returned rather than filtered, as on GitHub: the caller states how
+   * many of a review are already answered beside the ones that are not.
+   */
+  async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
+    assertInScope(repo, this.allowed);
+
+    const base = `/repos/${repo.owner}/${repo.name}/pulls/${pr}`;
+    const reviews =
+      (await this.api<readonly PullReviewResponse[] | null>(repo, `${base}/reviews`)) ?? [];
+    const comments: ReviewComment[] = [];
+
+    for (const review of reviews) {
+      // An APPROVED review with no prose is the ordinary way to approve. Quoted, it would
+      // say a human had objected to nothing.
+      if ((review.body ?? "").trim().length > 0) {
+        comments.push({
+          id: `review-${review.id}`,
+          repo,
+          pr,
+          ...this.attribution(review.user),
+          body: review.body ?? "",
+          ...(review.html_url === undefined ? {} : { url: review.html_url }),
+          createdAt: review.submitted_at ?? "",
+          // A review body belongs to no thread, so there is nothing to resolve and no line
+          // for it to drift off.
+          resolved: false,
+          outdated: false,
+        });
+      }
+
+      const own =
+        (await this.api<readonly PullReviewCommentResponse[] | null>(
+          repo,
+          `${base}/reviews/${review.id}/comments`,
+        )) ?? [];
+
+      for (const comment of own) {
+        // Null `position` with the original still recorded is a comment whose hunk has gone.
+        // The line is dropped with it: `src/index.ts:null` points a session at nothing.
+        const outdated = comment.position == null;
+        comments.push({
+          id: String(comment.id),
+          repo,
+          pr,
+          ...this.attribution(comment.user),
+          body: comment.body ?? "",
+          ...(comment.path == null ? {} : { path: comment.path }),
+          ...(comment.position == null ? {} : { line: comment.position }),
+          ...(comment.html_url === undefined ? {} : { url: comment.html_url }),
+          createdAt: comment.created_at ?? "",
+          resolved: comment.resolver != null,
+          outdated,
+        });
+      }
+    }
+
+    return comments;
+  }
+
+  /**
+   * Who wrote it, and whether that is us.
+   *
+   * There is no bot flag on Forgejo — the fleet is an ordinary account — so the only thing
+   * that distinguishes our own comment from a human's is that it belongs to the account the
+   * tokens were issued for. Case-insensitive, because Forgejo resolves logins that way and
+   * an exclusion one letter can be walked around is not an exclusion (`isSameRepo`).
+   */
+  private attribution(
+    user: { readonly login?: string } | null | undefined,
+  ): { readonly author: string; readonly fromFleet: boolean } {
+    // A deleted account leaves no login, and the comment still says what it said.
+    const login = user?.login ?? "(unknown)";
+    return {
+      author: login,
+      fromFleet: login.toLowerCase() === this.options.username.toLowerCase(),
+    };
   }
 
   /**

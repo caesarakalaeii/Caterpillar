@@ -1780,11 +1780,85 @@ later.
 the record of what the council said, and a human resuming wants to see what they are
 answering.
 
+#### A review left in the forge is guidance too
+
+Everything above gives a human one place to talk: the task's Discord thread. The place they
+actually are is the pull request. §12.1 let the review council block a change with a verdict
+and left a human unable to do the same thing without switching surfaces — so a reviewer who
+read the diff, found the swallowed error, and wrote it on the line it was on was **talking
+into a void**. Nothing read it, and the next session opened with no idea it existed.
+
+So unresolved review comments are a guidance source, fetched at session start and spliced
+into the prompt after the handoff — last, because the prompt orders itself most-actionable
+closest to the model's attention, and an objection from outside the loop is the most
+actionable thing in it.
+
+**The supervisor fetches, and it is the SESSION RUNNER that does it.** Not the loop: the
+loop's forge dependency is narrowed to `RepoReach` on purpose (§9.1.1) — it answers whether a
+repo can be reached and cannot mint a token — and widening it to a minting factory to read
+some comments would trade that bound for a convenience. The runner already holds the task's
+scoped forge and its credential lease for exactly the length of the session, so the read costs
+no new credential and no new plumbing. The agent still never holds anything (§9.2): what it
+gets is rendered text.
+
+**A forge that cannot be reached does not fail the task**, per invariant 6 and exactly as
+tracker mirroring behaves. The review is not the work, and a 500 from GitHub costing a task
+its session would be a worse failure than a session that ran without seeing a comment. The
+failure is logged per pull request, so one unreachable sibling does not discard what the
+primary already answered.
+
+**Which comments count** is decided in one pure place, `agent/review-guidance.ts`, and the
+answer is narrower than "all of them" in two ways that matter:
+
+- **A closed thread is not an instruction.** A resolved comment was accepted and an outdated
+  one was written against a line that no longer exists. Quoted in full they send the agent to
+  redo work that already landed, and on an old pull request they are most of what there is to
+  read. So they are counted rather than quoted, and the count appears only BESIDE something
+  still open — it says "part of this review is already answered", which is worth knowing next
+  to the part that is not and is a sentence about finished work on its own. A pull request
+  whose every thread is resolved renders no section at all.
+- **The fleet's own voice is not guidance.** The agent replies to reviews and the reviewer
+  identity posts approvals, both onto the pull request being graded. Read back, they are a
+  loop with no human in it. On GitHub the discriminator is GraphQL's `author.__typename`,
+  which reports `Bot` for any App; on Forgejo the fleet is an ordinary account, so it is the
+  account the tokens were issued for.
+
+GitHub's read is the one GraphQL call in `forge/github-app.ts`, and it has to be: thread
+resolution is exposed nowhere but `pullRequest.reviewThreads`. On REST alone every comment a
+human ever accepted would arrive as an open instruction forever. Forgejo needs no such thing —
+Gitea's `PullReviewComment` carries `resolver`, the account that closed the thread — but it
+does need two levels, because a review's own BODY is where "this is the wrong approach" gets
+written and reading only per-line comments drops every objection about the change as a whole.
+
+**A comment resets the review round count**, for §12.1's reason word for word: the cap detects
+a loop with nothing new entering it, and a human objection is precisely something new. Left
+unforgiven the whole feature does not work — a task already at the cap parks on the very next
+rejection, so the objection is never tested and the human concludes, correctly, that
+commenting had no effect.
+
+It is forgiven **once per objection**, which is the other half. `review.commentSeen` records
+the newest comment already acted on, and forgiving without it would delete the cap rather
+than inform it: one comment would buy a round on every session for the rest of the task's
+life. The reset is written in `recordSession` rather than in `convene` because of the
+ordering — `recordSession` runs first, and a round forgiven after the council has spoken has
+already been spent. `review.last` and `review.reason` are untouched, as they are for typed
+guidance: a human who commented wants to see what they are answering.
+
 #### What is deliberately absent
 
 **No `/steer` command.** Every message in a task's thread already is one, and a command
 language in the one place §7.1 removed it would be the same friction arriving under a new
 name.
+
+**No replying to a review comment, and no resolving one.** The agent answers a review in the
+code, which is where an answer belongs; a thread the fleet closed itself would be a thread the
+human never agreed was finished. Marking one resolved is a human's act on both forges and
+stays one.
+
+**Nothing polls the forge between sessions.** A comment left mid-session is read by the next
+one, not delivered into the running one. Steering already exists for the case where somebody
+wants to interrupt, it costs no forge requests, and a review comment is written to be read
+against the whole change rather than mid-turn.
 
 **Steering is not offered to the council, the plan maintainer or the digest summariser.**
 They all call `runSession` and all pass nothing. They are not the agent, they run for minutes
@@ -2927,6 +3001,44 @@ the thing that finally stopped the spend-limit retry storm on 2026-08-15, by par
 task — which is the right mechanism reaching the wrong conclusion about the wrong actor,
 and exactly the kind of evidence that makes a park unreadable.
 
+**A session that ended in `ask_human` is neutral: neither progress nor a stall.** It is
+the one exit reason that is, and the reason is the charter above — the question is whether
+the *agent* is going in circles, and an agent that established it needs a decision only a
+human can make is not. §7 says it plainly: "Nothing is running while you think."
+
+§7 half-conceded this already, by clearing the streak when an **answer** arrives, on the
+grounds that `awaiting-human` is only ever reached from a session that produced no commit.
+That fixes the park and not the reading. Between the question and the answer — which is
+hours, because the whole point is that a human is asleep or busy — the task carries a
+streak it did not earn, and `caterpillar_no_progress_streak` reports it. That is how
+`BS-1540279100223127564-01` fired `CaterpillarTaskThrashing` on 2026-08-21: session 3 was
+a completion claim the verifier rejected and scored a stall honestly (streak 1); session 4
+read the rejection, worked out that its acceptance list runs the whole frontend's lint
+while the task owns only a slice of the reported errors, and asked. Streak 2, alert firing,
+and nothing running on the task for the next four hours. A task waiting **too long** on a
+human is a real problem and §11 already gives it its own alert (`awaiting-human > 24h`),
+which is about a human rather than about the code.
+
+Neutral rather than forgiving, deliberately. Clearing the streak here would hand an agent
+a way to reset the detector on demand — stall, ask anything, get answered, stall again —
+so a streak earned by other sessions survives an `ask_human` untouched. Evidence still
+wins over the exit reason: a session that commits real work and *then* discovers it needs
+a decision moved the task forward, and is scored as progress. `handoff` is deliberately
+not exempt: it is how most sessions end and says nothing about what was achieved, so
+exempting it would blind the detector to the exact failure it exists for.
+
+**The gauge is a claim about right now, and nothing expires it.** `recordSession` was the
+only writer of `caterpillar_no_progress_streak{task=...}`, while three other sites forgive
+the streak in state (an answer, guidance, a resume) and a parked or finished task stops
+having sessions at all. So the series reported a number the state no longer held for as
+long as the pod lived — `BS-1540252370968117339-04` reached streak 2 and then merged its
+PR, and went on reporting 2. Since this is an **alerting** rule, a stale sample is not
+cosmetic: it pages somebody about work that is over. Every forgiveness now publishes, and
+`transition` **removes** the series when a task reaches a terminal status — the state keeps
+the streak, because it is the record of why the task parked, but the gauge stops claiming
+there is a session to measure. Removed rather than zeroed: 0 is a real reading, meaning a
+task that is making progress.
+
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
 exists — the point the task branch forked from. Both halves are load-bearing:
@@ -3038,10 +3150,189 @@ Two rules come out of it, and the second is the expensive one:
   read as a defect in the code under review — which is precisely the "session with
   nothing to do" this whole section is about, manufactured by the fix for it.
 
+**A fourth, and it is the one that made the third expensive: the gate said a job was red
+and never said why.** `summarise` in `github-app.ts` read three fields of a check-run —
+`status`, `conclusion`, `name` — so a rejection was `CI is red — failing: check (26)` and
+nothing more. That is the whole of what the next session gets to act on, and it cannot get
+more on its own: the agent holds no forge credential (§9.2), the image has no `gh` or
+`curl`, the unauthenticated API 404s on a private repo, and the App has no `actions: read`
+by deliberate choice. So the only moves left are to re-prove the tree green or to change
+code blind, and both produce a session with no commit — the detector then scores that
+honestly, and the opacity has manufactured the streak.
+
+It is recorded three times over. `ALERT-6155db6ffb83deff` spent session 2 proving one tree
+green five ways against a leg the machine cannot execute ("Node 26 is not available on this
+machine") and session 7 concluding "the red is unexplained from here";
+`BS-1539163866305658891-07` records "four sessions were burned on blind changes to a
+GitGuardian issue that turned out to be dashboard triage". The rule above — a red leg that
+reproduces nowhere is a race, not a version — is the correct reading, and none of those
+sessions could reach it, because the message they were handed contained no information to
+read either way.
+
+GitHub was returning the answer all along, in the same response the names come from:
+`output.title`/`output.summary` and `html_url` per check-run, under the `checks: read`
+permission the App already holds. Those are now declared and used — title before summary
+(for an Actions job the title is the one-line verdict; the summary can run to pages), first
+line only, name alone where a run offers neither. The job log itself is still out of reach
+and stays that way: fetching it needs `actions: read`, and "no admin, no workflows" is a
+stated property of this App rather than an oversight. A link a human can follow is the
+honest substitute, and quoting it in an `ask_human` is the right move for a red leg the
+container cannot run.
+
+The same change deduplicates by job name. `push: ['**']` and `pull_request` both trigger
+the workflow, so every job has two check-runs at one sha: `ALERT-76f2ff229fea37b1`'s own
+rejection read `failing: check (22), check (26), check (26), check (22)` — four entries for
+two broken jobs, which invites the reader to hunt for a difference between them. There is
+none; they are the same two jobs reported twice.
+
+**A fifth, found while trying to explain the fourth's own red CI: the acceptance command
+could not fail.** `npm test` ran `node --test --test-force-exit`, and force-exit tears the
+process down as soon as the root test settles, discarding the results of tests still
+reporting from other files. The numbering closes over the gap and `fail` stays 0, so this
+suite reported 1425, 1428, 1440 or its true 1441 tests run to run — always losing the tail
+of `src/cluster/preflight.test.ts` from the *middle* of the stream — and exited 0 every
+time. A test that never ran was indistinguishable from a test that passed.
+
+The journal had already noticed the symptom twice and filed it as cosmetic: "`npm test`
+registers 1421 or 1431 tests run to run … harmless to the gate". It was not harmless and it
+was not the reporter. `npm test` is an acceptance command (§12), so it is one of the three
+things that decide whether a task is done; a gate that cannot fail certifies nothing, and a
+session whose work is waved through by it is a session whose defect surfaces later, to
+someone with less context.
+
+Force-exit is gone. It was added as a hang backstop — a hung test once held CI open for
+twenty minutes — so removing it required the hang to still be caught. Force-exit turned out
+to be the weaker of the two, not the stronger: with stdout piped it reported a deliberately
+hanging file as a **pass with exit 0**, on every version tried. The suite is now
+deterministic, at unchanged speed. `--test-concurrency=1` also stabilised it, and was
+rejected — 47% more wall time to narrow a race rather than remove it.
+
+**Two things about `node --test` differ by node version, and the CI matrix spans two
+versions deliberately (§12), so getting this right on the machine to hand is not getting it
+right.** Both were found only by running the suite under node 24 as a proxy for the node 26
+leg — the leg that had rejected two consecutive completion claims on this very task with a
+verdict no one could reproduce.
+
+- **The summary format.** node 22 emits TAP when stdout is a pipe; node 24+ emits `spec`,
+  which marks summary lines with `ℹ` rather than `#`. A verdict matching only `#` sees no
+  summary at all and rejects a green tree. The reporter is now pinned with
+  `--test-reporter=tap`, and the parser accepts either prefix — belt and braces, because a
+  parser that silently matches nothing is precisely how the defect above worked.
+- **Whether the runner exits after reporting a timeout.** node 22 reaps the hung file's
+  process and exits 1. node 24 reports the timeout and then waits forever, so a wrapper
+  that waits on the runner inherits the hang — the twenty-minute stall again, on the newer
+  leg only. `npm test` therefore keeps a deadline of its own (twenty minutes, against a
+  150-second suite) and SIGKILLs the runner past it. It waits on the child's `exit` rather
+  than `close`, since a killed runner can leave a grandchild holding the pipe open and
+  `close` would wait on that instead.
+
+Belt and braces, in `src/testing/run-report.ts`: the run is judged against a known test
+count, so a result lost for some other reason — a file that fails to load registers nothing
+at all — cannot read as a pass either. The floor is a hand-maintained constant rather than
+a high-water mark on disk, because a self-updating floor ratchets down the first time a run
+truncates, which is exactly the failure it is there to catch. Note that a timed-out test
+reports `cancelled`, not `fail`, so a check that only reads `fail` would miss the hang.
+
+**A sixth, and it rejected three consecutive completion claims on the branch carrying the
+five above: a test's own teardown lost a race with a subprocess it had leaked.** The
+verdict was `failing: check (22), check (26), check (26), check (22)`, both legs, twice
+over, on a tree that ran green locally on every version available. The actual failure:
+
+    not ok - src/supervisor/loop.test.ts
+    failureType: 'hookFailed'
+    error: "ENOTEMPTY: directory not empty, rmdir '.../caterpillar-loop-XXXX/state/.git/objects'"
+
+`rm -rf` walks a tree and then rmdir's each directory it believes it emptied. A process
+still creating files between those two steps makes the rmdir fail, and `force: true` does
+not cover it — that suppresses `ENOENT`, the opposite race. The leaked writer is a git
+child: `Supervisor.run` awaits both its loops, but `housekeepingLoop` checks the abort
+signal only *between* passes, so an abort landing inside `housekeepOnce` leaves that pass's
+`store.pull` still writing after the test's `await running` has resolved. `loop.test.ts`
+drives a real supervisor over a real git remote across 69 tests, so it is the file where
+this is reachable, and one file failing in a hook fails that whole leg.
+
+This is the third rule above collecting its own interest — a red on one leg reproducing
+nowhere is a race, not a version — with the twist that it fires on *both* legs, because a
+coin toss lands on each half the time. It is `src/testing/tempdir.ts` now: a removal that
+retries a bounded number of times, used by that teardown, rethrowing if the tree really
+cannot go. Test teardown only, and documented as such; production code removes trees it
+owns exclusively, where a retry would hide a real concurrent writer rather than tolerate an
+expected one.
+
+Two further notes for whoever meets this next:
+
+- **The rejection message came from `main`, not from the branch under test.** The verifier
+  runs the deployed supervisor, so the fourth fix above — which makes a red verdict name a
+  reason and a URL — cannot improve the verdicts of the very branch that introduces it.
+  Three sessions read a bare, doubled job list as evidence about their own code; it was
+  `main`'s `summarise` all along, and the doubling is the pre-dedup format. **A verdict
+  describes the branch with the code that produced the verdict, which during a change to
+  the gate is not the branch being graded.**
+- **A flake needs a reproduction before a fix.** This one showed at roughly 1 full run in
+  3 on node 24, 0 in 5 runs of the file alone, and never on node 22 — so "it passed
+  locally" was true and worthless. What settled it was running the suite repeatedly on the
+  other matrix version, then reducing the race to a 40-iteration probe that reproduced the
+  identical error 15 times by removing a tree under an un-awaited `git fetch`.
+
+**What the sixth fix did NOT settle, recorded so the next session starts here rather than
+where session 1 did.** The claim after it was rejected with the same verdict again, and the
+tree is green: all three acceptance commands exit 0 from a clean clone under node 22.23.2
+and 24.19.0, `# tests 1449 # pass 1449 # fail 0 # cancelled 0`, with a stable count across
+repeated runs. The following differences between this container and a GitHub runner were
+each tested and are **not** the cause — do not spend a session re-testing them:
+
+- **git identity.** The runner container exports `GIT_AUTHOR_*`/`GIT_COMMITTER_*` and has
+  no global gitconfig; an Actions runner has neither. The suite is green with all four
+  stripped, because the tests set their own.
+- **npm and the registry.** `npm ci --ignore-scripts` exits 0 on a cold cache. `.npmrc`'s
+  `min-release-age=2` cannot bite it: the setting works by pinning `before` to two days
+  ago, `npm ci` resolves from the lockfile's integrity hashes without consulting a
+  packument, and the youngest pinned dependency (`typescript@5.9.3`) was published in
+  2025 regardless — `time.modified` on that packument is recent, which is the package's
+  last change and not that version's release.
+- **Timeouts.** The slowest single test is 16s against a 180s per-test limit, and the
+  whole suite is ~150s against the wrapper's 20-minute deadline.
+- **The count floor.** Exactly 1449 on every run on both versions. The only conditionally
+  registered block is `redis/contract.test.ts`'s live-server `describe`, and a skipped
+  test still counts toward `# tests`.
+- **Checkout shape.** Green on a branch checkout, a detached HEAD, and a `--depth 1`
+  shallow clone with one commit of history — which is what `actions/checkout` produces.
+- **Load and memory.** Green under 8-way CPU oversubscription on 4 CPUs, in a container
+  capped at 4 GiB; an Actions runner has 4 CPUs and 16 GB.
+
+So the red is still unexplained from here, and the two facts that bound any future guess
+are that **both** legs fail — which excludes anything true only of node 26, since node 22
+is green locally — and that the verdict arrives about 3m20s after the push, four times
+running, while the `check` job's `npm test` step alone takes ~150s. Four *completed,
+failed* check-runs that fast means the jobs died early rather than running the suite to a
+red result, and `awaitChecks` never got to use its 20-minute budget because `summarise`
+returned `failure` on the first poll rather than `pending`. The next useful move is not
+another local run: it is reading the job log, which needs someone who can open the URL.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
-these and parked the work later instead of sooner.
+these and parked the work later instead of sooner. The fourth adds a corollary about the
+evidence rather than the limit: **a gate that rejects work must say what it saw.** A
+verdict the next session cannot act on spends a session to rediscover it, and three of
+those park the task. The fifth adds its converse: **a gate that accepts work must have been
+able to reject it.** A green that cannot go red is not evidence, and a number in a summary
+that nobody has checked against a known total is not either — twice it was seen varying and
+twice it was called harmless.
+
+**The `ask_human` exemption above is not an exception to that rule, and it matters that it
+is not.** The rule forbids making the detector less sensitive to hide a defect upstream of
+it; the exemption says a particular kind of session was never evidence of circling in the
+first place, which is a statement about what the metric *means*. The test is whether the
+change loses information: raising the limit to 4 would have let every defect in this
+section through, whereas nothing that an `ask_human` session could tell you about a
+thrashing agent is lost — the task is parked on a human either way, and §11's
+`awaiting-human > 24h` is the alert that says so. The upstream defect in
+`BS-1540279100223127564-01`'s case is still real and still unfixed by any of this: **an
+acceptance list that grades the whole repository cannot be satisfied by a task that owns
+part of it**, and a wave of sibling tasks cut from one plan will each be handed the same
+repo-wide `lint` gate. That belongs to §14's plan materialisation, not here, and the
+symptom to look for is a task whose acceptance output names files it never touched.
 
 ### 11.2 The Discord webhook
 
@@ -3183,6 +3474,12 @@ unforgiven it made the park unrecoverable rather than terminal: a resume bought 
 more round, so `BS-1539374658363854934` reached 13 rounds against a cap of 3 by being resumed
 ten times with nothing to say. `sessions` is still never forgiven, for this paragraph's
 original reason — that one is a budget, and raising it is a decision.
+
+**An unresolved review comment on the pull request resets it too (§7.3)**, and for this
+paragraph's argument rather than a new one: what the cap is measuring is the absence of new
+information, not the surface the information arrived on. It is forgiven once per objection,
+against the `review.commentSeen` watermark — forgiven per session instead, a single comment
+would delete the cap rather than inform it.
 
 **A task spanning several repos merges all of its pull requests, in `spec.repos` order, and
 stops at the first failure** (§9.4.1). The order is the closest thing to a dependency order the

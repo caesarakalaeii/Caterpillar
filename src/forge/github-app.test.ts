@@ -162,6 +162,111 @@ test("a response without total_count is trusted as complete", () => {
 });
 
 /**
+ * What a red verdict TELLS the next session (DESIGN.md §12).
+ *
+ * A rejection is the whole of what the next session gets to act on, and
+ * `failing: <job names>` is not enough to act on. The agent has no forge credential of
+ * its own, no `gh` and no `curl`, and the App deliberately has no `actions: read` — so a
+ * job name it cannot reproduce locally is a dead end, and the recorded outcome is
+ * sessions spent either re-proving the tree green or changing code blind:
+ *
+ *   ALERT-6155db6ffb83deff s2  "Node 26 is not available on this machine ... the one
+ *                               failing leg is the one I cannot execute."
+ *   ALERT-6155db6ffb83deff s7  "I could not read GitHub's job logs ... so the red is
+ *                               unexplained from here."
+ *   BS-1539163866305658891-07  "four sessions were burned on blind changes to a
+ *                               GitGuardian issue that turned out to be dashboard
+ *                               triage."
+ *
+ * Each of those is a no-progress session, which is what `caterpillar_no_progress_streak`
+ * counts and what CaterpillarTaskThrashing fires on.
+ *
+ * GitHub already hands us the answer in the same response the names come from:
+ * `output.title`/`output.summary` and `html_url`, under the `checks: read` permission the
+ * App has held all along. `summarise` read three fields and dropped the rest.
+ */
+test("a red verdict carries the failing run's own summary, not just its name", () => {
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [
+        {
+          status: "completed",
+          conclusion: "failure",
+          name: "check (26)",
+          output: { title: "Process completed with exit code 1", summary: "npm test failed" },
+        },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /Process completed with exit code 1/);
+});
+
+test("a red verdict carries a link to the failing run", () => {
+  // The one thing that always works: the agent cannot open it, but it can put the url in
+  // its question to a human, and `ask_human` is the correct exit for a red leg it cannot
+  // execute. Without it the question is "CI is red somewhere, please look".
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [
+        {
+          status: "completed",
+          conclusion: "failure",
+          name: "check (26)",
+          html_url: "https://github.com/acme/widget/runs/42",
+        },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.match(status.summary, /https:\/\/github\.com\/acme\/widget\/runs\/42/);
+});
+
+test("one job failing once is reported once, however many workflows ran it", () => {
+  // `push: ['**']` and `pull_request` both trigger the same workflow, so every job has
+  // two check-runs at the same sha. The verdict said
+  //   "failing: check (22), check (26), check (26), check (22)"
+  // which reads as four broken jobs and sends the reader looking for a difference
+  // between them. There are two, each reported twice.
+  const status = summarise(
+    {
+      total_count: 4,
+      check_runs: [
+        { status: "completed", conclusion: "failure", name: "check (22)" },
+        { status: "completed", conclusion: "failure", name: "check (26)" },
+        { status: "completed", conclusion: "failure", name: "check (26)" },
+        { status: "completed", conclusion: "failure", name: "check (22)" },
+      ],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /failing: check \(22\), check \(26\)$/);
+});
+
+test("a run that failed with no output still names the job", () => {
+  // GitHub omits `output` entirely for a job that never got as far as producing one, and
+  // external checks fill in neither field. The name alone is worse than the name plus a
+  // reason, and much better than nothing.
+  const status = summarise(
+    {
+      total_count: 1,
+      check_runs: [{ status: "completed", conclusion: "failure", name: "GitGuardian" }],
+    },
+    { state: "success", total_count: 0 },
+  );
+
+  assert.equal(status.conclusion, "failure");
+  assert.match(status.summary, /failing: GitGuardian/);
+});
+
+/**
  * Reachability (DESIGN.md §9.1).
  *
  * The 422 these cover cost a real brainstorm its whole session: `/brainstorm
@@ -509,4 +614,232 @@ test("the ordinary path still opens one PR and looks nothing up", async () => {
     url: "https://github.test/pull/7",
   });
   assert.equal(routes.filter((r) => r.includes("/pulls?")).length, 0, "no lookup on the happy path");
+});
+
+/* ─────────────────────── review comments as task guidance ─────────────────────── */
+
+/**
+ * Resolution is the reason this one query is GraphQL (DESIGN.md §7.3).
+ *
+ * REST's `pulls/{n}/comments` carries no resolved flag at all — GitHub exposes thread
+ * resolution nowhere but `pullRequest.reviewThreads`. Without it every comment a human
+ * ever accepted would come back as an open instruction on every session.
+ */
+const reviewThreads = (
+  threads: readonly Record<string, unknown>[],
+  hasNextPage = false,
+  endCursor: string | null = null,
+): unknown => ({
+  data: {
+    repository: {
+      pullRequest: {
+        // Returned on EVERY page, exactly as GitHub does: `reviews` is a second connection
+        // on the same pull request and is not paged with the threads. A reader that appended
+        // it per page would quote every review body once per page of comments.
+        reviews: {
+          nodes: [
+            {
+              id: "PRR_1",
+              author: { __typename: "User", login: "a-human" },
+              body: "the shape is wrong",
+              submittedAt: "2026-08-12T10:00:00.000Z",
+            },
+          ],
+        },
+        reviewThreads: { pageInfo: { hasNextPage, endCursor }, nodes: threads },
+      },
+    },
+  },
+});
+
+const thread = (
+  comments: readonly Record<string, unknown>[],
+  over: Record<string, unknown> = {},
+): Record<string, unknown> => ({ isResolved: false, isOutdated: false, comments: { nodes: comments }, ...over });
+
+const graphqlComment = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: "PRRC_1",
+  author: { __typename: "User", login: "a-human" },
+  body: "this swallows the error",
+  path: "src/index.ts",
+  line: 12,
+  url: "https://github.com/acme/widget/pull/7#discussion_r1",
+  createdAt: "2026-08-13T10:00:00.000Z",
+  ...over,
+});
+
+test("review comments come back with their file, line and thread state", async () => {
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([graphqlComment()]),
+          thread([graphqlComment({ id: "PRRC_2", body: "dealt with" })], { isResolved: true }),
+          thread([graphqlComment({ id: "PRRC_3", body: "moved" })], { isOutdated: true }),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+
+  assert.equal(comments.length, 4, "resolved and outdated ones are returned, not filtered");
+  assert.deepEqual(
+    comments.map((c) => [c.body, c.resolved, c.outdated]),
+    [
+      // The review body first: it is prose about the change as a whole, so it belongs to no
+      // thread and there is nothing about it to resolve or to go outdated.
+      ["the shape is wrong", false, false],
+      ["this swallows the error", false, false],
+      ["dealt with", true, false],
+      ["moved", false, true],
+    ],
+  );
+  const first = comments[1];
+  assert.equal(first?.path, "src/index.ts");
+  assert.equal(first?.line, 12);
+  assert.equal(first?.author, "a-human");
+  assert.equal(first?.fromFleet, false);
+  assert.deepEqual(first?.repo, REPO);
+  assert.equal(first?.pr, 7);
+});
+
+test("a comment from an App is marked as the fleet's own, not as a human's", async () => {
+  // `__typename` is the only reliable discriminator: the authoring App, the reviewer
+  // identity and any other bot all report as `Bot`, and none of them is a human whose
+  // objection should forgive a review round (§12.1).
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([
+            graphqlComment({ author: { __typename: "Bot", login: "caterpillar" }, body: "mine" }),
+          ]),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments.find((c) => c.body === "mine")?.fromFleet, true);
+});
+
+test("a comment whose line has gone is reported without one rather than as line null", async () => {
+  // GitHub answers `line: null` for an outdated comment. Carried through as a number it
+  // renders as `src/index.ts:null`, which points a session at nothing.
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return reviewThreads([
+          thread([graphqlComment({ line: null, path: null })], { isOutdated: true }),
+        ]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  assert.equal(comments[0]?.line, undefined);
+  assert.equal(comments[0]?.path, undefined);
+});
+
+test("every page of review threads is read, not just the first", async () => {
+  // The same omission that let a red matrix build through the CI gate: one unpaginated
+  // request looks identical to a complete answer, and the comment a human is waiting on
+  // is as likely to be on page two as page one.
+  let calls = 0;
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        calls += 1;
+        return calls === 1
+          ? reviewThreads([thread([graphqlComment({ body: "page one" })])], true, "cursor-1")
+          : reviewThreads([thread([graphqlComment({ id: "PRRC_9", body: "page two" })])]);
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+  // Both pages of thread comments, and the review body ONCE. `reviews` is a second
+  // connection on the same pull request rather than something paged alongside the threads,
+  // so a reader that appended it per page would quote every review body per page of comments.
+  assert.deepEqual(comments.map((c) => c.body), ["the shape is wrong", "page one", "page two"]);
+});
+
+test("GraphQL errors are thrown, so an empty list never means 'could not ask'", async () => {
+  // The caller logs and continues past a failure (invariant 6), and it can only do that
+  // if a failure is distinguishable from a pull request nobody has commented on.
+  const { factory } = github(
+    withToken((route) => {
+      if (route === "/graphql") {
+        return { errors: [{ message: "Resource not accessible by integration" }] };
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(() => forge.listReviewComments(REPO, 7), /not accessible/);
+});
+
+test("review comments are refused for a repo outside the task's scope", async () => {
+  const { factory } = github(withToken(() => ({})));
+  const forge = await factory.forTask(SPEC);
+  await assert.rejects(
+    () => forge.listReviewComments({ host: "github.com", owner: "acme", name: "elsewhere" }, 1),
+    /not in this task's scope/,
+  );
+});
+
+test("a GitHub review's own body is guidance too, not just its line comments", async () => {
+  // The asymmetry that nearly shipped. `reviewThreads` carries the comments written against
+  // lines and nothing else; "this is the wrong approach" is written on the REVIEW, which
+  // lives on `pullRequest.reviews`. The Forgejo side reads both, and a session must not see
+  // a different review depending on which forge its repo happens to be on.
+  const { factory } = github(
+    withToken((route, init) => {
+      if (route === "/graphql") {
+        const query = String(JSON.parse(String(init?.body ?? "{}")).query);
+        assert.match(query, /reviews\(/, "the query must ask for review bodies");
+        return {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] },
+                reviews: {
+                  nodes: [
+                    {
+                      author: { __typename: "User", login: "a-human" },
+                      body: "this is the wrong approach",
+                      url: "https://github.com/acme/widget/pull/7#pullrequestreview-1",
+                      submittedAt: "2026-08-13T10:00:00.000Z",
+                    },
+                    // An APPROVED review with no prose is the ordinary way to approve.
+                    // Rendered, it would be a blank quote saying a human objected to nothing.
+                    { author: { __typename: "User", login: "a-human" }, body: "" },
+                  ],
+                },
+              },
+            },
+          },
+        };
+      }
+      throw new Error(`unexpected route ${route}`);
+    }),
+  );
+
+  const forge = await factory.forTask(SPEC);
+  const comments = await forge.listReviewComments(REPO, 7);
+
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0]?.body, "this is the wrong approach");
+  assert.equal(comments[0]?.path, undefined, "a review body is attached to no file");
+  assert.equal(comments[0]?.resolved, false, "a review body belongs to no thread");
 });

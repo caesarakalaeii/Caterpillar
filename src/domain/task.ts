@@ -323,6 +323,18 @@ export interface ReviewRecord {
    * Absent when `last` is `pass`, and absent on state written before this existed.
    */
   readonly reason?: string;
+  /**
+   * When the newest pull-request review comment this task has already been forgiven a round
+   * for was written (DESIGN.md §7.3).
+   *
+   * The watermark, and it is what makes an objection forgive ONE round rather than every
+   * round from now on: without it a single comment would buy a session on every claim for the
+   * rest of the task's life, which is the cap deleted rather than informed.
+   *
+   * Absent until a human has commented on a pull request, and on state written before this
+   * existed — which `isNewerComment` reads as "nothing has been acted on yet".
+   */
+  readonly commentSeen?: string;
 }
 
 /**
@@ -462,6 +474,19 @@ export interface SessionOutcome {
   readonly prs?: readonly TaskPullRequest[];
   /** Set when reason is `plan-proposed` — the decomposition awaiting the council. */
   readonly plan?: ProposedPlan;
+  /**
+   * When the newest human review comment this session was SHOWN was written (§7.3).
+   *
+   * Reported by the runner rather than read by the supervisor because the loop holds no
+   * minting forge — `SupervisorDeps.forges` is narrowed to `RepoReach` on purpose. It is
+   * what `recordSession` compares against `review.commentSeen` to decide whether the
+   * council's round count is forgiven, and it must arrive before `convene` runs or the
+   * round has already been spent.
+   *
+   * Absent when the task has no pull request, when nobody has commented, and when the forge
+   * could not be reached — all three of which mean the same thing here: nothing new.
+   */
+  readonly reviewComment?: string;
   /** Free-text summary appended to the journal. */
   readonly summary: string;
 }

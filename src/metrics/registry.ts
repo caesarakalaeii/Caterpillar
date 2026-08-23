@@ -70,6 +70,28 @@ class Metric {
     this.samples.clear();
   }
 
+  /**
+   * Forget ONE label set, leaving the rest reporting.
+   *
+   * For the same absence of expiry `clear` exists for, where the dead label set is one
+   * among many live ones rather than a whole breakdown being replaced:
+   * `caterpillar_no_progress_streak{task=...}` is per-task, tasks end, and a task that
+   * parked or finished never gets another `set`. `clear` cannot be used for it because it
+   * would drop every other task's live streak too.
+   *
+   * Removing rather than zeroing, deliberately. A no-progress streak of 0 is a real and
+   * meaningful reading — a task that is making progress — so publishing it for a task
+   * that has stopped running would be a claim about a session that does not exist. Absent
+   * is the honest answer, and it is the one `absent()` and staleness handling in
+   * Prometheus are built for.
+   *
+   * Silent on a label set that was never reported: the caller is a status transition,
+   * which fires for tasks that never published a streak at all.
+   */
+  remove(labels: LabelValues): void {
+    this.samples.delete(this.key(labels));
+  }
+
   inc(labels: LabelValues, delta = 1): void {
     const key = this.key(labels);
     const existing = this.samples.get(key);
