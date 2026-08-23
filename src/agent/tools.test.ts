@@ -585,6 +585,33 @@ test("publish_artifact stores once for the same arguments", async () => {
   assert.equal(second, first, "a replay hands back what the first call returned");
 });
 
+test("republishing changed contents under one name stores them", async () => {
+  // `StateStore.writeArtifact` guards the count cap with `!existing.includes(name)`
+  // precisely so an overwrite is allowed: regenerating a file and publishing it again
+  // under the same name is a supported operation. Keyed on the ARGUMENTS alone the second
+  // call is a replay, so the new contents are silently dropped and the agent is handed the
+  // first call's message — a stale record producing a WRONG ANSWER rather than a duplicate
+  // attempt, which is the one outcome effects.ts says must never happen.
+  const base = harness();
+  const published: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: new FakeLedger(),
+    publish: async (name) => {
+      published.push(name);
+      return { stored: true, message: `Stored \`${name}\` (${published.length} bytes).` };
+    },
+  };
+  const tools = controlTools(ctx);
+  const params = { name: "scan.json", path: "scan.json", note: "the sublevel scan" };
+
+  await call(tools, "publish_artifact", params);
+  const second = await call(tools, "publish_artifact", params);
+
+  assert.deepEqual(published, ["scan.json", "scan.json"], "the second publish must reach the store");
+  assert.match(second, /2 bytes/, "the agent must be told about the contents it just stored");
+});
+
 test("a refused publish_artifact is not recorded, so the agent can fix it and retry", async () => {
   // `publish` answers refusals in PROSE rather than throwing — a file too big to store is a
   // prompt to summarise, not an error. Recording one would replay the refusal forever and
