@@ -280,6 +280,12 @@ test("a steer says the session picks it up without being restarted", () => {
 test("a done task is told to be done, and pointed somewhere that works", () => {
   const reply = describeOutcome(TASK, { kind: "finished" });
   assert.match(reply, /brainstorm/);
+  // `finished` answers a second `/done`, `/resume` or `/merge` on an already-done task, and
+  // that task may itself have been forced done with both gates skipped. So this one reply
+  // cannot assert HOW the task got there: claiming it "passed every gate and merged" would
+  // be the verified-completion lie that `/done` exists to keep out of the record.
+  assert.doesNotMatch(reply, /\bpassed\b/i, "this reply cannot know the gates ran");
+  assert.doesNotMatch(reply, /\bmerged\b/i, "this reply cannot know anything was merged");
 });
 
 test("a forced done says it was not verified, and never says it merged", () => {
