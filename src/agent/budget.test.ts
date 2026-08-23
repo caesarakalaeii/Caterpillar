@@ -109,6 +109,20 @@ test("a line longer than the whole byte ceiling is cut, and says so", () => {
   assert.equal(bounded.droppedLines, 1, "the one line is a fragment now, not a line");
 });
 
+test("when the head does not fit, the note says the tail alone was kept", () => {
+  // The module's headline promise is head AND tail, but a first line too long for the byte
+  // budget cannot be kept, and then only the tail survives. This is the one branch where
+  // the promise does not hold, so it is the one that must not be able to lie about it: a
+  // note claiming "head and tail" over a view with no head is worse than no note.
+  const longFirstLine = ["H".repeat(3_000), lines(200, "tail")].join("\n");
+
+  const bounded = boundOutput(longFirstLine, outputCeiling({ maxLines: 1_000, maxBytes: 2_000 }));
+
+  assert.match(bounded.text, /tail kept, the start elided/);
+  assert.doesNotMatch(bounded.text, /head and tail/, "no head survived, so it must not claim one");
+  assert.match(bounded.text, /^tail 200$/m, "the last line still has to survive");
+});
+
 test("the overflow file is named in the output when there is one", () => {
   // The information is not destroyed, only kept out of the window. A session that needs
   // the middle of a 40k-line run has to be told where to read it in slices.

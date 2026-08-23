@@ -240,7 +240,9 @@ test("the returned stdout is bounded too, for the callers that read it", async (
   // ceiling depend on which half a caller happens to read.
   const { subject } = await env(60, SILENT_LOGGER, outputCeiling({ maxLines: 40 }));
 
-  const result = await subject.exec("seq 1 8000");
+  // Half of it on stderr, so the assertion below about `stderr` being empty is about the
+  // bound and not about a command that had nothing to say on that channel anyway.
+  const result = await subject.exec("seq 1 4000; seq 4001 8000 >&2");
 
   assert.equal(result.ok, true);
   if (result.ok) {
@@ -249,6 +251,10 @@ test("the returned stdout is bounded too, for the callers that read it", async (
       `stdout had ${result.value.stdout.split("\n").length} lines`,
     );
     assert.match(result.value.stdout, /of 8,000 lines shown/);
+    // `stdout` already holds both streams interleaved, so a bounded `stderr` beside it
+    // would charge the same output to the window twice. Emptying it is deliberate, and
+    // this pins it: a refactor that reinstates an unbounded second copy fails here.
+    assert.equal(result.value.stderr, "", "stderr must not carry a second copy");
   }
 });
 
