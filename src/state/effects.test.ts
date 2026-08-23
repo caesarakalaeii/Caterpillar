@@ -119,6 +119,24 @@ test("the oldest effects over the cap are prunable, newest kept", () => {
   assert.deepEqual(prunableEffects(records), ["task_note-0", "task_note-1", "task_note-2"]);
 });
 
+test("effects sharing one timestamp are pruned in a fixed order", () => {
+  // `recordEffect` stamps `at` with millisecond resolution, and several verbs recorded in
+  // one millisecond is plausible. Sorting on `at` alone left `Array.prototype.sort` to
+  // pick among the ties, so which record was evicted was unspecified — harmless at this
+  // cap, since a tie means neither is a likelier replay target, but a retention rule that
+  // cannot say what it deletes cannot be tested either.
+  const tied = "2026-08-13T09:00:00.000Z";
+  const records = [
+    ...Array.from({ length: EFFECTS_KEPT }, (_, n) =>
+      record(`task_note-${n}`, new Date(Date.UTC(2026, 7, 13, 10, n)).toISOString()),
+    ),
+    record("task_note-b", tied),
+    record("task_note-a", tied),
+  ];
+
+  assert.deepEqual(prunableEffects(records), ["task_note-a", "task_note-b"]);
+});
+
 test("a record with no timestamp is pruned before one that has a timestamp", () => {
   // Records written before `at` existed must not outlive dated ones: an undated record is
   // by definition older than anything this deploy wrote.
