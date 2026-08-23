@@ -5896,6 +5896,13 @@ test("/done needs no PR and merges nothing", async () => {
       merges.push(`merge:${repo.name}#${pr}`);
       return Promise.resolve();
     },
+    // `/done` merges nothing, so it must not reach either landing path. Recorded the same
+    // way as `merge` so a regression shows up as an unexpected entry, not a thrown error.
+    mergeQueue: () => Promise.reject(new Error("unused")),
+    enqueue: (repo, pr) => {
+      merges.push(`enqueue:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
     revoke: () => Promise.resolve(),
   };
 
