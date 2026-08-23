@@ -59,6 +59,17 @@ test("a request id ignores the order the argument keys were written in", () => {
   assert.equal(first, second);
 });
 
+test("a request id treats an omitted argument and an undefined one alike", () => {
+  // A caller spreading optional fields into an object means "absent" by `undefined`, and
+  // one side of a replay may spell it either way — `handoff` with no `requires` against
+  // `handoff` with `requires: undefined`. An id that separated them would be a check that
+  // never matches, which is indistinguishable from no check at all.
+  const spread = effectRequestId(TASK, "handoff", { summary: "s", requires: undefined });
+  const omitted = effectRequestId(TASK, "handoff", { summary: "s" });
+
+  assert.equal(spread, omitted);
+});
+
 test("a request id separates the task, the verb and the arguments", () => {
   const args = { summary: "done" };
   const ids = new Set([
