@@ -870,12 +870,20 @@ test("a review comment on the pull request forgives a council round, once", asyn
 
   // The first rejection lands at round 1, not 3: the comment was newer than anything the
   // council had already been shown, so the count was cleared before it was incremented.
-  let firstRejection: TaskState | undefined;
+  //
+  // Read AT the commit rather than polling for it, per `waitForCommit`: `rounds === 1` is
+  // the state between the first rejection and the second, and the task goes straight back
+  // to `ready` and is re-claimed, so on a fast machine that window closes inside one poll
+  // interval. A poller that missed it reported the forgiveness as absent — the flake this
+  // replaces, seen on CI at 255ms where the same test takes ~1s locally.
+  const firstRejectionAt = await waitForCommit(
+    `chore(${REVIEWED}): review council requested changes`,
+    30_000,
+  );
   let parked: TaskState | undefined;
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const state = await pushedState(REVIEWED);
-    if (firstRejection === undefined && state?.review?.rounds === 1) firstRejection = state;
     if (state?.status === "parked") {
       parked = state;
       break;
@@ -886,7 +894,13 @@ test("a review comment on the pull request forgives a council round, once", asyn
   controller.abort();
   await running.catch(() => undefined);
 
-  assert.ok(firstRejection !== undefined, "the round count must be forgiven before it is raised");
+  assert.ok(firstRejectionAt !== undefined, "the round count must be forgiven before it is raised");
+  const firstRejection = await stateAt(firstRejectionAt, REVIEWED);
+  assert.equal(
+    firstRejection?.review?.rounds,
+    1,
+    "the round count must be forgiven before it is raised",
+  );
   assert.equal(
     firstRejection?.review?.commentSeen,
     "2026-08-20T10:00:00.000Z",
