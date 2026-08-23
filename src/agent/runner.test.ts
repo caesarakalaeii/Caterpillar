@@ -33,6 +33,7 @@ import {
   type TaskSpec,
   type TaskState,
 } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type {
   CheckStatus,
   Forge,
@@ -90,6 +91,12 @@ class FakeForge implements Forge {
     throw new Error("a session's forge never approves — that is the reviewer identity");
   }
   async merge(): Promise<void> {
+    throw new Error("a session's forge never merges — that is the reviewer identity");
+  }
+  async mergeQueue(): Promise<MergeQueueSupport> {
+    throw new Error("a session's forge never merges, so it never asks about the queue");
+  }
+  async enqueue(): Promise<void> {
     throw new Error("a session's forge never merges — that is the reviewer identity");
   }
   async revoke(): Promise<void> {}

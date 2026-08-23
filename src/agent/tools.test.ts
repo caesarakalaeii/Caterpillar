@@ -16,6 +16,7 @@ import { NamespaceNotAllowedError } from "../cluster/guard.ts";
 import { InvalidNameError } from "../cluster/names.ts";
 import { UnsupportedKindError } from "../cluster/redact.ts";
 import type { RepoRef, TaskKind } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type {
   CheckStatus,
   Forge,
@@ -58,6 +59,10 @@ class StubForge implements Forge {
   }
   async approve(): Promise<void> {}
   async merge(): Promise<void> {}
+  async mergeQueue(): Promise<MergeQueueSupport> {
+    return "absent";
+  }
+  async enqueue(): Promise<void> {}
   async revoke(): Promise<void> {}
 }
 
