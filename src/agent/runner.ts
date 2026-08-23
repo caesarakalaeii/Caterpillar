@@ -161,7 +161,15 @@ export class AgentSessionRunner {
 
     try {
       // repos[0] is the workspace repo and becomes cwd; the rest land under repos/.
-      const checkout = await worktrees.ensureTaskCheckout(spec.repos, spec.id);
+      //
+      // `ensureSessionCheckout`, not `ensureTaskCheckout`: this is the only caller that
+      // holds a live credential lease, so it is the only one that can reconcile each
+      // worktree with the work a previous session pushed. Starting behind
+      // `origin/agent/<task>` is indistinguishable from a task nobody has touched, and
+      // GH-96 re-implemented a whole task that way. It throws rather than start on a
+      // branch that has diverged, which reaches `SupervisorLoop.parkFailed` and parks the
+      // task naming both tips — the right outcome, because no ref move keeps both.
+      const checkout = await worktrees.ensureSessionCheckout(spec.repos, spec.id);
       const worktree = checkout.root;
       const recoveryNote = await this.recoverInterrupted(worktree);
 
