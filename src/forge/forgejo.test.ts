@@ -422,3 +422,18 @@ test("review comments are refused for a repo outside the task's scope", async ()
     RepoOutOfScopeError,
   );
 });
+
+test("Forgejo has no merge queue, and says so without a request", async () => {
+  // The seam degrades rather than fails (DESIGN.md §12.3). `absent` and not `unknown`:
+  // Forgejo has no queue concept at all, so this is a definite answer, and answering
+  // `unknown` would suggest something might be there that a later release could find.
+  const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));
+  assert.equal(await forge.mergeQueue(REPO, 7), "absent");
+});
+
+test("enqueuing on Forgejo is a programming error, not a silent no-op", async () => {
+  // Reachable only if `landingFor` returned `enqueue` for `absent`, which is exactly the
+  // bug this would hide. A no-op would report a change as queued on a forge with no queue.
+  const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));
+  await assert.rejects(() => forge.enqueue(REPO, 7), /merge queue/i);
+});

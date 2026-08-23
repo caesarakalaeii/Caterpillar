@@ -12,6 +12,7 @@ import type { Git } from "../state/git.ts";
 import { Serial } from "../state/serial.ts";
 import type { CommitIdentity, WorktreeReapConfig } from "../config/types.ts";
 import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
+import { parseConflicts, type ConflictFile, type ConflictSummary } from "../forge/mergeability.ts";
 import { taskSocketPath } from "../credential/service.ts";
 
 /**
@@ -841,6 +842,48 @@ export class WorktreeManager {
           },
         ];
       });
+  }
+
+  /**
+   * Does this worktree's `HEAD` still merge into `base`? (DESIGN.md §12.3)
+   *
+   *   - `undefined` — it merges cleanly.
+   *   - a `ConflictSummary` — it does not, with the files and their hunk counts.
+   *   - `"unknown"` — git could not answer, so nothing is known either way.
+   *
+   * `git merge-tree --write-tree` rather than a trial `git merge`: it touches neither the
+   * index nor the working tree, so it is safe to run at session start in a worktree the
+   * agent is about to work in. What it writes is a TREE carrying the conflict markers,
+   * which is where the hunk counts come from — `--name-only` would name the files and
+   * count nothing, and "three files conflict" is a very different instruction from "three
+   * files conflict, one line each".
+   *
+   * Never throws. This is decoration on a prompt and evidence in a report; a repository
+   * that cannot answer must not be able to end a session or fail a gate.
+   */
+  async conflictsWithBase(
+    worktree: string,
+    base: string,
+  ): Promise<ConflictSummary | "unknown" | undefined> {
+    const git = this.git.at(worktree);
+    const merged = await git.tryRun("merge-tree", "--write-tree", base, "HEAD");
+    const parsed = parseConflicts(merged);
+    if (parsed === undefined || parsed === "unknown") return parsed;
+
+    const files: ConflictFile[] = [];
+    for (const file of parsed.files) {
+      const blob = await git.tryRun("show", `${parsed.tree}:${file.path}`);
+      const markers =
+        blob.code === 0
+          ? blob.stdout.split("\n").filter((line) => line.startsWith("<<<<<<<")).length
+          : 0;
+      // A path with no readable blob and no markers in it is a delete-versus-modify
+      // conflict, or a submodule. It stays in the list without a count — it is still a
+      // file to rebase, and dropping it would understate the work.
+      files.push(markers > 0 ? { path: file.path, hunks: markers } : { path: file.path });
+    }
+
+    return { tree: parsed.tree, files };
   }
 
   /**

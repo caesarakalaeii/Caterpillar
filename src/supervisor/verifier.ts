@@ -3,7 +3,7 @@
  *
  * Runs in the SUPERVISOR, never in the agent. Both gates must pass:
  *   1. every acceptance command in spec.md exits 0
- *   2. a PR is open and CI is green
+ *   2. a PR is open, CI is green, and the branch still merges into its base
  *
  * The agent cannot influence this: it does not choose the commands, does not run
  * them, and does not report the result. `done` only triggers this check.
@@ -25,6 +25,7 @@ import {
   type TaskSpec,
   type TaskState,
 } from "../domain/task.ts";
+import { conflictGuidance } from "../forge/mergeability.ts";
 import type { CheckStatus, Forge, ForgeFactory } from "../forge/types.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { TASK_SHELL_ARGS, type ToolchainResolver } from "../workspace/toolchain.ts";
@@ -181,7 +182,48 @@ export class AcceptanceVerifier {
     // the evidence note has to be carried across, or a green UI gate would publish a
     // screenshot and mention it nowhere.
     const ci = await this.checkCi(spec, state);
-    return { ...ci, detail: `${ci.detail}${acceptance.evidence}` };
+    const reported = { ...ci, detail: `${ci.detail}${acceptance.evidence}` };
+    if (!reported.passed) return reported;
+
+    // LAST, because it is the cheapest of the three and the only one that can be true of a
+    // change nothing is wrong with. A conflict is the base branch having moved, not a
+    // defect — so it is worth reporting only once the change itself has passed.
+    const conflicts = await this.checkMergeable(spec, repo);
+    return conflicts ?? reported;
+  }
+
+  /**
+   * Gate 2's third question: does this branch still merge into its base? (§12.3.)
+   *
+   * Returns a REJECTION or `undefined`, so the caller keeps the CI detail when there is
+   * nothing to say. Both gates passing and the merge then failing is a terminal-looking
+   * failure caused by ordinary drift, arriving at the one point in the task where nothing
+   * is left to fix it: the council has approved, `state` is about to say `done`, and the
+   * merge is the last call. Rejecting here costs a session and gets the rebase done — and
+   * `agent/runner.ts` puts the same file list in that session's prompt, so it starts
+   * knowing what to rebase rather than discovering it.
+   *
+   * Never `pending`. §11.1's pending flag means "wait and ask again", which is right for a
+   * CI queue and wrong here: nothing about a conflict settles by waiting.
+   *
+   * A question git cannot answer passes. Same rule as the merge-queue detection: an
+   * unanswerable question must not be what stops a change that passed everything else.
+   */
+  private async checkMergeable(
+    spec: TaskSpec,
+    repo: RepoRef,
+  ): Promise<VerificationResult | undefined> {
+    const worktree = await this.options.worktrees.ensureWorktree(repo, spec.id);
+    const base = await this.options.worktrees.defaultBranch(worktree).catch(() => undefined);
+    if (base === undefined) return undefined;
+
+    const summary = await this.options.worktrees.conflictsWithBase(worktree, base);
+    if (summary === "unknown" || summary === undefined) return undefined;
+
+    const guidance = conflictGuidance(base, summary);
+    if (guidance === undefined) return undefined;
+
+    return { passed: false, detail: `The branch does not merge.\n\n${guidance}` };
   }
 
   /**

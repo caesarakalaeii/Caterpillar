@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { after, afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type {
   CheckStatus,
   Forge,
@@ -66,6 +67,12 @@ class FakeForge implements Forge {
     throw new Error("unused");
   }
   async merge(): Promise<void> {
+    throw new Error("unused");
+  }
+  async mergeQueue(): Promise<MergeQueueSupport> {
+    throw new Error("unused");
+  }
+  async enqueue(): Promise<void> {
     throw new Error("unused");
   }
   async revoke(): Promise<void> {}

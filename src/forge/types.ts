@@ -10,6 +10,7 @@
  * to git, so a token in argv becomes a token in git history (DESIGN.md §9.2).
  */
 import type { RepoRef, TaskSpec } from "../domain/task.ts";
+import type { MergeQueueSupport } from "./mergeability.ts";
 import type { RepoCatalog, RepoReach } from "./reach.ts";
 
 /** Credentials for one repo, shaped for git's credential helper protocol. */
@@ -153,6 +154,32 @@ export interface Forge {
    * not the token (DESIGN.md §9.1).
    */
   merge(repo: RepoRef, pr: number, options?: MergeOptions): Promise<void>;
+
+  /**
+   * Does the base branch of this pull request require a merge queue? (DESIGN.md §12.3)
+   *
+   * Asked about the PULL REQUEST rather than about a branch name, because the caller does
+   * not reliably know the base: `state.json` records a number and a url, and older state
+   * records only the primary repo's. The forge already knows what the pull request targets.
+   *
+   * REQUIRED rather than optional, and it must not throw. Every caller falls back to a
+   * direct merge when the answer is `unknown`, so an implementation that declined to
+   * answer by throwing would make the exception the caller's problem to translate. Saying
+   * `unknown` in the type puts "nobody could tell" where it can be handled once — and it is
+   * the answer both Forgejo's absence of the concept and GitHub's refused GraphQL field
+   * have to be turned into anyway.
+   */
+  mergeQueue(repo: RepoRef, pr: number): Promise<MergeQueueSupport>;
+
+  /**
+   * Add a pull request to its base branch's merge queue.
+   *
+   * Called instead of `merge`, never as well as it — a queue merges the pull request
+   * itself once its own checks pass against the speculative base. Throws when the forge
+   * refuses, because the alternative is announcing a change as queued with nothing
+   * waiting anywhere.
+   */
+  enqueue(repo: RepoRef, pr: number): Promise<void>;
 
   /**
    * Release any cached credentials. Called when a task completes or parks, so a

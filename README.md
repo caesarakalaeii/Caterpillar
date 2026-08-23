@@ -141,7 +141,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
-| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). `reach.ts` / `catalog.ts` answer whether a named repo can be reached, and offer the ones that can (§9.1.1). |
+| `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). `reach.ts` / `catalog.ts` answer whether a named repo can be reached, and offer the ones that can (§9.1.1). `mergeability.ts` decides merge-versus-enqueue and summarises conflicts — pure, no IO (§12.3). |
 | `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |

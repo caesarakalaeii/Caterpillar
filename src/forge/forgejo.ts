@@ -16,8 +16,12 @@
  * Forgejo also has NO Checks API: Forgejo Actions and external CI both report through
  * commit statuses, so the combined-status endpoint is the only CI signal, and it has
  * states GitHub does not (`error`, `warning`).
+ *
+ * And no MERGE QUEUE. `mergeQueue` therefore answers `absent` without a request — see
+ * the method for why that is a definite answer rather than `unknown`.
  */
 import { repoSlug, type RepoRef, type TaskSpec } from "../domain/task.ts";
+import type { MergeQueueSupport } from "./mergeability.ts";
 import type { UnreachableRepo } from "./reach.ts";
 import {
   assertInScope,
@@ -422,6 +426,37 @@ class ForgejoForge implements Forge {
         ...(options.title === undefined ? {} : { MergeTitleField: options.title }),
       }),
     });
+  }
+
+  /**
+   * Forgejo has no merge queue, so there is nothing to ask and nothing to enqueue into.
+   *
+   * `absent` rather than `unknown`, and the difference is the whole reason this method is
+   * required on the interface. `unknown` means "nobody could tell", which invites a caller
+   * to retry, log a degradation, or warn a human about a queue that might be there.
+   * Forgejo's answer is a fact about the forge: the concept does not exist, the direct
+   * merge below is correct, and nothing about that is a degradation to report.
+   */
+  mergeQueue(repo: RepoRef, _pr: number): Promise<MergeQueueSupport> {
+    assertInScope(repo, this.allowed);
+    return Promise.resolve("absent");
+  }
+
+  /**
+   * Unreachable, and it throws rather than doing nothing.
+   *
+   * `mergeQueue` answers `absent` for every branch, so `landingFor` never returns
+   * `enqueue` for a Forgejo repo. Getting here means the state machine changed and this
+   * did not — exactly the case a silent no-op would hide, by reporting a change as queued
+   * on a forge that has no queue to hold it.
+   */
+  enqueue(repo: RepoRef, pr: number): Promise<void> {
+    return Promise.reject(
+      new Error(
+        `Forgejo has no merge queue, so ${repoSlug(repo)}#${pr} cannot be enqueued — this ` +
+          `call should have been a direct merge`,
+      ),
+    );
   }
 
   async revoke(): Promise<void> {

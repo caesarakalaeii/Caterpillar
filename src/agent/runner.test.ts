@@ -34,6 +34,7 @@ import {
   type TaskSpec,
   type TaskState,
 } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type {
   CheckStatus,
   Forge,
@@ -96,6 +97,12 @@ class FakeForge implements Forge {
     throw new Error("a session's forge never approves — that is the reviewer identity");
   }
   async merge(): Promise<void> {
+    throw new Error("a session's forge never merges — that is the reviewer identity");
+  }
+  async mergeQueue(): Promise<MergeQueueSupport> {
+    throw new Error("a session's forge never merges, so it never asks about the queue");
+  }
+  async enqueue(): Promise<void> {
     throw new Error("a session's forge never merges — that is the reviewer identity");
   }
   async revoke(): Promise<void> {}
@@ -753,4 +760,76 @@ test("a forge that cannot be reached does not fail the session", async () => {
 
   assert.equal(outcome.reason, "done-claimed");
   assert.equal(outcome.reviewComment, undefined);
+});
+
+/**
+ * A branch that no longer merges is said so at session start (DESIGN.md §12.3).
+ *
+ * The failure this exists for: a task that ran for several sessions ends with a branch
+ * `main` has moved past, and the first thing that notices is the merge — after every gate
+ * has passed. That reads as terminal and is ordinary drift.
+ *
+ * Asserted on the TRANSCRIPT, like the review-comment tests, because the renderer's own
+ * unit tests cannot show that the summary was computed and spliced in at all.
+ */
+test("a branch that conflicts with its base says so in the prompt, with files and hunks", async () => {
+  const CONFLICTED = asTaskId("TASK-5");
+  await mkdir(join(stateRepo, "tasks", CONFLICTED), { recursive: true });
+  await writeFile(
+    join(stateRepo, "tasks", CONFLICTED, "spec.md"),
+    [
+      "---",
+      "workspace: test",
+      "repos:",
+      "  - github.com/acme/widget",
+      "acceptance:",
+      '  - "true"',
+      "---",
+      "",
+      "Edit README.md.",
+      "",
+    ].join("\n"),
+  );
+  const conflictedSpec = await store.readSpec(CONFLICTED);
+
+  // The branch edits the file...
+  const worktree = await worktrees.ensureWorktree(REPO, CONFLICTED);
+  await writeFile(join(worktree, "README.md"), "# widget\n\nwritten by the branch\n");
+  await sh("git add -A && git commit -qm 'Document the widget'", worktree);
+
+  // ...and `main` edits the same lines while the task is running.
+  await writeFile(join(source, "README.md"), "# widget\n\nwritten on main\n");
+  await sh("git add -A && git commit -qm 'Document the widget differently'", source);
+
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "rebased" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(conflictedSpec, { ...state({ sessions: 7 }), id: CONFLICTED });
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(CONFLICTED, 8);
+  assert.match(transcript, /no longer merges/, "the section has to reach the model");
+  assert.match(transcript, /README\.md/, "and name the file");
+  assert.match(transcript, /rebase/i, "and say what to do about it");
+});
+
+test("a branch that merges cleanly gets no conflict section", async () => {
+  // The common case, and the one that must stay silent: a note on every prompt is noise
+  // the model learns to skip past.
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "nothing to rebase" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(spec, state({ sessions: 8 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(TASK, 9);
+  assert.doesNotMatch(transcript, /no longer merges/);
 });

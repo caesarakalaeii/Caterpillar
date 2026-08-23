@@ -72,8 +72,15 @@ import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
 import { threadBindings, type ThreadIndex } from "../notify/threads.ts";
 import type { ThreadBindingWriter } from "../redis/threads.ts";
+import {
+  landingFor,
+  mergeNote,
+  stopsTheSequence,
+  type LandedPullRequest,
+  type MergeOutcome,
+} from "../forge/mergeability.ts";
 import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
-import type { ForgeFactory, WorkspaceScope } from "../forge/types.ts";
+import type { Forge, ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
@@ -2927,7 +2934,8 @@ export class Supervisor {
     }
 
     const forge = await factory.forTask(spec);
-    const merged: string[] = [];
+    const inOrder = ordered(spec.repos, prs);
+    const landed: LandedPullRequest[] = [];
     try {
       // IN `spec.repos` ORDER, and stopping at the first failure. The order is the one the
       // human typed and the one §14.3 already treats as meaningful — `repos[0]` is the working
@@ -2935,40 +2943,94 @@ export class Supervisor {
       // a failure would land a later repo whose counterpart did not land, which for the change
       // that motivated this (`viewer_public` read by an extension before the gateway sends it)
       // is exactly the broken intermediate state the split was arranged to avoid.
-      for (const pr of ordered(spec.repos, prs)) {
-        await forge.approve(pr.repo, pr.number, "Approved by the caterpillar review council.");
-        await forge.merge(pr.repo, pr.number);
-        logger.info("pr.merged", { task: spec.id, repo: repoSlug(pr.repo), pr: pr.number });
-        merged.push(`${repoSlug(pr.repo)}#${pr.number}`);
+      for (const pr of inOrder) {
+        const outcome = await this.landOne(forge, spec, pr);
+        landed.push({ slug: repoSlug(pr.repo), pr: pr.number, outcome });
+        // A QUEUED pull request stops the sequence for the same reason a failure does: it
+        // has not landed. The queue runs the change's checks against a speculative base and
+        // can still reject it, so pushing the sibling onto its default branch now risks
+        // exactly the half-landed state the ordering rule exists to prevent — and unlike a
+        // failure there is nothing to report as broken, so the remaining pull requests are
+        // simply left open for the human the note names them to.
+        if (stopsTheSequence(outcome)) break;
       }
+
+      // `landed` is short of `inOrder` exactly when the loop broke on a queued pull
+      // request. Naming the ones left open is the difference between "the change is
+      // landing" and a human wondering why a sibling repo never moved.
+      const untouched = inOrder.slice(landed.length).map((pr) => `${repoSlug(pr.repo)}#${pr.number}`);
+      // `prs` is non-empty and the loop always lands its first entry, so `mergeNote` always
+      // has something to say. The fallback is a sentence rather than an empty string because
+      // this is rendered into Discord, and a blank message says nothing at all.
+      const note = mergeNote(landed) ?? "Approved by the review council; nothing to merge.";
+
       return {
         merged: true,
         note:
-          merged.length === 1
-            ? "Approved by the review council and merged."
-            : `Approved by the review council and merged: ${merged.join(", ")}.`,
+          untouched.length === 0
+            ? note
+            : `${note} ${untouched.join(", ")} ${untouched.length === 1 ? "is" : "are"} not ` +
+              `merged yet: the repos of one change land in order, and the one ahead of ` +
+              `${untouched.length === 1 ? "it" : "them"} is still in a queue.`,
       };
     } catch (error) {
       logger.warn("pr.merge-failed", {
         task: spec.id,
-        merged: merged.join(", "),
+        landed: landed.map((one) => `${one.slug}#${one.pr}:${one.outcome}`).join(", "),
         ...errorFields(error),
       });
       const reason = error instanceof Error ? error.message : String(error);
-      // What DID merge is named, always. A partial merge is the one outcome where "could not
+      // What DID land is named, always. A partial merge is the one outcome where "could not
       // merge" on its own is actively misleading: some of the change is on the default branch
       // and a human has to know which half before deciding what to do about the rest.
+      const done = mergeNote(landed);
       return {
         merged: false,
         note:
-          merged.length === 0
+          done === undefined
             ? `Could not merge: ${reason}`
-            : `Merged ${merged.join(", ")}, then could not merge the rest: ${reason}. ` +
-              `The remaining pull request(s) are open and the change is half-landed.`,
+            : `${done} Then could not merge the rest: ${reason}. The remaining pull ` +
+              `request(s) are open and the change is half-landed.`,
       };
     } finally {
       await forge.revoke().catch(() => undefined);
     }
+  }
+
+  /**
+   * Approve one pull request, then land it the way its base branch allows.
+   *
+   * The detection is asked per pull request rather than once per task: a multi-repo task's
+   * repos are configured by different people and there is no reason they agree about
+   * queues. `mergeQueue` never throws, so a forge that cannot answer takes the direct
+   * merge — which is the behaviour that existed before queues were detected at all.
+   */
+  private async landOne(
+    forge: Forge,
+    spec: TaskSpec,
+    pr: TaskPullRequest,
+  ): Promise<MergeOutcome> {
+    const { logger } = this.deps;
+
+    await forge.approve(pr.repo, pr.number, "Approved by the caterpillar review council.");
+
+    const support = await forge.mergeQueue(pr.repo, pr.number);
+    const fields = { task: spec.id, repo: repoSlug(pr.repo), pr: pr.number };
+    if (support === "unknown") {
+      // Logged rather than swallowed silently: the merge still happens, and if a
+      // queue-protected repo starts refusing merges this line is where the reason is.
+      logger.info("pr.merge-queue-unknown", fields);
+    }
+
+    if (landingFor(support) === "enqueue") {
+      await forge.enqueue(pr.repo, pr.number);
+      logger.info("pr.enqueued", fields);
+      return "queued";
+    }
+
+    await forge.merge(pr.repo, pr.number);
+    logger.info("pr.merged", fields);
+    return "merged";
   }
 
   /**
@@ -3940,9 +4002,11 @@ export class Supervisor {
       }
 
       // The primary's url, which is what the reply renders. `merge.note` already names every
-      // repo when there was more than one, so the count is not lost.
+      // repo when there was more than one, so the count is not lost — and it is carried back
+      // rather than dropped because on a queue-protected base nothing has merged yet, and a
+      // reply saying "Merged" would be untrue.
       const primary = state.pr ?? taskPullRequests(spec.repos, state)[0];
-      return { kind: "merged", prUrl: primary?.url ?? "(merged)" };
+      return { kind: "merged", prUrl: primary?.url ?? "(merged)", note: merge.note };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }
