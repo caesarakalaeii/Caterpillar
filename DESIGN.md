@@ -843,8 +843,18 @@ handoff threshold by itself**, which is the failure the whole thing exists to pr
 session that hands off having run one `grep`.
 
 `cluster.maxLogLines` is now one configured case of this rule rather than a special one —
-same validation helper in `load.ts`, and its cap *is* `MAX_OUTPUT_LINES`. Two independent
-2,000s in two files is how they come to disagree, and the disagreement would be invisible.
+same validation helper in `load.ts`, and its cap is `MAX_OUTPUT_LINES` itself. Two
+independent 2,000s in two files is how they come to disagree, and the disagreement would be
+invisible.
+
+**What is deliberately left alone.** pi's `read` tool never goes through `exec` — it calls
+`readTextLines` — and it already bounds itself at the same 2,000 lines / 50KiB, declares the
+elision, and tells the model the `offset` to continue from. Head-only is the right choice
+there, unlike for a command: a file is read forwards. So it is left as it is, and the
+asymmetry is recorded here rather than "fixed" into a second mechanism. The knob it would
+need does not exist, which is the honest limitation: an operator who lowers
+`limits.commandOutputMaxLines` for a small window does not thereby lower what one `read`
+costs.
 
 An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
 session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and

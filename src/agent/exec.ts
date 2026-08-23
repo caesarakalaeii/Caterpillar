@@ -212,7 +212,12 @@ export class BoundedExecutionEnv extends NodeExecutionEnv {
       ...(overflowPath === undefined ? {} : { overflowPath }),
     });
 
-    this.logger.warn("exec.output-bounded", {
+    // `info`, between `exec.bounded`'s `debug` and `exec.timeout`'s `warn`. Nothing has
+    // gone wrong — the ceiling did its job — but unlike the timeout default this does not
+    // fire on every command, only on the wide ones, so it is not the noise `exec.bounded`
+    // would be at this level. And it is the line an operator wants when a task keeps
+    // handing off early: it says where the window went.
+    this.logger.info("exec.output-bounded", {
       task: this.task,
       totalLines: bounded.totalLines,
       droppedLines: bounded.droppedLines,

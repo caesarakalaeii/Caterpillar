@@ -135,8 +135,8 @@ const outputBound = (value: unknown, field: string, ceiling: number): number => 
   const asked = num(value, field, ceiling);
   if (!Number.isInteger(asked) || asked < 1) {
     throw new ConfigError(
-      `${field} (${asked}) must be a whole number of at least 1 — a shell whose output ` +
-        `ceiling is zero returns an elision note and nothing else`,
+      `${field} (${asked}) must be a whole number of at least 1 — a ceiling of zero shows ` +
+        `the model an elision note and nothing else`,
     );
   }
   return Math.min(asked, ceiling);
@@ -559,9 +559,8 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     );
   }
 
-  // Hoisted for the same reason as the sabotage budgets: validated before use, and refused
-  // rather than corrected. A ceiling of 0 is a shell whose every command returns nothing but
-  // an elision note, which is a typo and never an intent.
+  // Hoisted for the same reason as the sabotage budgets: validated before use rather than
+  // inline in the `limits` block below.
   const commandOutputMaxLines = outputBound(
     raw.limits?.commandOutputMaxLines,
     "limits.commandOutputMaxLines",
