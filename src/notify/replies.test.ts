@@ -288,9 +288,16 @@ test("a forced done says it was not verified, and never says it merged", () => {
   const reply = describeOutcome(TASK, { kind: "forced-done" });
   assert.match(reply, /done/i);
   assert.match(reply, /gate/i, "the reader has to be told nothing was checked");
-  // A DENIAL of the merge is fine and wanted; a claim of one is the lie. `describeOutcome`
-  // for `merged` is the wording being ruled out here.
-  assert.doesNotMatch(reply, /^Merged/im, "nothing was merged, and saying so would be a lie");
+  // A DENIAL of the merge is fine and wanted; a claim of one is the lie. So the guard is
+  // on the denial being PRESENT rather than on the word "merged" being absent: banning the
+  // word outright rejected the very sentence that makes the reply truthful, and banning it
+  // only at the start of a line let a mid-sentence "the PR was merged" through.
+  assert.match(reply, /nothing was merged/i, "the reader must be told no merge happened");
+  assert.doesNotMatch(
+    reply,
+    /(?<!nothing was )merged/i,
+    "the only permitted use of the word is the denial",
+  );
 });
 
 test("a refused force says to cancel it first", () => {
