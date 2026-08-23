@@ -5805,7 +5805,14 @@ test("a session that ends without a verb still journals what is on the branch", 
     summary: "Session ended without a control-plane decision.",
   });
 
-  await until(async () => (await pushedState(NO_VERB))?.sessions === 1);
+  // Waited on the REMOTE, for `pushedJournal`'s reason: the shard and the state land in
+  // one commit, so a pushed session count is the evidence that the entry is pushed too.
+  let recorded = false;
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline && !recorded) {
+    recorded = (await pushedState(NO_VERB))?.sessions === 1;
+    await sleep(50);
+  }
   controller.abort();
   sessions.stop();
   await running.catch(() => undefined);

@@ -86,7 +86,7 @@ import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
 import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
-import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
+import { checkLimits, commitNote, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
 
 /**
@@ -2052,6 +2052,8 @@ export class Supervisor {
 
     this.publishNoProgress(spec.id, progress.noProgressStreak);
 
+    const branchNote = commitNote(spec.id, evidence);
+
     const next: TaskState = {
       ...state,
       sessions: session,
@@ -2080,6 +2082,14 @@ export class Supervisor {
         [
           `**Exit:** ${outcome.reason}`,
           `**Context at exit:** ${outcome.contextTokens} tokens`,
+          // From the probe, above the agent's own prose, and present whatever the exit
+          // reason was. GH-96's sessions 4-7 ended with no control-plane verb and their
+          // entries said only that; session 7 read a journal reporting that nothing had
+          // happened and re-implemented the whole task over 18 commits that were already
+          // on the branch. The summary is exactly what a session killed by context
+          // exhaustion or a crash fails to write, so the one line a resumed session needs
+          // most cannot be sourced from it.
+          ...(branchNote === undefined ? [] : [branchNote]),
           "",
           outcome.summary,
         ].join("\n"),

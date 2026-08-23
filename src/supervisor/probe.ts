@@ -41,10 +41,24 @@ export class GitProgressProbe {
     // The fork point is used ONLY as that fallback. Comparing against it forever would
     // make every session after the first commit look productive, and an agent that
     // commits once and then spins would never trip the thrash detector (§11.1).
-    const previous =
-      state.progress.lastHeadOid ??
-      (await this.options.worktrees.branchPoint(worktree));
+    const forkPoint = await this.options.worktrees.branchPoint(worktree);
+    const previous = state.progress.lastHeadOid ?? forkPoint;
     const committed = head !== undefined && previous !== undefined && head !== previous;
+
+    // Against the FORK POINT, not against `previous`: this is the standing total the
+    // journal reports (`commitNote`), and a session resuming a branch needs to know that
+    // eighteen commits are on it even when this session added none of them. Measuring from
+    // the previous head would answer zero on exactly those sessions — which is what GH-96's
+    // journal already said, four times, while the work sat on the branch.
+    //
+    // Counted only with a fork point. `commitsSince` answers with nothing rather than
+    // throwing on a base the worktree does not carry, so passing a missing base would turn
+    // "cannot tell" into "nothing there" — the one reading a resumed session must never be
+    // given.
+    const commits =
+      forkPoint === undefined
+        ? undefined
+        : (await this.options.worktrees.commitsSince(worktree, forkPoint)).length;
 
     return {
       // The head observed now becomes the next session's baseline.
@@ -53,6 +67,7 @@ export class GitProgressProbe {
       stepCompleted: false,
       ...(head !== undefined ? { headOid: head } : {}),
       ...(previous !== undefined ? { baselineOid: previous } : {}),
+      ...(commits !== undefined ? { commits } : {}),
     };
   }
 }
