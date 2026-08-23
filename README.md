@@ -1152,8 +1152,17 @@ round before it parks again — the council refuses the same plan for the same r
 what breaks that, which is why it is the thing that resets the count and why the notification
 says resuming alone will not get past it.
 
-`/resume`, `/cancel` and `/task` take **no task id inside a thread** — the thread is the id.
-Typed with one they still address whatever you name, from anywhere.
+`/resume`, `/cancel`, `/task` and `/amend` take **no task id inside a thread** — the thread is
+the id. Typed with one they still address whatever you name, from anywhere.
+
+When the *criterion* is what is wrong rather than the work, `/amend <task>` opens a box holding
+the task's current acceptance criteria, one per line, and asks why they cannot stand. Editing
+them writes an append-only `amendments/NNN.yaml`; `spec.md` never changes, so the record of what
+the task was asked to do survives alongside the record of what it is now asked to satisfy. The
+same box is one press away on a verdict, a stalled review and a park — the three notifications
+you are reading when you find out a gate is impossible. It is refused while the task is
+`running`: `/cancel` first, or a session would go on grading itself against the old list. If
+the amendment is itself wrong, run `/amend` again — the highest-numbered one wins.
 
 To abandon one, `/cancel <task>` parks it and **closes its thread** — a last word saying
 so, then archived. It works on a task that is *running*, not only on an idle one: the
