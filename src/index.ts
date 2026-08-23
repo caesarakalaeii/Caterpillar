@@ -953,8 +953,8 @@ const runBridge = (deps: {
     channelId: bot.channelId,
     threads: router,
     logger,
-    onMessage: (content, author, channelId, messageId) =>
-      bridge.handleMessage(content, author, channelId, messageId),
+    onMessage: (content, author, channelId, messageId, replyTo) =>
+      bridge.handleMessage(content, author, channelId, messageId, replyTo),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
     // Passed WITHOUT a leadership check, unlike everything else the bridge does. Presence
     // is idempotent and identical on every replica — all four render from the same surveyed

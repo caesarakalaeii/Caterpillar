@@ -5484,6 +5484,9 @@ test("the tracker is told, with a reason naming it a forced completion", async (
     kind: "github-issues",
     listAgentItems: () => Promise.resolve([]),
     comment: () => Promise.resolve(),
+    // `/done` closes nothing and files nothing, so a call here is a bug worth failing on
+    // rather than a stub worth satisfying quietly.
+    create: () => Promise.reject(new Error("forcing a task done must not file a tracker item")),
     transition: (_ref, transition) => {
       seen.push(transition);
       return Promise.resolve();

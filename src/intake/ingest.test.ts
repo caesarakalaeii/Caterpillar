@@ -24,7 +24,12 @@ import type { RepoReach } from "../forge/reach.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
-import type { Tracker, TrackerItem, TrackerTransition } from "../tracker/types.ts";
+import type {
+  Tracker,
+  TrackerCreateRequest,
+  TrackerItem,
+  TrackerTransition,
+} from "../tracker/types.ts";
 import { Ingester, intakeDue, intakeRef, type ToolchainCheck } from "./ingest.ts";
 
 const WORKSPACE = asWorkspaceName("primary");
@@ -88,6 +93,11 @@ class FakeTracker implements Tracker {
   comment(ref: TrackerRef, text: string): Promise<void> {
     this.comments.push({ ref, text });
     return Promise.resolve();
+  }
+
+  create(_request: TrackerCreateRequest): Promise<TrackerRef> {
+    // Intake only ever READS from a tracker; filing is a supervisor path elsewhere.
+    return Promise.reject(new Error("FakeTracker does not file items"));
   }
 
   transition(_ref: TrackerRef, _t: TrackerTransition, _task: TaskId): Promise<void> {

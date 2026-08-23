@@ -184,8 +184,8 @@ const main = async (): Promise<void> => {
     channelId: bot.channelId,
     threads: router,
     logger,
-    onMessage: (content, author, channelId, messageId) =>
-      bridge.handleMessage(content, author, channelId, messageId),
+    onMessage: (content, author, channelId, messageId, replyTo) =>
+      bridge.handleMessage(content, author, channelId, messageId, replyTo),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
   });
 

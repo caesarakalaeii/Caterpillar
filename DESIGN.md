@@ -1372,6 +1372,26 @@ the only thing behind it is `done`, and nothing is swallowed because a message t
 is guidance the loop acts on. `/cancel` still archives, which is a stronger statement than
 unbinding and the one the human actually made.
 
+**A REPLY names its own task; rank is only what is left when nothing else does.** The rank rule
+above picks ONE owner for a shared thread, and for an ordinary message that is the best answer
+available. For a Discord *reply* it is not: the payload carries
+`message_reference.message_id`, and the message it names is one the bot posted about exactly
+one task — so a reply to child `-03`'s question can be placed exactly, instead of being filed
+against whichever sibling outranks it. Three tiers, in order, and each covers what the one
+before it cannot. An **in-memory index** of message → task, populated as the bot posts and
+bounded oldest-first, answers the common case at no request cost. A **REST read** of the
+referenced message, parsing the leading `**<task-id>**` every task-scoped message opens with
+and confirming it against the snapshot, covers what the index cannot hold: a message from
+before a restart, and — in the split of §7 — a notification the *supervisor* posted, since the
+process holding the index is not the process that sends them. Neither tier alone is enough,
+which is why both exist: index-only loses targeting for every live thread across a rollout,
+REST-only cannot place a message Discord will not show us and spends a request per reply.
+When both fail, the rank rule still decides — and the reply then **says which task it was
+filed against**. That note is not decoration. Answering the wrong sibling silently is the
+failure this whole path removes, and where the system cannot avoid guessing, a visible
+attribution is the only thing that lets a human catch it. It rides even on a steer, which is
+otherwise acknowledged with a reaction alone, because a reaction cannot name a task.
+
 **`/resume` brings back `parked` AND `failed`, but never `done`.** `failed` was left out
 of the original command, and it was an oversight rather than a decision — the argument for
 `/resume` existing is that the alternative is an operator editing `state.json`, which is a

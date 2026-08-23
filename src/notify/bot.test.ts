@@ -160,3 +160,59 @@ test("a bot without ADD_REACTIONS reports the failure rather than swallowing it"
 
   assert.equal(ok, false);
 });
+
+test("the task a referenced message is about is read over a real GET", async () => {
+  // Same defect class as `parentChannel`'s: a GET carrying a body dies inside `fetch` before
+  // a byte moves, and every caller here swallows failure into `undefined`. A stubbed fetch
+  // accepts a body on a GET and would never notice.
+  const { bot, received, close } = await harness((send) => {
+    send(
+      200,
+      JSON.stringify({
+        id: "5551212",
+        content: "**GH-acme-widget-42** needs input\nPhase: implementing\n\nWhich path?",
+      }),
+    );
+  });
+
+  try {
+    const task = await bot.taskForFetchedMessage("1537785980415778816", "5551212");
+
+    assert.equal(task, "GH-acme-widget-42", "the id must come back from the API");
+    assert.equal(received.method, "GET");
+    assert.equal(received.url, "/channels/1537785980415778816/messages/5551212");
+    assert.equal(received.authorization, "Bot tok", "the bot token authorises the read");
+    assert.equal(received.body, "", "a GET carries no body — the server must receive none");
+  } finally {
+    await close();
+  }
+});
+
+test("a message the bot cannot read resolves to undefined rather than throwing", async () => {
+  // A reply to a message in a channel the bot lost access to, or one since deleted. The
+  // caller's fallback is the rank rule with a visible note; a throw would take the whole
+  // message handler down instead.
+  const { bot, close } = await harness((send) =>
+    send(403, JSON.stringify({ message: "Missing Access", code: 50001 })),
+  );
+
+  try {
+    assert.equal(await bot.taskForFetchedMessage("1537785980415778816", "5551212"), undefined);
+  } finally {
+    await close();
+  }
+});
+
+test("a message whose text names no task resolves to undefined", async () => {
+  // A reply to another human's message, or to bot prose with no id in it. It must fall
+  // through cleanly — the whole point of the third tier.
+  const { bot, close } = await harness((send) =>
+    send(200, JSON.stringify({ id: "5551212", content: "morning all" })),
+  );
+
+  try {
+    assert.equal(await bot.taskForFetchedMessage("1537785980415778816", "5551212"), undefined);
+  } finally {
+    await close();
+  }
+});
