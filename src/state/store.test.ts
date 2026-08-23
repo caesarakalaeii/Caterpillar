@@ -188,7 +188,7 @@ test("readSpec takes the highest-numbered amendment wholesale, not a merge", asy
 });
 
 test("writeAmendment allocates 001, 002, 003 and overwrites none of them", async () => {
-  // The file list IS the audit trail (§12), so a reused number would erase the reasoning
+  // The file list IS the audit trail (§12.3), so a reused number would erase the reasoning
   // a human recorded for an earlier decision.
   const subject = await store();
   await subject.writeSpec(SPEC);

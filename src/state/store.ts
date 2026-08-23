@@ -140,7 +140,7 @@ export class SpecParseError extends Error {
 }
 
 /**
- * One append-only amendment to a task's acceptance criteria (DESIGN.md §12).
+ * One append-only amendment to a task's acceptance criteria (DESIGN.md §12.3).
  *
  * `acceptance` is a WHOLE-LIST replacement rather than a positional patch. A positional
  * diff against an immutable file reads as noise six months later — "replace entry 2"
@@ -834,7 +834,7 @@ export class StateStore {
   }
 
   /**
-   * The EFFECTIVE spec: `spec.md` with the newest acceptance amendment applied (§12).
+   * The EFFECTIVE spec: `spec.md` with the newest acceptance amendment applied (§12.3).
    *
    * This is the seam every caller already uses, and that is deliberate. An opt-in
    * `readEffectiveSpec` would be a rule each future call site has to remember, and the
@@ -986,7 +986,7 @@ export class StateStore {
   }
 
   /**
-   * Every acceptance amendment for a task, oldest first (DESIGN.md §12).
+   * Every acceptance amendment for a task, oldest first (DESIGN.md §12.3).
    *
    * Ordered by number so a caller can take `.at(-1)` for the effective one and `.length`
    * for how many times the gate has been argued with. Read-only — the numbering rule
@@ -1016,7 +1016,7 @@ export class StateStore {
   }
 
   /**
-   * Append one acceptance amendment, allocating the next number (DESIGN.md §12).
+   * Append one acceptance amendment, allocating the next number (DESIGN.md §12.3).
    *
    * Append-only: this never rewrites or removes an earlier file, so the directory listing
    * IS the audit trail of every time the gate was changed and why. The number comes from
