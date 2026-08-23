@@ -274,6 +274,15 @@ const HEADING = /^ {0,3}(#{1,2}) +(.*)$/;
 /** A well-formed section heading, after the `##`: `<lens>: <title>`. */
 const OWNED = /^([A-Za-z-]+) *: *(.+?) *$/;
 
+/** Drop wholly blank lines from both ends of a body, leaving every other line as written. */
+const trimBlankLines = (lines: readonly string[]): string => {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start]?.trim() === "") start += 1;
+  while (end > start && lines[end - 1]?.trim() === "") end -= 1;
+  return lines.slice(start, end).join("\n");
+};
+
 const isOwner = (key: string): key is RepoStandardOwner =>
   (REPO_STANDARD_OWNERS as readonly string[]).includes(key);
 
@@ -332,7 +341,13 @@ export const parseRepoStandards = (repo: string, text: string): readonly RepoSta
       );
     }
     const end = headings[position + 1]?.index ?? lines.length;
-    const body = lines.slice(heading.index + 1, end).join("\n").trim();
+    // Blank lines are dropped from the ends, but NOT the leading whitespace of a content
+    // line: four spaces is what makes an indented heading a code block rather than a
+    // heading, and `HEADING` allows it through on exactly that basis. A `.trim()` here
+    // would strip the indent off the first line and re-emit `# Attribution` at column
+    // zero, above every `##` section of the prompt this body is spliced into — turning the
+    // code-block carve-out into the way around the guard it sits next to.
+    const body = trimBlankLines(lines.slice(heading.index + 1, end));
     if (body === "") {
       throw refuse(
         `section "${heading.title}" is empty. A heading with no rule under it reads as a ` +
