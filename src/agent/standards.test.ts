@@ -204,6 +204,23 @@ test("a repo with no standards file contributes nothing", async () => {
   assert.deepEqual(await readRepoStandards([{ repo: "acme/web", path: root }]), []);
 });
 
+test("a standards file that cannot be read is refused, not read as absent", async () => {
+  // Only ENOENT is ordinary. Anything else — a permission error, or a directory where the
+  // file should be — is a broken checkout, and treating it as "this repo ships no
+  // standards" would hand the council a repo's rules on one runner and not on another:
+  // the asymmetry this whole feature exists to remove, arrived at by accident.
+  // A directory is the portable way to provoke it; chmod is not, and this suite runs as
+  // root in CI where a read-only mode would be ignored.
+  const root = await checkoutWith({});
+  await mkdir(join(root, REPO_STANDARDS_PATH), { recursive: true });
+
+  await assert.rejects(
+    () => readRepoStandards([{ repo: "acme/web", path: root }]),
+    (error: Error) =>
+      error instanceof RepoStandardsError && /acme\/web/.test(error.message),
+  );
+});
+
 test("each declared repo is read from its own checkout and tagged with its own slug", async () => {
   // §9.4.1: the siblings are separate worktrees, and per-repo scope is only meaningful if
   // each file is read from the repo it governs.
