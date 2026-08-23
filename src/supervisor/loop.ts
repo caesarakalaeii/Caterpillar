@@ -1622,7 +1622,12 @@ export class Supervisor {
           inFlight: this.slots.size,
           concurrency: config.concurrency,
         });
-        await this.mirror(spec, { kind: "claimed", runner: lease.runner }, state.sessions);
+        // The lease token, not `state.sessions`: the session index does not advance across a
+        // park that recorded no session, so a re-claim after a resume hashed to the previous
+        // claim and the mirror was skipped — leaving the item without `agent-wip`. Every
+        // claim pushes a new lease commit, so the oid is distinct per claim and stable
+        // within one, which is exactly the replay window (§4.4).
+        await this.mirror(spec, { kind: "claimed", runner: lease.runner }, lease.oid);
       } catch (error) {
         // Contained per CLAIM, for `startSlot`'s reason one step earlier: at N slots a
         // throw here would abandon the tasks already claimed in this same pass, which have
@@ -2336,7 +2341,9 @@ export class Supervisor {
         // OUTSIDE the unit, both of them. The tracker and Discord are views, git is
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
-        await this.mirror(spec, { kind: "question", question }, index);
+        // The question index, which advances per question asked and so already separates
+        // two questions with identical text.
+        await this.mirror(spec, { kind: "question", question }, String(index));
         await this.notifyTask(state, {
           kind: "question",
           task: spec.id,
@@ -2451,7 +2458,7 @@ export class Supervisor {
           prUrl,
           merged: merge.merged,
         });
-        await this.mirror(spec, { kind: "completed", prUrl }, reviewed.state.sessions);
+        await this.mirror(spec, { kind: "completed", prUrl }, String(reviewed.state.sessions));
         await this.notifyTask(reviewed.state, {
           kind: "done",
           task: spec.id,
@@ -3555,7 +3562,7 @@ export class Supervisor {
       await this.transition(lease, state, "parked");
       await this.push(lease, `chore(${spec.id}): parked`);
     });
-    await this.mirror(spec, { kind: "parked", reason }, state.sessions);
+    await this.mirror(spec, { kind: "parked", reason }, String(state.sessions));
     // `notifyTask`, not `notify`. This was the ONE task-scoped notification that dropped the
     // thread, and it was the one that could least afford to: every other outcome of a review
     // round reaches the thread through `notifyTask`, so a plan sent back for the third time
@@ -4490,12 +4497,12 @@ export class Supervisor {
    * supplies what only the supervisor has: the workspace's tracker, and the effect record
    * that stops a replayed mirror commenting twice (§4.4).
    *
-   * `occurrence` is the task's session index, which is what tells a REPLAY of one mirror
-   * from a genuinely new lifecycle event: the transition arguments alone do not, because
-   * `claimed` carries only the pod name and a task is claimed once per session. See
-   * `MirrorRequest.occurrence`.
+   * `occurrence` is what tells a REPLAY of one mirror from a genuinely new lifecycle event:
+   * the transition arguments alone do not, because `claimed` carries only the pod name.
+   * `claimed` passes the LEASE TOKEN (a claim is a lease commit) and the post-session
+   * transitions pass the session index. See `MirrorRequest.occurrence`.
    */
-  private mirror(spec: TaskSpec, transition: TrackerTransition, occurrence: number): Promise<void> {
+  private mirror(spec: TaskSpec, transition: TrackerTransition, occurrence: string): Promise<void> {
     const tracker = this.deps.trackers?.get(spec.workspace);
     return mirrorTransition({
       task: spec.id,

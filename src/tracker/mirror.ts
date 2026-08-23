@@ -47,7 +47,7 @@ export interface MirrorRequest {
   readonly tracker?: Tracker;
   readonly transition: TrackerTransition;
   /**
-   * Which occurrence of this transition it is — the task's session index at the call site.
+   * Which occurrence of this transition it is — an opaque token from the call site.
    *
    * Lifecycle transitions RECUR with identical arguments, which is what separates them
    * from a tool call inside one session. `claimed` carries only the runner id, and that is
@@ -56,13 +56,22 @@ export interface MirrorRequest {
    * — and `claimed` is the only transition that removes `needs-human` and re-adds
    * `agent-wip`, so the issue keeps advertising for help nobody needs (§9.5).
    *
-   * The session index is the right grain because it is exactly the window a replay lives
-   * in: a pod killed between the comment and the state write comes back in the SAME
-   * session and must collapse, while a park answered by a human opens a new session and
-   * must mirror. It is not part of the `TrackerTransition` — the tracker has no use for
-   * it, it only keys the record.
+   * The right grain is the window a replay lives in: identical for two attempts at the
+   * same lifecycle event, different for a genuinely new one. `claimed` uses the LEASE
+   * TOKEN, because a claim is a lease commit — a pod killed between the comment and the
+   * state write comes back under the same lease and collapses, while a later claim pushed
+   * a new lease commit and mirrors. The three post-session transitions use the session
+   * index, which is what distinguishes their attempts.
+   *
+   * A string, not a number, because the session index alone was wrong: it does not advance
+   * across a park that recorded no session (`parkFailed` on a toolchain failure, the
+   * `unreachableRepos` park, `checkLimits`), and `applyResume` does not touch it either, so
+   * a re-claim by the same pod after a resume hashed to the previous claim and vanished.
+   *
+   * It is not part of the `TrackerTransition` — the tracker has no use for it, it only
+   * keys the record.
    */
-  readonly occurrence: number;
+  readonly occurrence: string;
   readonly logger: Logger;
   /** Absent on a caller with no state repo behind it, which mirrors unconditionally. */
   readonly ledger?: MirrorLedger;
@@ -83,7 +92,7 @@ const verbFor = (transition: TrackerTransition): EffectVerb => `tracker.${transi
  * tracker writes what §9.5 says, the record keys what distinguishes one attempt from the
  * next.
  */
-const effectArgs = (transition: TrackerTransition, occurrence: number): unknown => ({
+const effectArgs = (transition: TrackerTransition, occurrence: string): unknown => ({
   transition,
   occurrence,
 });
