@@ -85,7 +85,7 @@ import type { ChatDrainer } from "../redis/inbox.ts";
 import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
-import type { ChatOutcome, ChatRequest } from "./inbox.ts";
+import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
 
@@ -3472,7 +3472,9 @@ export class Supervisor {
       };
     }
 
-    return this.applyAnswer({ kind: "answer", task: request.task, text: chosen, settle: request.settle });
+    // The INTENT, without the request's `settle`: this method's caller settles what is
+    // returned, and an answer path that could settle a second time would report twice.
+    return this.applyAnswer({ kind: "answer", task: request.task, text: chosen });
   }
 
   /**
@@ -3493,7 +3495,7 @@ export class Supervisor {
    * notification, a verdict notification and `/task` were all telling the human to "say what
    * to change in this thread". Three surfaces documented a path that ended in a `return`.
    */
-  private async applyAnswer(request: ChatRequest & { readonly kind: "answer" }): Promise<ChatOutcome> {
+  private async applyAnswer(request: ChatIntent & { readonly kind: "answer" }): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
     const state = await store.tryReadState(request.task);
@@ -3579,7 +3581,7 @@ export class Supervisor {
    *   says which of the two happened rather than letting a human find out by watching.
    */
   private async applyGuidance(
-    request: ChatRequest & { readonly kind: "answer" },
+    request: ChatIntent & { readonly kind: "answer" },
     state: TaskState,
   ): Promise<ChatOutcome> {
     const { store, leases, logger } = this.deps;
