@@ -274,10 +274,29 @@ a divergent local branch before anything could look at it. `^refs/heads/agent/<t
 not suppress that, because a negative refspec matches the *source* side and so cancels the
 mapping we asked for too. With a URL there is no configured remote to apply.
 
-The fetch never throws. `ensureWorktree` is also called by the progress probe and the
-verifier, which run after `clearActive()` has closed the credential service (§9.2); a fetch
-that cannot be made means the remote has nothing to say, which leaves the previous behaviour
-rather than failing a session that could have run.
+**"The remote has no such branch" and "the remote could not be asked" are different
+answers.** A fetch reports both as a plain non-zero, so code that decides existence from a
+fetch tolerates a network fault exactly as much as it tolerates a first session — and one
+expired credential then starts a session on the base with the pushed work upstream, which is
+the same defect with every local ref correct. Existence is therefore settled by `git ls-remote
+--exit-code`, which exits 2 for a ref the remote does not have and 128 for a remote it could
+not read.
+
+What an unreachable remote *means* is the caller's to say, because it differs by caller:
+
+- The **agent session runner** holds the task's credential lease, so it passes
+  `mustReachRemote` and gets a throw. The task parks through `parkFailed` with git's own
+  message in its journal, where a human fixes a credential — instead of a session silently
+  starting from scratch.
+- The **progress probe, verifier, review council and plan maintainer** all check out the same
+  task *after* `clearActive()` has closed the credential service (§9.2), where a fetch on a
+  private repo cannot succeed. They keep the tolerant reading: a silent remote has nothing to
+  say, and the checkout proceeds on what is on disk. Being strict there would take
+  verification down on every private repo.
+
+The flag is passed explicitly rather than inferred from the environment — say, from the task's
+credential socket existing — so that the strictness is something one caller asks for in code a
+reader can grep for, not a property that changes underneath it.
 
 #### Worktrees are reaped, because they are what actually grows
 
