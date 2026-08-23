@@ -2859,6 +2859,7 @@ export class Supervisor {
     }
 
     const forge = await factory.forTask(spec);
+    const inOrder = ordered(spec.repos, prs);
     const landed: LandedPullRequest[] = [];
     try {
       // IN `spec.repos` ORDER, and stopping at the first failure. The order is the one the
@@ -2867,7 +2868,7 @@ export class Supervisor {
       // a failure would land a later repo whose counterpart did not land, which for the change
       // that motivated this (`viewer_public` read by an extension before the gateway sends it)
       // is exactly the broken intermediate state the split was arranged to avoid.
-      for (const pr of ordered(spec.repos, prs)) {
+      for (const pr of inOrder) {
         const outcome = await this.landOne(forge, spec, pr);
         landed.push({ slug: repoSlug(pr.repo), pr: pr.number, outcome });
         // A QUEUED pull request stops the sequence for the same reason a failure does: it
@@ -2879,13 +2880,14 @@ export class Supervisor {
         if (stopsTheSequence(outcome)) break;
       }
 
-      // `landed` is short of `prs` exactly when the loop broke on a queued pull request.
-      // Naming the ones left open is the difference between "the change is landing" and a
-      // human wondering why a sibling repo never moved.
-      const untouched = ordered(spec.repos, prs)
-        .slice(landed.length)
-        .map((pr) => `${repoSlug(pr.repo)}#${pr.number}`);
-      const note = mergeNote(landed) ?? "Approved by the review council.";
+      // `landed` is short of `inOrder` exactly when the loop broke on a queued pull
+      // request. Naming the ones left open is the difference between "the change is
+      // landing" and a human wondering why a sibling repo never moved.
+      const untouched = inOrder.slice(landed.length).map((pr) => `${repoSlug(pr.repo)}#${pr.number}`);
+      // `prs` is non-empty and the loop always lands its first entry, so `mergeNote` always
+      // has something to say. The fallback is a sentence rather than an empty string because
+      // this is rendered into Discord, and a blank message says nothing at all.
+      const note = mergeNote(landed) ?? "Approved by the review council; nothing to merge.";
 
       return {
         merged: true,
