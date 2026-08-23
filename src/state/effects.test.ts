@@ -186,6 +186,21 @@ test("an unreadable record reads as absent rather than throwing", async () => {
   assert.equal(await subject.recordedEffect(TASK, id), undefined);
 });
 
+test("a stray file in the effects directory is neither read nor deleted", async () => {
+  // The directory is in a git repo a human can edit and a rebase can touch. A prune that
+  // tried to interpret every name would either throw on one it could not parse or delete
+  // something it did not write.
+  const subject = await store();
+  const dir = join(roots.at(-1) as string, "tasks", TASK, "effects");
+  for (let n = 0; n <= EFFECTS_KEPT; n += 1) {
+    const id = effectRequestId(TASK, "task_note", { text: `note ${n}` });
+    await subject.recordEffect(TASK, id, "task_note", null);
+    if (n === 0) await writeFile(join(dir, "README.json"), "left by a human\n", "utf8");
+  }
+
+  assert.ok(existsSync(join(dir, "README.json")), "a file this class did not write is not its to delete");
+});
+
 test("recording an effect prunes the task back under the cap", async () => {
   const subject = await store();
   const ids: string[] = [];
