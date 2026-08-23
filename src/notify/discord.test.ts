@@ -557,6 +557,87 @@ test("every park a human is expected to act on also offers to mark it done", () 
   }
 });
 
+test("every notification a rejection arrives on offers to amend the criteria", () => {
+  // Where the human is standing when they discover the gate is wrong. A verdict naming an
+  // impossible criterion, a review that stalled on the same one three times, and a park:
+  // three messages, all read at the moment amending is the only move that helps.
+  const carriers: readonly Notification[] = [
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+    },
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+      prUrl: "https://example.invalid/pr/1",
+    },
+    {
+      kind: "review-stalled",
+      task: TASK,
+      rounds: 3,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+      canMerge: true,
+      prUrl: "https://example.invalid/pr/1",
+    },
+    { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
+  ];
+
+  for (const carrier of carriers) {
+    const attached = componentsFor(carrier);
+    assert.ok(
+      labelsOf(attached).includes("Amend criteria"),
+      `${carrier.kind} should offer an Amend criteria button`,
+    );
+    assert.ok(idsOf(attached).includes(`c1:amd:${TASK}`), carrier.kind);
+  }
+});
+
+test("a notification with no gate to argue with carries no amend button", () => {
+  // `done` is past arguing about — the criteria passed and the PR merged — and `failed` is
+  // an environment that would not build, which no acceptance list fixes. A button on either
+  // would offer a move that cannot help.
+  for (const notification of [
+    { kind: "done", task: TASK, prUrl: "https://example.invalid/pr/1" },
+    { kind: "failed", task: TASK, error: "the dev environment could not be prepared" },
+  ] as const satisfies readonly Notification[]) {
+    assert.ok(
+      !labelsOf(componentsFor(notification)).includes("Amend criteria"),
+      `${notification.kind} must not offer to amend`,
+    );
+  }
+});
+
+test("a stalled review keeps every button it had when the amend one is added", () => {
+  // Five per row is a hard limit and `row` THROWS above it, which costs the whole message on
+  // the one path where silence means nobody learns the review is stuck. This is the busiest
+  // notification in the system, so it is the one that would hit it.
+  const attached = componentsFor({
+    kind: "review-stalled",
+    task: TASK,
+    rounds: 3,
+    summary: "blocked by correctness",
+    detail: "**Correctness** — throws on an empty repo list.",
+    canMerge: true,
+    prUrl: "https://example.invalid/pr/1",
+  });
+
+  assert.deepEqual(labelsOf(attached), [
+    "Merge anyway",
+    "Resume",
+    "Mark done",
+    "View PR",
+    "Amend criteria",
+  ]);
+  for (const row of attached ?? []) {
+    assert.ok(row.components.length <= 5, "a row over five buttons is a 400 for the message");
+  }
+});
+
 test("a resume button refuses to encode rather than address the wrong task", () => {
   // `custom_id` is capped at 100 characters and a task id is tracker-derived. A clipped id is
   // still a valid-looking id, so the button is dropped instead — and the prose is what is
