@@ -1151,6 +1151,49 @@ test("a session starts on the remote tip of its own branch, never behind it", as
   );
 });
 
+test("a worktree reset behind its remote branch is not handed to a session as-is", async () => {
+  // GH-95, the other half of GH-96. That session found its EXISTING worktree reset to a
+  // commit before its own work, with the branch's commits reachable only from
+  // `refs/pull/111/head`, and recovered them by hand.
+  //
+  // `addWorktreeLocked` returns early when the directory is already there, and the
+  // comment says why: the probe and the verifier both call `ensureWorktree` after
+  // `clearActive()` has closed the credential service (§9.2), so a fetch on that path
+  // fails on a private repo and takes the post-session work down with it. That reasoning
+  // holds for the READ paths. It does not license handing a session a checkout that is
+  // behind the branch it is about to commit on: the next `git push` is refused as
+  // non-fast-forward at the earliest, and at worst the agent concludes the task is
+  // untouched and starts again.
+  //
+  // So the invariant is the same as the fresh-worktree one, minus the part this path
+  // cannot promise: the session is at the remote tip, or it does not start. Refusing is
+  // the acceptable outcome here — a human reconciles two histories, which is what GH-95
+  // did — and it is strictly better than silence.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("GH-95");
+  const subject = manager(root);
+
+  // A worktree that exists and is BEHIND: created first, then another runner pushes.
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const base = (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim();
+  const pushed = await pushAgentBranch(root, REPO, task, "the commits GH-95 recovered\n");
+  assert.notEqual(pushed, base, "fixture is wrong: the remote must be ahead");
+
+  const reused = await subject.ensureWorktree(REPO, task).catch((error: unknown) => error);
+
+  if (reused instanceof Error) {
+    assert.match(reused.message, /GH-95/, "a refusal must name the task a human has to look at");
+    return;
+  }
+  assert.equal(
+    (await new Git(String(reused), HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "a reused worktree must be moved to the remote tip, or the call must throw",
+  );
+});
+
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
   // Feeds `review/tdd.ts`, whose whole subject is the ORDER — so oldest-first is the
   // contract, not a detail. `git log` defaults to newest-first, which would invert every
