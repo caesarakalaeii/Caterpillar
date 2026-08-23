@@ -6313,6 +6313,25 @@ test("amending a running task writes nothing at all", async () => {
   assert.deepEqual((await store.readSpec(BUSY)).acceptance, ["true"]);
 });
 
+test("the refused amendment leaves no task for a later supervisor to pick up", async () => {
+  // Every test in this file shares one state repo, and the tests further down start REAL
+  // supervisor loops against it at `concurrency: 1`. `running` is claimable by design (§6.2
+  // — it is what a crashed pod's task looks like), so a fixture left in that status is
+  // reclaimed by whichever loop starts next: it runs a whole session, a council pass and a
+  // verification, holding the single slot the test that started the loop is waiting for.
+  //
+  // That is invisible until the machine is slow, and then it is a 60-second `waitForCommit`
+  // that times out in a test which never mentions this task. So the refusal test above puts
+  // its task beyond claiming when it is done with it, and this pins that it did.
+  const BUSY = asTaskId("SMOKE-AMEND-3");
+  const state = await pushedState(BUSY);
+  assert.ok(state !== undefined, "the refusal test should have seeded this task");
+  assert.ok(
+    isTerminal(state.status),
+    `SMOKE-AMEND-3 was left ${state.status}, which a later loop will claim and work`,
+  );
+});
+
 test("amending a task that is not in the state repo says so", async () => {
   const inbox = new InMemoryChatQueue();
   const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
