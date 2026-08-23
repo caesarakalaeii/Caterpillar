@@ -119,6 +119,10 @@ const verifierFor = (
   const worktrees = {
     ensureWorktree: (_repo: RepoRef, _task: TaskId): Promise<string> =>
       Promise.resolve(worktree),
+    // A branch that merges, which is what every test using this harness assumes. The
+    // conflict cases have their own verifier at the bottom of the file.
+    defaultBranch: () => Promise.resolve("main"),
+    conflictsWithBase: () => Promise.resolve(undefined),
   } as unknown as WorktreeManager;
   const bindings: WorkspaceBindings =
     extra.bindings ?? { forges: new Map(), trackers: new Map() };
@@ -219,6 +223,10 @@ const ciVerifier = (worktree: string, bindings: WorkspaceBindings): AcceptanceVe
   new AcceptanceVerifier({
     worktrees: {
       ensureWorktree: () => Promise.resolve(worktree),
+      // These tests are about CI, and a branch that merges is the state they all assume.
+      // The conflict cases have their own verifier below.
+      defaultBranch: () => Promise.resolve("main"),
+      conflictsWithBase: () => Promise.resolve(undefined),
     } as unknown as WorktreeManager,
     bindings,
     toolchain: new ToolchainResolver({
