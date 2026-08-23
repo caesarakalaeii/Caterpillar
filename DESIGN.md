@@ -5527,6 +5527,15 @@ arrived in the same pass is read by the verdict it decides. It claims the task's
 before acting, because two replicas must not settle one verdict, and it re-reaches the
 verdict under that lease rather than trusting the one computed without it.
 
+**A fix that was only enqueued is not re-verified, and the journal says so.** On a
+queue-protected base the council enqueues rather than merges (§12.3), and a queued pull
+request is not on the default branch — the queue runs the change's own checks against a
+speculative base and can still reject it. There is therefore no merge instant to time a
+window from: one started now would run out while the fix was still on its way and park a
+change that works. So the hold is skipped and the skip is written into the journal, naming
+the queue. That is the same rule as `unverifiable`, applied one step earlier: what is not
+known is said rather than guessed at, in either direction.
+
 ### What is deliberately absent
 
 **No Alertmanager silence, ever** — not even a temporary one. A supervisor that can silence

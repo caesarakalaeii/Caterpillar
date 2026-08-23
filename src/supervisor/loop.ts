@@ -127,6 +127,20 @@ interface TaskRecord {
   readonly state: TaskState;
 }
 
+/** What `mergeReviewed` did, for the caller that reports it and the one that acts on it. */
+interface MergeReport {
+  /**
+   * True when the council's landing sequence ran without failing. NOT "the change is on the
+   * default branch": an enqueued pull request counts here, because nothing failed — read
+   * `landed` for what actually happened to each one.
+   */
+  readonly merged: boolean;
+  /** Every pull request acted on, in `spec.repos` order, with what happened to it. */
+  readonly landed: readonly LandedPullRequest[];
+  /** One sentence for the human, naming queued pull requests as queued. */
+  readonly note: string;
+}
+
 export interface SessionRunner {
   /**
    * Runs one session and returns why it stopped. Never mutates task state.
@@ -451,6 +465,34 @@ const ordered = (
     return index === -1 ? repos.length : index;
   };
   return [...prs].sort((a, b) => rank(a) - rank(b));
+};
+
+/**
+ * The journal entry for a remediation task that finished WITHOUT its alert being re-checked
+ * (DESIGN.md §20), or nothing when there is nothing to explain.
+ *
+ * The only case today is a fix the reviewer enqueued rather than merged. A queue runs the
+ * change's own checks against a speculative base and can still reject it, so there is no
+ * instant to time a settle window from and nothing yet on the default branch to have fixed
+ * the incident. Holding the task would park a working change; reporting a clear would be a
+ * guess.
+ *
+ * So it says neither, and it says that out loud. Absence of evidence is not evidence: a task
+ * that finishes with no verdict has to record that none was reached, or a skipped check reads
+ * exactly like the silence §20 exists to remove.
+ */
+const reverificationSkipped = (spec: TaskSpec, merge: MergeReport): string | undefined => {
+  if (spec.kind !== "remediation") return undefined;
+  if (!merge.landed.some((one) => one.outcome === "queued")) return undefined;
+
+  return (
+    "**The alert was NOT re-verified.** The fix went into the repository's merge queue " +
+    "rather than onto the default branch, so there is no merged change to check the alert " +
+    "against yet (DESIGN.md §20).\n\nThis is not a clear and not a failure: nobody knows " +
+    "whether the alert stopped. Watch the alert: this task is closed, and " +
+    "`ALERT-<fingerprint>` dedup means a re-fire of this exact alert finds this task " +
+    "rather than opening another one."
+  );
 };
 
 /**
@@ -2381,11 +2423,21 @@ export class Supervisor {
         // the alert stopped — and a task recorded as done is one nothing revisits. `held`
         // being false is the ordinary case for every other kind of task, and for a
         // remediation task whose record is gone; both finish exactly as they always did.
-        if (merge.merged && (await this.holdForReverification(lease, spec, reviewed.state))) {
+        if (
+          merge.merged &&
+          (await this.holdForReverification(lease, spec, reviewed.state, merge.landed))
+        ) {
           return true;
         }
 
+        // In the SAME unit as the transition, so a task recorded as done and the reason
+        // nobody re-verified it are one commit. Nothing at all for every task that is not a
+        // remediation task with an unlanded fix.
+        const skipped = reverificationSkipped(spec, merge);
         await this.unit(async () => {
+          if (skipped !== undefined) {
+            await store.appendJournal(spec.id, reviewed.state.sessions, skipped);
+          }
           await this.transition(lease, reviewed.state, "done");
           await this.push(lease, `chore(${spec.id}): done`);
         });
@@ -2958,20 +3010,21 @@ export class Supervisor {
    * PR, and GitHub will not let an author approve their own — so a merge attempt from it
    * is refused by the very branch protection that makes review meaningful (§9.1).
    */
-  private async mergeReviewed(
-    spec: TaskSpec,
-    state: TaskState,
-  ): Promise<{ readonly merged: boolean; readonly note: string }> {
+  private async mergeReviewed(spec: TaskSpec, state: TaskState): Promise<MergeReport> {
     const { reviewers, logger } = this.deps;
 
     const prs = taskPullRequests(spec.repos, state);
     if (prs.length === 0) {
-      return { merged: false, note: "No PR was recorded, so nothing was merged." };
+      return { merged: false, landed: [], note: "No PR was recorded, so nothing was merged." };
     }
 
     const factory = reviewers?.get(spec.workspace);
     if (factory === undefined) {
-      return { merged: false, note: "No reviewer identity is configured — merging is yours." };
+      return {
+        merged: false,
+        landed: [],
+        note: "No reviewer identity is configured — merging is yours.",
+      };
     }
 
     const forge = await factory.forTask(spec);
@@ -3007,6 +3060,7 @@ export class Supervisor {
 
       return {
         merged: true,
+        landed,
         note:
           untouched.length === 0
             ? note
@@ -3027,6 +3081,7 @@ export class Supervisor {
       const done = mergeNote(landed);
       return {
         merged: false,
+        landed,
         note:
           done === undefined
             ? `Could not merge: ${reason}`
@@ -3082,6 +3137,12 @@ export class Supervisor {
    * other kind of task, and for a remediation task with no alert record to read — both of
    * which finish exactly as they always did.
    *
+   * False as well when the fix was only ENQUEUED. A queued pull request is not on the
+   * default branch — the queue runs its own checks against a speculative base and can still
+   * reject it — so a window timed from now would run out while the fix was still on its way
+   * and park a change that works. The caller says so in the journal instead: see
+   * `reverificationSkipped`.
+   *
    * The hold is `ready` plus a filter in `claimUpTo`, not a new status, and the reason is
    * blast radius: a seventh `TaskStatus` would touch the web view, the slash commands, the
    * digest ordering, the snapshot ranking, the worktree live set and `isTerminal`, none of
@@ -3093,9 +3154,11 @@ export class Supervisor {
     lease: LeaseHandle,
     spec: TaskSpec,
     state: TaskState,
+    landed: readonly LandedPullRequest[],
   ): Promise<boolean> {
     const { store, logger } = this.deps;
     if (spec.kind !== "remediation") return false;
+    if (landed.some((one) => one.outcome === "queued")) return false;
 
     // From the policy as it stands now, because this is the moment the window is chosen and
     // written down. `settle` later reads it back off the record rather than re-reading the
