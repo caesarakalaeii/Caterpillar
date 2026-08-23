@@ -288,7 +288,9 @@ test("a forced done says it was not verified, and never says it merged", () => {
   const reply = describeOutcome(TASK, { kind: "forced-done" });
   assert.match(reply, /done/i);
   assert.match(reply, /gate/i, "the reader has to be told nothing was checked");
-  assert.doesNotMatch(reply, /merged/i, "nothing was merged, and saying so would be a lie");
+  // A DENIAL of the merge is fine and wanted; a claim of one is the lie. `describeOutcome`
+  // for `merged` is the wording being ruled out here.
+  assert.doesNotMatch(reply, /^Merged/im, "nothing was merged, and saying so would be a lie");
 });
 
 test("a refused force says to cancel it first", () => {

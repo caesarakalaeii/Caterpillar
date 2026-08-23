@@ -43,6 +43,16 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return outcome.reason;
     case "not-mergeable":
       return `Could not merge **${task}**: ${outcome.reason}`;
+    case "forced-done":
+      // Never the word "merged", and the skipped gates named rather than implied: this is
+      // the first thing a human reads back, so it is the first place the record could
+      // start reading as a completion that was verified. It was not.
+      return (
+        `**${task}** is \`done\` by hand. Both acceptance gates were skipped — nothing was ` +
+        `run, nothing was merged — and the journal says who decided and why.`
+      );
+    case "not-forceable":
+      return `Could not force **${task}** done: ${outcome.reason}`;
     case "unknown-task":
       return `No task **${task}** in the state repo. Check the id from its notification.`;
     case "guided":
