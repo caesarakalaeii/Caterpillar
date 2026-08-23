@@ -630,6 +630,34 @@ const evidenceVerifier = (
     evidence: { store: evidence, dir: () => evidenceDir },
   });
 
+/**
+ * A branch that no longer merges (DESIGN.md §12).
+ *
+ * Reported HERE rather than left to the council's merge. Both gates passing and then the
+ * merge failing is a terminal-looking failure caused by ordinary drift, arriving at the
+ * one point in the task where nothing is left to fix it.
+ */
+const conflictVerifier = (
+  worktree: string,
+  bindings: WorkspaceBindings,
+  conflicts: Awaited<ReturnType<WorktreeManager["conflictsWithBase"]>>,
+): AcceptanceVerifier =>
+  new AcceptanceVerifier({
+    worktrees: {
+      ensureWorktree: () => Promise.resolve(worktree),
+      defaultBranch: () => Promise.resolve("main"),
+      conflictsWithBase: () => Promise.resolve(conflicts),
+    } as unknown as WorktreeManager,
+    bindings,
+    toolchain: new ToolchainResolver({
+      logger: SILENT_LOGGER,
+      config: DEFAULT_TOOLCHAIN_CONFIG,
+      tasksDir: worktree,
+      identity: TEST_IDENTITY,
+      baseEnv: { PATH: process.env["PATH"] ?? "/usr/bin:/bin" },
+    }),
+  });
+
 test("a gate is told where to leave evidence", async () => {
   const worktree = await scratch();
   const dir = join(await scratch(), "evidence");
@@ -752,4 +780,44 @@ test("a verifier with no evidence collaborator behaves exactly as before", async
   const result = await verifier.verify(specWith(['test -z "$CATERPILLAR_EVIDENCE_DIR"']), state);
 
   assert.equal(result.detail, NO_PR);
+});
+
+/* a branch that no longer merges into its base (DESIGN.md §12.3) */
+
+test("a branch that no longer merges fails the gate, naming the files", async () => {
+  const worktree = await scratch();
+  const { bindings } = ciForge({});
+  const result = await conflictVerifier(worktree, bindings, {
+    tree: "abc123",
+    files: [{ path: "src/forge/types.ts", hunks: 3 }],
+  }).verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /src\/forge\/types\.ts/);
+  // Not `pending`: nothing settles by waiting, and the next session has real work to do.
+  assert.notEqual(result.pending, true);
+});
+
+test("a branch that merges cleanly passes the gate as before", async () => {
+  const worktree = await scratch();
+  const { bindings } = ciForge({});
+  const result = await conflictVerifier(worktree, bindings, undefined).verify(
+    specWith(["true"]),
+    stateWithPr,
+  );
+
+  assert.equal(result.passed, true, result.detail);
+});
+
+test("a mergeability question git could not answer does not fail the gate", async () => {
+  // Same rule the merge-queue detection follows: an unanswerable question must not be
+  // what stops a change that passed everything else.
+  const worktree = await scratch();
+  const { bindings } = ciForge({});
+  const result = await conflictVerifier(worktree, bindings, "unknown").verify(
+    specWith(["true"]),
+    stateWithPr,
+  );
+
+  assert.equal(result.passed, true, result.detail);
 });
