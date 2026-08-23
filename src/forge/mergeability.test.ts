@@ -38,6 +38,7 @@ test("the note names what merged and what is only queued", () => {
     { slug: "acme/gateway", pr: 7, outcome: "merged" },
     { slug: "acme/extension", pr: 3, outcome: "queued" },
   ]);
+  assert.ok(note !== undefined);
   assert.match(note, /acme\/gateway#7/);
   assert.match(note, /acme\/extension#3/);
   assert.match(note, /queue/i);
@@ -45,12 +46,14 @@ test("the note names what merged and what is only queued", () => {
 
 test("a note for one merged pull request does not talk about queues", () => {
   const note = mergeNote([{ slug: "acme/gateway", pr: 7, outcome: "merged" }]);
+  assert.ok(note !== undefined);
   assert.match(note, /merged/i);
   assert.doesNotMatch(note, /queue/i);
 });
 
 test("a note for a single queued pull request says the merge has not happened", () => {
   const note = mergeNote([{ slug: "acme/gateway", pr: 7, outcome: "queued" }]);
+  assert.ok(note !== undefined);
   assert.match(note, /queue/i);
   // "in queue" is its own state — reporting it as merged is the failure mode this exists
   // to prevent, because a human reading "merged" stops watching.
@@ -109,7 +112,7 @@ test("a path git listed but nobody could count is reported without a hunk count"
     code: 1,
     stdout: "abc123\n100644 def456 1\tREADME.md\n",
   });
-  assert.deepEqual(conflicts?.files, [{ path: "README.md" }]);
+  assert.deepEqual(conflicts, { tree: "abc123", files: [{ path: "README.md" }] });
 });
 
 test("a merge-tree that could not run at all reports nothing rather than a clean tree", () => {
