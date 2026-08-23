@@ -43,7 +43,7 @@ export const madeProgress = (evidence: ProgressEvidence): boolean =>
  * How many characters of an oid the journal shows. Git's own default abbreviation, so the
  * line can be pasted straight into a `git show` and matches the `git log` a human runs.
  */
- const ABBREVIATED_OID = 7;
+const ABBREVIATED_OID = 7;
 
 /**
  * The journal's sentence about what a session left on the task branch — zero lines or one,
