@@ -3108,6 +3108,27 @@ the streak, because it is the record of why the task parked, but the gauge stops
 there is a session to measure. Removed rather than zeroed: 0 is a real reading, meaning a
 task that is making progress.
 
+**And removing it in `transition` alone was not enough, because the gauge is per-process
+and tasks are not.** `transition` runs in whichever process performed the terminal
+transition; the sample lives in that process's registry. A task migrates between replicas
+across sessions — 19 tasks in the state repo carry journal shards written by two to four
+different runners — so the pod that published the streak is routinely not the pod that
+finishes the task. Pod A hands off at streak 2, pod B takes the task `done` and removes the
+series from its own registry where nothing ever set it, and pod A goes on reporting 2 until
+somebody restarts it. The rule does not aggregate over `pod`, so one orphan is enough to
+keep `CaterpillarTaskThrashing` firing about merged work. `survey` therefore drops the
+series for every task it reads as terminal: it is the one pass that reads every task's
+committed state on every poll in **every** replica, which is the same property that makes
+the fleet presence it publishes fleet-wide. `transition`'s removal is kept as the fast path
+for the common case, where the pod that finishes a task is the pod that was running it.
+
+This is what fired on `BS-1540288291008684052-02` on 2026-08-21, and the task itself was
+fine: session 1 committed all three commits, sessions 2 and 3 committed nothing because
+there was nothing left to commit, and session 3's completion claim passed the gate and the
+council and merged. The streak of 2 was truthful, the task never parked, and the alert then
+fired for 36 hours — on a pod whose image predated the `transition` fix by 28 hours, which
+is the other lesson: a metrics fix does nothing until it is rolled out.
+
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
 exists — the point the task branch forked from. Both halves are load-bearing:
