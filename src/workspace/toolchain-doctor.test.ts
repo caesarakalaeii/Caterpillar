@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_TOOLCHAIN_CONFIG } from "./toolchain.ts";
 import {
+  DEFAULT_DOCTOR_TIMEOUT_SECONDS,
   nearestPackage,
   packageCheckExpression,
   ToolchainDoctor,
@@ -68,6 +69,26 @@ const fakeNix = (attributes: readonly string[]): NixEval => ({
       candidates: attributes,
     };
   },
+});
+
+test("the evaluation is bounded by the doctor's own timeout, not the build timeout", async () => {
+  // `ToolchainConfig.timeoutSeconds` is 900 and bounds a BUILD. Intake runs every labelled
+  // item on one thread of control, so waiting 15 minutes for a cold evaluation would stall
+  // the whole pass behind one item's environment.
+  assert.ok(
+    DEFAULT_DOCTOR_TIMEOUT_SECONDS < DEFAULT_TOOLCHAIN_CONFIG.timeoutSeconds,
+    "the doctor must not inherit the build timeout",
+  );
+
+  let handed: number | undefined;
+  const nix: NixEval = {
+    async evaluate(_expression, timeoutMs) {
+      handed = timeoutMs;
+      return { kind: "answered", missing: [], candidates: [] };
+    },
+  };
+  await new ToolchainDoctor({ config, nix }).fault({ mode: "nix", packages: ["jq"] });
+  assert.equal(handed, DEFAULT_DOCTOR_TIMEOUT_SECONDS * 1000);
 });
 
 test("a toolchain whose packages all resolve is not a fault", async () => {
