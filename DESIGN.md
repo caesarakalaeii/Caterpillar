@@ -830,6 +830,13 @@ is never committable, and reaped with the task rather than accumulating on the w
 A failed spill does not fail the command — the bounded view is still correct, and the note
 says plainly that the rest is gone.
 
+Known limitation: one file per bounded command accumulates for the LIFE of the task, and
+`removeTaskWorktrees` deliberately does not reap on handoff or `awaiting-human` — so a
+long-lived task that greps widely every session grows the directory without a cap. Usage
+accounting does see it, since it measures `paths.tasks`, so this shows up as disk pressure
+rather than as a silent leak. Left alone here because capping the directory means changing
+when the reaper runs, which is the supervisor's concern and not this ceiling's.
+
 **It is applied to the STREAM, not to the return value.** This is the part that would have
 been got wrong. pi's bash tool reads `env.exec`'s `onStdout`/`onStderr` callbacks and
 ignores the `stdout` it returns, so bounding the return value alone leaves the model's own
