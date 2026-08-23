@@ -236,6 +236,54 @@ property of every task on the repo, not of one invocation — and because `confi
 every worktree create *and* reuse, mirrors already on a PVC are healed the next time a task
 touches them.
 
+#### A session starts at the tip of its own pushed branch, or does not start
+
+The two rules above are both about not letting a mirror fetch clobber a checked-out branch,
+and together they left a hole: **nothing ever brought a pushed `agent/<task>` back onto a
+runner.** `^refs/heads/agent/*` excludes those refs from every fetch, so a runner that has
+never seen a task's branch never learns it exists, and `addWorktreeLocked` then creates the
+branch from the mirror's default branch. It also skips the fetch entirely when the worktree
+already exists, so a local ref that has fallen behind is not corrected either.
+
+Starting on the base is *indistinguishable, from inside the worktree, from a task nobody has
+touched* — so the session does the task again. GH-96 did exactly that: sessions 2-3 pushed 18
+commits, sessions 4-7 started on `main`, and session 7 re-implemented the whole task. It found
+out when `git push` was refused as non-fast-forward, by which point two complete, independently
+written implementations of one task were on the remote and a human had to pick one. GH-95 hit
+the same reset a week earlier and recovered its commits from `refs/pull/111/head`.
+
+Rule: **if `origin/agent/<task>` exists, the session's worktree is at its tip or the session
+refuses to start.** `WorktreeManager.ensureSessionCheckout` is `ensureTaskCheckout` plus one
+reconciliation per declared repo — fetch the remote tip, and either the worktree already
+contains it, or fast-forward onto it, or throw. A silent start behind it is the one outcome
+that is not reachable.
+
+Three details are load-bearing:
+
+- **It is a separate entry point, and the difference is the network.** The progress probe, the
+  verifier, the review council and the plan maintainer all check out the same task *after* the
+  session, hence after `clearActive()`, where the credential service refuses to answer by
+  design (§9.2). A fetch there fails on every private repo and takes verification down with
+  it — which is why `addWorktreeLocked` skips its own fetch on an existing worktree in the
+  first place. Only the session-start path holds a live credential lease, so only it
+  reconciles.
+- **Divergence throws rather than picking a side.** Local commits the remote lacks *and*
+  remote commits the local branch lacks cannot both be kept by moving a ref. Discarding the
+  remote re-creates GH-96; discarding the local destroys a session's unpushed work. The error
+  names the branch and both oids and reaches `parkFailed`, so a human reconciles. The advance
+  is `merge --ff-only`, not `reset --hard`, so an interrupted session's uncommitted files make
+  the session refuse instead of vanishing.
+- **`--refmap=` on the fetch is not cosmetic.** Omitting the destination half of the refspec is
+  not enough in a mirror: git still applies the configured `+refs/*:refs/*` as an
+  opportunistic update, resolves the destination to `refs/heads/agent/<task>`, and dies with
+  the same `refusing to fetch into branch ... checked out at` that this whole section is
+  about. The empty refmap disables opportunistic updates, so the fetch writes only
+  `FETCH_HEAD`. It runs under the mirror lock like every other mirror-mutating operation
+  (§6.4), because `FETCH_HEAD` lives in the common directory and is not per-worktree.
+
+The other half of GH-96 is §11.1: the journal entry now states what is on the branch, so a
+resumed session is *told* rather than left to infer it from a worktree.
+
 #### Worktrees are reaped, because they are what actually grows
 
 A mirror is fetched incrementally and its size tracks the repository's history. A worktree
@@ -3194,6 +3242,30 @@ The fork point is resolved locally (`merge-base` against the mirror's default br
 because the probe runs after the session's credential lease is closed, and the credential
 service then refuses to answer for that task by design (§9.2) — anything touching the
 network fails.
+
+**The probe also counts the branch's commits, and the journal entry states them.** That
+count is the *standing total* from the fork point, not this session's delta, and the
+difference is the entire point. GH-96's sessions 4-7 each added nothing while 18 commits
+sat on the branch, and each journalled "without a control-plane decision" and no more — so
+the journal session 7 read reported that nothing had ever happened. It believed the journal
+and implemented the whole task a second time. `recordSession` now writes a line above the
+agent's summary naming the branch, the count and the abbreviated tip, and writes it whatever
+the exit reason was.
+
+Three things about that line:
+
+- **It comes from the probe, never from the summary.** The summary is precisely what a
+  session killed by context exhaustion or a crash fails to write, and the only part of the
+  entry that can be wrong about the repository.
+- **It says "on the branch", not "pushed".** The probe runs with no credential and the mirror
+  keeps no remote-tracking ref for `agent/*` (§2), so this runner cannot check the remote at
+  that point and must not claim to have. Naming the branch is what makes the line actionable
+  anyway, and with §2's start-at-the-tip invariant in place what is on the branch is
+  everything that was pushed.
+- **A count it could not take produces no line at all.** `commitsSince` answers with nothing
+  rather than throwing on a base the worktree does not carry, so absent has to stay
+  distinguishable from zero: "0 commits" asserted into the entry of every session that only
+  read code is both wrong and loud enough to bury the case this exists for.
 
 **The detector measures sessions; it cannot tell you whether the session should have
 run.** `BS-…-07` parked on 2026-08-18 with a streak of 3, and the probe was right about
