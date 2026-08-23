@@ -163,6 +163,12 @@ export const effectFileName = (requestId: string): string => {
  * shape this repo has met before (§14.2's rejections), and an undated record is by
  * definition older than anything the current deploy wrote — keeping it in preference to a
  * dated one would make the cap unable to evict its oldest entries at all.
+ *
+ * The request id breaks a tie on `at`, which is stamped to the millisecond and so ties
+ * whenever a session records several verbs in quick succession. Which of two equally old
+ * records is evicted does not matter — neither is a plausible replay target — but a rule
+ * that cannot say what it deletes cannot be tested, so the order is total rather than
+ * whatever `Array.prototype.sort` happens to do with the ties.
  */
 export const prunableEffects = (records: readonly EffectAge[]): readonly string[] => {
   if (records.length <= EFFECTS_KEPT) return [];
@@ -184,6 +190,14 @@ export interface EffectAge {
   readonly at?: string;
 }
 
-/** ISO timestamps sort chronologically as strings; anything unusable sorts first. */
-const sortKey = (record: EffectAge): string =>
-  typeof record.at === "string" && record.at !== "" ? record.at : "";
+/**
+ * ISO timestamps sort chronologically as strings; anything unusable sorts first.
+ *
+ * The request id is appended so records stamped the same millisecond have a defined order.
+ * `\n` separates the two halves because it is below every character an ISO timestamp or a
+ * request id can contain, so a short key can never sort into the middle of a longer one.
+ */
+const sortKey = (record: EffectAge): string => {
+  const at = typeof record.at === "string" && record.at !== "" ? record.at : "";
+  return `${at}\n${record.requestId}`;
+};
