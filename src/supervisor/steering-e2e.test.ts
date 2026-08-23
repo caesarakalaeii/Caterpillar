@@ -177,6 +177,7 @@ const world = async (tasks: readonly TaskState[]): Promise<World> => {
       housekeepingSeconds: 1,
       secretsDir: join(root, "secrets"),
       digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+      schedule: { enabled: false },
       cluster: {
         enabled: false,
         namespaces: [],

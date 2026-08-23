@@ -1630,3 +1630,193 @@ test("state.json is replaced atomically, so a concurrent reader never sees half 
   await Promise.all([...readers, writers]);
   assert.equal(torn, undefined, `a reader saw a partial file: ${String(torn)}`);
 });
+
+test("listSchedules reads every schedule, and one bad file costs only itself", async () => {
+  // The whole point of one file per schedule (§22): a fleet with four schedules and one
+  // typo must keep firing the other three. A single document could not do that.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "schedules"), { recursive: true });
+
+  const write = (name: string, body: string): Promise<void> =>
+    writeFile(join(root, "schedules", name), body, "utf8");
+
+  const good = [
+    "version: 1",
+    "trigger:",
+    '  cron: "0 9 * * 1-5"',
+    "  timezone: Europe/Berlin",
+    "workspace: primary",
+    "repos:",
+    "  - github.com/acme/widget",
+    "prompt: audit the dependencies",
+    "acceptance:",
+    "  - npm test",
+    "",
+  ].join("\n");
+
+  await write("deps-audit.yaml", good);
+  await write("stale-branches.yaml", good.replace("0 9 * * 1-5", "0 7 * * 1"));
+  await write("broken.yaml", good.replace("acceptance:", "acceptence:"));
+  // Not a schedule at all, and not an error either: an operator's notes must not read as
+  // a malformed schedule.
+  await write("README.md", "these are the schedules\n");
+
+  const listed = await subject.listSchedules();
+
+  assert.deepEqual(
+    listed.schedules.map((schedule) => schedule.id),
+    ["deps-audit", "stale-branches"],
+  );
+  assert.equal(listed.errors.length, 1);
+  assert.equal(listed.errors[0]?.schedule, "broken");
+  assert.match(listed.errors[0]?.message ?? "", /unknown key/);
+});
+
+test("a state repo with no schedules/ has no schedules and no errors", async () => {
+  // The housekeeping loop calls this every pass and most state repos have never heard of
+  // schedules — a throw there would log a failure every thirty seconds (§20's reasoning
+  // for a missing `alerts/policy.yaml`, verbatim).
+  const subject = await store();
+
+  assert.deepEqual(await subject.listSchedules(), { schedules: [], errors: [] });
+});
+
+test("a file name that is not a schedule id is refused rather than read", async () => {
+  // The name becomes a task id and a git ref component, and it is read off a directory
+  // listing — so a file somebody dropped in by hand must not become either.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "schedules"), { recursive: true });
+  await writeFile(join(root, "schedules", "not a schedule.yaml"), "version: 1\n", "utf8");
+
+  const listed = await subject.listSchedules();
+
+  assert.deepEqual(listed.schedules, []);
+  assert.equal(listed.errors.length, 1);
+  assert.match(listed.errors[0]?.message ?? "", /identifier/);
+});
+
+test("an occurrence record persists, and says which schedule and instant it is about", async () => {
+  // The ledger is what makes a SKIPPED occurrence visible. A precheck that never passes
+  // is otherwise indistinguishable from a schedule nobody is polling.
+  const subject = await store();
+
+  assert.equal(await subject.readScheduleRecord("deps-audit", "2026-08-17T0700Z"), undefined);
+
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "precheck exited 1",
+  });
+
+  const record = await subject.readScheduleRecord("deps-audit", "2026-08-17T0700Z");
+  assert.equal(record?.outcome, "skipped");
+  assert.equal(record?.detail, "precheck exited 1");
+  assert.ok(!Number.isNaN(Date.parse(record?.at ?? "")), "it carries a parseable timestamp");
+
+  assert.deepEqual((await subject.listScheduleRecords()).map((r) => r.occurrence), [
+    "2026-08-17T0700Z",
+  ]);
+});
+
+test("a schedule id or occurrence that is not one is never joined into a path", async () => {
+  // Both halves of the file name are checked, not trusted: `..` is a legal directory name
+  // that resolves out of `schedules/`.
+  const subject = await store();
+
+  for (const [schedule, occurrence] of [
+    ["../escape", "2026-08-17T0700Z"],
+    ["deps-audit", "../../etc/passwd"],
+    ["deps-audit", "not-an-occurrence"],
+  ] as const) {
+    await assert.rejects(
+      subject.writeScheduleRecord(schedule, occurrence, {
+        schedule,
+        occurrence,
+        outcome: "skipped",
+      }),
+      /cannot be filed/,
+      `'${schedule}' / '${occurrence}' must be refused`,
+    );
+    assert.equal(await subject.readScheduleRecord(schedule, occurrence), undefined);
+  }
+});
+
+test("open tasks are counted per schedule using the one notion of terminal", async () => {
+  // `maxOpenTasks` exists so a weekly audit whose last task is still in review does not
+  // open a second one saying the same thing — `countOpenAlertTasks`'s rule (§20), applied
+  // to a schedule, and counted from the task tree rather than from the ledger so a task
+  // deleted by hand frees its slot.
+  const subject = await store();
+
+  const task = async (id: string, status: TaskState["status"]): Promise<void> => {
+    await subject.writeState({
+      id: asTaskId(id),
+      status,
+      phase: "implementing",
+      requires: [],
+      sessions: 0,
+      limits: { maxSessions: 20 },
+      usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+      progress: { lastProgressSession: 0, noProgressStreak: 0 },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  await task("SCHED-deps-audit-2026-08-17T0700Z", "running");
+  await task("SCHED-deps-audit-2026-08-18T0700Z", "ready");
+  await task("SCHED-deps-audit-2026-08-19T0700Z", "done");
+  await task("SCHED-deps-audit-2026-08-20T0700Z", "parked");
+  await task("SCHED-stale-branches-2026-08-17T0500Z", "running");
+
+  assert.equal(await subject.countOpenScheduleTasks("deps-audit"), 2);
+  assert.equal(await subject.countOpenScheduleTasks("stale-branches"), 1);
+  assert.equal(await subject.countOpenScheduleTasks("nothing-here"), 0);
+});
+
+test("commitAndPush stages occurrence records, and pull sweeps unpushed ones", async () => {
+  // The alert rule (§20) applied to the schedule ledger. Without `schedules` in the
+  // `git add` list a record is written locally and never pushed, so a deploy loses the
+  // fleet's account of what fired. Without it in the `git clean` list a record whose
+  // commit never landed says "settled" on this runner and nowhere else — and the operator
+  // reading `/intake` on another runner sees an occurrence that never happened.
+  const { store: subject, bare, other, root } = await sharedStateRepo();
+
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "precheck exited 1",
+  });
+  await subject.commitAndPush("chore(schedules): record an occurrence", "origin", "main");
+
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^schedules\/occurrences\/deps-audit-2026-08-17T0700Z\.json$/m);
+
+  // Force the reset path with a record on disk that reached no commit. The other clone
+  // has to move main first, or nothing needs resetting.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  const orphan = join(root, "schedules", "occurrences", "deps-audit-2026-08-18T0700Z.json");
+  // Written PAST the store, like the alert case: going through `writeScheduleRecord`
+  // would mark the tree dirty and the pull would correctly decline.
+  await writeFile(
+    orphan,
+    '{"schedule":"deps-audit","occurrence":"2026-08-18T0700Z","outcome":"fired"}\n',
+    "utf8",
+  );
+
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.equal(
+    existsSync(orphan),
+    false,
+    "an unpushed occurrence record must not outlive the branch it was written on",
+  );
+  assert.ok(
+    existsSync(join(root, "schedules", "occurrences", "deps-audit-2026-08-17T0700Z.json")),
+    "the pushed one is tracked, so the sweep leaves it alone",
+  );
+});

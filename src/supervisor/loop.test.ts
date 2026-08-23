@@ -204,6 +204,7 @@ const config: RunnerConfig = {
   // No web view in the loop's tests: these exercise the supervisor, and a listening
   // socket per fixture is a port collision waiting for a parallel run.
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  schedule: { enabled: false },
   cluster: {
     enabled: false,
     namespaces: [],
@@ -3481,7 +3482,14 @@ test("intake keeps running while a session holds the runner", async () => {
     intake: {
       ingest: () => {
         passes += 1;
-        return Promise.resolve({ seen: 0, created: 0, rejected: 0, failed: 0 });
+        return Promise.resolve({
+          seen: 0,
+          created: 0,
+          rejected: 0,
+          failed: 0,
+          schedules: 0,
+          schedulesInvalid: 0,
+        });
       },
     },
   });
@@ -5211,6 +5219,56 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
 
   await retire(WAITING);
   await retire(RUNNING);
+});
+
+test("scheduled work is fired from the housekeeping loop, and a failing pass is not fatal", async () => {
+  // The schedule runs on the housekeeping loop (§22) — no new listener, no new port, no
+  // new Deployment. Two properties matter: it is reached on an ordinary pass, and it can
+  // never be the reason the loop stops. `ScheduleRunner` already swallows its own failures
+  // and hands its claims back; this is for the one thing it cannot handle, itself throwing.
+  const calls: Date[] = [];
+  const schedule = {
+    maybeFire: (now: Date): Promise<never> => {
+      calls.push(now);
+      return Promise.reject(new Error("the state repo rejected the push"));
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    schedule,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && calls.length < 2) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    calls.length >= 2,
+    `the loop must keep housekeeping after a schedule pass throws — it called it ${calls.length} time(s)`,
+  );
 });
 
 test("a rejected claim still pushes the evidence its gate published", async () => {

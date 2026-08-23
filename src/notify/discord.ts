@@ -141,6 +141,23 @@ export type Notification =
       readonly severity?: string;
     }
   /**
+   * A schedule's occurrence became a task (DESIGN.md §22). The intake notification of the
+   * sixth path onto the channel: work nobody typed appeared, so the channel is where anyone
+   * finds out it did.
+   *
+   * A SKIPPED occurrence is deliberately not notified. A precheck that says "nothing to
+   * audit" is the normal case for a schedule worth having, and a message per occurrence per
+   * schedule would make the channel a cron log — which is what the ledger under
+   * `schedules/occurrences/` and the `/intake` page are for.
+   */
+  | {
+      readonly kind: "schedule-task";
+      readonly task: TaskId;
+      readonly schedule: string;
+      /** `YYYY-MM-DDTHHMMZ`, so a reader can tell which morning this is about. */
+      readonly occurrence: string;
+    }
+  /**
    * A firing alert was declined, and this is the ONE message about it.
    *
    * Sent once per alert per reason, never once per delivery: Alertmanager re-sends a firing
@@ -657,6 +674,9 @@ export const componentsFor = (
     // pressing anything here.
     case "alert-task":
     case "alert-refused":
+    // Nor is a scheduled task: nobody typed it, so there is nothing here anyone is waiting
+    // to answer. It is claimed, sessioned and reviewed like every other task.
+    case "schedule-task":
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -796,6 +816,13 @@ const frame = (notification: Notification, hint: boolean): string => {
         `🔔 **${notification.alertname}** is firing — created \`${task}\`` +
         `${notification.severity === undefined ? "" : ` (severity ${notification.severity})`}.\n` +
         `It is queued like any other task and ends in a pull request; nothing touches the cluster.`
+      );
+    case "schedule-task":
+      return (
+        `🗓️ Schedule **${notification.schedule}** fired for ${notification.occurrence} — ` +
+        `created \`${task}\`.\n` +
+        `Nobody typed it. It is claimed, sessioned and gated like any other task; if there ` +
+        `turns out to be nothing to do, the session says so instead of opening a pull request.`
       );
     case "provider-unavailable":
       return fit(notification.detail, (text) =>

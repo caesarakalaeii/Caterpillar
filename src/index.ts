@@ -19,6 +19,8 @@ import { CredentialService } from "./credential/service.ts";
 import { MirrorChangeReader } from "./digest/changes.ts";
 import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
+import { schedulePrecheck } from "./schedule/precheck.ts";
+import { ScheduleRunner } from "./schedule/run.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import { mergedCatalog } from "./forge/catalog.ts";
 import type { RepoCatalog } from "./forge/reach.ts";
@@ -330,6 +332,17 @@ const main = async (): Promise<void> => {
     ...(credentialStore(config.llm, logger) ?? {}),
   });
 
+  const scheduler = createScheduler({
+    config,
+    store,
+    leases,
+    worktrees,
+    toolchain,
+    notifier: discord.notifier,
+    metrics,
+    logger,
+  });
+
   const digester = createDigest({
     config,
     git,
@@ -373,6 +386,7 @@ const main = async (): Promise<void> => {
     store,
     leases,
     ...(digester === undefined ? {} : { digest: digester }),
+    ...(scheduler === undefined ? {} : { schedule: scheduler }),
     chat,
     runner: new AgentSessionRunner({
       config,
@@ -568,6 +582,57 @@ const main = async (): Promise<void> => {
     // that hangs (`IoRedisClient.close`).
     await plane.close().catch((error: unknown) => logger.warn("redis.close-failed", errorFields(error)));
   }
+};
+
+/**
+ * Build the scheduled-work runner, if this runner was told to fire schedules (DESIGN.md §22).
+ *
+ * Off by default, like the digest and for the digest's reason: firing an occurrence writes
+ * tasks into the shared state repo, and a runner someone starts on a workstation must not
+ * begin doing that because it was upgraded. The claim protocol makes a second firing runner
+ * harmless, not welcome.
+ *
+ * The precheck runner is always supplied when this is built, and that is deliberate rather
+ * than incidental: a schedule that declares a gate and a runner that cannot run one is a
+ * combination `ScheduleRunner` has to treat as "leave this occurrence alone", which costs an
+ * occurrence and explains nothing. Every runner that fires schedules can run their
+ * prechecks.
+ */
+const createScheduler = (options: {
+  readonly config: RunnerConfig;
+  readonly store: StateStore;
+  readonly leases: LeaseManager;
+  readonly worktrees: WorktreeManager;
+  readonly toolchain: ToolchainResolver;
+  readonly notifier: Notifier;
+  readonly metrics: AgentMetrics;
+  readonly logger: Logger;
+}): ScheduleRunner | undefined => {
+  const { config, logger } = options;
+
+  if (!config.schedule.enabled) {
+    logger.info("schedule.disabled", { reason: "schedule.enabled is false" });
+    return undefined;
+  }
+
+  logger.info("schedule.configured", { runner: config.runnerId });
+
+  return new ScheduleRunner({
+    store: options.store,
+    leases: options.leases,
+    notifier: options.notifier,
+    logger,
+    runner: config.runnerId,
+    branch: config.stateRepo.branch,
+    maxSessionsPerTask: config.limits.maxSessionsPerTask,
+    precheck: schedulePrecheck({
+      worktrees: options.worktrees,
+      toolchain: options.toolchain,
+      logger,
+    }),
+    onSettled: (schedule, outcome) =>
+      options.metrics.schedules.inc({ runner: config.runnerId, schedule, outcome }),
+  });
 };
 
 /**

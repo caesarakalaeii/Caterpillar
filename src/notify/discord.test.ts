@@ -238,6 +238,12 @@ test("every notification kind renders with the task id and its payload", async (
     },
     { kind: "provider-recovered", task: TASK },
     { kind: "alert-task", task: TASK, alertname: "CaterpillarNoProgress", severity: "warning" },
+    {
+      kind: "schedule-task",
+      task: TASK,
+      schedule: "deps-audit",
+      occurrence: "2026-08-17T0700Z",
+    },
   ];
 
   for (const notification of cases) {

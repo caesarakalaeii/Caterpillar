@@ -4002,7 +4002,7 @@ leave the supervisor, because Kubernetes RBAC cannot express "keys but not value
 
 ## 14. Task intake
 
-Five paths, all converging on a `spec.md`:
+Six paths, all converging on a `spec.md`:
 
 1. **GitHub issue** labelled `agent` → ingester renders a spec. (`primary`)
 2. **Vikunja task** labelled `agent` → ingester renders a spec. (`oss`)
@@ -4017,6 +4017,13 @@ Five paths, all converging on a `spec.md`:
    `alerts/policy.yaml`. The entry supplies the workspace, the repos and the acceptance
    commands verbatim — this path synthesises none of them. An unlisted alert is refused
    once, durably, rather than per delivery.
+6. **A clock** — a `schedules/<id>.yaml` in the state repo, fired on the housekeeping loop
+   when its cron expression comes due in its named IANA zone (§22). The second path with no
+   human in it at the moment it fires, and the only one that can decline to spend a session
+   at all: a schedule may declare a **precheck**, a bounded command whose non-zero exit
+   records a skipped occurrence instead of creating a task. Like path 5 it synthesises
+   nothing — the workspace, the repos, the prompt and the acceptance commands are the
+   operator's — and it is off until `schedule.enabled` says otherwise.
 
 Path 5 answers Alertmanager in milliseconds and enqueues in memory; the spec is written on
 the supervisor's own thread of control on the next poll, because the loop owns the state repo
@@ -5329,3 +5336,271 @@ to do about it rather than silently receiving nothing; `applyChatRequests` reads
 drains everything, routing an in-flight cancel to the session in process (§6.4). If a real
 selective pop is ever written, that flag flips and the branch disappears — but the flag
 must never be flipped without it.
+
+---
+
+## 22. Scheduled work
+
+A sixth intake path (§14): **a clock becomes a task**. "Every weekday at 09:00, audit the
+dependency updates in these repos" was not expressible anywhere in the system, and that is
+the shape of a large amount of real unattended work — dependency audits, code-quality
+sweeps, stale-branch cleanup, documentation drift. Every other path starts with somebody
+deciding something is worth doing now: a labelled item, a `/brainstorm`, a hand-committed
+spec, a firing alert. None of them is a calendar.
+
+```
+schedules/deps-audit.yaml  →  next occurrence  →  claim  →  precheck  →  spec.md
+       (state repo)          (pure, clock in)     (ref)     (exit 0?)   (kind: implement)
+                                                              │
+                                                            non-0 → skipped occurrence,
+                                                                    no session spent
+```
+
+Everything after the spec is identical to every other path: it is claimed, sessioned, gated
+by §12 and ends in a pull request.
+
+### It runs on the housekeeping loop and nowhere else
+
+No listener, no port, no second Deployment, no `CronJob`. The supervisor already has a loop
+that runs every `housekeepingSeconds` whether or not a session is in flight (§6.4), and
+"has an occurrence come due" is a question about a checkout this runner already has plus one
+`ls-remote`. A Kubernetes `CronJob` would have been a second scheduler with its own
+credential, its own image tag and no access to the leases; it would also be unable to fire
+for a runner on somebody's desk behind NAT, which the capability system exists to include.
+
+Housekeeping rather than the work loop, for `maybeDigest`'s reason: an occurrence that comes
+due while a session is running must still become a task, and the work loop is blocked for as
+long as the session takes.
+
+### `schedules/<id>.yaml`, one file per schedule
+
+```yaml
+version: 1
+trigger:
+  cron: "0 9 * * 1-5"           # required, five fields
+  timezone: Europe/Berlin       # required, a NAMED IANA zone
+workspace: primary              # required, a known workspace
+repos:                          # required, >= 1, host/owner/name
+  - github.com/acme/widget
+prompt: |                       # required — the goal handed to each session
+  Audit dependency updates across these repos…
+acceptance:                     # REQUIRED, >= 1 command (§12)
+  - npm test
+requires: []                    # optional, from KNOWN_CAPABILITIES
+precheck:                       # optional — the gate below
+  command: "npm outdated --json | grep -q ."
+  timeoutSeconds: 120
+enabled: true                   # optional, default true
+maxOpenTasks: 1                 # optional, default 1
+```
+
+**In the state repo, not this repo and not a ConfigMap**, for the reason §20 gives about
+`alerts/policy.yaml`: adding scheduled work must be a commit to the thing the supervisor
+already polls — reviewable, revertable, live on the next cycle — rather than a redeploy. The
+supervisor never writes one; there is no `writeSchedule`, which is what keeps "what work
+happens unattended" outside the fleet's own reach.
+
+**One file per schedule, unlike the alert policy's single list.** Two reasons, and both are
+about what an operator does with these: a schedule is edited on its own and a diff naming the
+file says which one changed, and a malformed schedule then costs itself alone. A single
+document would make one bad cron expression refuse every schedule in the fleet.
+
+**`acceptance` is required, so a schedule that cannot express machine-checkable completion
+may not exist** (§12). This is not a formality: an unattended task with no completion gate is
+one that accumulates sessions and can never be closed, and nobody is watching it happen.
+
+**`enabled: false` is a state a schedule may be in.** The alternative is deleting the file,
+which loses the prompt and the acceptance commands somebody wrote and makes turning the
+schedule back on a rewrite rather than an edit.
+
+### The cron dialect is the small one
+
+Five fields — minute, hour, day-of-month, month, day-of-week — with `*`, lists, ranges,
+steps and three-letter names. No `@daily`, no seconds field, no `L`, no `#`, no `?`. Each of
+those is a thing an operator would have to learn is supported here and not in the crontab
+they know, and none of them expresses work this fleet does.
+
+Two properties of the dialect are load-bearing and both are tested:
+
+- **`day-of-month` and `day-of-week` are a UNION when both are restricted.** `0 9 1 * 1` is
+  "the first of the month OR every Monday", which is what every cron implementation does and
+  what an author expects. Read as a conjunction it fires roughly a tenth as often, which is
+  the kind of wrong nobody notices for a month.
+- **An expression that can never fire is refused.** `0 9 31 2 *` matches no day of any year.
+  A schedule that silently never runs is indistinguishable from a fleet that is not
+  scheduling at all, so it is refused when the file is committed.
+
+### A named zone, and the occurrence maths is pure
+
+`schedule/occurrence.ts` takes `now` as a parameter and does no IO, exactly like
+`digest/day.ts` — which is what makes a DST boundary a test rather than a thing to wait a
+year for. This subsystem has two of them: a schedule can name an hour the clocks skip and
+an hour they repeat.
+
+A **named IANA zone, never a fixed offset**, for §19's reason inverted: `+02:00` is correct
+for five months of the year and an hour wrong for the other seven, and the wrongness is
+silent — the audit simply starts at 08:00 or 10:00. `isTimeZone` refuses an offset even
+though `Intl` accepts one.
+
+The search runs forward over WALL-CLOCK minutes and converts each candidate to an instant,
+rather than stepping in UTC, because the zone is the authority on what the clocks read. A
+wall-clock minute a spring-forward deleted resolves past the gap and fires once; a minute an
+autumn fall-back repeats yields one instant and fires once.
+
+**Catch-up is bounded twice.** `CATCH_UP_OCCURRENCES` is 1 and `MAX_LATENESS_MS` is six
+hours. The count alone is not a bound: "the previous occurrence" of an hourly schedule is an
+hour old and worth running, while the previous occurrence of a weekly one can be six days
+old, and firing a Monday audit on Saturday evening produces a task nobody asked for against
+a repo that has moved on. Keel rolls this pod on every push to main, so missing ONE
+occurrence is routine; missing five means nobody was home, and waking up to fire seven
+dependency audits at once turns an outage into a mess somebody has to clean up.
+
+### Exactly one runner fires each occurrence
+
+`refs/schedules/<id>/<occurrence>` is created by a compare-and-swap against an empty expected
+value, which exactly one push in the fleet can win — the mechanism §5 proved and §19 reused,
+for the same reason: every runner reaches 09:00 at the same instant and all of them can read
+the whole state repo. Nothing renews it and nothing steals it; an occurrence that has been
+served does not become unserved.
+
+The occurrence's name is the instant **in UTC** (`2026-08-17T0700Z`), not in the schedule's
+own zone. UTC is what makes two runners agree without talking, and it means an operator who
+edits the timezone does not make an occurrence that already fired look unfired.
+
+The ordering is **claim, then create, and release the claim if creating failed**, because the
+two failures are not symmetric. Firing twice is visible: two tasks, two branches, and a human
+who can see both. Firing never is silent: the ref says the occurrence is settled, no task
+exists, and nobody finds out until they wonder why the Monday audit stopped happening.
+
+**A failed CAS is never read as "someone else did it" without checking the ref.** A rejected
+push is also what a dead network looks like, and getting this backwards writes off an
+occurrence nobody fired.
+
+Inside the claim the order is `state.json`, then `spec.md`, then the ledger entry — and that
+last position is forced rather than chosen. A write that throws hands the claim back, and a
+`fired` record already on disk would stop this runner (and only this runner, since the record
+is unpushed) from ever retrying: the record means "settled, no retry needed", which is
+precisely what a released claim is not.
+
+That leaves one residual, stated rather than papered over: a process killed BETWEEN the two
+task writes holds the claim, has written no record, and leaves a task directory the claim loop
+skips because it has no `spec.md`. The occurrence does not fire, and nothing retries it — the
+next occurrence does. It is the narrowest window in the path (two local file writes with no
+network between them) and closing it would need the record and the task to be one atomic
+write, which git does not offer inside a working tree.
+
+Two cheaper, local answers come first, in this order: the occurrence ledger and
+`hasTask`. Both are files in a checkout this runner already has, so an occurrence that has
+already been settled costs no network at all — which matters because the question is asked
+on every housekeeping pass for as long as the occurrence is inside the catch-up window.
+
+### The precheck: a command instead of a session
+
+A bounded command, run in the task's toolchain environment **before a session is started**.
+Exit 0 and the occurrence becomes a task; anything else records a **skipped** occurrence and
+spends no session.
+
+This is the cheap answer to the residual §11.1 admits. Work whose only blocker is external
+state — no dependency updates this week, no stale branches, no drifted docs — currently costs
+a whole session to discover there was nothing to do, and §11.1 then scores that session
+honestly as no progress. Three of those park the task.
+
+It runs in the environment the **session** would have had: the first repo's worktree and the
+toolchain the resolver produces for the same spec (§8.1). A precheck answering from a shell
+without the package manager is not a fact about the repository.
+
+Four rules, each of which was a decision rather than an accident:
+
+- **A timeout is a "no".** The command runs on the housekeeping loop, which the chat drain,
+  intake, the digest and the survey share, so the bound is enforced rather than trusted —
+  and a check that cannot answer within its own budget has not established that there is
+  work. Firing on a timeout would make the slowest possible precheck the one that always
+  passes. `timeoutSeconds` is capped at 600: an operator who wrote an hour meant a session.
+- **A skipped occurrence KEEPS its claim.** The decision has been made; releasing it would
+  have the next pass re-run the command, every pass, until the hour elapsed.
+- **A precheck that could not be RUN releases the claim and records nothing.** "The worktree
+  is not on this volume" or "the flake would not build" is not evidence about the work, and
+  the runner that can answer may not be this one. Same for a schedule that declares a
+  precheck on a runner with no way to run one.
+- **Its output is recorded in the ledger.** A skip with no detail is indistinguishable from a
+  schedule nobody is polling.
+
+The precheck worktree is keyed on the SCHEDULE and not the occurrence
+(`SCHED-<id>-precheck`), so a daily schedule does not clone a fresh tree every morning for a
+check that is meant to be cheap. It is swept like any other orphaned worktree (§3.1).
+
+### `schedules/occurrences/<schedule>-<occurrence>.json`
+
+The ledger. Written for a **fired** occurrence as well as a skipped or refused one, and that
+is what makes the skipped ones legible: "the precheck said no" and "nothing is polling this
+schedule" both produce zero tasks, and only the record separates them.
+
+Durable and pushed rather than in memory, for §14.2's reason verbatim: Keel rolls the pod on
+every push to main, so an in-memory note of "already handled 09:00" is emptied by a deploy.
+Two consequences for `StateStore`, the same pair §20 records for `alerts/`:
+
+- `schedules` is in `commitAndPush`'s staging list. Without it the fleet's account of what
+  fired is written locally and lost on the next deploy.
+- `schedules` is in the reset path's `git clean` list. Without it a record whose commit never
+  landed says "settled" on one runner and nowhere else, so the ledger a human reads disagrees
+  with the ledger that stopped the work. The operator's `schedules/*.yaml` are tracked, so
+  the sweep cannot touch them.
+
+`maxOpenTasks` (default 1) is `alerts/policy.yaml`'s field for its reason: a weekly audit
+whose last task is still in review must not open a second one saying the same thing. "Open"
+is `!isTerminal(status)` — the supervisor's one notion of task status — so a **parked** task
+counts as closed, because it is waiting on a human and the next occurrence is the nudge that
+should be allowed to open fresh work. It is counted from the task tree rather than from the
+ledger, since `SCHED-<schedule>-<occurrence>` carries the schedule's name, so a task deleted
+by hand frees its slot.
+
+### `kind` is `implement`, deliberately
+
+There is no fourth task kind. A scheduled task writes code, opens a pull request and is
+gated by §12 exactly as a tracker-sourced one is, and nothing about its origin changes what
+the session must be told. `remediation` is a separate kind only because its brief is about a
+cluster it may read and must never write (§20); a schedule has no such brief.
+
+What the goal DOES carry, beyond the operator's prompt, is one paragraph saying that nobody
+is waiting and there may be nothing to do — because the failure mode of unattended work is a
+plausible pull request opened to have something to show for the session, and the review
+council reads for exactly that (§12.1).
+
+### Validated when committed, not when it fires
+
+A malformed schedule is refused on the **intake pass** and shown on `/intake`. The firing
+pass can only skip what it cannot parse, at 09:00, with nobody watching; the intake pass runs
+on a timer whose whole output is a report, and the moment a schedule becomes malformed is the
+commit that made it so — which is when somebody is looking.
+
+Nothing durable is written for a refusal and nothing is commented on: there is no tracker
+item and no author to tell. `IntakePass` carries `schedules` and `schedulesInvalid`, the
+supervisor logs `intake.schedule-invalid` once per bad file per pass naming the field, and
+the `/intake` page renders the message above the table of schedules that did parse — for
+`policyPanel`'s reason, since an empty table reads as "nothing has come due".
+
+### Off by default
+
+`schedule.enabled` defaults to false, like `digest.enabled` and `web.enabled`, and for the
+digest's reason: firing an occurrence writes tasks into the shared state repo, and a runner
+someone started on a workstation must not begin doing that because it was upgraded. The claim
+protocol makes a second firing runner harmless, not welcome. The `/intake` page says so out
+loud, because an empty occurrence ledger on a runner that fires nothing is otherwise
+indistinguishable from a scheduler that has broken.
+
+`caterpillar_schedule_occurrences_total{schedule,outcome}` counts what was settled.
+`outcome="skipped"` is the series it exists for: a schedule whose precheck never passes
+creates no tasks, and neither does one nobody is polling.
+
+### What is deliberately absent
+
+**No `@reboot`, and no "run it now" button.** An occurrence is a point on a calendar that
+every runner can compute; a manual trigger is a task, and the four other intake paths already
+create those.
+
+**No per-occurrence overrides.** A schedule that needs a different prompt on Fridays is two
+schedules, which the per-file layout makes cheap.
+
+**No catch-up beyond one occurrence, ever, and no configuration to widen it.** The bound is
+the design (see above), and an operator who wants a week of missed audits wants one audit
+that covers the week.

@@ -96,6 +96,7 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
   housekeepingSeconds: 1,
   secretsDir: join(root, "secrets"),
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  schedule: { enabled: false },
   cluster: {
     enabled: false,
     namespaces: [],
@@ -175,7 +176,14 @@ const runUntil = async (supervisor: Supervisor, done: () => boolean): Promise<vo
   await running.catch(() => undefined);
 };
 
-const PASS: IntakePass = { seen: 3, created: 0, rejected: 1, failed: 0 };
+const PASS: IntakePass = {
+  seen: 3,
+  created: 0,
+  rejected: 1,
+  failed: 0,
+  schedules: 0,
+  schedulesInvalid: 0,
+};
 
 test("the last intake pass is remembered where the web view can read it", async () => {
   // `IntakePass` was returned, logged once at info, and thrown away. `seen` is the field

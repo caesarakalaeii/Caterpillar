@@ -516,3 +516,18 @@ test("a negative disk floor is refused, but zero is a legitimate no-floor", asyn
   const config = await load({ limits: { sabotageMinFreeGb: 0 } });
   assert.equal(config.limits.sabotageMinFreeGb, 0);
 });
+
+test("a config that says nothing about schedules fires none", async () => {
+  // Off by default, like the digest and for the same reason (§22): a schedule creates
+  // tasks in the shared state repo, and a runner someone started on a workstation must
+  // not begin doing that because it was upgraded. The claim protocol makes a second
+  // firing runner harmless, not welcome.
+  const config = await load({});
+
+  assert.equal(config.schedule.enabled, false);
+});
+
+test("schedule.enabled is a boolean, not a truthy string", async () => {
+  assert.equal((await load({ schedule: { enabled: true } })).schedule.enabled, true);
+  await assert.rejects(() => load({ schedule: { enabled: "yes" } }), ConfigError);
+});
