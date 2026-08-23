@@ -125,8 +125,7 @@ export const boundOutput = (
     return { text, elided: false, droppedLines: 0, totalLines };
   }
 
-  const lines = text.split("\n");
-  const kept = keepBothEnds(lines, ceiling, options.overflowPath);
+  const kept = keepBothEnds(splitLines(text), ceiling, options.overflowPath);
 
   // No whole line fits — one line is longer than the entire byte budget. The "never a
   // partial line" guarantee has to give way here, and it gives way loudly: a cut line that
@@ -155,10 +154,21 @@ export const boundOutput = (
  * Without this, `printf 'a\n'` is two lines and every bounded count is off by one against
  * what `wc -l` told the operator.
  */
-const countLines = (text: string): number => {
-  if (text.length === 0) return 0;
-  const newlines = text.split("\n").length - 1;
-  return text.endsWith("\n") ? newlines : newlines + 1;
+const countLines = (text: string): number => splitLines(text).length;
+
+/**
+ * The lines `countLines` counts, so the note cannot disagree with the budget it describes.
+ *
+ * The trailing empty element of `"a\nb\n".split("\n")` is not a line — it is what follows
+ * the last newline. Handing it to `keepBothEnds` cost a real tail line to an empty string
+ * and had the note claim one more line than it displayed, on every command whose output
+ * ends with a newline, which is nearly all of them.
+ */
+const splitLines = (text: string): string[] => {
+  if (text.length === 0) return [];
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
 };
 
 /** Fraction of the line budget spent on the head. The rest goes to the tail. */
