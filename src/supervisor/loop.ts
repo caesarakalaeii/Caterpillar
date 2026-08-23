@@ -3467,8 +3467,8 @@ export class Supervisor {
       return {
         kind: "refused",
         reason:
-          `**${request.task}** does not offer that option any more — the question it belonged ` +
-          `to has moved on. Read the current one and answer it in prose.`,
+          `**${request.task}** no longer offers that option — the question it belonged to has ` +
+          `moved on. Read the current one and answer it in prose.`,
       };
     }
 

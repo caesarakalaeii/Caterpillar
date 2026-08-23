@@ -5316,7 +5316,7 @@ test("a question's options are pushed with it and offered in the notification", 
 
   assert.ok(asked !== undefined, "the question was never pushed");
   assert.equal(
-    await blobAt(asked, `tasks/${ASKED}/questions/000-options.json`),
+    await blobAt(asked, `tasks/${ASKED}/questions/001-options.json`),
     `${JSON.stringify(["Use the existing one", "Write a new one"], null, 2)}\n`,
   );
   assert.deepEqual(offered, [["Use the existing one", "Write a new one"]]);
@@ -5375,33 +5375,51 @@ test("pressing an option lands exactly where the same text typed by hand lands",
   const running = supervisor.run(controller.signal);
   const pressed = await inbox.submit({ kind: "answer-option", task: PRESSED, option: 0 });
   const typed = await inbox.submit({ kind: "answer", task: TYPED, text: OPTION });
+  // Read at the commit the answer made rather than at `main`: both tasks go `ready` the
+  // moment they are answered and are then claimed by the failing runner above, which parks
+  // them and journals that — noise that is nothing to do with what is being compared.
+  const answered = {
+    pressed: await waitForCommit(`chore(${PRESSED}): answered question 4`, 30_000),
+    typed: await waitForCommit(`chore(${TYPED}): answered question 4`, 30_000),
+  };
   controller.abort();
   await running.catch(() => undefined);
 
   assert.deepEqual(pressed, typed, "the two paths must report the same outcome");
+  assert.ok(answered.pressed !== undefined && answered.typed !== undefined, "an answer went unpushed");
 
-  const answerOf = (task: TaskId): Promise<string | undefined> =>
-    new Git(origin)
-      .tryRun("show", `main:tasks/${task}/questions/004-answer.md`)
-      .then((shown) => (shown.code === 0 ? shown.stdout : undefined));
+  const answerFile = (commit: string, task: TaskId): Promise<string | undefined> =>
+    blobAt(commit, `tasks/${task}/questions/004-answer.md`);
 
-  assert.equal(await answerOf(PRESSED), `${OPTION}\n`, "the full option text, untruncated");
-  assert.equal(await answerOf(PRESSED), await answerOf(TYPED));
-
-  // Journals differ only by the task id they were written for, so compare with it removed.
-  const anonymise = (task: TaskId, journal: string): string => journal.split(task).join("<task>");
   assert.equal(
-    anonymise(PRESSED, await pushedJournal(PRESSED)),
-    anonymise(TYPED, await pushedJournal(TYPED)),
+    await answerFile(answered.pressed, PRESSED),
+    `${OPTION}\n`,
+    "the full option text, untruncated",
+  );
+  assert.equal(
+    await answerFile(answered.pressed, PRESSED),
+    await answerFile(answered.typed, TYPED),
   );
 
-  // Same for the state, whose timestamps and id are the only fields that may differ. The
-  // streak reset is the one that matters: it is what stops an answered task parking again
-  // before it has run.
-  const forget = (state: TaskState | undefined): unknown =>
-    state === undefined ? undefined : { ...state, id: "<task>", updatedAt: "<at>", createdAt: "<at>" };
-  assert.equal((await pushedState(PRESSED))?.progress.noProgressStreak, 0);
-  assert.deepEqual(forget(await pushedState(PRESSED)), forget(await pushedState(TYPED)));
+  // The task id and the wall clock are the only things allowed to differ, so both are
+  // erased before the comparison. Everything else — the entry's heading, its session
+  // ordinal, its wording, the answer inside it — has to match exactly.
+  const anonymise = (task: TaskId, text: string): string =>
+    text.split(task).join("<task>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<at>");
+  assert.match(await journalAt(answered.pressed, PRESSED), /Answer from the operator/);
+  assert.equal(
+    anonymise(PRESSED, await journalAt(answered.pressed, PRESSED)),
+    anonymise(TYPED, await journalAt(answered.typed, TYPED)),
+  );
+
+  // Same for the state. The streak reset is the field that matters: it is what stops an
+  // answered task parking again before it has run.
+  const pressedState = await stateAt(answered.pressed, PRESSED);
+  assert.equal(pressedState?.progress.noProgressStreak, 0);
+  assert.equal(
+    anonymise(PRESSED, JSON.stringify(pressedState)),
+    anonymise(TYPED, JSON.stringify(await stateAt(answered.typed, TYPED))),
+  );
 
   await retire(PRESSED);
   await retire(TYPED);
