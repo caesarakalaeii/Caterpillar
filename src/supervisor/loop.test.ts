@@ -6310,7 +6310,7 @@ test("a merged remediation fix is held for a verdict, and parked when the alert 
     HELD,
     { pr: { number: 20, url: "https://example.invalid/pr/20" } },
     ["github.com/acme/widget"],
-    undefined,
+    /* no tracker: nothing filed this, an alert did */ undefined,
     "remediation",
   );
   // The record the queue writes when it creates a remediation task. Seeded BEFORE the
@@ -6373,7 +6373,7 @@ test("a merged remediation fix whose alert cleared reaches done, and says how lo
     CLEARED,
     { pr: { number: 21, url: "https://example.invalid/pr/21" } },
     ["github.com/acme/widget"],
-    undefined,
+    /* no tracker: nothing filed this, an alert did */ undefined,
     "remediation",
   );
   await seedAlertRecord(FINGERPRINT, ALERTNAME, CLEARED);
