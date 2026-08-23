@@ -39,6 +39,7 @@ alerts:
       This alert usually means a session wedged on a provider cooldown.
     runbook: https://runbooks.example.invalid/no-progress
     maxOpenTasks: 2
+    settleSeconds: 900
   - alertname: CaterpillarPodCrashLooping
     workspace: primary
     repos:
@@ -98,6 +99,7 @@ test("a valid multi-entry document parses into normalised entries", () => {
   assert.match(first.goalPrefix ?? "", /provider cooldown/);
   assert.equal(first.runbook, "https://runbooks.example.invalid/no-progress");
   assert.equal(first.maxOpenTasks, 2);
+  assert.equal(first.settleSeconds, 900);
 
   assert.equal(second.alertname, "CaterpillarPodCrashLooping");
   assert.equal(second.repos.length, 2);
@@ -107,6 +109,7 @@ test("a valid multi-entry document parses into normalised entries", () => {
   assert.equal(second.maxOpenTasks, 1);
   // `exactOptionalPropertyTypes`: an omitted optional must be ABSENT, not present and
   // undefined, or a round-trip through `deepEqual` in a sibling test stops matching.
+  assert.equal("settleSeconds" in second, false);
   assert.equal("goalPrefix" in second, false);
   assert.equal("runbook" in second, false);
 });
@@ -344,6 +347,29 @@ alerts:
   refuses(document("-1"), /`maxOpenTasks`/);
   refuses(document("1.5"), /`maxOpenTasks`/);
   refuses(document('"1"'), /`maxOpenTasks`/);
+});
+
+test("`settleSeconds` must be a positive integer no larger than the ceiling", () => {
+  const document = (value: string): string => `
+version: 1
+alerts:
+  - alertname: CaterpillarNoProgress
+    workspace: primary
+    repos:
+      - github.com/acme/caterpillar
+    acceptance:
+      - npm test
+    settleSeconds: ${value}
+`;
+  // The post-merge re-verification (§20) holds the task open for this long, so a window
+  // of a day is a task nothing closes and an alert nothing re-files. The ceiling is
+  // refused HERE rather than clamped silently: an operator who wrote 86400 meant it, and
+  // being quietly given six hours would look like the feature ignoring them.
+  refuses(document("0"), /`settleSeconds`/, /positive integer/);
+  refuses(document("-60"), /`settleSeconds`/);
+  refuses(document("90.5"), /`settleSeconds`/);
+  refuses(document('"600"'), /`settleSeconds`/);
+  refuses(document("86400"), /`settleSeconds`/, /21600/);
 });
 
 test("invalid YAML is a PolicyParseError, not a raw YAMLParseError", () => {
