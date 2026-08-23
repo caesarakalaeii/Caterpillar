@@ -65,6 +65,7 @@ import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
 import { ToolchainResolver } from "./workspace/toolchain.ts";
+import { NixCommandEval, ToolchainDoctor } from "./workspace/toolchain-doctor.ts";
 import { nixStoreDir, UsageMonitor } from "./workspace/usage.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
@@ -445,6 +446,15 @@ const main = async (): Promise<void> => {
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
+      // The same idea as `forges` above, for the environment rather than the repos: a
+      // `toolchain.packages` list with a typo'd nixpkgs attribute is refused here instead
+      // of parking a claimed task in `nix print-dev-env` a session later (§8.1). On a
+      // runner without nix it evaluates nothing and refuses nothing.
+      toolchainDoctor: new ToolchainDoctor({
+        config: loaded.toolchain,
+        nix: new NixCommandEval(),
+        logger,
+      }),
     }),
     intakeStatus,
     // The fifth intake path (§20). Present whether or not the receiver is listening: the
