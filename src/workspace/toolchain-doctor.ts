@@ -67,6 +67,17 @@ export interface UnresolvedPackage {
 const ATTRIBUTE = /^[A-Za-z0-9_+-]+$/;
 
 /**
+ * How many leading characters a candidate must share with a misspelt name.
+ *
+ * Two, which is a trade rather than a tuning: it keeps `nix eval`'s output to a few
+ * hundred names instead of ~100k, and it gives up on a typo in the FIRST two characters
+ * (`ghc` for `hgc`). Those are rarer than a wrong separator, which is what this exists to
+ * catch, and the cost of missing one is a refusal without a suggestion rather than a wrong
+ * refusal.
+ */
+const PREFIX_LENGTH = 2;
+
+/**
  * The declared names this check can actually evaluate, and the ones it cannot.
  *
  * Pure, and separate from the expression, because "cannot ask" and "must not interpolate"
@@ -232,17 +243,6 @@ export const packageCheckExpression = (
   candidates = if missing == [] then [] else builtins.filter near (builtins.attrNames pkgs);
 in { inherit missing candidates; }`;
 };
-
-/**
- * How many leading characters a candidate must share with a misspelt name.
- *
- * Two, which is a trade rather than a tuning: it keeps `nix eval`'s output to a few
- * hundred names instead of ~100k, and it gives up on a typo in the FIRST two characters
- * (`ghc` for `hgc`). Those are rarer than a wrong separator, which is what this exists to
- * catch, and the cost of missing one is a refusal without a suggestion rather than a wrong
- * refusal.
- */
-const PREFIX_LENGTH = 2;
 
 /**
  * What one evaluation came back with.

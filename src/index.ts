@@ -452,7 +452,7 @@ const main = async (): Promise<void> => {
       // runner without nix it evaluates nothing and refuses nothing.
       toolchainDoctor: new ToolchainDoctor({
         config: loaded.toolchain,
-        nix: new NixCommandEval(process.env),
+        nix: new NixCommandEval(),
         logger,
       }),
     }),
