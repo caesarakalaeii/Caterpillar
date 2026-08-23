@@ -1150,3 +1150,82 @@ test("commitsSince answers with nothing rather than throwing on a bad base", asy
 
   assert.deepEqual(await manager(root).commitsSince(repo, "0000000000000000000000000000000000000000"), []);
 });
+
+/**
+ * Conflicts against the base branch (DESIGN.md §12).
+ *
+ * A task that ran for several sessions can end on a branch that no longer merges. Read at
+ * the merge, that is a terminal-looking failure after every gate has passed; read at
+ * session start, it is a rebase the agent does as ordinary work.
+ */
+test("conflictsWithBase names the conflicting files and counts their hunks", async () => {
+  const root = await scratch();
+  const repo = join(root, "work");
+  await new Git(root, HERMETIC).run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  // Twenty lines so the two edits are far enough apart to be separate hunks. One hunk
+  // would not distinguish "counts hunks" from "counts files".
+  const lines = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
+  await writeFile(join(repo, "shared.ts"), `${lines}\n`);
+  await writeFile(join(repo, "untouched.ts"), "stable\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed the repository");
+
+  await git.run("checkout", "-b", "agent/TASK-1");
+  await writeFile(join(repo, "shared.ts"), `${lines.replace("line 2", "branch 2").replace("line 18", "branch 18")}\n`);
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Edit both ends on the branch");
+
+  await git.run("checkout", "main");
+  await writeFile(join(repo, "shared.ts"), `${lines.replace("line 2", "main 2").replace("line 18", "main 18")}\n`);
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Edit both ends on main");
+
+  await git.run("checkout", "agent/TASK-1");
+
+  const conflicts = await manager(root).conflictsWithBase(repo, "main");
+
+  assert.notEqual(conflicts, "unknown");
+  assert.ok(typeof conflicts === "object");
+  assert.deepEqual(
+    conflicts.files.map((file) => file.path),
+    ["shared.ts"],
+    "a file nobody touched must not be reported",
+  );
+  assert.equal(conflicts.files[0]?.hunks, 2, "two edits at opposite ends are two hunks");
+});
+
+test("conflictsWithBase answers nothing when the branch still merges cleanly", async () => {
+  const root = await scratch();
+  const repo = join(root, "work");
+  await new Git(root, HERMETIC).run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  await writeFile(join(repo, "a.ts"), "one\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed");
+
+  await git.run("checkout", "-b", "agent/TASK-2");
+  await writeFile(join(repo, "b.ts"), "two\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Add an unrelated file");
+
+  assert.equal(await manager(root).conflictsWithBase(repo, "main"), undefined);
+});
+
+test("conflictsWithBase says 'unknown' for a base it cannot resolve", async () => {
+  // Reachable whenever a worktree's mirror has been re-pointed, exactly as `commitsSince`
+  // documents. "Unknown" and not "clean": a caller told the branch merges would report
+  // nothing and let the merge fail later for a reason nobody had looked for.
+  const root = await scratch();
+  const repo = join(root, "work");
+  await new Git(root, HERMETIC).run("init", "--initial-branch=main", repo);
+
+  const git = new Git(repo, HERMETIC);
+  await writeFile(join(repo, "a.ts"), "one\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "Seed");
+
+  assert.equal(await manager(root).conflictsWithBase(repo, "no-such-branch"), "unknown");
+});
