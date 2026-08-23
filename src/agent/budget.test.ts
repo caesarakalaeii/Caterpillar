@@ -42,7 +42,9 @@ test("output over the line ceiling keeps the head AND the tail", () => {
 });
 
 test("what was dropped is declared in the output, not left to be inferred", () => {
-  const bounded = boundOutput(lines(40_112), outputCeiling({ maxLines: 1_284 }));
+  // 1,285 rather than 1,284: one line of the ceiling pays for the note itself, so 1,284 is
+  // what the model is shown. The figure the note states is the count it really showed.
+  const bounded = boundOutput(lines(40_112), outputCeiling({ maxLines: 1_285 }));
 
   assert.match(
     bounded.text,

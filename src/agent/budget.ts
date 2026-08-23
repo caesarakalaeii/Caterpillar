@@ -181,14 +181,25 @@ const forContent = (maxBytes: number, overflowPath: string | undefined): number 
  *
  * Tail first, and the tail gets what the head does not use: on a failing command the last
  * line is the one the session most needs, so if only one line fits it must be that one.
+ *
+ * One line of the budget is reserved for the elision note, for the same reason `forContent`
+ * reserves bytes for it: the note is a line the model reads, so `maxLines` of content plus
+ * a note is over the ceiling. Being over by one is not cosmetic — pi's bash tool bounds its
+ * own capture at 2,000 lines, tail-only, so a view one line over the shipped default gets
+ * cut again and the line that goes is the first head line.
+ *
+ * A head line, a tail line and the note are each irreducible, so a ceiling below 4 lines
+ * returns 3 and is over it — the same floor `forContent` applies to bytes, and unreachable
+ * for the same reason: the smallest ceiling `ContextBudget` will construct is far above it.
  */
 const keepBothEnds = (
   lines: readonly string[],
   ceiling: OutputCeiling,
   overflowPath: string | undefined,
 ): { readonly head: string[]; readonly tail: string[] } => {
-  const headLimit = Math.max(1, Math.floor(ceiling.maxLines * HEAD_SHARE));
-  const tailLimit = ceiling.maxLines - headLimit;
+  const forLines = Math.max(1, ceiling.maxLines - 1);
+  const headLimit = Math.max(1, Math.floor(forLines * HEAD_SHARE));
+  const tailLimit = Math.max(1, forLines - headLimit);
   const maxBytes = forContent(ceiling.maxBytes, overflowPath);
 
   const tail: string[] = [];
