@@ -167,9 +167,16 @@ export class DiscordBridge {
      * working, and its absence degrades to saying the acknowledgement in words.
      */
     messageId?: string,
+    /**
+     * The message this one REPLIES to, when it is a reply (`gateway.ts`).
+     *
+     * Optional, and absent is the ordinary case. See `targetOf` for what it buys.
+     */
+    replyTo?: string,
   ): Promise<void> {
     if (!this.acts()) return;
-    const thread = await this.resolveThread(channelId);
+    const target = await this.targetOf(channelId, replyTo);
+    const thread = target.task;
 
     // A message in a thread nothing can name. Ordinarily unreachable — the gateway delivers
     // from the channel, from threads the index knows, and from threads whose parent is ours —
@@ -198,6 +205,15 @@ export class DiscordBridge {
     this.deps.logger.info("bridge.command", { kind: command.kind, author, thread });
 
     if (thread !== undefined && command.kind === "answer") {
+      // Said whenever the reply could not be placed and rank had to decide (see `targetOf`).
+      // Not decoration: answering the wrong sibling SILENTLY is the failure this path exists
+      // to remove, and where the system cannot avoid guessing, a visible attribution is the
+      // only way a human catches it.
+      const note = target.guessed
+        ? `\n\nI could not tell which task you were replying to, so I filed this against ` +
+          `**${command.task}**. If that is wrong, say so with \`/answer <task-id>\`.`
+        : "";
+
       const outcome = await this.deps.inbox.submit({
         kind: "answer",
         task: command.task,
@@ -218,17 +234,92 @@ export class DiscordBridge {
           messageId === undefined
             ? false
             : await this.deps.bot.react(channelId, messageId, STEERED).catch(() => false);
-        // Only when the reaction could not be added. A silent failure here would put us back
-        // where we started, with a human unable to tell delivery from discard.
-        if (!reacted) await this.say(describeOutcome(command.task, outcome), channelId);
+        // Only when the reaction could not be added, or when the target had to be guessed. A
+        // silent failure here would put us back where we started, with a human unable to tell
+        // delivery from discard — and a reaction cannot say WHICH task took the steer, which
+        // is precisely what a guess has to be able to say.
+        if (!reacted || note.length > 0) {
+          await this.say(
+            describeOutcome(command.task, outcome) + note,
+            channelId,
+            undefined,
+            command.task,
+          );
+        }
         return;
       }
 
-      await this.say(describeOutcome(command.task, outcome), channelId, resumeRow(command.task, outcome));
+      await this.say(
+        describeOutcome(command.task, outcome) + note,
+        channelId,
+        resumeRow(command.task, outcome),
+        command.task,
+      );
       return;
     }
 
     await this.say(await this.execute(command, author), channelId);
+  }
+
+  /**
+   * Which task a message is for, and whether that had to be GUESSED.
+   *
+   * Three tiers, and all three are load-bearing because a thread does not name one task. A
+   * plan's children inherit their brainstorm's thread (§14.3), so `threadBindings` picks an
+   * owner by rank — `awaiting-human` over `running`/`ready` over `parked`/`failed`, then id
+   * — and a reply meant for one child was filed against whichever sibling ranked highest.
+   *
+   * A Discord reply names the message it answers, and every task-scoped message the bot
+   * posts is about exactly one task. So:
+   *
+   *   1. the in-memory index (`MessageIndex`), which costs nothing and covers the common
+   *      case — a live thread, a reply within minutes of the question;
+   *   2. a REST read of the referenced message, parsing its leading `**<task-id>**` and
+   *      confirming it against the snapshot. Needed because the index does not survive a
+   *      restart, and in the split deployment (§7) the process that posts a notification is
+   *      not the one that reads the reply;
+   *   3. the rank rule, unchanged — but flagged, so the caller says which task it chose.
+   *
+   * Neither of the first two alone would do. Index-only loses targeting for every live
+   * thread across a rollout; REST-only cannot place a message Discord will not show us, and
+   * spends a request per reply besides.
+   *
+   * A reply to something that is not a bot message, or to a message belonging to no known
+   * task, falls through to tier 3 rather than erroring — that is the same answer as not
+   * having replied at all, plus a note.
+   *
+   * Reply targeting only ever refines WHICH task inside a channel we already read. It does
+   * not make the main channel a new door: replying to a notification there is not an
+   * `!answer`, exactly as typing there is not.
+   */
+  private async targetOf(
+    channelId: string,
+    replyTo?: string,
+  ): Promise<{ readonly task?: TaskId; readonly guessed: boolean }> {
+    const ranked = await this.resolveThread(channelId);
+    // Nothing to refine: not a reply, or a channel that names no task at all — in which case
+    // the caller's next step is the honest "I cannot place this thread" reply, not routing.
+    if (replyTo === undefined || ranked === undefined) {
+      return ranked === undefined ? { guessed: false } : { task: ranked, guessed: false };
+    }
+
+    const indexed = this.deps.bot.taskForMessage(replyTo);
+    if (indexed !== undefined) return { task: indexed, guessed: false };
+
+    const fetched = await this.deps.bot
+      .taskForFetchedMessage(channelId, replyTo)
+      .catch(() => undefined);
+    // Confirmed against the snapshot, because `isTaskId` admits any directory-safe name and
+    // not every bold opener is a task: the brainstorm opening message begins `**Brainstorm**`,
+    // which parses cleanly and answers to nothing. Filing against a task that does not exist
+    // is worse than the rank fallback — it answers with "no such task" instead of at all.
+    if (fetched !== undefined) {
+      const known = await this.deps.snapshot.find(fetched).catch(() => undefined);
+      if (known !== undefined) return { task: fetched, guessed: false };
+    }
+
+    this.deps.logger.info("bridge.reply-unplaced", { channel: channelId, replyTo, task: ranked });
+    return { task: ranked, guessed: true };
   }
 
   /**
@@ -549,21 +640,28 @@ export class DiscordBridge {
 
     // Answered in the THREAD rather than where the command was typed, so the whole
     // conversation stays in one place.
-    await this.say(describeOutcome(task, outcome), threadId);
+    await this.say(describeOutcome(task, outcome), threadId, undefined, task);
     return `Brainstorming in <#${threadId}>.`;
   }
 
-  /** Say something in the channel. Never throws — a lost reply must not unwind a click. */
+  /**
+   * Say something in the channel. Never throws — a lost reply must not unwind a click.
+   *
+   * `task` records what the message is about, so a human replying to it can be routed back
+   * to the same task rather than to whichever sibling outranks it (§7.3).
+   */
   private async say(
     content: string,
     channelId?: string,
     components?: readonly ActionRow[],
+    task?: TaskId,
   ): Promise<void> {
     await this.deps.bot
       .postMessage({
         content,
         ...(channelId === undefined ? {} : { channelId }),
         ...(components === undefined ? {} : { components }),
+        ...(task === undefined ? {} : { task }),
       })
       .catch((error: unknown) => {
         this.deps.logger.warn("bridge.reply-failed", {

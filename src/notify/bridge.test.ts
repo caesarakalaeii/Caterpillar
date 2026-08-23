@@ -22,6 +22,7 @@ import { DiscordBot } from "./bot.ts";
 import { DiscordBridge } from "./bridge.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, RESPONSE, type Interaction } from "./interactions.ts";
+import { MAX_REMEMBERED_MESSAGES, MessageIndex } from "./messages.ts";
 import { ThreadIndex } from "./threads.ts";
 import { ANSWER_FIELD } from "./slash.ts";
 
@@ -66,11 +67,19 @@ const harness = (
     /** False makes every reaction fail, as an installation without `ADD_REACTIONS` does. */
     readonly reactions?: boolean;
     readonly router?: { deliverable: (channelId: string) => Promise<boolean> };
+    /**
+     * What a GET of a single message says back, for the REST tier of reply targeting.
+     *
+     * Absent means Discord refuses the read — a message the bot cannot see, which is the
+     * case that has to fall through to rank rather than throw.
+     */
+    readonly fetchedMessage?: { readonly content: string };
   } = {},
 ): {
   readonly bridge: DiscordBridge;
   readonly inbox: InMemoryChatQueue;
   readonly calls: Call[];
+  readonly messages: MessageIndex;
 } => {
   const calls: Call[] = [];
   const fetch = (url: string, init?: RequestInit): Promise<Response> => {
@@ -84,6 +93,13 @@ const harness = (
     if (over.reactions === false && url.includes("/reactions/")) {
       return Promise.resolve(new Response(JSON.stringify({ message: "Missing Permissions" }), { status: 403 }));
     }
+    // A GET of one message: `/channels/<id>/messages/<id>`, as against the POST to
+    // `/channels/<id>/messages` that sends one.
+    if ((init?.method ?? "GET") === "GET" && /\/messages\/[^/]+$/.test(url)) {
+      return over.fetchedMessage === undefined
+        ? Promise.resolve(new Response(JSON.stringify({ message: "Unknown Message" }), { status: 404 }))
+        : Promise.resolve(new Response(JSON.stringify(over.fetchedMessage), { status: 200 }));
+    }
     return Promise.resolve(new Response(JSON.stringify({ id: "999" }), { status: 200 }));
   };
 
@@ -95,8 +111,9 @@ const harness = (
   ]);
 
   const inbox = new InMemoryChatQueue();
+  const messages = new MessageIndex();
   const bridge = new DiscordBridge({
-    bot: new DiscordBot({ token: "bot-token", channelId: CHANNEL, fetch, apiBase: API }),
+    bot: new DiscordBot({ token: "bot-token", channelId: CHANNEL, fetch, apiBase: API, messages }),
     inbox,
     snapshot,
     logger: SILENT_LOGGER,
@@ -108,7 +125,7 @@ const harness = (
     fetch,
   });
 
-  return { bridge, inbox, calls };
+  return { bridge, inbox, calls, messages };
 };
 
 const interaction = (over: Partial<Interaction>): Interaction => ({
@@ -729,4 +746,176 @@ test("a message in the thread of a task that is DONE says so instead of stalling
   const content = String((posted(calls)[0]?.body ?? {})["content"]);
   assert.doesNotMatch(content, /catching up/);
   assert.match(content, /brainstorm/);
+});
+
+/* ───────────── which task a REPLY is for, in a thread several tasks share (§7.3) ───────────── */
+
+/**
+ * The sibling that does NOT own the thread under the rank rule.
+ *
+ * `threadBindings` ranks `awaiting-human` above `ready`, so with both bound to one thread
+ * the binding names `TASK` and a reply meant for this one was filed against `TASK` —
+ * silently. Every test below is a variation on catching that.
+ */
+const SIBLING = asTaskId("GH-acme-widget-7");
+
+/** A thread whose binding names `TASK`, with `SIBLING` sharing it as a plan child does. */
+const sharedThread = (): ThreadIndex => {
+  const threads = new ThreadIndex();
+  threads.bind(THREAD, TASK);
+  return threads;
+};
+
+const queuedTask = async (inbox: InMemoryChatQueue, outcome: ChatOutcome): Promise<string> => {
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+  const requests = await inbox.drain();
+  const first = requests[0];
+  assert.ok(first !== undefined, "nothing was queued for the loop");
+  for (const request of requests) request.settle(outcome);
+  return first.kind === "brainstorm" ? "" : first.task;
+};
+
+test("a reply to an indexed message goes to that message's task, not the thread's owner", async () => {
+  // THE BUG. Both tasks share one thread, `TASK` outranks `SIBLING`, and the human replied
+  // to `SIBLING`'s question. Answering the higher-ranked sibling instead is the silent
+  // misfiling this removes.
+  const { bridge, inbox, messages } = harness({ threads: sharedThread() });
+  messages.record("question-msg", SIBLING);
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, SIBLING, "the reply must land on the task whose message was replied to");
+});
+
+test("a reply to a message the index has lost is targeted by fetching it", async () => {
+  // The index is in memory, so a restart empties it while the thread it served is still
+  // live. Without this tier every reply after a rollout would be misfiled again.
+  const { bridge, inbox, calls } = harness({
+    threads: sharedThread(),
+    fetchedMessage: { content: `**${SIBLING}** needs input\nPhase: implementing\n\nWhich path?` },
+  });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, SIBLING, "the id must be read out of the fetched message's own text");
+  const fetched = calls.find((call) => call.url.endsWith("/messages/question-msg"));
+  assert.ok(fetched !== undefined, "the referenced message was never read back");
+  assert.equal(fetched.method, "GET");
+  assert.equal(fetched.url, `${API}/channels/${THREAD}/messages/question-msg`);
+});
+
+test("a reply the bot cannot place falls back to rank and says which task it used", async () => {
+  // Both tiers failed: nothing indexed, and Discord will not show the message. Rank is all
+  // that is left — but answering the wrong sibling in silence is the exact failure being
+  // removed, so the reply names what it was filed against and a human can see the mistake.
+  const { bridge, inbox, calls } = harness({ threads: sharedThread() });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, TASK, "with nothing to go on, today's rank rule still applies");
+  const said = String(posted(calls)[0]?.body["content"]);
+  assert.match(said, /I filed this against/, "an unavoidable guess must be a visible one");
+  assert.match(said, new RegExp(TASK), "the note is worthless without naming the task");
+});
+
+test("a reply whose fetched message names no task falls back the same way", async () => {
+  // A reply to a human's message, or to bot prose with no id in it. It must fall through
+  // cleanly rather than error, and still carry the note.
+  const { bridge, inbox, calls } = harness({
+    threads: sharedThread(),
+    fetchedMessage: { content: "morning all" },
+  });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, TASK);
+  assert.match(String(posted(calls)[0]?.body["content"]), /I filed this against/);
+});
+
+test("a steer that had to be guessed is said in words, not only reacted to", async () => {
+  // A steer is normally acknowledged with a reaction alone (§7.3), to keep a conversation
+  // of many short replies from becoming a wall of receipts. A reaction cannot say WHICH
+  // task it was filed against, so the one case that had to guess gets a line as well.
+  const { bridge, inbox, calls } = harness({ threads: sharedThread() });
+
+  const handled = bridge.handleMessage("hold on", "operator", THREAD, "human-msg", "question-msg");
+  await settleQueued(inbox, { kind: "steered" });
+  await handled;
+
+  assert.match(String(posted(calls)[0]?.body["content"]), /I filed this against/);
+});
+
+test("a message that is not a reply routes by rank with nothing said about it", async () => {
+  // The unchanged path, and the reason the note is attached to guessing rather than to
+  // rank: in a thread nobody replied in, rank is the answer rather than a fallback, and a
+  // note under every line would be the receipts wall §7.3 avoided.
+  const { bridge, inbox, calls } = harness({ threads: sharedThread() });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, TASK);
+  assert.equal(
+    calls.some((call) => call.method === "GET"),
+    false,
+    "an ordinary message must not cost a REST call",
+  );
+  assert.doesNotMatch(String(posted(calls)[0]?.body["content"]), /I filed this against/);
+});
+
+test("the message index evicts its oldest entry rather than growing without limit", async () => {
+  // It grows by one per task-scoped message the bot posts, in a process meant to run for
+  // weeks. Unbounded, that is a leak with no ceiling.
+  const { messages } = harness();
+
+  for (let n = 0; n <= MAX_REMEMBERED_MESSAGES; n++) messages.record(`m${n}`, TASK);
+
+  assert.equal(messages.size, MAX_REMEMBERED_MESSAGES);
+  assert.equal(messages.taskFor("m0"), undefined, "the oldest entry must be the one dropped");
+  assert.equal(
+    messages.taskFor(`m${MAX_REMEMBERED_MESSAGES}`),
+    TASK,
+    "and the newest must be the one kept — a reply targets a recent message",
+  );
+});
+
+test("a task-scoped message the bot posts is remembered, so a reply to it is placeable", async () => {
+  // The index is only worth having if it is populated by the ordinary posting path. Every
+  // notification and every outcome names its task; nothing else has to be threaded through.
+  const { bridge, inbox, calls, messages } = harness({ threads: sharedThread() });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg");
+  await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(posted(calls).length, 1, "the outcome should have been posted");
+  // The stubbed API hands back id `999` for every message it accepts.
+  assert.equal(messages.taskFor("999"), TASK, "the outcome the bot just posted must be placeable");
+});
+
+test("a fetched message whose bold prefix is not a task falls back rather than misrouting", async () => {
+  // Not every bold opener is a task id. The brainstorm opening message starts `**Brainstorm**`
+  // and `Brainstorm` passes `isTaskId` — it is a legal directory name — so parsing alone
+  // would file the answer against a task that does not exist, and the human would be told
+  // "No task **Brainstorm** in the state repo" instead of being answered.
+  const { bridge, inbox, calls } = harness({
+    threads: sharedThread(),
+    fetchedMessage: { content: "**Brainstorm** — acme/widget\n\nmake the overlay themeable" },
+  });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, TASK, "an id no task answers to must not win over the rank rule");
+  assert.match(String(posted(calls)[0]?.body["content"]), /I filed this against/);
 });

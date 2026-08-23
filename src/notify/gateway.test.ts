@@ -52,8 +52,7 @@ const fakeSocket = (): Fake => {
 };
 
 const build = (
-  onMessage: (content: string, author: string, channelId: string) => Promise<void> = () =>
-    Promise.resolve(),
+  onMessage: GatewayOptions["onMessage"] = () => Promise.resolve(),
   presence?: GatewayOptions["presence"],
   threads?: GatewayOptions["threads"],
 ): { gateway: DiscordGateway; sockets: Fake[]; slept: number[] } => {
@@ -161,6 +160,51 @@ test("bots, webhooks and other channels are ignored", async () => {
   await new Promise((r) => setImmediate(r));
 
   assert.deepEqual(seen, []);
+  await stop();
+});
+
+test("a reply carries the message it replies to through to the handler", async () => {
+  // The bug this closes. `message_reference` was dropped in the parse, so a Discord reply
+  // was indistinguishable from an ordinary message — and in a thread several tasks share
+  // (a plan's children inherit their brainstorm's), the bridge had nothing to route on but
+  // rank. Asserted on the parsed ARGUMENTS rather than on any downstream effect, because
+  // the field never reached the bridge at all: nothing further along could see it.
+  const seen: { readonly messageId: string; readonly replyTo?: string }[] = [];
+  const built = build(async (_content, _author, _channelId, messageId, replyTo) => {
+    seen.push({ messageId, ...(replyTo === undefined ? {} : { replyTo }) });
+  });
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(
+    messageCreate({
+      id: "human-msg",
+      message_reference: { message_id: "bot-msg", channel_id: CHANNEL },
+    }),
+  );
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(seen, [{ messageId: "human-msg", replyTo: "bot-msg" }]);
+  await stop();
+});
+
+test("an ordinary message carries no reply reference", async () => {
+  // The fall-through every existing caller depends on: absent, not empty string, so the
+  // bridge can tell "not a reply" from "a reply to something" without a sentinel.
+  const seen: (string | undefined)[] = [];
+  const built = build(async (_content, _author, _channelId, _messageId, replyTo) => {
+    seen.push(replyTo);
+  });
+  const { socket, stop } = await start(built);
+
+  socket.emit(hello());
+  socket.emit(messageCreate({ id: "human-msg" }));
+  // A reference Discord sends with no message id at all — a forward, or a reply to a
+  // deleted message. It must read as "not a reply" rather than as a reply to "".
+  socket.emit(messageCreate({ id: "human-msg-2", message_reference: { channel_id: CHANNEL } }));
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(seen, [undefined, undefined]);
   await stop();
 });
 
