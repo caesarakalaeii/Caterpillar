@@ -870,12 +870,20 @@ test("a review comment on the pull request forgives a council round, once", asyn
 
   // The first rejection lands at round 1, not 3: the comment was newer than anything the
   // council had already been shown, so the count was cleared before it was incremented.
-  let firstRejection: TaskState | undefined;
+  //
+  // Read AT the commit rather than polling for it, per `waitForCommit`: `rounds === 1` is
+  // the state between the first rejection and the second, and the task goes straight back
+  // to `ready` and is re-claimed, so on a fast machine that window closes inside one poll
+  // interval. A poller that missed it reported the forgiveness as absent — the flake this
+  // replaces, seen on CI at 255ms where the same test takes ~1s locally.
+  const firstRejectionAt = await waitForCommit(
+    `chore(${REVIEWED}): review council requested changes`,
+    30_000,
+  );
   let parked: TaskState | undefined;
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const state = await pushedState(REVIEWED);
-    if (firstRejection === undefined && state?.review?.rounds === 1) firstRejection = state;
     if (state?.status === "parked") {
       parked = state;
       break;
@@ -886,7 +894,13 @@ test("a review comment on the pull request forgives a council round, once", asyn
   controller.abort();
   await running.catch(() => undefined);
 
-  assert.ok(firstRejection !== undefined, "the round count must be forgiven before it is raised");
+  assert.ok(firstRejectionAt !== undefined, "the round count must be forgiven before it is raised");
+  const firstRejection = await stateAt(firstRejectionAt, REVIEWED);
+  assert.equal(
+    firstRejection?.review?.rounds,
+    1,
+    "the round count must be forgiven before it is raised",
+  );
   assert.equal(
     firstRejection?.review?.commentSeen,
     "2026-08-20T10:00:00.000Z",
@@ -5260,4 +5274,236 @@ test("a rejected claim still pushes the evidence its gate published", async () =
   );
 
   await retire(EVIDENCE);
+});
+
+test("a question's options are pushed with it and offered in the notification", async () => {
+  // The option TEXT has to reach the state repo, because that is the only place a button
+  // press can look it up: a `custom_id` holds 100 characters and the task id has spent most
+  // of them (DESIGN.md §7).
+  const ASKED = asTaskId("SMOKE-OPTIONS-1");
+  await seedTask(ASKED);
+
+  const offered: (readonly string[] | undefined)[] = [];
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: (spec) => {
+        if (spec.id !== ASKED) return Promise.reject(new Error("session not under test"));
+        return Promise.resolve({
+          reason: "ask-human" as const,
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "Which migration path?",
+          questionOptions: ["Use the existing one", "Write a new one"],
+          summary: "needs a decision",
+        });
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: {
+      notify: (notification) => {
+        if (notification.kind === "question") offered.push(notification.options);
+        return Promise.resolve();
+      },
+    },
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const asked = await waitForCommit(`chore(${ASKED}): awaiting human input`, 30_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(asked !== undefined, "the question was never pushed");
+  assert.equal(
+    await blobAt(asked, `tasks/${ASKED}/questions/001-options.json`),
+    `${JSON.stringify(["Use the existing one", "Write a new one"], null, 2)}\n`,
+  );
+  assert.deepEqual(offered, [["Use the existing one", "Write a new one"]]);
+
+  await retire(ASKED);
+});
+
+test("pressing an option lands exactly where the same text typed by hand lands", async () => {
+  // THE constraint. One answer path, not two: a button press resolves to the stored option
+  // text and then goes through `applyAnswer` unchanged. Asserted by COMPARING the two
+  // resulting states rather than by checking each against a list — a second path that
+  // diverges later would still satisfy two separate sets of assertions.
+  const PRESSED = asTaskId("SMOKE-OPTIONS-2");
+  const TYPED = asTaskId("SMOKE-OPTIONS-3");
+  const OPTION = "Use the existing migration path";
+
+  const store = new StateStore(statePath, stateGit);
+  for (const task of [PRESSED, TYPED]) {
+    await seedTask(task);
+    await store.pull("origin", config.stateRepo.branch);
+    await store.writeQuestion(task, 4, "Which migration path?", [OPTION, "Write a new one"]);
+    await store.writeState({
+      ...seed,
+      id: task,
+      status: "awaiting-human",
+      sessions: 4,
+      progress: { lastProgressSession: 1, noProgressStreak: 3 },
+    });
+    await store.commitAndPush(`chore(${task}): awaiting human`, "origin", "main");
+  }
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const pressed = await inbox.submit({ kind: "answer-option", task: PRESSED, option: 0 });
+  const typed = await inbox.submit({ kind: "answer", task: TYPED, text: OPTION });
+  // Read at the commit the answer made rather than at `main`: both tasks go `ready` the
+  // moment they are answered and are then claimed by the failing runner above, which parks
+  // them and journals that — noise that is nothing to do with what is being compared.
+  const answered = {
+    pressed: await waitForCommit(`chore(${PRESSED}): answered question 4`, 30_000),
+    typed: await waitForCommit(`chore(${TYPED}): answered question 4`, 30_000),
+  };
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(pressed, typed, "the two paths must report the same outcome");
+  assert.ok(answered.pressed !== undefined && answered.typed !== undefined, "an answer went unpushed");
+
+  const answerFile = (commit: string, task: TaskId): Promise<string | undefined> =>
+    blobAt(commit, `tasks/${task}/questions/004-answer.md`);
+
+  assert.equal(
+    await answerFile(answered.pressed, PRESSED),
+    `${OPTION}\n`,
+    "the full option text, untruncated",
+  );
+  assert.equal(
+    await answerFile(answered.pressed, PRESSED),
+    await answerFile(answered.typed, TYPED),
+  );
+
+  // The task id and the wall clock are the only things allowed to differ, so both are
+  // erased before the comparison. Everything else — the entry's heading, its session
+  // ordinal, its wording, the answer inside it — has to match exactly.
+  const anonymise = (task: TaskId, text: string): string =>
+    text.split(task).join("<task>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<at>");
+  assert.match(await journalAt(answered.pressed, PRESSED), /Answer from the operator/);
+  assert.equal(
+    anonymise(PRESSED, await journalAt(answered.pressed, PRESSED)),
+    anonymise(TYPED, await journalAt(answered.typed, TYPED)),
+  );
+
+  // Same for the state. The streak reset is the field that matters: it is what stops an
+  // answered task parking again before it has run.
+  const pressedState = await stateAt(answered.pressed, PRESSED);
+  assert.equal(pressedState?.progress.noProgressStreak, 0);
+  assert.equal(
+    anonymise(PRESSED, JSON.stringify(pressedState)),
+    anonymise(TYPED, JSON.stringify(await stateAt(answered.typed, TYPED))),
+  );
+
+  await retire(PRESSED);
+  await retire(TYPED);
+});
+
+test("an option index the stored question does not have is refused, and writes nothing", async () => {
+  // A button lives in the channel forever, so a press can arrive against a question that
+  // has been superseded — or against one that never had options at all. Answering it would
+  // write SOMEBODY ELSE'S choice into the answer file, which the next session then obeys.
+  const STALE = asTaskId("SMOKE-OPTIONS-4");
+  await seedTask(STALE);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  await store.writeQuestion(STALE, 4, "Which migration path?", ["the existing one"]);
+  await store.writeState({
+    ...seed,
+    id: STALE,
+    status: "awaiting-human",
+    sessions: 4,
+    progress: { lastProgressSession: 1, noProgressStreak: 3 },
+  });
+  await store.commitAndPush(`chore(${STALE}): awaiting human`, "origin", "main");
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "answer-option", task: STALE, option: 1 });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(
+    outcome.kind === "refused" ? outcome.reason : "",
+    /no longer offer/,
+    "the refusal has to say why, or the human presses it again",
+  );
+
+  const answer = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${STALE}/questions/004-answer.md`,
+  );
+  assert.notEqual(answer.code, 0, "nothing may be written for an option that does not exist");
+  assert.equal(
+    (await pushedState(STALE))?.status,
+    "awaiting-human",
+    "the task must stay parked on the question it asked",
+  );
+
+  await retire(STALE);
 });

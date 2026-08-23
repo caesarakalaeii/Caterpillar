@@ -1192,6 +1192,17 @@ Nothing is running while you think. You reply:
 The bridge commits `questions/NNN-answer.md` and flips `status = ready`. The next poll
 claims it into a fresh session that reads the answer from the task directory.
 
+**Options are buttons** (amended when they were built). `options` is capped at five, which is
+Discord's buttons-per-row limit, and refused above it rather than truncated: an option that
+cannot be rendered is a choice the human is never offered. The text is written to
+`questions/NNN-options.json` beside the question and the button's `custom_id` carries only the
+INDEX — a `custom_id` holds 100 characters and a tracker-derived task id has spent most of them.
+Pressing one resolves the index against that file and then goes through the ordinary answer
+path, so a press produces the same answer file, journal entry and `noProgressStreak` reset as a
+typed `!answer`; an index the stored question does not have is refused, because a button
+outlives the question it was posted under. The free-text button is always offered as well:
+"none of these" is always a possible answer.
+
 **How the bridge is built** (amended when it was): a Discord **gateway websocket, in the
 supervisor process** — not the separate `discord-bridge` Deployment §10 anticipated, and
 not a public interactions endpoint. §6 has runners polling outward precisely so a machine

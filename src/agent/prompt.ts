@@ -56,7 +56,9 @@ Because of this, the durable record is what matters, not your memory:
   acceptance criteria and checks CI. Do not claim completion speculatively — a false
   claim costs a full session round-trip.
 - \`ask_human\` ends your session and parks the task. Use it when you genuinely cannot
-  proceed, and put everything the operator needs in the question.
+  proceed, and put everything the operator needs in the question. When the question is a
+  choice between named alternatives, pass them as \`options\` — the operator answers with
+  one press instead of typing your list back. Keep prose for everything else.
 - If work needs a machine you are not on (GPU, hardware, a human present), call
   \`handoff\` with \`requires\`.
 - You have no credentials. Pushes work through a credential helper and PRs through
@@ -112,6 +114,9 @@ How to work:
   ambiguous requirement, a choice between approaches, a constraint you cannot infer.
   ONE question at a time — each one parks the task until it is answered, which costs
   nothing while someone thinks, and a list of six questions gets one answer covering two.
+  When you are asking someone to pick from alternatives you can name, pass them as
+  \`options\`: those become buttons, and a choice answered with one press comes back
+  sooner than one that has to be typed.
 - Do not ask what you can find out. A question whose answer is in the repository is a
   round trip you spent instead of reading.
 - When the shape is settled, call \`submit_plan\`.

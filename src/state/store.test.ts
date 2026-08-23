@@ -685,6 +685,46 @@ test("a task that was never asked anything has no question history", async () =>
   assert.deepEqual(await subject.listQuestions(asTaskId("TASK-quiet")), []);
 });
 
+test("the options a question offered are stored beside it and read back in order", async () => {
+  // The option TEXT lives here rather than in the Discord button that offers it: a
+  // `custom_id` holds 100 characters, so the button can only carry an INDEX into this list.
+  const subject = await store();
+  const task = asTaskId("TASK-options");
+  await subject.writeQuestion(task, 3, "which migration path?", ["the existing one", "a new one"]);
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 3,
+    question: "which migration path?\n",
+    options: ["the existing one", "a new one"],
+  });
+});
+
+test("a question asked without options reads back without them", async () => {
+  const subject = await store();
+  const task = asTaskId("TASK-no-options");
+  await subject.writeQuestion(task, 1, "what is the retention policy?");
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 1,
+    question: "what is the retention policy?\n",
+  });
+});
+
+test("a corrupt options sidecar leaves the question answerable in prose", async () => {
+  // The sidecar is a convenience; the question is the record. A half-written file must cost
+  // the buttons, never the ability to answer at all — which is the one thing the task is
+  // waiting for.
+  const { subject, root } = await storeAt();
+  const task = asTaskId("TASK-bad-options");
+  await subject.writeQuestion(task, 2, "which one?", ["a", "b"]);
+  await writeFile(join(root, "tasks", task, "questions", "002-options.json"), "{ not json");
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 2,
+    question: "which one?\n",
+  });
+});
+
 test("every council verdict is kept, not just the last", async () => {
   const subject = await store();
   const task = asTaskId("TASK-verdicts");

@@ -392,6 +392,16 @@ const fromComponent = (interaction: Interaction): Intent => {
   switch (action.verb) {
     case "ans":
       return { kind: "open-answer-modal", task: action.task };
+    case "opt": {
+      // `arg` is text off the wire, so an index that is not a non-negative whole number is
+      // ignored rather than coerced. Defaulting to 0 would answer the question with whatever
+      // the first option happens to be, which is a choice the human never made.
+      const option = Number(action.arg);
+      if (action.arg === undefined || action.arg === "" || !Number.isSafeInteger(option) || option < 0) {
+        return { kind: "ignored", reason: "option button without a usable index" };
+      }
+      return { kind: "run", command: { kind: "answer-option", task: action.task, option } };
+    }
     case "park":
       return { kind: "run", command: { kind: "park", task: action.task } };
     case "merge":
