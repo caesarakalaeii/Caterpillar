@@ -84,6 +84,31 @@ export interface TaskCheckout {
   readonly siblings: ReadonlyMap<string, string>;
 }
 
+/**
+ * What `origin` had to say about `agent/<task>`: its tip, that it has no such branch, or
+ * that it could not be asked.
+ *
+ * `absent` and `unreachable` are separate cases and that separation is the point. See
+ * `WorktreeManager.fetchAgentBranch`.
+ */
+type AgentBranchTip =
+  | { readonly state: "tip"; readonly commit: string }
+  | { readonly state: "absent" }
+  | { readonly state: "unreachable"; readonly reason: string };
+
+/** Options for a checkout. See `WorktreeManager.ensureTaskCheckout`. */
+export interface CheckoutOptions {
+  /**
+   * Refuse the checkout when `origin` cannot be asked about `agent/<task>`, instead of
+   * reading the silence as "nobody has pushed".
+   *
+   * Set by the agent session runner and by nothing else: it is the only caller inside the
+   * task's credential lease, so it is the only one for which an unanswerable remote is a
+   * fault rather than the expected state (§9.2).
+   */
+  readonly mustReachRemote?: boolean;
+}
+
 export interface WorktreeOptions {
   readonly git: Git;
   readonly mirrorsDir: string;
@@ -386,9 +411,13 @@ export class WorktreeManager {
    * The branch is created from the mirror's default branch on first use and reused
    * afterwards, so a handoff resumes exactly where the previous session stopped.
    */
-  async ensureWorktree(repo: RepoRef, task: TaskId): Promise<string> {
+  async ensureWorktree(
+    repo: RepoRef,
+    task: TaskId,
+    options: CheckoutOptions = {},
+  ): Promise<string> {
     const path = join(this.options.tasksDir, task, repo.name);
-    await this.addWorktreeAt(repo, task, path);
+    await this.addWorktreeAt(repo, task, path, options);
     return path;
   }
 
@@ -402,9 +431,16 @@ export class WorktreeManager {
    * the mirror's COMMON config (see `configureShared`), so two of them interleaving is two
    * processes editing one file.
    */
-  private addWorktreeAt(repo: RepoRef, task: TaskId, path: string): Promise<void> {
+  private addWorktreeAt(
+    repo: RepoRef,
+    task: TaskId,
+    path: string,
+    options: CheckoutOptions,
+  ): Promise<void> {
     const mirror = mirrorPath(this.options.mirrorsDir, repo);
-    return this.onMirror(mirror, () => this.addWorktreeLocked(repo, mirror, task, path));
+    return this.onMirror(mirror, () =>
+      this.addWorktreeLocked(repo, mirror, task, path, options),
+    );
   }
 
   /** `addWorktreeAt`'s body. The caller must already hold this mirror's lock. */
@@ -413,6 +449,7 @@ export class WorktreeManager {
     mirrorDir: string,
     task: TaskId,
     path: string,
+    options: CheckoutOptions,
   ): Promise<void> {
     const branch = `agent/${task}`;
 
@@ -427,7 +464,7 @@ export class WorktreeManager {
       await this.enableWorktreeConfig(await this.commonDir(path));
       await this.configureShared(path);
       await this.configureTask(path, task);
-      await this.catchUpWorktree(repo, task, branch, path);
+      await this.catchUpWorktree(repo, task, branch, path, options);
       return;
     }
 
@@ -438,7 +475,7 @@ export class WorktreeManager {
     await mkdir(join(path, ".."), { recursive: true });
     const git = this.git.at(mirror);
 
-    const start = await this.startPoint(repo, mirror, task, branch);
+    const start = await this.startPoint(repo, mirror, task, branch, options);
     if (start.creating) {
       await git.run("worktree", "add", "-b", branch, path, start.commit);
     } else {
@@ -483,10 +520,17 @@ export class WorktreeManager {
     mirror: string,
     task: TaskId,
     branch: string,
+    options: CheckoutOptions,
   ): Promise<{ readonly commit: string; readonly creating: boolean }> {
     const git = this.git.at(mirror);
     const local = await git.revParse(`refs/heads/${branch}`);
-    const remote = await this.fetchAgentBranch(mirror, task, branch);
+    const remote = await this.remoteTip(
+      repo,
+      mirror,
+      task,
+      branch,
+      options.mustReachRemote === true,
+    );
 
     if (remote === undefined) {
       if (local !== undefined) return { commit: local, creating: false };
@@ -547,13 +591,20 @@ export class WorktreeManager {
     task: TaskId,
     branch: string,
     path: string,
+    options: CheckoutOptions,
   ): Promise<void> {
     const git = this.git.at(path);
     const on = await git.tryRun("symbolic-ref", "--short", "--quiet", "HEAD");
     if (on.code !== 0 || on.stdout.trim() !== branch) return;
 
     const mirror = await this.commonDir(path);
-    const remote = await this.fetchAgentBranch(mirror, task, branch);
+    const remote = await this.remoteTip(
+      repo,
+      mirror,
+      task,
+      branch,
+      options.mustReachRemote === true,
+    );
     if (remote === undefined) return;
 
     const head = await git.revParse("HEAD");
@@ -571,8 +622,20 @@ export class WorktreeManager {
   }
 
   /**
-   * The remote's tip of `branch`, fetched into `refs/remotes/origin/<branch>`. Undefined
-   * when the remote does not have it, or when the fetch could not be made.
+   * The remote's tip of `branch`, fetched into `refs/remotes/origin/<branch>`, or WHY there
+   * is no tip to report.
+   *
+   * The three answers are kept apart because two of them mean opposite things to a session.
+   * `absent` is the ordinary first session on a task nobody has pushed. `unreachable` is a
+   * question that was never asked — an expired credential, a DNS failure, a throttled forge
+   * — and reading it as `absent` is GH-96 with no local ref wrong anywhere: the session
+   * starts on the base while the pushed work sits upstream. Collapsing them into one
+   * `undefined`, as the first version of this did, makes that indistinguishable.
+   *
+   * Existence is settled by `ls-remote --exit-code` and not by the fetch, because a fetch
+   * cannot tell them apart: it reports both as a plain non-zero, so anything built on it
+   * tolerates a network fault exactly as much as it tolerates a fresh task. `ls-remote`
+   * exits 2 for a ref the remote does not have and 128 for a remote it could not read.
    *
    * Fetched from `origin`'s URL rather than from the remote NAME, which is the one
    * non-obvious line here. A mirror's `remote.origin.fetch` is `+refs/*:refs/*`, and git
@@ -593,34 +656,94 @@ export class WorktreeManager {
    * `cloneUrl`, but nothing stops an operator re-pointing a mirror, and a test fixture's
    * origin is a local path.
    *
-   * Never throws. This runs at the top of every fresh checkout, including the progress
-   * probe's and the verifier's on a repo whose credential service has already been closed
-   * (§9.2), and on a task whose branch nobody has ever pushed. A fetch that cannot be made
-   * means "the remote has nothing to say", which returns the caller to the behaviour it had
-   * before this existed rather than failing a session that could have run.
+   * Never throws, whatever it finds. Deciding what an `unreachable` remote MEANS is the
+   * caller's, because it differs by caller: this runs at the top of every checkout,
+   * including the progress probe's and the verifier's on a repo whose credential service has
+   * already been closed (§9.2), where a fetch cannot succeed and failing would take
+   * verification down with it. `remoteTip` is where that judgement is made.
    */
   private async fetchAgentBranch(
     mirror: string,
     task: TaskId,
     branch: string,
-  ): Promise<string | undefined> {
+  ): Promise<AgentBranchTip> {
     const tracking = `refs/remotes/origin/${branch}`;
     const git = this.git.at(mirror);
     const url = await git.tryRun("config", "--get", "remote.origin.url");
-    if (url.code !== 0) return undefined;
+    if (url.code !== 0) {
+      return { state: "unreachable", reason: `${mirror} has no remote.origin.url` };
+    }
+    const remote = url.stdout.trim();
+
+    const listed = await git.tryRun(
+      ...this.credentialArgs(task),
+      "ls-remote",
+      "--exit-code",
+      remote,
+      `refs/heads/${branch}`,
+    );
+    if (listed.code === 2) return { state: "absent" };
+    if (listed.code !== 0) {
+      return {
+        state: "unreachable",
+        reason:
+          listed.stderr.trim() || `git ls-remote ${remote} exited ${listed.code}`,
+      };
+    }
 
     const fetched = await git.tryRun(
       ...this.credentialArgs(task),
       "fetch",
       "--no-tags",
-      url.stdout.trim(),
+      remote,
       `+refs/heads/${branch}:${tracking}`,
     );
-    // A remote with no such branch is a fetch FAILURE ("couldn't find remote ref"), not an
-    // empty success, so the stale tracking ref a previous session left must not be read as
-    // the current tip — the branch may have been deleted by a merge.
-    if (fetched.code !== 0) return undefined;
-    return git.revParse(tracking);
+    if (fetched.code !== 0) {
+      return {
+        state: "unreachable",
+        reason: fetched.stderr.trim() || `git fetch ${remote} exited ${fetched.code}`,
+      };
+    }
+
+    // `ls-remote` said the branch is there and the fetch succeeded, so a tracking ref that
+    // will not resolve is this runner's own object store disagreeing with itself rather than
+    // anything about the remote — reported as unreachable so it cannot be read as "nobody
+    // has pushed", which is the one reading that costs a duplicate implementation.
+    const tip = await git.revParse(tracking);
+    if (tip === undefined) {
+      return { state: "unreachable", reason: `${tracking} did not resolve after a fetch` };
+    }
+    return { state: "tip", commit: tip };
+  }
+
+  /**
+   * `fetchAgentBranch`, with the caller's answer to "and what if we could not ask?".
+   *
+   * The tip when the remote has the branch, `undefined` when it does not — and a throw when
+   * the remote could not be reached AND the caller said it must be. That flag comes from
+   * `ensureTaskCheckout`'s options and is set by the agent session runner alone, because
+   * only that caller holds the task's credential lease (§9.2): for it, a remote it cannot
+   * reach is a fault, and starting anyway would be GH-96 by a route no local ref can reveal.
+   * Every other caller runs after `clearActive()` and needs the old tolerance, where a
+   * silent remote means "nothing to say" and the checkout proceeds on what is on disk.
+   */
+  private async remoteTip(
+    repo: RepoRef,
+    mirror: string,
+    task: TaskId,
+    branch: string,
+    mustReachRemote: boolean,
+  ): Promise<string | undefined> {
+    const found = await this.fetchAgentBranch(mirror, task, branch);
+    if (found.state === "tip") return found.commit;
+    if (found.state === "absent") return undefined;
+
+    if (!mustReachRemote) return undefined;
+    throw new Error(
+      `refusing to start ${task} on ${repo.owner}/${repo.name}: origin could not be asked ` +
+        `about ${branch}, so this runner cannot tell a task nobody has pushed from one ` +
+        `whose work is already on the remote. git said: ${found.reason}`,
+    );
   }
 
   /**
@@ -737,20 +860,25 @@ export class WorktreeManager {
    * relying on its `.gitignore`: exclude is local-only, so the agent cannot
    * accidentally commit a sibling repo even in a repo that has not thought to ignore
    * the directory.
+   *
+   * `options.mustReachRemote` applies to EVERY repo the task declares, not only the
+   * workspace one. A session that starts behind on a sibling re-does the sibling's work,
+   * which is the same defect in a place a reviewer is less likely to look.
    */
   async ensureTaskCheckout(
     repos: readonly RepoRef[],
     task: TaskId,
+    options: CheckoutOptions = {},
   ): Promise<TaskCheckout> {
     const workspace = repos[0];
     if (workspace === undefined) throw new Error(`task ${task} declares no repos`);
 
-    const root = await this.ensureWorktree(workspace, task);
+    const root = await this.ensureWorktree(workspace, task, options);
     const siblings = new Map<string, string>();
 
     for (const repo of repos.slice(1)) {
       const path = join(root, "repos", repo.name);
-      await this.addWorktreeAt(repo, task, path);
+      await this.addWorktreeAt(repo, task, path, options);
       siblings.set(`${repo.owner}/${repo.name}`, path);
     }
 
