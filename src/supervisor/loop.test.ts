@@ -27,6 +27,7 @@ import {
   type TrackerRef,
   type WorkspaceName,
 } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { type Notifier, NullNotifier } from "../notify/discord.ts";
@@ -6202,6 +6203,8 @@ test("the tracker is told, with a reason naming it a forced completion", async (
 const reverifyingSupervisor = (
   queue: AlertQueue,
   prUrl: string,
+  /** `required` for the one test about a fix that was enqueued rather than merged. */
+  mergeQueue: MergeQueueSupport = "absent",
 ): { readonly supervisor: Supervisor; readonly store: StateStore } => {
   const store = new StateStore(statePath, stateGit);
 
@@ -6213,10 +6216,8 @@ const reverifyingSupervisor = (
     listReviewComments: () => Promise.resolve([]),
     approve: () => Promise.resolve(),
     merge: () => Promise.resolve(),
-    // No merge queue: the sequence under test is merge-then-hold, and a queued merge is a
-    // different path with its own tests.
-    mergeQueue: () => Promise.resolve("absent" as const),
-    enqueue: () => Promise.reject(new Error("no queue to enqueue into")),
+    mergeQueue: () => Promise.resolve(mergeQueue),
+    enqueue: () => Promise.resolve(),
     revoke: () => Promise.resolve(),
   };
 
@@ -6431,4 +6432,55 @@ test("a merged remediation fix whose alert cleared reaches done, and says how lo
   const after = await readAlertRecord(FINGERPRINT);
   assert.equal(after?.alertname, ALERTNAME);
   assert.equal(after?.verify, undefined);
+});
+
+test("a fix that only reached the merge queue is not re-verified, and says so", async () => {
+  // A queued pull request has not landed: the queue runs its own checks against a
+  // speculative base and can still reject it (`stopsTheSequence`). Holding the task for a
+  // settle window here would time the window from an instant the fix was not yet on the
+  // default branch, and then park a task whose fix was still on its way — reporting a
+  // working change as one that did not clear the alert.
+  //
+  // So the hold is skipped, and the skip is SAID. Absence of evidence is not evidence: a
+  // task that finishes with no re-verification has to record that none was performed, or
+  // this reads exactly like the silence §20 exists to remove.
+  const FINGERPRINT = "6155dbcc";
+  const ALERTNAME = "CaterpillarQueued";
+  const ENQUEUED = asTaskId(`ALERT-${FINGERPRINT}`);
+
+  await seedAlertPolicy(ALERTNAME, 1);
+  await seedTask(
+    ENQUEUED,
+    { pr: { number: 22, url: "https://example.invalid/pr/22" } },
+    ["github.com/acme/widget"],
+    /* no tracker: nothing filed this, an alert did */ undefined,
+    "remediation",
+  );
+  await seedAlertRecord(FINGERPRINT, ALERTNAME, ENQUEUED);
+
+  const queue = new AlertQueue();
+  const { supervisor } = reverifyingSupervisor(queue, "https://example.invalid/pr/22", "required");
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let doneAt: string | undefined;
+  try {
+    doneAt = await waitForCommit(`chore(${ENQUEUED}): done`, 60_000);
+  } finally {
+    controller.abort();
+    await running.catch(() => undefined);
+  }
+
+  assert.ok(doneAt !== undefined, "a queued fix left the task unfinished");
+  assert.equal((await stateAt(doneAt, ENQUEUED))?.status, "done");
+
+  const journal = await journalAt(doneAt, ENQUEUED);
+  assert.match(journal, /not re-verified/i, "the skipped re-verification must be recorded");
+  assert.match(journal, /queue/i, "and it must say why, or the next reader cannot act on it");
+  assert.doesNotMatch(journal, /alert cleared/i, "a skipped check must never read as a clear");
+
+  // No hold, so no merge instant: the record is untouched and the alertname's slot stays
+  // taken, exactly as it would be for a task that never merged at all.
+  const record = await readAlertRecord(FINGERPRINT);
+  assert.equal(record?.verify, undefined, "a queued fix must not stamp a merge instant");
 });
