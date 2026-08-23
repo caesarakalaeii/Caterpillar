@@ -472,8 +472,8 @@ const journalOf = async (
  *
  * Read from the JOURNAL rather than from `alerts/refusals/`, and that is not a shortcut. The
  * record is deleted by a failed verdict and stripped of its `verify` block by a successful
- * one — by design, so a re-fire can become work again — which means by the time a digest
- * runs there is nothing left on it to read. The journal is the durable record of what was
+ * one — by design, to free the alertname's slot — which means by the time a digest runs
+ * there is nothing left on it to read. The journal is the durable record of what was
  * concluded, and the digest is already collecting it.
  *
  * The LAST match wins. A task can be re-verified, parked, resumed, re-merged and

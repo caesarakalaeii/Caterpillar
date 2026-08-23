@@ -5489,14 +5489,23 @@ The window a task is held for is the one read back off the RECORD, not the polic
 stands at the verdict — the entry can change while a fix is in review, and the number the
 journal already quoted is the one the task is entitled to.
 
-**A failed re-verification resets the fingerprint's record.** That deletion is the
-load-bearing write of the whole feature, not a tidy-up: without it, `ALERT-<fingerprint>`
-dedup means the fix that did not work goes on suppressing its own alert forever, which is a
-worse outcome than never having re-verified. A CLEARED verdict deletes only the `verify`
-block and keeps the record, because the record is what `countOpenAlertTasks` joins to
-`tasks/` — removing it while the task is still being written as done would free the
-alertname's slot, and a firing in that window would open a second task for an incident that
-had just been fixed.
+**A failed re-verification resets the fingerprint's record.** Deleting
+`alerts/refusals/<fingerprint>.json` frees the alertname's `maxOpenTasks` slot —
+`countOpenAlertTasks` joins that directory to `tasks/`, so a record naming a task that
+failed to fix its incident would otherwise go on holding the slot and refusing every other
+firing of the same alertname. It also drops the stale `verify` block, so nothing settles the
+same verdict twice.
+
+What it does NOT do is let the same fingerprint fire into a new task. That dedup is
+`hasTask(ALERT-<fingerprint>)` and a task directory outlives its task, so a re-fire finds
+the parked task — which is the honest answer: that task holds the diagnosis, the merged fix
+that did not work, and the verdict, and a second task for one incident would start from
+nothing. The way it becomes work again is the park's notification and `/resume`, which is
+why the park carries the evidence and why the failure is notified rather than logged.
+
+A CLEARED verdict deletes only the `verify` block and keeps the record, because removing it
+while the task is still being written as done would free the alertname's slot, and a firing
+in that window would open a second task for an incident that had just been fixed.
 
 **A failure parks, and parks with the evidence.** Not `failed`: the change merged and
 passed every gate, so `failed` would be a lie about the change. What is true is that the

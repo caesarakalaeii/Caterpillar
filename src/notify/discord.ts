@@ -757,8 +757,8 @@ const frame = (notification: Notification, hint: boolean): string => {
             `fix merged, so the task is done.`
           : `⚠️ **${task}** — ${text}. The change merged and passed every gate, but ` +
             `\`${notification.alertname}\` is not settled, so the task is **parked** rather ` +
-            `than done. Its dedup record has been reset: a fresh firing can open a new task, ` +
-            `and \`/resume\` sends a session back at this one.`,
+            `than done. Its dedup record has been reset, freeing \`${notification.alertname}\`'s ` +
+            `slot for other firings; \`/resume\` sends a session back at this one.`,
       );
     case "done": {
       const note = notification.note;

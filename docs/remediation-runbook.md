@@ -506,8 +506,19 @@ journal, and the window it was held for is on its record:
 git -C <state-repo> show main:alerts/refusals/a1b2c3d4e5f60718.json
 ```
 
-A `verify` block still present means the task is settling right now. A failed verdict
-deletes the whole record, which is what lets the next firing of that alert open a new task.
+A `verify` block still present means the task is settling right now. A failed verdict deletes
+the whole record, which frees that alertname's `maxOpenTasks` slot so its OTHER firings can
+open tasks. A re-fire of the same fingerprint still finds the parked task — that is the one
+holding the diagnosis and the fix that did not work, so `/resume` it rather than expecting a
+second task to appear.
+
+### A remediation task closed with "the alert was NOT re-verified"
+
+The repo's base branch has a merge queue, so the council enqueued the pull request instead of
+merging it. A queued change is not on the default branch yet and can still be rejected by the
+queue, so there is no merge instant to measure a settle window from and no re-verification is
+attempted (DESIGN.md §20). The task closes, and the journal says so rather than reporting a
+clear nobody established. Watch the alert yourself, or check the queue.
 
 You do not have to: the next firing after the entry exists is handled on its merits and the
 record is cleared by the success path anyway. Delete it when you want the notification back

@@ -6358,9 +6358,9 @@ test("a merged remediation fix is held for a verdict, and parked when the alert 
   // with a warning in a log line.
   assert.match(await journalAt(parkedAt, HELD), /alert still firing/i);
 
-  // And the dedup record is GONE, so the next firing of this alert becomes work again.
-  // Without this the feature is worse than not having it: the fix that failed would go on
-  // suppressing its own alert forever.
+  // And the dedup record is GONE, which frees the alertname's `maxOpenTasks` slot: without
+  // it, a record naming the task that failed to fix its incident goes on refusing every
+  // other firing of that alertname (`countOpenAlertTasks`).
   assert.equal(await readAlertRecord(FINGERPRINT), undefined);
 });
 

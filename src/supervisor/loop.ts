@@ -3282,9 +3282,10 @@ export class Supervisor {
             state.sessions,
             `**Re-verified:** ${line}.\n\nThe change merged and passed every gate, so this is ` +
               `not a rejected fix — it is a fix that did not end the incident. The alert's ` +
-              `dedup record has been reset, so a fresh firing can open a new task. Start from ` +
-              `what this one already established rather than from scratch: the diagnosis is ` +
-              `in the journal above.`,
+              `dedup record has been reset, which frees this alertname's slot for other ` +
+              `firings; a re-fire of this exact alert still finds this task, so \`/resume\` is ` +
+              `how it becomes work again. Start from what this one already established rather ` +
+              `than from scratch: the diagnosis is in the journal above.`,
           );
           await this.transition(handle, state, "parked");
           await this.push(handle, `chore(${task}): parked`);

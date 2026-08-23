@@ -609,11 +609,16 @@ export interface DueReverification {
  *
  * ## What a failure does to the record
  *
- * A still-firing or unverifiable verdict DELETES the record. That is the load-bearing
- * write, not a tidy-up: task ids on this path are `ALERT-<fingerprint>`, so the next firing
- * of the same alert is deduped against the task that already exists. Leaving the record
- * behind would let an ineffective fix permanently suppress its own alert, which is a worse
- * outcome than never having re-verified at all.
+ * A still-firing or unverifiable verdict DELETES the record. `countOpenAlertTasks` joins
+ * `alerts/refusals/` to `tasks/` to answer "how many tasks does this alertname have open",
+ * so a record naming a task that failed to fix its incident would go on holding the
+ * alertname's `maxOpenTasks` slot and refusing every other firing of it. The deletion frees
+ * that slot, and drops the stale `verify` block so nothing settles the same verdict twice.
+ *
+ * It does not reopen THIS fingerprint: that dedup is `hasTask(ALERT-<fingerprint>)` and a
+ * task directory outlives its task, so a re-fire finds the parked task — the one carrying
+ * the diagnosis, the merged fix and the verdict. `/resume` on it, prompted by the park's
+ * notification, is how it becomes work again.
  *
  * A CLEARED verdict deletes only the `verify` block. The record itself is what
  * `countOpenAlertTasks` joins to `tasks/`, and removing it while the task is still being
@@ -740,8 +745,12 @@ export class AlertReverifier {
         const { verify: _settled, ...rest } = record;
         await this.store.writeAlertRefusal(fingerprint, rest);
       } else {
-        // The reset. A fix that did not work, or one nothing could check, must not go on
-        // suppressing its own alert through `ALERT-<fingerprint>` dedup.
+        // The reset. A record naming a task that failed to fix its incident would go on
+        // holding the alertname's `maxOpenTasks` slot (`countOpenAlertTasks`), refusing every
+        // other firing of that alertname. Deleting it frees the slot and drops the stale
+        // `verify` block so nothing settles the same verdict twice. It does NOT reopen this
+        // fingerprint — `hasTask` dedup outlives the record — and the park's notification is
+        // what makes the task work again.
         await this.store.clearAlertRefusal(fingerprint);
       }
     } catch (error) {
