@@ -65,8 +65,10 @@ import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
 import type { IntakeStatus } from "../intake/status.ts";
+import { lookupPolicy } from "../remediation/policy.ts";
 import type { AlertDelivery, AlertPass } from "../remediation/queue.ts";
 import type { AlertResolution, FiringAlert } from "../remediation/receiver.ts";
+import { describeVerdict, settleWindowSeconds } from "../remediation/verify.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -85,6 +87,7 @@ import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
+import { AlertReverifier } from "./verifier.ts";
 import { isNewerComment } from "../agent/review-guidance.ts";
 import { SlotSteering, type SteeringFeed } from "../agent/steering.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
@@ -604,9 +607,21 @@ export class Supervisor {
    */
   private readonly running = new Map<TaskId, Promise<void>>();
 
+  /**
+   * Post-merge re-verification of remediation tasks (DESIGN.md §20).
+   *
+   * Built here rather than injected, unlike every other gate, because it needs nothing this
+   * class does not already hold: the store, the logger and the clock. An optional dependency
+   * would have made the closing edge of §20 something a caller can forget to wire, and a
+   * caller that forgets it gets the old silence back — which is the one failure mode the
+   * whole feature exists to remove.
+   */
+  private readonly reverifier: AlertReverifier;
+
   constructor(deps: SupervisorDeps) {
     this.deps = deps;
     this.cooldown = new ProviderCooldown(deps.config.llm.cooldown);
+    this.reverifier = new AlertReverifier({ store: deps.store, logger: deps.logger });
   }
 
   /**
@@ -706,6 +721,11 @@ export class Supervisor {
     await this.applyChatRequests();
     await this.maybeIngest();
     await this.drainAlerts();
+    // AFTER the drain, so evidence that arrived in this very pass is read by the verdict it
+    // decides rather than waiting a whole interval for the next one — which for a resolution
+    // is the difference between reporting an alert as cleared and reporting it as still
+    // firing on its last delivery.
+    await this.settleReverifications();
     await this.maybeSchedule(signal);
     await this.maybeDigest(signal);
 
@@ -1465,6 +1485,11 @@ export class Supervisor {
       if (this.slots.has(id)) continue;
       if (!isClaimable(state, statusOf)) continue;
       if (!capabilitiesSatisfy(config.capabilities, state.requires)) continue;
+      // A remediation task whose merged fix is still settling (§20). It reads `ready` — which
+      // is honest: nothing is wrong with it and the work is not finished — and this is the
+      // one fact that distinguishes it. Free for every other task: `pending` answers from
+      // the task id alone unless it starts with `ALERT-`.
+      if (await this.reverifier.pending(id)) continue;
 
       const spec = await store.readSpec(id).catch(() => undefined);
       if (spec === undefined) continue;
@@ -2350,6 +2375,16 @@ export class Supervisor {
         await this.deps.leases.assertHeld(await lease.current());
 
         const merge = await this.mergeReviewed(spec, reviewed.state);
+
+        // §20's closing edge, and it goes BEFORE the transition to `done`. A remediation
+        // task exists because an alert fired, so the question the fleet still has is whether
+        // the alert stopped — and a task recorded as done is one nothing revisits. `held`
+        // being false is the ordinary case for every other kind of task, and for a
+        // remediation task whose record is gone; both finish exactly as they always did.
+        if (merge.merged && (await this.holdForReverification(lease, spec, reviewed.state))) {
+          return true;
+        }
+
         await this.unit(async () => {
           await this.transition(lease, reviewed.state, "done");
           await this.push(lease, `chore(${spec.id}): done`);
@@ -3037,6 +3072,167 @@ export class Supervisor {
     await forge.merge(pr.repo, pr.number);
     logger.info("pr.merged", fields);
     return "merged";
+  }
+
+  /**
+   * Hold a merged remediation task open until the alert it was created for is re-checked
+   * (DESIGN.md §20).
+   *
+   * True when the task was held, and the caller must then NOT finish it. False for every
+   * other kind of task, and for a remediation task with no alert record to read — both of
+   * which finish exactly as they always did.
+   *
+   * The hold is `ready` plus a filter in `claimUpTo`, not a new status, and the reason is
+   * blast radius: a seventh `TaskStatus` would touch the web view, the slash commands, the
+   * digest ordering, the snapshot ranking, the worktree live set and `isTerminal`, none of
+   * which has anything to say about an alert. `ready` is also honest here — nothing is wrong
+   * with the task and the work is not finished — and the filter is where the one fact that
+   * distinguishes it lives.
+   */
+  private async holdForReverification(
+    lease: LeaseHandle,
+    spec: TaskSpec,
+    state: TaskState,
+  ): Promise<boolean> {
+    const { store, logger } = this.deps;
+    if (spec.kind !== "remediation") return false;
+
+    // From the policy as it stands now, because this is the moment the window is chosen and
+    // written down. `settle` later reads it back off the record rather than re-reading the
+    // policy, so an operator editing the entry mid-settle cannot move a deadline the journal
+    // has already quoted.
+    const settleSeconds = await this.settleWindowFor(spec);
+    if (!(await this.reverifier.begin(spec.id, settleSeconds))) return false;
+
+    const window = settleWindowSeconds(settleSeconds);
+    await this.unit(async () => {
+      await store.appendJournal(
+        spec.id,
+        state.sessions,
+        `**Fix merged. Re-verifying the alert** for up to ${Math.round(window / 60)} minute(s) ` +
+          `before this task is closed (DESIGN.md §20).\n\nNo action is needed and no session ` +
+          `will be started: the supervisor is watching what Alertmanager delivers for this ` +
+          `fingerprint. If the alert clears the task is recorded as done; if it keeps firing, ` +
+          `or if nothing can be established either way, the task is parked with the evidence.`,
+      );
+      // `ready`, not `done`. The filter in `claimUpTo` is what stops a session starting on it.
+      await this.transition(lease, state, "ready");
+      await this.push(lease, `chore(${spec.id}): re-verifying`);
+    });
+
+    logger.info("task.reverifying", { task: spec.id, settleSeconds: window });
+    return true;
+  }
+
+  /**
+   * The settle window an alertname's policy entry asks for, or nothing.
+   *
+   * Nothing on any failure, which `settleWindowSeconds` turns into the default: a policy
+   * document that stopped parsing since the task was created must not be able to prevent the
+   * fix from being re-verified at all.
+   */
+  private async settleWindowFor(spec: TaskSpec): Promise<number | undefined> {
+    const { store, logger } = this.deps;
+    try {
+      const policy = await store.readAlertPolicy();
+      // The alertname is on the record rather than in the spec, because a fingerprint is a
+      // hash and the goal's prose is not a lookup key.
+      const record = await store.readAlertRefusal(spec.id.slice("ALERT-".length));
+      if (record === undefined) return undefined;
+      return lookupPolicy(policy, record.alertname)?.settleSeconds;
+    } catch (error) {
+      logger.warn("reverify.policy-unreadable", { task: spec.id, ...errorFields(error) });
+      return undefined;
+    }
+  }
+
+  /**
+   * Reach a verdict on every held task whose window has run out (DESIGN.md §20).
+   *
+   * On the HOUSEKEEPING pass, beside the alert drain, because it is an observation and not
+   * work: it starts no session, spends no tokens and needs no slot. Running it here also
+   * means a settle window elapses on schedule while this runner is busy with something else,
+   * which is the whole reason housekeeping is a separate loop.
+   *
+   * Never throws. A report about whether a fix worked must never be the thing that stops the
+   * fleet working.
+   */
+  private async settleReverifications(): Promise<void> {
+    const { store, leases, logger } = this.deps;
+
+    for (const { task, alertname, verdict } of await this.reverifier.due()) {
+      // A task this runner is working, or one another replica is: the lease is the only
+      // answer, and taking it here is what stops two runners settling the same verdict.
+      if (this.slots.has(task)) continue;
+
+      let lease: Lease | undefined;
+      try {
+        lease = await leases.claim(task);
+        if (lease === undefined) continue;
+        const handle = heldLease(lease);
+
+        const spec = await store.readSpec(task);
+        const state = await store.readState(task);
+        // Decided again, and only now recorded: `due` deliberately does not write, so the
+        // verdict acted on is the one this runner has just re-read under the lease it holds.
+        const settled = await this.reverifier.settle(task);
+        if (settled === undefined) continue;
+
+        const line = describeVerdict(settled);
+        logger.info("reverify.verdict", { task, alertname, verdict: settled.kind, detail: line });
+
+        if (settled.kind === "cleared") {
+          await this.unit(async () => {
+            await store.appendJournal(state.id, state.sessions, `**Re-verified:** ${line}.`);
+            await this.transition(handle, state, "done");
+            await this.push(handle, `chore(${task}): done`);
+          });
+          await this.mirror(spec, { kind: "completed", prUrl: state.pr?.url ?? "(merged)" });
+          await this.notifyTask(state, {
+            kind: "alert-reverified",
+            task,
+            alertname,
+            cleared: true,
+            detail: line,
+          });
+          await this.reapTask(spec, "done");
+          continue;
+        }
+
+        // Parked, not `done` and not `failed`. The work merged and every gate passed, so
+        // `failed` would be a lie about the change; what is true is that the incident is not
+        // over and a human has to decide what next. The park reason and the journal carry
+        // the evidence, so the next session starts from "the previous fix did not work"
+        // rather than from scratch.
+        await this.unit(async () => {
+          await store.appendJournal(
+            state.id,
+            state.sessions,
+            `**Re-verified:** ${line}.\n\nThe change merged and passed every gate, so this is ` +
+              `not a rejected fix — it is a fix that did not end the incident. The alert's ` +
+              `dedup record has been reset, so a fresh firing can open a new task. Start from ` +
+              `what this one already established rather than from scratch: the diagnosis is ` +
+              `in the journal above.`,
+          );
+          await this.transition(handle, state, "parked");
+          await this.push(handle, `chore(${task}): parked`);
+        });
+        await this.mirror(spec, { kind: "parked", reason: line });
+        await this.notifyTask(state, {
+          kind: "alert-reverified",
+          task,
+          alertname,
+          cleared: false,
+          detail: line,
+        });
+      } catch (error) {
+        // One task that cannot be settled must not cost the pass, and must never cost the
+        // housekeeping loop: everything else it does is unrelated to this alert.
+        logger.warn("reverify.failed", { task, ...errorFields(error) });
+      } finally {
+        if (lease !== undefined) await leases.release(lease).catch(() => undefined);
+      }
+    }
   }
 
   /**

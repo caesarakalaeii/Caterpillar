@@ -244,6 +244,13 @@ test("every notification kind renders with the task id and its payload", async (
       schedule: "deps-audit",
       occurrence: "2026-08-17T0700Z",
     },
+    {
+      kind: "alert-reverified",
+      task: TASK,
+      alertname: "CaterpillarNoProgress",
+      cleared: true,
+      detail: "fix merged, alert cleared after 4m",
+    },
   ];
 
   for (const notification of cases) {
@@ -269,6 +276,38 @@ test("a refused alert names the alert rather than a task, and says it speaks onc
   assert.match(content, /a1b2c3d4/);
   assert.match(content, /alerts\/refusals\//);
   assert.ok(size(content) <= CONTENT_LIMIT);
+});
+
+test("a re-verified alert reads differently depending on whether the fix worked", () => {
+  // The whole point of §20's closing edge: a silent success and a silent failure must not
+  // look the same. Two messages, and a reader has to be able to tell them apart at a glance
+  // — which for the failure means being told what to do next, because a merged fix that did
+  // not end the incident is not something anyone expects to read about.
+  const cleared = render({
+    kind: "alert-reverified",
+    task: TASK,
+    alertname: "CaterpillarNoProgress",
+    cleared: true,
+    detail: "fix merged, alert cleared after 4m",
+  });
+  const firing = render({
+    kind: "alert-reverified",
+    task: TASK,
+    alertname: "CaterpillarNoProgress",
+    cleared: false,
+    detail: "fix merged, alert still firing (last delivered 2026-08-23T12:09:00.000Z)",
+  });
+
+  assert.match(cleared, /cleared after 4m/);
+  assert.match(firing, /still firing/);
+  assert.notEqual(cleared, firing);
+  // The failure says the task is parked and the alert can become work again, because both
+  // are things a reader would otherwise have to go and check.
+  assert.match(firing, /parked/i);
+  for (const content of [cleared, firing]) {
+    assert.match(content, /CaterpillarNoProgress/);
+    assert.ok(size(content) <= CONTENT_LIMIT);
+  }
 });
 
 test("a pause says what broke, that no task is at fault, and when it retries", () => {
