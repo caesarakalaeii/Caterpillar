@@ -441,6 +441,32 @@ const count = (paths: readonly string[], pattern: RegExp): number =>
  * before the change have their whole history in that one file, and a window ending just
  * after it must show the last append to it as well as the first shard.
  */
+const journalOf = async (
+  git: Git,
+  from: string | undefined,
+  to: string,
+  id: TaskId,
+): Promise<{ journal?: string }> => {
+  const parts = [
+    await legacyJournalAdded(git, from, to, id),
+    ...(await shardJournalAdded(git, from, to, id)),
+  ];
+
+  const trimmed = parts
+    .flatMap((part) => (part === undefined ? [] : [part.trim()]))
+    .filter((part) => part !== "")
+    .join("\n\n");
+  if (trimmed === "") return {};
+
+  const points = [...trimmed];
+  return {
+    journal:
+      points.length <= JOURNAL_LIMIT
+        ? trimmed
+        : `… (earlier entries omitted)\n${points.slice(-JOURNAL_LIMIT).join("")}`,
+  };
+};
+
 /**
  * The `**Re-verified:** …` line the supervisor wrote, pulled back out of the journal (§20).
  *
@@ -469,32 +495,6 @@ const reverificationOf = (journal: string | undefined): { reverified?: string } 
   for (const match of journal.matchAll(REVERIFIED)) last = match[1]?.trim();
 
   return last === undefined || last === "" ? {} : { reverified: last };
-};
-
-const journalOf = async (
-  git: Git,
-  from: string | undefined,
-  to: string,
-  id: TaskId,
-): Promise<{ journal?: string }> => {
-  const parts = [
-    await legacyJournalAdded(git, from, to, id),
-    ...(await shardJournalAdded(git, from, to, id)),
-  ];
-
-  const trimmed = parts
-    .flatMap((part) => (part === undefined ? [] : [part.trim()]))
-    .filter((part) => part !== "")
-    .join("\n\n");
-  if (trimmed === "") return {};
-
-  const points = [...trimmed];
-  return {
-    journal:
-      points.length <= JOURNAL_LIMIT
-        ? trimmed
-        : `… (earlier entries omitted)\n${points.slice(-JOURNAL_LIMIT).join("")}`,
-  };
 };
 
 /**
