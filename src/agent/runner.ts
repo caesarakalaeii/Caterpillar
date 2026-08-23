@@ -35,6 +35,7 @@ import type {
   TaskState,
   WorkspaceName,
 } from "../domain/task.ts";
+import { conflictGuidance } from "../forge/mergeability.ts";
 import type { Forge, ForgeFactory, ReviewComment } from "../forge/types.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
@@ -252,6 +253,7 @@ export class AgentSessionRunner {
         state,
         ...(await this.promptContext(spec, recoveryNote)),
         ...(await this.stagedSection(spec, state)),
+        ...(await this.conflictSection(spec, repo, worktree)),
         ...(review.section === undefined ? {} : { reviewGuidance: review.section }),
       });
 
@@ -510,6 +512,69 @@ export class AgentSessionRunner {
   ): Promise<{ readonly artifacts?: string }> {
     const staged = await this.stageArtifacts(spec, state).catch(() => undefined);
     return staged === undefined ? {} : { artifacts: staged };
+  }
+
+  /**
+   * The branch's conflicts with its base, as a prompt section (DESIGN.md §12).
+   *
+   * Computed at session start so the rebase happens as ordinary work. A task that ran for
+   * several sessions can end on a branch its base has moved past, and the first thing that
+   * notices today is the merge — after every gate has passed, which reads as a terminal
+   * failure and is nothing of the kind.
+   *
+   * The PRIMARY repo only. A multi-repo task has a branch per repo and each can drift, but
+   * every extra repo costs a `merge-tree` and a `git show` per conflicting file on a path
+   * that runs before the first token; `repos[0]` is where the agent's working directory is
+   * (§14.3) and the overwhelming majority of the conflict. If sibling drift turns out to
+   * cost a session, this is the loop that grows.
+   *
+   * **The mirror is refreshed first, and it has to be.** `addWorktreeLocked` deliberately
+   * does not fetch for a worktree that already exists — a session after the first would
+   * otherwise compare its branch against the base as of whenever the worktree was created,
+   * which for the multi-session task this whole feature is about is the commit it forked
+   * from. The comparison would then be against a base that cannot have moved, and would
+   * report "merges cleanly" for every drift there is. Safe here specifically: this runs
+   * inside `credentials.activate`, so a private repo's fetch can be authorised — which is
+   * exactly what the verifier and the progress probe cannot do, and why the fetch is here
+   * rather than in `ensureTaskCheckout`.
+   *
+   * Never fails the session. An unreachable mirror, an unresolvable base or an unreadable
+   * worktree leaves the section out, which is the state every session before this one
+   * was in.
+   */
+  private async conflictSection(
+    spec: TaskSpec,
+    repo: RepoRef,
+    worktree: string,
+  ): Promise<{ readonly conflicts?: string }> {
+    const { worktrees, logger } = this.options;
+
+    try {
+      await worktrees.syncMirror(repo, spec.id);
+    } catch (error) {
+      // A stale base is still worth comparing against — it just cannot see drift since the
+      // last successful fetch. Logged, because a mirror that stops refreshing makes this
+      // section quietly useless rather than visibly broken.
+      logger.warn("branch.mirror-unrefreshed", {
+        task: spec.id,
+        repo: repoSlug(repo),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const base = await worktrees.defaultBranch(worktree).catch(() => undefined);
+    if (base === undefined) return {};
+
+    const summary = await worktrees.conflictsWithBase(worktree, base);
+    if (summary === "unknown") {
+      // Said out loud rather than passed over: "nobody could compare" and "it merges" look
+      // identical from the prompt, and this is the line that tells them apart afterwards.
+      logger.info("branch.mergeability-unknown", { task: spec.id, base });
+      return {};
+    }
+
+    const section = conflictGuidance(base, summary);
+    return section === undefined ? {} : { conflicts: section };
   }
 
   /** Journal, handoff and any operator answer that unparked this task. */

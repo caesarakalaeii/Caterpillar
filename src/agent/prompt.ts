@@ -29,6 +29,8 @@ export interface PromptParts {
   readonly artifacts?: string;
   /** Unresolved review comments on the task's pull requests (DESIGN.md §7.3). */
   readonly reviewGuidance?: string;
+  /** The branch no longer merges into its base, and which files (DESIGN.md §12). */
+  readonly conflicts?: string;
 }
 
 export const SYSTEM_PROMPT = `You are a long-running autonomous coding agent.
@@ -230,6 +232,10 @@ export const buildPrompt = (parts: PromptParts): string => {
     // most actionable thing in the prompt — it is the one instruction that came from
     // outside the loop the task is already in.
     section("Review comments on your pull request", parts.reviewGuidance),
+    // After the review, and for the weaker version of the same argument: a conflict is
+    // work that has to happen this session, but nobody asked for it — it is the base
+    // branch having moved. A review comment outranks it because a human is waiting.
+    section("Your branch no longer merges", parts.conflicts),
   ].join("");
 
   const first = parts.handoff === undefined && parts.journal === undefined;
