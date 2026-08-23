@@ -588,9 +588,18 @@ test("a doctor that throws lets the item through", async () => {
 test("an item declaring no toolchain is never handed to the doctor", async () => {
   const { store } = await stateRepo();
   const tracker = new FakeTracker([item(VALID)]);
+  // Counted rather than `assert.fail()`ed. A throw from inside the doctor lands in
+  // `toolchainReason`'s catch, which fails open by design and swallows it — so the
+  // obvious version of this test passed even with the `declared === undefined` guard
+  // deleted, which is the one thing it exists to detect.
+  let calls = 0;
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
-    fault: () => assert.fail("nothing declared a toolchain"),
+    fault: () => {
+      calls += 1;
+      return Promise.resolve(undefined);
+    },
   });
 
   assert.equal((await subject.ingest("origin", "main")).created, 1);
+  assert.equal(calls, 0, "an item with no toolchain must not reach the doctor");
 });
