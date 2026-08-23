@@ -2588,6 +2588,18 @@ written together, and that is not redundancy — every reader that only wants so
 which is the only PR a session could open then; a rolling deploy has both shapes in the state
 repo at once, so that is a live path rather than a migration nicety.
 
+**An entry is keyed on the repo AND the head branch.** `open_pr` replaces rather than appends, so
+that a session retrying a failed call does not leave the gate two numbers for one repository —
+it would check the stale one and merge the stale one. Keyed on the repo alone, though, that rule
+also evicted pull requests that were never retries. `BS-1539685872142647429-04` opened its
+deliverable from its own agent branch, then opened a side-fix for a CI flake from
+`fix/discord-listener-reconnect-test-hang`; the second replaced the first, so the gate approved
+and merged only the side-fix, marked the task `done` and reaped the worktree. The deliverable
+(`all-chat#758`) stayed open with nothing left that would ever merge it, and the task's own
+`state.json` pointed at the wrong PR. A retry is the same repo *and* the same branch; a different
+branch is a different pull request. An entry with no `head` is state written before the field
+existed, stored under the repo-only key, so it keeps the old meaning and is still replaced.
+
 **The gate checks every repo and stops at the first red.** All of them, because the work is one
 change and half of it being green is not it passing; the first failure rather than a collected
 report, because a red suite in one repo is a full session's work whether or not the other is
