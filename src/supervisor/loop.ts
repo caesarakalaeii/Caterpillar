@@ -3926,7 +3926,17 @@ export class Supervisor {
       // `completed` and §12 (`tracker/github-issues.ts`). A task forced done did not pass
       // §12, so an item left open with the reason on it is the honest view — and closing it
       // needs a transition of its own, which is a change to `Tracker` and not to this.
-      const spec = await store.readSpec(request.task).catch(() => undefined);
+      //
+      // A spec that will not read is logged rather than swallowed: the `done` is already
+      // pushed, so the only consequence left is a tracker item nobody updated, and that is
+      // exactly the kind of divergence that has to be findable afterwards.
+      const spec = await store.readSpec(request.task).catch((error: unknown) => {
+        logger.warn("task.forced-done.spec-unreadable", {
+          task: request.task,
+          ...errorFields(error),
+        });
+        return undefined;
+      });
       if (spec !== undefined) {
         await this.mirror(spec, {
           kind: "parked",

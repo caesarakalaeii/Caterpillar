@@ -234,6 +234,14 @@ export const doneModal = (task: TaskId, fieldId: string): Modal | undefined =>
     label: "Why (the gates are skipped)",
   });
 
+/**
+ * The shape both modals share: one required paragraph box, keyed to a verb and a task.
+ *
+ * Factored out when the second one arrived rather than copied, because the part worth not
+ * duplicating is not the literal — it is `required: true` and the `custom_id` round trip.
+ * A modal whose field is optional accepts an empty submit, and both callers depend on it
+ * being impossible.
+ */
 const singleFieldModal = (options: {
   readonly verb: Verb;
   readonly task: TaskId;

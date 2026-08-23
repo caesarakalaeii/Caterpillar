@@ -3554,6 +3554,31 @@ Five properties, and each is a decision rather than an accident:
   that is a machine property — which makes it `requires` (§8), not something the resolver
   can grant.
 
+**A human can write `done` past both gates, and the record has to say so.** A task can be
+*obsolete* rather than finished — superseded, descoped, or answering a question nobody is
+asking any more — and until `/done` there was no way to say that. `/merge` is the closest
+thing and it is not this: it merges the PR under the reviewer identity, so it refuses with
+no PR and with no reviewer identity configured, and it is an override of the *council*
+rather than of the gates. Obsolete work has nothing to merge and often nothing on a branch.
+
+So `/done task:<id> reason:<text>` writes `status = done` and merges nothing. `reason` is
+required on both the command and the button's modal, because a forced completion with no
+stated cause is unauditable — and the journal entry names who forced it, quotes the reason,
+and says the gates were **BYPASSED**. It must never read as a task that was verified; that
+is the whole point of the entry, and `loop.test.ts` asserts the words `passed` and
+`verified` appear nowhere in it.
+
+It is refused on `running`. The session holds the lease, so the write would either lose its
+compare-and-swap or land under an agent still working — `/cancel` stops one at a turn
+boundary and the force is available a poll later. `parked`, `failed` and `awaiting-human`
+are the statuses it is for.
+
+The tracker is mirrored through the **`parked`** transition, not `completed`. `completed`
+carries a `prUrl` this command may not have, and it is the transition that *means* the gates
+passed — it comments "acceptance criteria and CI verified" and closes the item. `parked`
+releases the item and puts the reason on it, which leaves the issue open and honest. Closing
+it needs a transition of its own (§9.5) and the reason above is why it cannot be this one.
+
 ### 12.1 The review council
 
 A third gate, after those two and never instead of them. Both of the first pair measure

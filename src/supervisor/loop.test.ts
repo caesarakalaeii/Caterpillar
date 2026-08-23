@@ -5367,11 +5367,13 @@ test("forcing a task done records no gate as passed, anywhere", async () => {
   assert.equal(state?.status, "done");
   assert.equal(state?.review?.last, undefined, "the council never ran, so it recorded nothing");
 
-  // `\b` on both sides deliberately: the entry says the gates were BYPASSED, and a
-  // substring match on "passed" would reject the very wording that makes it honest.
+  // The two words a verified completion is written with, each on its own and anywhere in
+  // the entry, which is far stricter than a phrase match. Word-bounded on purpose: the
+  // honest wording is "BYPASSED" and "not by verification", and an unanchored substring
+  // match on "passed" or "verif" would reject exactly the sentences that make it honest.
   const journal = await pushedJournal(UNVERIFIED);
-  assert.doesNotMatch(journal, /\bgates? \bpassed\b/i, "nothing may read as a gate that passed");
-  assert.doesNotMatch(journal, /criteria and CI verified/i, "the wording a real completion uses");
+  assert.doesNotMatch(journal, /\bpassed\b/i, "nothing may read as a gate that passed");
+  assert.doesNotMatch(journal, /\bverified\b/i, "nor as a task that was verified");
   assert.match(journal, /BYPASSED/);
 });
 
@@ -5465,9 +5467,11 @@ test("/done is accepted on failed and on awaiting-human", async () => {
   }
 });
 
-test("the tracker item is closed, with a reason naming it a forced completion", async () => {
+test("the tracker is told, with a reason naming it a forced completion", async () => {
   // Mirrored through the EXISTING `parked` transition: `completed` requires a PR url and
-  // `/done` must work without one. The reason field is what carries the truth.
+  // `/done` must work without one. The reason field is what carries the truth — which is
+  // also why the name of this test is not "closed": `parked` releases the item and comments
+  // on it, and closing an issue is reserved for `completed` and the gates it stands for.
   const MIRRORED = asTaskId("SMOKE-FORCE-5");
   await seedTask(MIRRORED, { status: "parked" }, ["github.com/acme/widget"], {
     kind: "github-issues",
