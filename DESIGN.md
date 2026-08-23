@@ -556,7 +556,8 @@ and the only way to be right. Which verbs skip on a replay is therefore decided 
 | Verb | On a replay |
 |---|---|
 | `open_pr` | asks the forge anyway; the forge is the authority |
-| `task_note`, `publish_artifact` | skipped — a duplicate tracker comment is permanent, and a replayed publish would hit §17's cap or a file the agent has since deleted |
+| `task_note` | skipped — a duplicate tracker comment is permanent |
+| `publish_artifact` | attempted first; the record answers only if the attempt was *refused* (see below) |
 | `done`, `handoff`, `ask_human`, `submit_plan` | recorded, and they still signal: the sink is in memory and the record is not, so a resumed session that already claimed done must still stop |
 | `tracker.*` (§9.5) | skipped — a retried mirror already may not fail a task, and now may not double one either |
 
@@ -570,12 +571,40 @@ and `claimed` is the only transition that removes `needs-human` and re-adds `age
 issue keeps advertising for help nobody needs. That is the regression §9.5 records as an
 amendment already made once.
 
-So `mirrorTransition` hashes the transition **and the task's session index**. That index is the
-window a replay lives in: `sessions` counts *completed* sessions, so a pod killed between the
-tracker comment and the state write is reclaimed at the same index and collapses, while a park
-a human answered opens a new session and mirrors normally. A discriminator per mirror *attempt*
-would be wrong in the other direction — it could never match, making the record dead weight.
-The index keys the record only; the tracker never sees it.
+So `mirrorTransition` hashes the transition **and an occurrence token** supplied by the call
+site. The token must be identical for two attempts at one lifecycle event and different for a
+genuinely new one; a discriminator per mirror *attempt* would be wrong in the other direction,
+since it could never match and the record would be dead weight. It keys the record only — the
+tracker never sees it.
+
+Which token is right depends on the transition, so each call site chooses:
+
+- `claimed` uses the **lease token** (`Lease.oid`). A claim *is* a lease commit: every claim
+  pushes a new one, so the oid differs across claims and is identical within one. The session
+  index was tried first and is wrong here, because it does not advance on every claim —
+  `parkFailed` on a toolchain failure, the `unreachableRepos` park and `checkLimits` all park
+  before any session is recorded, and `applyResume` does not touch `sessions` either. Keyed on
+  the index, a re-claim by the same pod after a human resumed the task hashed to the previous
+  claim and the mirror vanished: the `parked` mirror had just removed `agent-wip` and `claimed`
+  is the only transition that re-adds it, so the item read as unowned for the whole next
+  session.
+- `question` uses the **question index**, which advances per question asked and so already
+  separates two questions with identical text.
+- `completed` and `parked` use the **session index**. Both follow a completed session, so the
+  index does advance between two genuine occurrences, and a pod killed between the tracker
+  comment and the state write comes back at the same index and collapses.
+
+**`publish_artifact` checks its record last, not first.** Every other skipping verb reads the
+record before acting. This one acts and reads the record only if the attempt was *refused*,
+because the effect is a file write and a write is already idempotent — the same bytes under the
+same name twice is the same end state, so there is no duplicate to suppress. Checking first was
+wrong: overwriting an existing artifact name is supported (`StateStore.writeArtifact` guards
+§17's count cap with `!existing.includes(name)` to allow it), so an agent that regenerated a
+file and republished it under the same name, path and note got no store at all and was handed
+the previous call's byte count. That is a stale record producing a *wrong answer* rather than a
+duplicate attempt, which this section forbids. The record still earns its place: a replay after
+a restart, whose fresh worktree no longer carries the generated file, refuses on the read and
+is handed the recorded result instead of failing a verb over work that already landed.
 
 Every read and write of the record swallows its own errors. A ledger failure means the state
 repo could not be reached, which says nothing about whether the effect landed, and failing a
@@ -2921,7 +2950,9 @@ parked        → comment with the reason, remove agent-wip
 ```
 
 Every one of those transitions is mirrored **at most once per occurrence**, keyed in the task's
-effect record (§4.4) on the transition, its arguments, and the session index it happened in. A
+effect record (§4.4) on the transition, its arguments, and an occurrence token from the call
+site — the lease token for a claim, the question index for a question, the session index for
+the two that follow a completed session. A
 mirror happens after the authoritative git write, so a pod killed in between comes back and
 replays it — and a duplicate comment on a tracker item is permanent, reading to the human it is
 for as an agent that has lost track of what it has said. A mirror may not *fail* a task, and it
@@ -2929,11 +2960,13 @@ may not *double* one. A mirror that threw is deliberately not recorded, so the n
 still happens; two parks for two different reasons are two effects, because the key is the
 arguments and not just the kind.
 
-The session index in that key is load-bearing, and §4.4 makes the case: these transitions
-*recur* with byte-identical arguments, unlike a tool call inside one session. `claimed` carries
-only the pod name, so without it the second claim of a task by the same pod is silently skipped
-— and a claim is the only thing that clears `needs-human`, which is the very failure the
-amendment below was made to fix.
+The occurrence in that key is load-bearing, and §4.4 makes the case: these transitions *recur*
+with byte-identical arguments, unlike a tool call inside one session. `claimed` carries only the
+pod name, so without an occurrence the second claim of a task by the same pod is silently
+skipped — and a claim is the only thing that clears `needs-human`, which is the very failure the
+amendment below was made to fix. §4.4 also records why a claim's occurrence is the lease token
+rather than the session index: the index does not advance across a park that recorded no
+session, so keying on it reintroduced that same failure by a longer route.
 
 `needs-human` is cleared on claim and on done (**amended** after the first
 intake-sourced task finished `done`, closed, and still wearing it). A claim is the only
@@ -4335,11 +4368,13 @@ state transition is typed and auditable.
 
 **Every one of them is idempotent, and by the same mechanism.** Each verb takes an
 `EffectLedger` — two callbacks the supervisor binds to that task's effect record (§4.4) — and
-consults or updates it before acting. `open_pr` was the only verb that survived being called twice; now
-`task_note` posted twice with the same text comments once, a replayed `publish_artifact` hands
-back what the first call stored, and `done`, `handoff`, `ask_human` and `submit_plan` still
-signal on a replay because their signal is in memory and the record is not. §4.4 has the table
-of what skips and what does not, and why the answer differs per verb.
+consults or updates it around acting. `open_pr` was the only verb that survived being called
+twice; now `task_note` posted twice with the same text comments once, a `publish_artifact` whose
+file has gone from a fresh worktree is handed back what the first call stored instead of
+failing, and `done`, `handoff`, `ask_human` and `submit_plan` still signal on a replay because
+their signal is in memory and the record is not. §4.4 has the table of what skips and what does
+not, why the answer differs per verb, and why `publish_artifact` alone reads its record *after*
+acting rather than before.
 
 The ledger is *optional* on `ToolContext`, and a context without one behaves exactly as it did
 before. The CLI verifiers build one with no state repo behind it, and an idempotency record
