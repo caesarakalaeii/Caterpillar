@@ -282,6 +282,23 @@ test("a done task is told to be done, and pointed somewhere that works", () => {
   assert.match(reply, /brainstorm/);
 });
 
+test("a forced done says it was not verified, and never says it merged", () => {
+  // The reply is the first thing a human reads back, so it is the first place the record
+  // could start reading as a verified completion. It must not.
+  const reply = describeOutcome(TASK, { kind: "forced-done" });
+  assert.match(reply, /done/i);
+  assert.match(reply, /gate/i, "the reader has to be told nothing was checked");
+  assert.doesNotMatch(reply, /merged/i, "nothing was merged, and saying so would be a lie");
+});
+
+test("a refused force says to cancel it first", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "not-forceable",
+    reason: "it is running right now — `/cancel` it first",
+  });
+  assert.match(reply, /cancel/i);
+});
+
 test("a running task's review lines say guidance needs no restart", () => {
   // The wording that was wrong: it told a human to say what to change "before the next
   // session starts", which is advice for a mechanism that did not exist and a session that

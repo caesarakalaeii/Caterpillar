@@ -390,6 +390,38 @@ test("every park a human is expected to act on carries the way back twice", () =
   }
 });
 
+test("every park a human is expected to act on also offers to mark it done", () => {
+  // The other half of the decision a park asks for: the task may be OBSOLETE rather than
+  // stuck, and until now the only offered move was to resume it into work nobody wants.
+  const parks: readonly Notification[] = [
+    { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
+    { kind: "failed", task: TASK, error: "the dev environment could not be prepared" },
+    {
+      kind: "plan-stalled",
+      task: TASK,
+      rounds: 3,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — unmeasurable.",
+    },
+    {
+      kind: "review-stalled",
+      task: TASK,
+      rounds: 3,
+      reason: "the council keeps sending it back",
+      canMerge: true,
+      prUrl: "https://example.invalid/pr/1",
+    },
+  ];
+
+  for (const park of parks) {
+    const attached = componentsFor(park);
+    const labels = (attached ?? []).flatMap((r) =>
+      r.components.map((c) => ("label" in c ? c.label : "")),
+    );
+    assert.ok(labels.includes("Mark done"), `${park.kind} should offer a Mark done button`);
+  }
+});
+
 test("a resume button refuses to encode rather than address the wrong task", () => {
   // `custom_id` is capped at 100 characters and a task id is tracker-derived. A clipped id is
   // still a valid-looking id, so the button is dropped instead — and the prose is what is

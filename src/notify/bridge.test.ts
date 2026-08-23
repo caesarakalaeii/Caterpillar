@@ -23,7 +23,7 @@ import { DiscordBridge } from "./bridge.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, RESPONSE, type Interaction } from "./interactions.ts";
 import { ThreadIndex } from "./threads.ts";
-import { ANSWER_FIELD } from "./slash.ts";
+import { ANSWER_FIELD, DONE_REASON_FIELD } from "./slash.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
 const CHANNEL = "1537550186388258866";
@@ -226,6 +226,53 @@ test("the Answer button opens a modal and writes nothing yet", async () => {
 
   assert.equal(inbox.size, 0);
   assert.equal(callback(calls).body["type"], RESPONSE.modal);
+});
+
+test("the Mark done button asks for a reason before anything is written", async () => {
+  const customId = encodeCustomId({ verb: "done", task: TASK });
+  assert.ok(customId !== undefined);
+  const { bridge, inbox, calls } = harness();
+
+  await bridge.handleInteraction(
+    interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+  );
+
+  assert.equal(inbox.size, 0, "the click itself must force nothing");
+  assert.equal(callback(calls).body["type"], RESPONSE.modal);
+});
+
+test("the Mark done modal forces the task done, naming whoever submitted it", async () => {
+  // The author is not on the intent the parser produces — the bridge is the only place that
+  // knows who pressed the button, and the journal entry is unauditable without it.
+  const customId = encodeCustomId({ verb: "done", task: TASK });
+  assert.ok(customId !== undefined);
+  const { bridge, inbox, calls } = harness();
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.modalSubmit,
+      data: {
+        custom_id: customId,
+        components: [{ components: [{ custom_id: DONE_REASON_FIELD, value: "obsolete" }] }],
+      },
+    }),
+  );
+
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+  const queued = await inbox.drain();
+  assert.deepEqual(queued.map((request) => ({ ...request, settle: undefined })), [
+    {
+      kind: "force-done",
+      task: TASK,
+      reason: "obsolete",
+      author: "operator",
+      settle: undefined,
+    },
+  ]);
+  for (const request of queued) request.settle({ kind: "forced-done" });
+  await handled;
+
+  assert.equal(posted(calls).length, 1);
 });
 
 test("a submitted modal answers the task the button came from", async () => {
