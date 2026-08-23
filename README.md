@@ -154,6 +154,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/budget.ts` | Bounded view of one tool's output, with the elision stated. Pure, no IO (§6.4). |
 | `src/agent/exec.ts` | The agent's shell with a per-command time *and* output ceiling (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
+| `src/agent/review-guidance.ts` | Unresolved pull request review comments → a prompt section. Pure, no IO (§7.3). |
 | `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against (§12.2). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |

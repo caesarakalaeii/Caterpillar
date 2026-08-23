@@ -30,6 +30,7 @@ import {
   type ProposedPlan,
   type RepoRef,
   type ProviderOutage,
+  type ReviewRecord,
   type SessionOutcome,
   type TaskId,
   type TaskPhase,
@@ -77,6 +78,7 @@ import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
+import { isNewerComment } from "../agent/review-guidance.ts";
 import { SlotSteering, type SteeringFeed } from "../agent/steering.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
 import type { ChatDrainer } from "../redis/inbox.ts";
@@ -2043,6 +2045,7 @@ export class Supervisor {
       // display reader already reads.
       ...(outcome.pr !== undefined ? { pr: outcome.pr } : {}),
       ...(outcome.prs !== undefined ? { prs: outcome.prs } : {}),
+      ...this.forgiveReviewRounds(spec, state, outcome),
     };
 
     // Three files and a commit as ONE unit — the journal shard, the handoff and the state.
@@ -2095,6 +2098,43 @@ export class Supervisor {
     }
     void config;
     return next;
+  }
+
+  /**
+   * Clear the council's round count when a human commented on the pull request (§7.3, §12.1).
+   *
+   * The same departure typed guidance makes, for the same surface-independent reason: the cap
+   * exists to detect a loop with nothing new entering it, and a human objection is precisely
+   * something new. Left unforgiven, a task already at the cap parks on the very next
+   * rejection — so the objection is never tested, and the human concludes, correctly, that
+   * commenting on the pull request had no effect.
+   *
+   * Written HERE rather than in `convene` because of the ordering: `recordSession` runs
+   * before `applyOutcome`, which is what convenes the council. Forgiven afterwards, the round
+   * has already been counted and the task has already parked.
+   *
+   * The watermark moves whether or not there was anything to forgive, so one comment buys one
+   * round rather than a round on every session for the rest of the task's life. `last` and
+   * `reason` stay put, exactly as `applyGuidance` leaves them: a human who commented wants to
+   * see what they are answering.
+   */
+  private forgiveReviewRounds(
+    spec: TaskSpec,
+    state: TaskState,
+    outcome: SessionOutcome,
+  ): { readonly review?: ReviewRecord } {
+    const comment = outcome.reviewComment;
+    if (comment === undefined) return {};
+
+    const review = state.review ?? { rounds: 0 };
+    if (!isNewerComment(comment, review.commentSeen)) return {};
+
+    this.deps.logger.info("review.rounds-forgiven", {
+      task: spec.id,
+      rounds: review.rounds,
+      commentAt: comment,
+    });
+    return { review: { ...review, rounds: 0, commentSeen: comment } };
   }
 
   /**
@@ -2399,6 +2439,12 @@ export class Supervisor {
         // (§snapshot). Cleared on acceptance so a passing task does not keep quoting the
         // objection it has already answered.
         ...(cut.kind === "rejected" ? { reason: recordedReason(cut.reason) } : {}),
+        // Carried forward, unlike everything else here. It is not a fact about this round:
+        // it records which review comment has already been forgiven a round, and dropping
+        // it would let the same comment forgive one again on the next session (§7.3).
+        ...(state.review?.commentSeen === undefined
+          ? {}
+          : { commentSeen: state.review.commentSeen }),
       },
     };
 
@@ -2554,6 +2600,11 @@ export class Supervisor {
         last: verdict.decision,
         // See `applyPlan`: the objections have to be in state to be reachable from `/task`.
         ...(verdict.decision === "changes" ? { reason: recordedReason(detail) } : {}),
+        // See `applyPlan` again: the review-comment watermark is not a fact about this
+        // round and must survive it, or the same comment forgives a round twice (§7.3).
+        ...(state.review?.commentSeen === undefined
+          ? {}
+          : { commentSeen: state.review.commentSeen }),
       },
     };
 

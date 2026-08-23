@@ -796,6 +796,109 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
   assert.match(verdict.stdout, /runner\.ts:107/);
 });
 
+test("a review comment on the pull request forgives a council round, once", async () => {
+  // The forge is where a human naturally reviews a change, and until this existed the
+  // council could block a change with a verdict and a human could not — except by
+  // switching to Discord and typing (§7.3). A comment is guidance, so it buys the same
+  // forgiveness typed guidance does (§12.1): otherwise the very next rejection parks the
+  // task at the cap and the objection is never tested.
+  //
+  // ONCE, which is the other half. Forgiven on every session, one comment would delete
+  // the round cap rather than inform it, and the loop it exists to detect would run
+  // forever with nothing new in it.
+  const REVIEWED = asTaskId("SMOKE-REVIEW-1");
+  await seedTask(REVIEWED, {
+    pr: { number: 9, url: "https://example.invalid/pr/9" },
+    // At the cap already: without forgiveness the first rejection below parks it.
+    review: { rounds: 2, last: "changes", reason: "**Correctness** — throws." },
+  });
+
+  let convened = 0;
+  const council: Council = {
+    reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+    review: () => {
+      convened += 1;
+      return Promise.resolve({
+        usage: EMPTY_USAGE,
+        verdict: decide([
+          {
+            lens: "correctness",
+            title: "Correctness",
+            decision: "changes",
+            blocking: true,
+            summary: "Still throws on an empty repo list.",
+            findings: [],
+          },
+        ]),
+      });
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config: { ...config, limits: { ...config.limits, maxReviewRounds: 2 } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Every session reports the SAME comment, which is what makes "once" testable: the
+    // first forgives, the second must not, so the task still parks at the cap.
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+          reviewComment: "2026-08-20T10:00:00.000Z",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council,
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // The first rejection lands at round 1, not 3: the comment was newer than anything the
+  // council had already been shown, so the count was cleared before it was incremented.
+  let firstRejection: TaskState | undefined;
+  let parked: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(REVIEWED);
+    if (firstRejection === undefined && state?.review?.rounds === 1) firstRejection = state;
+    if (state?.status === "parked") {
+      parked = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(firstRejection !== undefined, "the round count must be forgiven before it is raised");
+  assert.equal(
+    firstRejection?.review?.commentSeen,
+    "2026-08-20T10:00:00.000Z",
+    "the comment that was acted on is recorded, or it forgives a round forever",
+  );
+  assert.equal(parked?.status, "parked", "the same comment must not forgive a second round");
+  assert.equal(parked?.review?.rounds, 2, "the cap still terminates the loop");
+  assert.ok(convened >= 2, `the council ran ${convened} times, so a round was really spent`);
+});
+
 test("a passing verdict is approved and merged by the reviewer identity", async () => {
   // The order is the point. GitHub refuses a merge on a protected branch until an
   // approving review exists, and refuses that review from the PR's own author — so
@@ -810,6 +913,7 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
     credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
     openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
     checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
     approve: (_repo, pr) => {
       calls.push(`approve:${pr}`);
       return Promise.resolve();
@@ -4671,6 +4775,7 @@ test("a two-repo task merges both PRs, in the order its repos were named", async
     credential: () => Promise.reject(new Error("unused")),
     openPr: () => Promise.reject(new Error("unused")),
     checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
     approve: (repo, pr) => {
       merges.push(`approve:${repo.name}#${pr}`);
       return Promise.resolve();
@@ -4759,6 +4864,7 @@ test("a merge that fails halfway names what DID land", async () => {
     credential: () => Promise.reject(new Error("unused")),
     openPr: () => Promise.reject(new Error("unused")),
     checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
     approve: () => Promise.resolve(),
     merge: (repo) =>
       repo.name === "widget"

@@ -31,6 +31,7 @@ import {
   type MergeOptions,
   type PrRequest,
   type PrResult,
+  type ReviewComment,
   type WorkspaceScope,
 } from "./types.ts";
 
@@ -42,6 +43,28 @@ import {
  */
 const CHECK_RUN_PAGE_SIZE = 100;
 const CHECK_RUN_PAGES = 10;
+
+/**
+ * Review-thread pagination. 100 is GitHub's maximum page size for a GraphQL connection and
+ * 10 pages is 1000 threads — past any pull request a session could act on. As with the
+ * check-run cap this is a ceiling rather than a loop, so a pathological pull request cannot
+ * spin here; unlike that one, hitting it drops the tail rather than reporting truncation,
+ * because a partial list of comments is still guidance while a partial list of checks is not
+ * a verdict.
+ */
+const REVIEW_THREAD_PAGE_SIZE = 100;
+const REVIEW_THREAD_PAGES = 10;
+/** Comments per thread. A conversation longer than this has stopped being a review. */
+const THREAD_COMMENTS = 50;
+/**
+ * Review bodies read per request, newest last.
+ *
+ * Unpaginated on purpose, unlike the threads: a review body is the prose about the change as
+ * a whole, a pull request accumulates one per submitted review, and the ones worth reading
+ * are the recent ones. Fifty is more submitted reviews than any pull request a session is
+ * still working on has.
+ */
+const REVIEW_BODIES = 50;
 
 /** Re-mint this long before expiry so a slow push never straddles the boundary. */
 const RENEW_MARGIN_MS = 10 * 60 * 1000;
@@ -192,6 +215,77 @@ interface CombinedStatusResponse {
   readonly state: string;
   readonly total_count: number;
 }
+
+/**
+ * `pullRequest.reviewThreads`, the only place GitHub reports thread RESOLUTION.
+ *
+ * `author` is nullable: GitHub answers null for a deleted account, and `__typename`
+ * distinguishes a `Bot` — the authoring App, the reviewer identity — from a human whose
+ * objection is new information (DESIGN.md §7.3).
+ */
+interface ReviewThreadsResponse {
+  readonly errors?: readonly { readonly message?: string }[];
+  readonly data?: {
+    readonly repository?: {
+      readonly pullRequest?: {
+        /**
+         * The prose each reviewer wrote about the change as a whole — a separate connection
+         * from `reviewThreads`, which only carries what was written against a line.
+         */
+        readonly reviews?: {
+          readonly nodes?: readonly {
+            readonly id?: string;
+            readonly author?: { readonly __typename?: string; readonly login?: string } | null;
+            readonly body?: string;
+            readonly url?: string;
+            readonly submittedAt?: string;
+          }[];
+        };
+        readonly reviewThreads?: {
+          readonly pageInfo?: {
+            readonly hasNextPage?: boolean;
+            readonly endCursor?: string | null;
+          };
+          readonly nodes?: readonly {
+            readonly isResolved?: boolean;
+            readonly isOutdated?: boolean;
+            readonly comments?: {
+              readonly nodes?: readonly {
+                readonly id?: string;
+                readonly author?: { readonly __typename?: string; readonly login?: string } | null;
+                readonly body?: string;
+                readonly path?: string | null;
+                readonly line?: number | null;
+                readonly url?: string;
+                readonly createdAt?: string;
+              }[];
+            };
+          }[];
+        };
+      };
+    };
+  };
+}
+
+const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$threads:Int!,$comments:Int!,$reviews:Int!,$cursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      reviews(last:$reviews){
+        nodes{id author{__typename login} body url submittedAt}
+      }
+      reviewThreads(first:$threads,after:$cursor){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          isResolved
+          isOutdated
+          comments(first:$comments){
+            nodes{id author{__typename login} body path line url createdAt}
+          }
+        }
+      }
+    }
+  }
+}`;
 
 const base64Url = (input: Buffer | string): string =>
   Buffer.from(input).toString("base64url");
@@ -386,6 +480,96 @@ class GitHubAppForge implements Forge {
     return { total_count: total, check_runs: runs };
   }
 
+  /**
+   * Every review comment on a pull request (DESIGN.md §7.3).
+   *
+   * The one GraphQL call in this file, and it is GraphQL for a reason that is not
+   * preference: REST's `pulls/{n}/comments` reports no resolution at all, and GitHub
+   * exposes it nowhere but `pullRequest.reviewThreads`. Without the flag every comment a
+   * human had already accepted would come back as an open instruction on every session.
+   *
+   * Resolved and outdated threads are returned rather than filtered: the caller states how
+   * many of a review are already answered beside the ones that are not, and a list it had
+   * pre-filtered could not say. Deciding what is quoted is `agent/review-guidance.ts`'s job.
+   *
+   * Two levels, as on Forgejo: a review's own BODY is where "this is the wrong approach" gets
+   * written, and it lives on `reviews` rather than on `reviewThreads`. Reading only the
+   * second drops every objection that is not about a particular line — and would make the
+   * review a session sees depend on which forge its repo happens to be on.
+   */
+  async listReviewComments(repo: RepoRef, pr: number): Promise<readonly ReviewComment[]> {
+    assertInScope(repo, this.allowed);
+
+    const comments: ReviewComment[] = [];
+    let cursor: string | undefined;
+
+    for (let page = 0; page < REVIEW_THREAD_PAGES; page += 1) {
+      const body = await this.graphql<ReviewThreadsResponse>(repo, REVIEW_THREADS_QUERY, {
+        owner: repo.owner,
+        name: repo.name,
+        number: pr,
+        threads: REVIEW_THREAD_PAGE_SIZE,
+        comments: THREAD_COMMENTS,
+        reviews: REVIEW_BODIES,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+
+      // First page only: `reviews` is not paged with the threads, and asking again on page
+      // two would return the same bodies and quote every one of them twice.
+      if (page === 0) {
+        for (const review of body.data?.repository?.pullRequest?.reviews?.nodes ?? []) {
+          // An APPROVED review with no prose is the ordinary way to approve. Quoted, it
+          // would say a human had objected to nothing.
+          if ((review.body ?? "").trim().length === 0) continue;
+          comments.push({
+            id: review.id ?? "",
+            repo,
+            pr,
+            author: review.author?.login ?? "(unknown)",
+            fromFleet: review.author?.__typename === "Bot",
+            body: review.body ?? "",
+            ...(review.url === undefined ? {} : { url: review.url }),
+            createdAt: review.submittedAt ?? "",
+            // A review body belongs to no thread, so there is nothing to resolve and no line
+            // for it to drift off.
+            resolved: false,
+            outdated: false,
+          });
+        }
+      }
+
+      const threads = body.data?.repository?.pullRequest?.reviewThreads;
+      for (const thread of threads?.nodes ?? []) {
+        for (const comment of thread.comments?.nodes ?? []) {
+          comments.push({
+            id: comment.id ?? "",
+            repo,
+            pr,
+            // A deleted account leaves `author: null`, and the comment still says what it
+            // said. Attributed to nobody rather than dropped.
+            author: comment.author?.login ?? "(unknown)",
+            fromFleet: comment.author?.__typename === "Bot",
+            body: comment.body ?? "",
+            // `null` for an outdated comment, and a `null` carried through as a number
+            // renders as `src/index.ts:null` — a location that points at nothing.
+            ...(comment.path == null ? {} : { path: comment.path }),
+            ...(comment.line == null ? {} : { line: comment.line }),
+            ...(comment.url === undefined ? {} : { url: comment.url }),
+            createdAt: comment.createdAt ?? "",
+            resolved: thread.isResolved === true,
+            outdated: thread.isOutdated === true,
+          });
+        }
+      }
+
+      const next = threads?.pageInfo;
+      if (next?.hasNextPage !== true || next.endCursor == null) break;
+      cursor = next.endCursor;
+    }
+
+    return comments;
+  }
+
   async approve(repo: RepoRef, pr: number, body: string): Promise<void> {
     assertInScope(repo, this.allowed);
 
@@ -435,6 +619,40 @@ class GitHubAppForge implements Forge {
       "x-github-api-version": "2022-11-28",
       "content-type": "application/json",
     };
+  }
+
+  /**
+   * One GraphQL request, with GitHub's own error envelope turned into a throw.
+   *
+   * GraphQL answers 200 with an `errors` array for a query it refused — a permission it was
+   * not granted, a pull request that is not there. Read as success that is an empty comment
+   * list, which is indistinguishable from a pull request nobody has reviewed, and the caller
+   * that logs and continues (invariant 6) would have nothing to log.
+   *
+   * The route is `${apiBase}/graphql`, which is right for github.com and wrong for GitHub
+   * Enterprise — there REST is `/api/v3` and GraphQL is `/api/graphql`. Nothing in this
+   * repo runs against Enterprise, and inventing a second configured base for a host nobody
+   * has is a knob with no caller; if one appears, this is the line it changes.
+   */
+  private async graphql<T extends { readonly errors?: readonly { readonly message?: string }[] }>(
+    repo: RepoRef,
+    query: string,
+    variables: Readonly<Record<string, unknown>>,
+  ): Promise<T> {
+    const body = await this.api<T>(repo, "/graphql", {
+      method: "POST",
+      body: JSON.stringify({ query, variables }),
+    });
+
+    const errors = body.errors ?? [];
+    if (errors.length > 0) {
+      throw new GitHubApiError(
+        200,
+        "/graphql",
+        errors.map((error) => error.message ?? "unknown GraphQL error").join("; "),
+      );
+    }
+    return body;
   }
 
   private async api<T>(repo: RepoRef, route: string, init: RequestInit = {}): Promise<T> {
