@@ -61,6 +61,7 @@ import {
 import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { ReapResult } from "../workspace/worktree.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
+import { effectRequestId } from "../state/effects.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
@@ -85,6 +86,7 @@ import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { Forge, ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
+import { mirrorTransition, type MirrorLedger } from "../tracker/mirror.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
 import { AlertReverifier } from "./verifier.ts";
@@ -4483,44 +4485,41 @@ export class Supervisor {
   /**
    * Mirror a lifecycle change into the task's tracker (DESIGN.md §9.5).
    *
-   * Always after the authoritative git write — the lease CAS for a claim, the state
-   * push for everything else. The tracker is a VIEW, git wins when they disagree, and
-   * that ordering is why a failure here only logs: an unreachable Vikunja must never
-   * fail a task, and the next transition overwrites the view anyway.
-   *
-   * Handoffs are deliberately not mirrored: a multi-hour task would otherwise become
-   * twenty comments of noise.
+   * The policy itself is `tracker/mirror.ts` — it is four rules about a view of git, and
+   * rules that can only be observed by running a poll loop are rules without a test. This
+   * supplies what only the supervisor has: the workspace's tracker, and the effect record
+   * that stops a replayed mirror commenting twice (§4.4).
    */
-  private async mirror(spec: TaskSpec, transition: TrackerTransition): Promise<void> {
-    const ref = spec.tracker;
-    if (ref === undefined) return;
-
+  private mirror(spec: TaskSpec, transition: TrackerTransition): Promise<void> {
     const tracker = this.deps.trackers?.get(spec.workspace);
-    if (tracker === undefined) return;
+    return mirrorTransition({
+      task: spec.id,
+      workspace: spec.workspace,
+      transition,
+      logger: this.deps.logger,
+      ledger: this.mirrorLedger(spec.id),
+      ...(spec.tracker === undefined ? {} : { ref: spec.tracker }),
+      ...(tracker === undefined ? {} : { tracker }),
+    });
+  }
 
-    if (tracker.kind !== ref.kind) {
-      // Config error: the workspace's tracker is not the one this task came from, so
-      // its ids mean something else entirely. Writing anyway would comment on an
-      // unrelated item.
-      this.deps.logger.error("tracker.kind-mismatch", {
-        task: spec.id,
-        workspace: spec.workspace,
-        specKind: ref.kind,
-        workspaceKind: tracker.kind,
-      });
-      return;
-    }
-
-    try {
-      await tracker.transition(ref, transition, spec.id);
-    } catch (error) {
-      this.deps.logger.warn("tracker.mirror-failed", {
-        task: spec.id,
-        tracker: tracker.kind,
-        transition: transition.kind,
-        ...errorFields(error),
-      });
-    }
+  /**
+   * The effect record for one task's tracker mirrors (DESIGN.md §4.4).
+   *
+   * The supervisor writes it, never the agent: the record lives in the state repo, which
+   * no task-scoped credential can reach (§9.3). The request id is derived in one place so
+   * the lookup and the write cannot compute it differently — an id that disagreed with
+   * itself would be a check that never matches, which is indistinguishable from one that
+   * works.
+   */
+  private mirrorLedger(task: TaskId): MirrorLedger {
+    const { store } = this.deps;
+    return {
+      landed: async (verb, args) =>
+        (await store.recordedEffect(task, effectRequestId(task, verb, args))) !== undefined,
+      record: (verb, args) =>
+        store.recordEffect(task, effectRequestId(task, verb, args), verb, null),
+    };
   }
 
   /**
