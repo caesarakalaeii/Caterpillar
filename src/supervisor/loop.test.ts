@@ -6281,11 +6281,18 @@ test("a second amendment appends 002 and leaves 001 exactly as it was", async ()
   assert.deepEqual((await store.readSpec(TWICE)).acceptance, ["npx vitest run src/widget"]);
 });
 
-test("amending a running task writes nothing at all", async () => {
+test("amending a running task writes nothing at all", async (t) => {
   // Refused rather than queued for later. A criterion that changes under a session already
   // grading itself against the old list is worse than a refusal a human can act on now.
   const BUSY = asTaskId("SMOKE-AMEND-3");
   await seedTask(BUSY, { status: "running" });
+
+  // `running` is claimable by design (§6.2), and the tests below this one start real
+  // supervisor loops against this same state repo at `concurrency: 1`. Left as it is, this
+  // fixture is reclaimed by the next loop to start, which spends that single slot on a
+  // whole session for it — starving the test that opened the loop of the slot it is waiting
+  // on. Parked once the assertions are done, which is beyond claiming.
+  t.after(() => seedTask(BUSY, { status: "parked" }));
 
   const store = new StateStore(statePath, stateGit);
   const inbox = new InMemoryChatQueue();
