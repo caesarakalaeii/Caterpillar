@@ -544,7 +544,7 @@ const withLedger = (): LedgerHarness => {
     trackerRef: TRACKER_REF,
     publish: async (name) => {
       stored.push(name);
-      return `Stored ${name}.`;
+      return { stored: true, message: `Stored ${name}.` };
     },
   };
   return { ...base, ctx, ledger, tracker, stored };
@@ -583,6 +583,35 @@ test("publish_artifact stores once for the same arguments", async () => {
 
   assert.deepEqual(stored, ["scan.json"]);
   assert.equal(second, first, "a replay hands back what the first call returned");
+});
+
+test("a refused publish_artifact is not recorded, so the agent can fix it and retry", async () => {
+  // `publish` answers refusals in PROSE rather than throwing — a file too big to store is a
+  // prompt to summarise, not an error. Recording one would replay the refusal forever and
+  // the agent would never be able to store the file it just fixed.
+  const base = harness();
+  const ledger = new FakeLedger();
+  const attempts: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: ledger,
+    publish: async (name, path) => {
+      attempts.push(name);
+      return attempts.length === 1
+        ? { stored: false, message: `Could not read \`${path}\`; nothing was stored.` }
+        : { stored: true, message: `Stored ${name}.` };
+    },
+  };
+  const tools = controlTools(ctx);
+  const params = { name: "scan.json", path: "out/scan.json", note: "sublevel scan" };
+
+  const refused = await call(tools, "publish_artifact", params);
+  assert.match(refused, /nothing was stored/);
+  assert.equal(ledger.recorded.size, 0, "a refusal is not an effect that landed");
+
+  const stored = await call(tools, "publish_artifact", params);
+  assert.match(stored, /Stored scan\.json/);
+  assert.deepEqual(attempts, ["scan.json", "scan.json"]);
 });
 
 test("open_pr asks the forge even when the effect is on record", async () => {
