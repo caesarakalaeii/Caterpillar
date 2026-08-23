@@ -60,6 +60,24 @@ test("the kept lines are never more than the ceiling allows", () => {
   assert.equal(bounded.droppedLines, 5_000 - kept.length);
 });
 
+test("the whole returned view fits the line ceiling, elision note included", () => {
+  // The note is a line the model reads, so a view of `maxLines` content lines PLUS a note
+  // is over its own ceiling by one. That one line is not cosmetic: pi's bash tool bounds
+  // what it captures at 2,000 lines itself, tail-only, so at the shipped default a view of
+  // 2,001 lines gets truncated a second time and the line that goes is the FIRST head line
+  // — the compiler's first error, which is the whole reason the head is kept.
+  const bounded = boundOutput(lines(40_000), outputCeiling({}));
+  const returned = bounded.text.split("\n").length;
+
+  assert.ok(
+    returned <= MAX_OUTPUT_LINES,
+    `returned ${returned} lines against a ceiling of ${MAX_OUTPUT_LINES}: the view handed ` +
+      `to the model, elision note included, must fit the ceiling it declares`,
+  );
+  // Guard against the other way to satisfy the line above: keeping almost nothing.
+  assert.ok(returned > MAX_OUTPUT_LINES - 10, `only ${returned} lines survived`);
+});
+
 test("a byte ceiling bites even when the line count is small", () => {
   // One `cat` of a minified lockfile is a handful of very long lines. A line ceiling
   // alone lets it through whole, which is the case that costs the most context.
