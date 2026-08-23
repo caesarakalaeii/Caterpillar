@@ -427,6 +427,7 @@ export class WorktreeManager {
       await this.enableWorktreeConfig(await this.commonDir(path));
       await this.configureShared(path);
       await this.configureTask(path, task);
+      await this.catchUpWorktree(repo, task, branch, path);
       return;
     }
 
@@ -509,6 +510,54 @@ export class WorktreeManager {
     // that did would have taken the reuse path at the top of `addWorktreeLocked`.
     await git.run("branch", "-f", branch, remote);
     return { commit: remote, creating: false };
+  }
+
+  /**
+   * Bring a worktree that ALREADY exists up to the remote tip of its own branch, or refuse
+   * to hand it over.
+   *
+   * The reuse path above returns early for a documented reason, and that reason is about
+   * fetching, not about correctness: the progress probe and the verifier both call
+   * `ensureWorktree` after `clearActive()` has closed the credential service (§9.2), so a
+   * fetch there fails on a private repo. `fetchAgentBranch` never throws and answers
+   * `undefined` when it cannot reach the remote, which is exactly what those callers need —
+   * they get the old behaviour, unchanged.
+   *
+   * What the early return did NOT justify is handing a session a checkout that sits behind
+   * the branch it is about to commit on. That is GH-95: a worktree found reset to a commit
+   * before its own work, whose commits survived only in `refs/pull/111/head` and were
+   * recovered by hand. It is also the ordinary two-runner case — runner A holds a worktree,
+   * runner B works the task and pushes, A claims it again — where the first `git push` is
+   * refused as non-fast-forward and the agent has no way to tell it started behind.
+   *
+   * Fast-forward, never force. `merge --ff-only` declines rather than moving a tree with
+   * local modifications, and declines on a divergence, so the failure modes it does not fix
+   * it reports: the throw below is the invariant's second half, and a session that refuses
+   * to start leaves both histories intact for a human, which is what GH-95 did by hand.
+   */
+  private async catchUpWorktree(
+    repo: RepoRef,
+    task: TaskId,
+    branch: string,
+    path: string,
+  ): Promise<void> {
+    const mirror = await this.commonDir(path);
+    const remote = await this.fetchAgentBranch(mirror, task, branch);
+    if (remote === undefined) return;
+
+    const git = this.git.at(path);
+    const head = await git.revParse("HEAD");
+    if (head === remote) return;
+
+    const advance = await git.tryRun("merge", "--ff-only", remote);
+    if (advance.code !== 0) {
+      throw new Error(
+        `refusing to start ${task} on ${repo.owner}/${repo.name}: its worktree is at ` +
+          `${head ?? "an unreadable HEAD"} and cannot fast-forward to origin/${branch} ` +
+          `(${remote}). Starting behind would lose the pushed work; reconcile ${path} by ` +
+          `hand. git said: ${advance.stderr.trim()}`,
+      );
+    }
   }
 
   /**
