@@ -68,7 +68,7 @@ const mirror = (
   tracker: Tracker | undefined,
   transition: TrackerTransition,
   ledger?: MirrorLedger,
-  occurrence = 0,
+  occurrence = "0",
 ): Promise<void> =>
   mirrorTransition({
     task: TASK,
@@ -145,11 +145,38 @@ test("the same transition in a later occurrence is mirrored again", async () => 
   const ledger = new FakeLedger();
   const claimed: TrackerTransition = { kind: "claimed", runner: "pod-7f3a" };
 
-  await mirror(tracker, claimed, ledger, 1);
-  await mirror(tracker, claimed, ledger, 1);
-  await mirror(tracker, claimed, ledger, 2);
+  await mirror(tracker, claimed, ledger, "1");
+  await mirror(tracker, claimed, ledger, "1");
+  await mirror(tracker, claimed, ledger, "2");
 
   assert.deepEqual(tracker.transitions, [claimed, claimed]);
+});
+
+test("a re-claim after a park that recorded no session is mirrored again", async () => {
+  // The occurrence used to be the task's SESSION INDEX, and that index does not advance on
+  // every claim. `parkFailed` on a toolchain flake, the `unreachableRepos` park and
+  // `checkLimits` all park before any session is recorded, and `applyResume` leaves
+  // `sessions` untouched — so after a human fixes the cause and resumes, the same pod
+  // re-claims at the same index. Keyed on that index the `claimed` mirror is suppressed:
+  // no "Picked up by" comment, and `agent-wip` is not re-added after the `parked` mirror
+  // removed it, so the item reads as unowned for the whole next session.
+  //
+  // The lease token is the right grain because a claim IS a lease commit: every claim
+  // pushes a new one, so the token differs across claims and is identical within one —
+  // which is exactly the replay window the record has to collapse.
+  const tracker = new RecordingTracker();
+  const ledger = new FakeLedger();
+  const claimed: TrackerTransition = { kind: "claimed", runner: "pod-7f3a" };
+
+  await mirror(tracker, claimed, ledger, "lease-oid-aaa");
+  await mirror(tracker, claimed, ledger, "lease-oid-aaa");
+  await mirror(tracker, claimed, ledger, "lease-oid-bbb");
+
+  assert.deepEqual(
+    tracker.transitions,
+    [claimed, claimed],
+    "a replay within one claim collapses; a new claim mirrors",
+  );
 });
 
 test("a tracker that cannot be reached does not throw, and is not recorded", async () => {
