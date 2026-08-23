@@ -3448,6 +3448,22 @@ red result, and `awaitChecks` never got to use its 20-minute budget because `sum
 returned `failure` on the first poll rather than `pending`. The next useful move is not
 another local run: it is reading the job log, which needs someone who can open the URL.
 
+**A seventh, and it is the case where ONE leg red really was about the version — but about
+its npm, not its node.** `BS-1540375555520598126-05` had a completion claim rejected with
+`failing: check (26)` alone, on a tree whose four acceptance commands all passed locally.
+The rule above says a single red leg reproducing nowhere is a race; the exception is that
+`setup-node` installs the npm bundled with the node, so the two matrix legs differ in npm
+as well. Node 22 carries npm 10, node 26 carries npm 12, and npm 12 hard-fails `npm ci` on
+the lockfile root entry drift that npm 10 and 11 only silently rewrite — the same drift
+#123 had just reconciled on `main`. So the leg died in the install step, before `npm test`
+ran at all, which is consistent with the fast verdict the fourth note describes. Merging
+`main` was the fix. **What to check first on a one-leg red, before reaching for the race
+explanation: whether the two legs differ in a tool the node version drags along.** Note
+that the theory could not be executed here — no npm 12 exists on any container in reach,
+and npm 10 and 11 both accept the old lockfile — so it stays a strong inference rather than
+a reproduction, and the confirmation available was a whole-suite run on node 22 and node 24
+against the merged tree.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
@@ -3526,8 +3542,9 @@ Two independent gates, both required:
    a task may span several repos (§9.4.1), the work is one change, and half of it being green
    is not it passing. This checked `repos[0]` alone until §9.4.1's completion-path pass.
 
-Only then `status = done`, Discord gets the terminal message, and the supervisor closes the
-tracker item (§9.5). The agent participates in none of these three steps — it can only
+Only then `status = done` — except by a human's explicit decision, see *A human can write
+`done` past both gates* below — Discord gets the terminal message, and the supervisor closes
+the tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
 
 > **A branch that is gone reads as no CI signal, and on a task with a pull request that
@@ -3616,6 +3633,31 @@ Five properties, and each is a decision rather than an accident:
   is. A repo that genuinely wants the real sandbox needs a runner configured for it, and
   that is a machine property — which makes it `requires` (§8), not something the resolver
   can grant.
+
+**A human can write `done` past both gates, and the record has to say so.** A task can be
+*obsolete* rather than finished — superseded, descoped, or answering a question nobody is
+asking any more — and until `/done` there was no way to say that. `/merge` is the closest
+thing and it is not this: it merges the PR under the reviewer identity, so it refuses with
+no PR and with no reviewer identity configured, and it is an override of the *council*
+rather than of the gates. Obsolete work has nothing to merge and often nothing on a branch.
+
+So `/done task:<id> reason:<text>` writes `status = done` and merges nothing. `reason` is
+required on both the command and the button's modal, because a forced completion with no
+stated cause is unauditable — and the journal entry names who forced it, quotes the reason,
+and says the gates were **BYPASSED**. It must never read as a task that was verified; that
+is the whole point of the entry, and `loop.test.ts` asserts the words `passed` and
+`verified` appear nowhere in it.
+
+It is refused on `running`. The session holds the lease, so the write would either lose its
+compare-and-swap or land under an agent still working — `/cancel` stops one at a turn
+boundary and the force is available a poll later. `parked`, `failed` and `awaiting-human`
+are the statuses it is for.
+
+The tracker is mirrored through the **`parked`** transition, not `completed`. `completed`
+carries a `prUrl` this command may not have, and it is the transition that *means* the gates
+passed — it comments "acceptance criteria and CI verified" and closes the item. `parked`
+releases the item and puts the reason on it, which leaves the issue open and honest. Closing
+it needs a transition of its own (§9.5) and the reason above is why it cannot be this one.
 
 ### 12.1 The review council
 

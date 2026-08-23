@@ -98,7 +98,7 @@ export interface Modal {
  * than its text — the text is stored beside the question in the state repo, because an
  * option long enough to be worth a button is long enough to break the 100.
  */
-export type Verb = "ans" | "opt" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no";
+export type Verb = "ans" | "opt" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no" | "done";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -145,10 +145,10 @@ export const decodeCustomId = (raw: string): ButtonAction | undefined => {
   return { verb, task, ...(arg === undefined ? {} : { arg }) };
 };
 
-// Parallel to `Verb` and checked by nothing but review: a verb added to the type and not to
-// here type-checks fine and then decodes as unrecognised at runtime, which reads as a dead
-// button rather than as a bug.
-const VERBS: readonly string[] = ["ans", "opt", "park", "merge", "res", "back", "plan-ok", "plan-no"];
+// Parallel to `Verb` by hand, and it has to stay that way: `isVerb` is a runtime check and
+// the union is erased, so a verb added to one and not the other type-checks and then decodes
+// as "unrecognised button" in front of whoever pressed it.
+const VERBS: readonly string[] = ["ans", "opt", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
 
@@ -215,20 +215,58 @@ export const disableAll = (attached: readonly ActionRow[]): readonly ActionRow[]
   }));
 
 /** The single-field modal behind the Answer button. */
-export const answerModal = (task: TaskId, fieldId: string): Modal | undefined => {
-  const customId = encodeCustomId({ verb: "ans", task });
+export const answerModal = (task: TaskId, fieldId: string): Modal | undefined =>
+  singleFieldModal({
+    verb: "ans",
+    task,
+    fieldId,
+    title: `Answer ${task}`,
+    label: "Your answer",
+  });
+
+/**
+ * The modal behind the Mark done button.
+ *
+ * A button cannot carry prose and the reason is REQUIRED — a forced completion with no
+ * stated cause is unauditable — so the click has to ask for one before anything is written.
+ */
+export const doneModal = (task: TaskId, fieldId: string): Modal | undefined =>
+  singleFieldModal({
+    verb: "done",
+    task,
+    fieldId,
+    title: `Mark ${task} done`,
+    label: "Why (the gates are skipped)",
+  });
+
+/**
+ * The shape both modals share: one required paragraph box, keyed to a verb and a task.
+ *
+ * Factored out when the second one arrived rather than copied, because the part worth not
+ * duplicating is not the literal — it is `required: true` and the `custom_id` round trip.
+ * A modal whose field is optional accepts an empty submit, and both callers depend on it
+ * being impossible.
+ */
+const singleFieldModal = (options: {
+  readonly verb: Verb;
+  readonly task: TaskId;
+  readonly fieldId: string;
+  readonly title: string;
+  readonly label: string;
+}): Modal | undefined => {
+  const customId = encodeCustomId({ verb: options.verb, task: options.task });
   if (customId === undefined) return undefined;
   return {
     custom_id: customId,
-    title: clamp(`Answer ${task}`, MODAL_TITLE_LIMIT),
+    title: clamp(options.title, MODAL_TITLE_LIMIT),
     components: [
       {
         type: COMPONENT.actionRow,
         components: [
           {
             type: COMPONENT.textInput,
-            custom_id: fieldId,
-            label: "Your answer",
+            custom_id: options.fieldId,
+            label: clamp(options.label, LABEL_LIMIT),
             style: TEXT_INPUT_STYLE.paragraph,
             required: true,
             max_length: TEXT_INPUT_LIMIT,

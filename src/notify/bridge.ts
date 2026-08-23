@@ -27,7 +27,7 @@ import type { SnapshotReader } from "../redis/snapshot.ts";
 import type { ChatOutcome } from "../supervisor/inbox.ts";
 import type { DiscordBot } from "./bot.ts";
 import { parseCommand, type Command } from "./commands.ts";
-import { answerModal, button, BUTTON_STYLE, disableAll, row, rows, type ActionRow } from "./components.ts";
+import { answerModal, button, BUTTON_STYLE, disableAll, doneModal, row, rows, type ActionRow } from "./components.ts";
 import type { FetchLike } from "./http.ts";
 import {
   autocomplete,
@@ -42,7 +42,7 @@ import {
   type InteractionResponse,
 } from "./interactions.ts";
 import { describeList, describeOutcome, describeTask, queued } from "./replies.ts";
-import { ANSWER_FIELD, parseInteraction, repoChoices } from "./slash.ts";
+import { ANSWER_FIELD, DONE_REASON_FIELD, parseInteraction, repoChoices } from "./slash.ts";
 import type { ThreadIndex } from "./threads.ts";
 
 export interface BridgeDeps {
@@ -473,6 +473,20 @@ export class DiscordBridge {
         return;
       }
 
+      case "open-done-modal": {
+        const modal = doneModal(intent.task, DONE_REASON_FIELD);
+        await this.answer(
+          interaction,
+          modal === undefined
+            ? reply(
+                `\`${intent.task}\` is too long to force done from a button — use \`/done\`.`,
+                { ephemeral: true },
+              )
+            : openModal(modal),
+        );
+        return;
+      }
+
       case "run":
         await this.run(interaction, intent.command, who);
         return;
@@ -517,6 +531,8 @@ export class DiscordBridge {
           return `Resuming ${command.task}`;
         case "park":
           return `Cancelling ${command.task}`;
+        case "force-done":
+          return `Marking ${command.task} done`;
       }
     })();
     await this.answer(interaction, this.acknowledge(interaction, queued(what, who)));
@@ -584,6 +600,19 @@ export class DiscordBridge {
         return describeOutcome(
           command.task,
           await inbox.submit({ kind: "merge", task: command.task }),
+        );
+      case "force-done":
+        // The one write that carries `author` into the loop. Nothing downstream can
+        // reconstruct it, and the journal entry it goes into is the only record that this
+        // `done` was somebody's decision rather than a verification.
+        return describeOutcome(
+          command.task,
+          await inbox.submit({
+            kind: "force-done",
+            task: command.task,
+            reason: command.reason,
+            author,
+          }),
         );
     }
   }

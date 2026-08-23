@@ -50,6 +50,7 @@ test("every intent in the union survives the round trip unchanged", async () => 
     { kind: "park", task: TASK },
     { kind: "resume", task: TASK },
     { kind: "merge", task: TASK },
+    { kind: "force-done", task: TASK, reason: "obsolete", author: "ada" },
     {
       kind: "brainstorm",
       topic: "a shared cache",
@@ -155,8 +156,47 @@ test("an intent missing a required field is refused rather than half-applied", a
       intent: { kind: "brainstorm", topic: "x", repos: [7], threadId: "1", author: "me" },
     }),
   );
+  // A `force-done` with no reason is the one this file cares about most: the reason is the
+  // only record of WHY a task was marked done without either gate, so a blank one would
+  // leave an unauditable `done` behind.
+  await redis.rpush(
+    INBOX_KEY,
+    JSON.stringify({ id: "d", intent: { kind: "force-done", task: TASK, author: "ada" } }),
+  );
+  await redis.rpush(
+    INBOX_KEY,
+    JSON.stringify({
+      id: "e",
+      intent: { kind: "force-done", task: TASK, reason: "  ", author: "ada" },
+    }),
+  );
+  await redis.rpush(
+    INBOX_KEY,
+    JSON.stringify({ id: "f", intent: { kind: "force-done", task: TASK, reason: "obsolete" } }),
+  );
 
   assert.deepEqual(await queue.drain(), []);
+});
+
+test("every outcome the loop can publish is rendered rather than timed out", async () => {
+  const redis = new MemoryRedisClient();
+  const queue = new RedisChatQueue({ redis, logger: SILENT_LOGGER, submitTimeoutMs: 200 });
+
+  // `forced-done` and `not-forceable` are the two the loop publishes for `/done`. Missing
+  // from the parser's set, they would be dropped and the submitter told the request may
+  // still be queued — for a task that was in fact already marked done, inviting a retry.
+  const outcomes = [{ kind: "forced-done" }, { kind: "not-forceable", reason: "it is running" }] as const;
+
+  for (const outcome of outcomes) {
+    const submitted = queue.submit({ kind: "force-done", task: TASK, reason: "obsolete", author: "ada" });
+    await flush();
+
+    const drained = await queue.drain();
+    assert.equal(drained.length, 1, JSON.stringify(outcome));
+    drained[0]?.settle(outcome);
+
+    assert.deepEqual(await submitted, outcome);
+  }
 });
 
 test("an outcome kind this build does not know falls through to the give-up path", async () => {

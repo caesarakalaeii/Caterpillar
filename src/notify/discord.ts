@@ -568,6 +568,17 @@ const hardSplit = (line: string, budget: number): readonly string[] => {
 const resumeButton = (task: TaskId): Button | undefined =>
   button({ action: { verb: "res", task }, label: "Resume", style: BUTTON_STYLE.primary });
 
+/**
+ * The other answer to a park, as a button.
+ *
+ * Every notification that offers Resume is asking a human to decide, and the decision has
+ * two answers: the task can be OBSOLETE rather than stuck, in which case resuming it buys
+ * a session nobody wants. Secondary styling and second position, because that is the rarer
+ * answer. Pressing it writes nothing on its own — it opens the modal that asks why.
+ */
+const doneButton = (task: TaskId): Button | undefined =>
+  button({ action: { verb: "done", task }, label: "Mark done", style: BUTTON_STYLE.secondary });
+
 export const componentsFor = (
   notification: Notification,
   options: { readonly inThread?: boolean } = {},
@@ -626,6 +637,7 @@ export const componentsFor = (
               })
             : undefined,
           resumeButton(notification.task),
+          doneButton(notification.task),
           notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
         ),
       );
@@ -634,12 +646,12 @@ export const componentsFor = (
     // posted in the thread the prose will be typed in, so the way back belongs in the same
     // place rather than as a command to be retyped underneath it.
     case "plan-stalled":
-      return rows(row(resumeButton(notification.task)));
+      return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // Every other park, for the same reason. `/resume` on something parked is the single most
     // predictable next act in the system, and until now it was the only one with no button.
     case "parked":
     case "failed":
-      return rows(row(resumeButton(notification.task)));
+      return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // An alert notification is a statement, not a prompt. Creating the task has already
     // happened, and a refusal is fixed by committing a policy entry rather than by
     // pressing anything here.
