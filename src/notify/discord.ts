@@ -172,6 +172,24 @@ export type Notification =
       readonly detail: string;
     }
   /**
+   * A merged remediation fix was re-checked against the alert it was for (§20).
+   *
+   * Sent for BOTH outcomes, which is the whole point of it: before this, a fix that ended
+   * the incident and a fix that changed nothing produced the same silence, and the only
+   * signal was a human noticing the alert was still there weeks later.
+   *
+   * `cleared` is the verdict and `detail` is the one-line sentence `describeVerdict` wrote,
+   * so Discord, the journal and the digest all quote the same words.
+   */
+  | {
+      readonly kind: "alert-reverified";
+      readonly task: TaskId;
+      readonly alertname: string;
+      /** True only on positive evidence that the alert stopped. Never on silence. */
+      readonly cleared: boolean;
+      readonly detail: string;
+    }
+  /**
    * The model provider stopped answering and this runner is sitting it out (§6.3).
    *
    * Sent ONCE per incident, not once per attempt: the runner keeps re-checking on a
@@ -677,6 +695,12 @@ export const componentsFor = (
     // Nor is a scheduled task: nobody typed it, so there is nothing here anyone is waiting
     // to answer. It is claimed, sessioned and reviewed like every other task.
     case "schedule-task":
+    // The failure case IS parked, so it gets the resume button every other park has: the
+    // next act on it is a human deciding whether to send a session back at the incident.
+    case "alert-reverified":
+      return notification.kind === "alert-reverified" && !notification.cleared
+        ? rows(row(resumeButton(notification.task)))
+        : undefined;
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -726,6 +750,16 @@ const frame = (notification: Notification, hint: boolean): string => {
     }
     case "parked":
       return fit(notification.reason, (text) => `**${task}** parked — ${text}`);
+    case "alert-reverified":
+      return fit(notification.detail, (text) =>
+        notification.cleared
+          ? `✅ **${task}** — ${text}. \`${notification.alertname}\` stopped firing after the ` +
+            `fix merged, so the task is done.`
+          : `⚠️ **${task}** — ${text}. The change merged and passed every gate, but ` +
+            `\`${notification.alertname}\` is not settled, so the task is **parked** rather ` +
+            `than done. Its dedup record has been reset: a fresh firing can open a new task, ` +
+            `and \`/resume\` sends a session back at this one.`,
+      );
     case "done": {
       const note = notification.note;
       return fit(notification.prUrl, (text) =>

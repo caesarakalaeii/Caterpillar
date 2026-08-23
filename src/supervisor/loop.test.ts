@@ -21,6 +21,7 @@ import {
   type RepoRef,
   type RunnerId,
   type SessionOutcome,
+  type TaskKind,
   type TaskId,
   type TaskState,
   type TrackerRef,
@@ -120,6 +121,8 @@ const seedTask = async (
   repos: readonly string[] = ["github.com/acme/widget"],
   /** The tracker item the task came from, for tests about what is mirrored back to it. */
   tracker?: TrackerRef,
+  /** Omitted for `implement`, which is what `readSpec` reads an absent `kind` as. */
+  kind?: TaskKind,
 ): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
@@ -128,6 +131,7 @@ const seedTask = async (
     [
       "---",
       "workspace: test",
+      ...(kind === undefined ? [] : [`kind: ${kind}`]),
       "repos:",
       ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
@@ -158,20 +162,32 @@ const seedTask = async (
 /**
  * Write `alerts/refusals/<fingerprint>.json` on the remote, as the alert path would.
  *
- * Committed and pushed rather than left in the local checkout, because the supervisor pulls
- * before every claim and would otherwise reset over it. Used to stand in for what
- * Alertmanager delivered, which is the only evidence a post-merge re-verification has (§20).
+ * Through a SEPARATE checkout, and that is not tidiness. `statePath` is the working copy the
+ * supervisor under test owns; committing into it from here mid-run interleaves two writers in
+ * one git directory, which is the exact hazard `StateStore`'s mutex exists to prevent. The
+ * first version of this helper did that and the test failed in a way that looked like the
+ * feature was broken.
+ *
+ * Stands in for what Alertmanager delivered, which is the only evidence a post-merge
+ * re-verification has (§20).
  */
+const injectorPath = join(root, "injector");
+await setup.run("clone", origin, injectorPath);
+const injector = new Git(injectorPath);
+await injector.run("config", "user.email", "test@example.invalid");
+await injector.run("config", "user.name", "test");
+
 const writeAlertRecord = async (fingerprint: string, record: AlertRefusal): Promise<void> => {
-  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
-  await mkdir(join(statePath, "alerts", "refusals"), { recursive: true });
+  await injector.run("fetch", "origin", "main");
+  await injector.run("reset", "--hard", "origin/main");
+  await mkdir(join(injectorPath, "alerts", "refusals"), { recursive: true });
   await writeFile(
-    join(statePath, "alerts", "refusals", `${fingerprint}.json`),
+    join(injectorPath, "alerts", "refusals", `${fingerprint}.json`),
     `${JSON.stringify(record, null, 2)}\n`,
   );
-  await stateGit.run("add", "-A");
-  await stateGit.run("commit", "-m", `seed alert ${fingerprint}`);
-  await stateGit.run("push", "origin", "HEAD:main");
+  await injector.run("add", "-A");
+  await injector.run("commit", "-m", `seed alert ${fingerprint}`);
+  await injector.run("push", "origin", "HEAD:main");
 };
 
 /** The same record as the remote has it, or undefined once a failed verdict deleted it. */
@@ -6143,7 +6159,13 @@ test("a merged remediation fix is held for a verdict, and parked when the alert 
   // refactor can drop without any unit test noticing.
   const FINGERPRINT = "6155db6f";
   const HELD = asTaskId(`ALERT-${FINGERPRINT}`);
-  await seedTask(HELD, { pr: { number: 20, url: "https://example.invalid/pr/20" } });
+  await seedTask(
+    HELD,
+    { pr: { number: 20, url: "https://example.invalid/pr/20" } },
+    ["github.com/acme/widget"],
+    undefined,
+    "remediation",
+  );
 
   // The alert record the queue writes when it creates a remediation task, and the evidence
   // Alertmanager delivered afterwards: the alert is still firing well past the window.
@@ -6272,7 +6294,13 @@ test("a merged remediation fix is held for a verdict, and parked when the alert 
 test("a merged remediation fix whose alert cleared reaches done, and says how long it took", async () => {
   const FINGERPRINT = "6155dbaa";
   const CLEARED = asTaskId(`ALERT-${FINGERPRINT}`);
-  await seedTask(CLEARED, { pr: { number: 21, url: "https://example.invalid/pr/21" } });
+  await seedTask(
+    CLEARED,
+    { pr: { number: 21, url: "https://example.invalid/pr/21" } },
+    ["github.com/acme/widget"],
+    undefined,
+    "remediation",
+  );
   await writeAlertRecord(FINGERPRINT, {
     fingerprint: FINGERPRINT,
     alertname: "CaterpillarBudget",

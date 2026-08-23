@@ -68,7 +68,11 @@ import type { IntakeStatus } from "../intake/status.ts";
 import { lookupPolicy } from "../remediation/policy.ts";
 import type { AlertDelivery, AlertPass } from "../remediation/queue.ts";
 import type { AlertResolution, FiringAlert } from "../remediation/receiver.ts";
-import { describeVerdict, settleWindowSeconds } from "../remediation/verify.ts";
+import {
+  describeVerdict,
+  settleWindowSeconds,
+  type ReverifyVerdict,
+} from "../remediation/verify.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Notification, Notifier } from "../notify/discord.ts";
 import type { Presence, ThreadCloser } from "../notify/bot.ts";
@@ -3160,7 +3164,10 @@ export class Supervisor {
   private async settleReverifications(): Promise<void> {
     const { store, leases, logger } = this.deps;
 
-    for (const { task, alertname, verdict } of await this.reverifier.due()) {
+    // `due` reports the verdict too, and it is deliberately not used: it was reached without
+    // a lease, so between then and now another replica may have settled the same task. The
+    // one acted on is re-read under the lease below.
+    for (const { task, alertname } of await this.reverifier.due()) {
       // A task this runner is working, or one another replica is: the lease is the only
       // answer, and taking it here is what stops two runners settling the same verdict.
       if (this.slots.has(task)) continue;
@@ -3173,38 +3180,36 @@ export class Supervisor {
 
         const spec = await store.readSpec(task);
         const state = await store.readState(task);
-        // Decided again, and only now recorded: `due` deliberately does not write, so the
-        // verdict acted on is the one this runner has just re-read under the lease it holds.
-        const settled = await this.reverifier.settle(task);
-        if (settled === undefined) continue;
 
-        const line = describeVerdict(settled);
-        logger.info("reverify.verdict", { task, alertname, verdict: settled.kind, detail: line });
+        // ONE unit around the verdict, the journal, the transition and the push, and that is
+        // load-bearing rather than tidy. `settle` writes under `alerts/refusals/`, and a
+        // commit made inside a unit stages only the paths that unit wrote (`stageCommitPush`)
+        // — so a verdict recorded outside the unit would sit uncommitted until some later
+        // unrelated bare commit happened to stage it. The reset that lets a re-fire become
+        // work again has to land with the park that motivates it, or the two disagree in git.
+        //
+        // `settled` is read back out because the decision is made inside the closure: `due`
+        // reached its verdict without a lease, and this is the one that is acted on.
+        let settled: ReverifyVerdict | undefined;
+        let line = "";
 
-        if (settled.kind === "cleared") {
-          await this.unit(async () => {
+        const cleared = await this.unit(async () => {
+          settled = await this.reverifier.settle(task);
+          if (settled === undefined) return undefined;
+          line = describeVerdict(settled);
+
+          if (settled.kind === "cleared") {
             await store.appendJournal(state.id, state.sessions, `**Re-verified:** ${line}.`);
             await this.transition(handle, state, "done");
             await this.push(handle, `chore(${task}): done`);
-          });
-          await this.mirror(spec, { kind: "completed", prUrl: state.pr?.url ?? "(merged)" });
-          await this.notifyTask(state, {
-            kind: "alert-reverified",
-            task,
-            alertname,
-            cleared: true,
-            detail: line,
-          });
-          await this.reapTask(spec, "done");
-          continue;
-        }
+            return true;
+          }
 
-        // Parked, not `done` and not `failed`. The work merged and every gate passed, so
-        // `failed` would be a lie about the change; what is true is that the incident is not
-        // over and a human has to decide what next. The park reason and the journal carry
-        // the evidence, so the next session starts from "the previous fix did not work"
-        // rather than from scratch.
-        await this.unit(async () => {
+          // Parked, not `done` and not `failed`. The work merged and every gate passed, so
+          // `failed` would be a lie about the change; what is true is that the incident is
+          // not over and a human has to decide what next. The park reason and the journal
+          // carry the evidence, so the next session starts from "the previous fix did not
+          // work" rather than from scratch.
           await store.appendJournal(
             state.id,
             state.sessions,
@@ -3216,13 +3221,26 @@ export class Supervisor {
           );
           await this.transition(handle, state, "parked");
           await this.push(handle, `chore(${task}): parked`);
+          return false;
         });
-        await this.mirror(spec, { kind: "parked", reason: line });
+
+        if (cleared === undefined || settled === undefined) continue;
+        logger.info("reverify.verdict", { task, alertname, verdict: settled.kind, detail: line });
+
+        // Outside the unit, both of them, exactly as every other outcome in this class does
+        // it: the tracker and Discord are views of what git already says, and holding the
+        // state checkout across a network round trip stalls every other slot's writes.
+        if (cleared) {
+          await this.mirror(spec, { kind: "completed", prUrl: state.pr?.url ?? "(merged)" });
+          await this.reapTask(spec, "done");
+        } else {
+          await this.mirror(spec, { kind: "parked", reason: line });
+        }
         await this.notifyTask(state, {
           kind: "alert-reverified",
           task,
           alertname,
-          cleared: false,
+          cleared,
           detail: line,
         });
       } catch (error) {
