@@ -50,14 +50,21 @@ test("packageCheckExpression refuses a package name that is not a bare attribute
 
 const config = { ...DEFAULT_TOOLCHAIN_CONFIG, timeoutSeconds: 5 };
 
-/** A nix that answers from a fixed set of attribute names, without running nix. */
+/**
+ * A nix that answers from a fixed set of attribute names, without running nix.
+ *
+ * Reads the declared names out of the expression's `wanted = [ … ]` binding rather than
+ * every quoted string in it: the expression also carries a lowercase translation table,
+ * and a fake that scraped all quoted strings reported the whole alphabet as missing.
+ */
 const fakeNix = (attributes: readonly string[]): NixEval => ({
   async evaluate(expression) {
-    const wanted = [...expression.matchAll(/"([A-Za-z0-9._+-]+)"/g)].map((m) => m[1] ?? "");
-    const missing = wanted.filter((name) => !attributes.includes(name));
+    const declared = /wanted = \[ ([^\]]*) \]/.exec(expression)?.[1] ?? "";
+    const wanted = [...declared.matchAll(/"([^"]+)"/g)].map((match) => match[1] ?? "");
+    assert.ok(wanted.length > 0, "the fake found no declared packages to check");
     return {
       kind: "answered",
-      missing,
+      missing: wanted.filter((name) => !attributes.includes(name)),
       candidates: attributes,
     };
   },
