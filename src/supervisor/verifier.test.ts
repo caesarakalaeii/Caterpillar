@@ -499,7 +499,7 @@ test("a not-found failure still fails the gate", async () => {
 });
 
 /**
- * A branch that no longer merges (DESIGN.md §12).
+ * A branch that no longer merges (DESIGN.md §12.3).
  *
  * Reported HERE rather than left to the council's merge. Both gates passing and then the
  * merge failing is a terminal-looking failure caused by ordinary drift, arriving at the

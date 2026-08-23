@@ -98,7 +98,7 @@ test("a conflicted merge-tree run names every conflicting path, once, sorted", (
 test("a merge-tree that could not run at all reports nothing rather than a clean tree", () => {
   // Exit 2 and up is git failing, not a conflict: an unknown base, a missing object. A
   // caller told "no conflicts" would then merge into a base it never compared against.
-  assert.equal(parseConflicts({ code: 2, stdout: "", stderr: "not something we can merge" }), "unknown");
+  assert.equal(parseConflicts({ code: 2, stdout: "" }), "unknown");
 });
 
 test("the prompt section names the base, the files and the hunk counts", () => {

@@ -162,7 +162,7 @@ test("a response without total_count is trusted as complete", () => {
 });
 
 /**
- * What a red verdict TELLS the next session (DESIGN.md §12).
+ * What a red verdict TELLS the next session (DESIGN.md §12.3).
  *
  * A rejection is the whole of what the next session gets to act on, and
  * `failing: <job names>` is not enough to act on. The agent has no forge credential of
@@ -845,7 +845,7 @@ test("a GitHub review's own body is guidance too, not just its line comments", a
 });
 
 /**
- * Merge queues (DESIGN.md §12).
+ * Merge queues (DESIGN.md §12.3).
  *
  * `pullRequest.mergeQueue` rather than `branchProtectionRule.requiresMergeQueue`, because a
  * queue can be required by a ruleset as well as by a protection rule and only the former

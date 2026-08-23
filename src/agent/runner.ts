@@ -515,7 +515,7 @@ export class AgentSessionRunner {
   }
 
   /**
-   * The branch's conflicts with its base, as a prompt section (DESIGN.md §12).
+   * The branch's conflicts with its base, as a prompt section (DESIGN.md §12.3).
    *
    * Computed at session start so the rebase happens as ordinary work. A task that ran for
    * several sessions can end on a branch its base has moved past, and the first thing that

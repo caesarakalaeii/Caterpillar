@@ -1,5 +1,5 @@
 /**
- * Whether a change can land, and how. See DESIGN.md §12.
+ * Whether a change can land, and how. See DESIGN.md §12.3.
  *
  * Pure: no forge calls, no git calls, no clock. Everything here is a decision or a
  * parse, so the two things that were previously implicit on the merge path can be
@@ -114,11 +114,16 @@ export interface ConflictSummary {
   readonly files: readonly ConflictFile[];
 }
 
-/** Enough of a `GitResult` to read; keeps this module free of the git module. */
+/**
+ * Enough of a `GitResult` to read; keeps this module free of the git module.
+ *
+ * `stderr` is deliberately absent. `merge-tree` writes its diagnosis to stdout and its
+ * exit code says which of the three answers it is, so a field nothing reads would be a
+ * field the next reader looks for a use of.
+ */
 export interface MergeTreeResult {
   readonly code: number;
   readonly stdout: string;
-  readonly stderr?: string;
 }
 
 /**
