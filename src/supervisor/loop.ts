@@ -4511,6 +4511,12 @@ export class Supervisor {
    * the lookup and the write cannot compute it differently — an id that disagreed with
    * itself would be a check that never matches, which is indistinguishable from one that
    * works.
+   *
+   * The write is not pushed here. A mirror runs OUTSIDE the write-then-commit unit that
+   * precedes it (see each call site), so the record waits for whichever commit comes next —
+   * exactly as `transition("running")`'s `state.json` does. A record that never reaches the
+   * remote costs a duplicate comment, which is what the record is for and not what it
+   * guarantees; pushing here would put a git round trip in front of every lifecycle change.
    */
   private mirrorLedger(task: TaskId): MirrorLedger {
     const { store } = this.deps;

@@ -468,6 +468,12 @@ export class AgentSessionRunner {
    * `landed` and `record` derive it from the same task, verb and arguments, and an id
    * computed differently at the two call sites would be an idempotency check that never
    * matches — which looks exactly like one that is working.
+   *
+   * Writes land on disk and wait for the supervisor's next commit, like every other write a
+   * session makes. Within a session that is enough — a second `task_note` reads the file the
+   * first one wrote. Across a pod restart the record is only as good as the last push, and
+   * that is the bound the design accepts: a lost record costs a repeated effect, never a
+   * wrong one.
    */
   private effectLedger(spec: TaskSpec): EffectLedger {
     const { store } = this.options;
