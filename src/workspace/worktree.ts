@@ -593,6 +593,13 @@ export class WorktreeManager {
    * it reports: the throw below is the invariant's second half, and a session that refuses
    * to start leaves both histories intact for a human, which is what GH-95 did by hand.
    *
+   * The tolerant callers inherit that throw, which `mustReachRemote` does not shield them
+   * from: it governs an unreachable remote, not a decline. A probe on a worktree that is
+   * behind with local modifications does propagate the refusal. It needs the remote to move
+   * DURING the session to arise, which is what the lease is for, so this is left as is
+   * rather than softened into a silence — a probe reporting on a checkout it knows is behind
+   * would be a worse answer than no answer.
+   *
    * Only ever on `agent/<task>` itself, and that check is not a formality. An agent that ran
    * `git checkout` is documented elsewhere in this file (§`refspecs`), and merging the task
    * branch into whatever it is standing on would be worse than the bug: on `main` it
@@ -650,6 +657,8 @@ export class WorktreeManager {
    * cannot tell them apart: it reports both as a plain non-zero, so anything built on it
    * tolerates a network fault exactly as much as it tolerates a fresh task. `ls-remote`
    * exits 2 for a ref the remote does not have and 128 for a remote it could not read.
+   * `Git.lsRemote` is not used for it precisely because it throws — both codes arrive as one
+   * exception, which is the distinction this function exists to make.
    *
    * That costs a second round trip on the path where the branch DOES exist, and buys back a
    * fetch on the two paths where it does not — an absent branch and an unreachable remote

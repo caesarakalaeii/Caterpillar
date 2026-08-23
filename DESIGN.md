@@ -256,10 +256,12 @@ does not start.** Starting silently behind it is the one outcome that is not ava
 Both checkout paths enforce it:
 
 - *Creating* a worktree fetches the remote branch into `refs/remotes/origin/agent/<task>` and
-  starts there, fast-forwarding the local ref. A local ref carrying commits the remote does
-  not gets a throw, because nothing in the runner can choose between two histories: forcing
-  would discard commits that exist nowhere else, and starting on the local ref is the drift
-  the rule exists to stop.
+  starts there, fast-forwarding the local ref. A local ref that already *contains* the remote
+  tip is the start point instead — a session killed between a commit and a push leaves the
+  branch exactly there, routinely, and nothing on the remote is lost by resuming on it. Only
+  a true divergence gets a throw, because nothing in the runner can choose between two
+  histories: forcing would discard commits that exist nowhere else, and starting on the local
+  ref is the drift the rule exists to stop.
 - *Reusing* one runs `merge --ff-only` onto the remote tip, and only while HEAD is actually
   on `agent/<task>`. A worktree that is ahead is left alone — those commits exist nowhere
   else — and a divergence or a dirty tree makes the merge decline, which becomes the same
@@ -677,6 +679,11 @@ On reclaim, the new session:
 
 1. Commits any uncommitted worktree changes to the task branch as `wip: recovered from
    interrupted session`, rather than discarding them.
+   This step is conditional on the catch-up above succeeding, and cannot be moved ahead of
+   it: the worktree path comes from `ensureTaskCheckout`. So if the remote moved while the
+   session was dead and the fast-forward touches a file the dirty tree also touches, the
+   checkout refuses and the WIP stays uncommitted for a human. Nothing is lost — the changes
+   are still on disk — but the recovery is not automatic in that case.
 2. Appends a journal entry recording the interruption.
 3. Replays context from `spec.md` + the journal + `handoff.md`.
 
