@@ -3125,9 +3125,13 @@ for the common case, where the pod that finishes a task is the pod that was runn
 This is what fired on `BS-1540288291008684052-02` on 2026-08-21, and the task itself was
 fine: session 1 committed all three commits, sessions 2 and 3 committed nothing because
 there was nothing left to commit, and session 3's completion claim passed the gate and the
-council and merged. The streak of 2 was truthful, the task never parked, and the alert then
-fired for 36 hours — on a pod whose image predated the `transition` fix by 28 hours, which
-is the other lesson: a metrics fix does nothing until it is rolled out.
+council and merged. The streak of 2 was truthful, the task never parked, and §11.1 scored
+all three sessions correctly. The alert nevertheless fired for 36 hours, on pods whose
+image predated the `transition` fix, because CI was billing-blocked and the image carrying
+that fix was never built. That is the other lesson, and it is not a code one: a fix to an
+in-memory gauge changes nothing until a new image is built AND rolled out, so an alert on a
+stale gauge keeps creating remediation tasks in the meantime. Check the running image's
+digest against the commit you believe fixes it before reading the metric as a live defect.
 
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
