@@ -2602,8 +2602,32 @@ Continuing past a failure would land exactly that broken intermediate.
 
 A **partial** merge names what did land. It is the one outcome where "could not merge" on its own
 is actively misleading — some of the change is on the default branch, and a human cannot decide
-what to do about the rest without knowing which half. `mergeReviewed` still never fails the
-task, for the reason it never did.
+what to do about the rest without knowing which half.
+
+**`mergeReviewed` answers with a kind, and a refused merge PARKS the task.** It never throws and
+it never marks the task `failed` — the work passed every gate, so nothing about it is wrong — but
+it no longer lets the task reach `done` either. The three kinds exist because `merged: false`
+was answering two unrelated questions at once:
+
+- `skipped` — no PR was recorded, or the workspace has no reviewer identity. Merging was never
+  this system's job here, so the task is no less complete for it. Treating this as a failure
+  would park every task on every runner that deliberately leaves landing to a human.
+- `failed` — the merge was attempted and the forge refused. The work is sound but the branch will
+  not land without a human, almost always a rebase.
+- `merged` — every PR landed.
+
+`done` is the one status `/resume` refuses and the one that reaps the checkout, so calling a
+refused merge `done` made the failure **permanent**: nothing automated would ever retry it, and
+the only trace was one `warn`-level `pr.merge-failed` line. That is not hypothetical. Between
+2026-08-21 and 2026-08-23 it abandoned four pull requests on `all-chat` — #744, #746, #747 and
+#757 — each approved by the reviewer identity, each green, each refused with
+`405 Pull Request has merge conflicts` because a sibling in the same plan had landed first and
+moved the base underneath it. All four sat open until a human went looking for them.
+
+Parking rather than failing is also what makes the recovery cheap: `park` keeps the worktree, and
+`/resume` puts the task back to `ready` on the same branch, so the rebase does not pay for a
+fresh clone and a full dependency install. The park reason is `merge.note`, so the forge's own
+words reach Discord — and on a partial multi-repo merge it still names which repos DID land.
 
 **The system prompt says so.** A tool that can do a thing an agent does not know about is a tool
 that does not exist: the sibling-layout paragraph now says to call `open_pr` once per repo, and

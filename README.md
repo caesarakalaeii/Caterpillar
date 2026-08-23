@@ -235,7 +235,10 @@ awkward, the change is probably wrong.
    sends it back, and an abstention is never an approval. Nothing merges as the identity
    that opened the PR: GitHub will not let a pull request's author approve it, and that
    refusal is the only thing making branch protection a real gate — so the council
-   approves and merges through a *second* App, or not at all.
+   approves and merges through a *second* App, or not at all. And a merge the forge
+   *refuses* parks the task rather than completing it: `done` is the status `/resume`
+   declines and the one that reaps the checkout, so calling a conflicted PR done would
+   abandon it for good.
 3. **The agent cannot write the state repo.** Task-scoped tokens never cover it, so the
    audit trail cannot be rewritten by the thing being audited.
 4. **Every push verifies the lease first.** Claim-time exclusion is not enough — a

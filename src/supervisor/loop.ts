@@ -2294,6 +2294,25 @@ export class Supervisor {
         await this.deps.leases.assertHeld(await lease.current());
 
         const merge = await this.mergeReviewed(spec, reviewed.state);
+        // A refused merge is not a completed task. The outcome was read only as a log field
+        // and the task was marked `done` regardless, which made every merge failure
+        // permanent: `done` is the status `/resume` refuses and the one that reaps the
+        // checkout, so a `405 Pull Request has merge conflicts` left an approved, green,
+        // unmergeable PR behind with one `warn` line as the only trace. It happened four times
+        // on all-chat in two days (#744, #746, #747, #757) and nothing automated retried any of
+        // them.
+        //
+        // `park`, not `failed`: the work passed the council and the acceptance gates, so it is
+        // the LANDING that needs a human — usually a rebase. Parking keeps the worktree and
+        // `/resume` puts the task back to `ready` on the same branch, so that rebase does not
+        // pay for a fresh clone and dependency install. `merge.note` is the park reason, which
+        // means the forge's own words reach Discord instead of being swallowed; on a partial
+        // multi-repo merge it also names which repos DID land, which is the one thing a human
+        // has to know before deciding what to do about the rest.
+        if (merge.kind === "failed") {
+          await this.park(lease, spec, reviewed.state, merge.note);
+          return true;
+        }
         await this.unit(async () => {
           await this.transition(lease, reviewed.state, "done");
           await this.push(lease, `chore(${spec.id}): done`);
@@ -2304,7 +2323,6 @@ export class Supervisor {
           task: spec.id,
           sessions: reviewed.state.sessions,
           prUrl,
-          merged: merge.merged,
         });
         await this.mirror(spec, { kind: "completed", prUrl });
         await this.notifyTask(reviewed.state, {
@@ -2858,10 +2876,18 @@ export class Supervisor {
   /**
    * Approve and merge, through the REVIEWER identity (DESIGN.md §12.1).
    *
-   * Never throws, and never fails the task. By this point every gate has passed and git
-   * already records the work as complete; a forge that refuses the merge is the same
-   * class of problem as a tracker that refuses a comment (README invariant 6). The
-   * outcome is reported instead, in the message that announces the task is done.
+   * Never throws. Reports one of three outcomes, and the CALLER decides what each means
+   * for the task — which is the distinction this used to lose by answering `merged: false`
+   * to two unrelated questions:
+   *
+   *   - `merged` — every PR landed.
+   *   - `skipped` — there was nothing here to merge: no PR was recorded, or no reviewer
+   *     identity is configured for the workspace. Merging was never this system's job, so a
+   *     task is no less complete for it, and saying otherwise would park every task on every
+   *     runner that deliberately leaves landing to a human.
+   *   - `failed` — the merge WAS attempted and the forge refused. That is a task whose work
+   *     is sound but whose branch will not land without a human, and treating it as complete
+   *     is how four approved, green, unmergeable PRs were abandoned on all-chat.
    *
    * Without a reviewer identity this does nothing at all. The primary App authored the
    * PR, and GitHub will not let an author approve their own — so a merge attempt from it
@@ -2870,17 +2896,23 @@ export class Supervisor {
   private async mergeReviewed(
     spec: TaskSpec,
     state: TaskState,
-  ): Promise<{ readonly merged: boolean; readonly note: string }> {
+  ): Promise<{
+    readonly kind: "merged" | "skipped" | "failed";
+    readonly note: string;
+  }> {
     const { reviewers, logger } = this.deps;
 
     const prs = taskPullRequests(spec.repos, state);
     if (prs.length === 0) {
-      return { merged: false, note: "No PR was recorded, so nothing was merged." };
+      return { kind: "skipped", note: "No PR was recorded, so nothing was merged." };
     }
 
     const factory = reviewers?.get(spec.workspace);
     if (factory === undefined) {
-      return { merged: false, note: "No reviewer identity is configured — merging is yours." };
+      return {
+        kind: "skipped",
+        note: "No reviewer identity is configured — merging is yours.",
+      };
     }
 
     const forge = await factory.forTask(spec);
@@ -2899,7 +2931,7 @@ export class Supervisor {
         merged.push(`${repoSlug(pr.repo)}#${pr.number}`);
       }
       return {
-        merged: true,
+        kind: "merged",
         note:
           merged.length === 1
             ? "Approved by the review council and merged."
@@ -2916,7 +2948,7 @@ export class Supervisor {
       // merge" on its own is actively misleading: some of the change is on the default branch
       // and a human has to know which half before deciding what to do about the rest.
       return {
-        merged: false,
+        kind: "failed",
         note:
           merged.length === 0
             ? `Could not merge: ${reason}`
@@ -3880,7 +3912,7 @@ export class Supervisor {
 
     try {
       const merge = await this.mergeReviewed(spec, state);
-      if (!merge.merged) return { kind: "not-mergeable", reason: merge.note };
+      if (merge.kind !== "merged") return { kind: "not-mergeable", reason: merge.note };
 
       // Merging a parked task settles it: the work is on the default branch, and leaving
       // it parked would invite a human to pick up something already shipped.

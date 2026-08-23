@@ -1037,6 +1037,141 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
   assert.deepEqual(calls, ["approve:11", "merge:11"], "approve must come first, or the merge is refused");
 });
 
+test("a merge the forge refuses parks the task instead of marking it done", async () => {
+  // Observed four times on all-chat over two days (#744, #746, #747, #757). The council passed,
+  // the reviewer identity approved, and the merge came back `405 Pull Request has merge
+  // conflicts` — and the task went `done` anyway, because the transition never read
+  // `merge.merged`. `done` is the one status `/resume` refuses and the one that reaps the
+  // checkout, so each failure was permanent: four PRs approved, green, and unmergeable, with a
+  // single `warn` line as the only trace. Nothing automated would ever retry them.
+  //
+  // Parking is the fix rather than `failed` because the work is sound — it is the LANDING that
+  // needs a human (a rebase, usually), and `park` keeps the worktree so that human's answer
+  // does not pay for a fresh clone and dependency install.
+  const REFUSED = asTaskId("SMOKE-MERGE-REFUSED");
+  await seedTask(REFUSED, { pr: { number: 12, url: "https://example.invalid/pr/12" } });
+
+  const calls: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
+    openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
+    approve: (_repo, pr) => {
+      calls.push(`approve:${pr}`);
+      return Promise.resolve();
+    },
+    merge: (_repo, pr) => {
+      calls.push(`merge:${pr}`);
+      // Refused for THIS task's PR only. Every test in this file drives a real supervisor
+      // against one shared state repo, and a runner claims whichever task is `ready` — so a
+      // forge that refused every merge would park the tasks the neighbouring tests are
+      // asserting on, and this test would report their PR numbers instead of its own.
+      if (pr !== 12) return Promise.resolve();
+      return Promise.reject(new Error("GitHub /merge failed with 405: Pull Request has merge conflicts"));
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const { reaper, reaped } = recordingReaper();
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: true,
+          detail: "acceptance passed",
+          prUrl: "https://example.invalid/pr/12",
+        }),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () =>
+        Promise.resolve({
+          usage: EMPTY_USAGE,
+          verdict: decide([
+            {
+              lens: "correctness",
+              title: "Correctness",
+              decision: "pass",
+              blocking: false,
+              summary: "Reads correctly.",
+              findings: [],
+            },
+          ]),
+        }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    worktrees: reaper,
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let settled: TaskState | undefined;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const state = await pushedState(REFUSED);
+    const held = await new Git(origin).tryRun("show-ref", "--verify", leaseRef(REFUSED));
+    if (state !== undefined && state.status !== "ready" && held.code !== 0) {
+      settled = state;
+      break;
+    }
+    await sleep(100);
+  }
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  // Subsequences, not the whole list, for the shared-remote reason above.
+  assert.ok(calls.includes("approve:12"), `approve was never attempted: ${calls.join(", ")}`);
+  assert.ok(calls.includes("merge:12"), `merge was never attempted: ${calls.join(", ")}`);
+  assert.equal(
+    settled?.status,
+    "parked",
+    "a task whose PR did not land is not done — `done` refuses /resume and reaps the checkout",
+  );
+  assert.ok(
+    !reaped.includes(REFUSED),
+    "a park keeps the worktree so the rebase does not pay for a reclone",
+  );
+});
+
 test("a blocked task is not claimed until its blocker is done", async () => {
   // The property that makes waves safe. Without it two agents can work a task and its
   // dependency at the same time on different branches, which on a multi-replica runner
