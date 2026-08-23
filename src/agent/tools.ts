@@ -73,6 +73,21 @@ export interface ControlSink {
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: null });
 
 /**
+ * What `publish` did, and what to tell the agent about it.
+ *
+ * `stored` exists because every refusal here comes back as PROSE rather than a throw — a
+ * file too big for §17's cap is a prompt to summarise, and an exception would end the
+ * session over something the agent could fix in its next turn. Without the flag the tool
+ * cannot tell a refusal from a success, and it recorded the refusal as the effect's result:
+ * a replay then handed that refusal back forever and the file could never be stored.
+ */
+export interface PublishResult {
+  readonly stored: boolean;
+  /** What the agent is told, in either case. */
+  readonly message: string;
+}
+
+/**
  * The task's effect record, as a tool may reach it (DESIGN.md §4.4).
  *
  * A narrow pair of callbacks rather than the store, for `publish`'s reason one field down:
@@ -201,7 +216,7 @@ export interface ToolContext {
    * A callback rather than the store itself: the tool must not be able to reach any task
    * but its own, and a bound function is the narrowest thing that expresses that.
    */
-  readonly publish?: (name: string, path: string, note: string) => Promise<string>;
+  readonly publish?: (name: string, path: string, note: string) => Promise<PublishResult>;
   /**
    * This task's effect record, when the supervisor gave the session one (DESIGN.md §4.4).
    *
@@ -326,8 +341,8 @@ export const askHumanTool = (ctx: ToolContext): AgentTool<typeof AskHumanParams,
     // The signal is set whether or not this is a replay. It lives in memory and the record
     // does not, so a resumed session that already asked must still STOP — one that recorded
     // the verb and then declined to signal would keep running with nothing left to do. What
-    // the record buys here is the tracker mirror: `mirrorEffect` keys the comment and the
-    // `needs-human` label on the same call, so the question is not posted twice (§9.5).
+    // the record buys here is the tracker mirror: `mirrorTransition` keys the comment and
+    // the `needs-human` label on the same call, so the question is not posted twice (§9.5).
     ctx.control.signal = {
       reason: "ask-human",
       summary: `asked: ${params.question}`,
@@ -502,9 +517,13 @@ export const publishArtifactTool = (
     const landed = await alreadyLanded<string>(ctx.effects, "publish_artifact", params);
     if (landed !== undefined) return text(landed.result);
 
-    const stored = await publish(params.name, params.path, params.note);
-    await noteLanded(ctx.effects, "publish_artifact", params, stored);
-    return text(stored);
+    const result = await publish(params.name, params.path, params.note);
+    // Only a stored artifact is an effect. A refusal has to stay retryable, or the agent
+    // that summarises the file it was told to summarise is handed the old refusal again.
+    if (result.stored) {
+      await noteLanded(ctx.effects, "publish_artifact", params, result.message);
+    }
+    return text(result.message);
   },
 });
 

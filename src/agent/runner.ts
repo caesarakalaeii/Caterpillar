@@ -54,7 +54,13 @@ import { readRepoStandards, repoCheckoutsOf } from "./standards.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
 import { effectRequestId, type EffectVerb } from "../state/effects.ts";
-import { toolsForKind, type ControlSink, type EffectLedger, type ToolContext } from "./tools.ts";
+import {
+  toolsForKind,
+  type ControlSink,
+  type EffectLedger,
+  type PublishResult,
+  type ToolContext,
+} from "./tools.ts";
 
 void _gzipSync;
 
@@ -482,7 +488,9 @@ export class AgentSessionRunner {
    *
    * Every refusal comes back as TEXT the agent can act on rather than as a thrown error:
    * a file that is too big is a prompt to summarise, and an exception here would end the
-   * session over something the agent could have fixed in its next turn.
+   * session over something the agent could have fixed in its next turn. `stored` is what
+   * distinguishes those refusals from a success, because they are otherwise both prose —
+   * and a refusal recorded as a landed effect (§4.4) would be replayed forever.
    *
    * The path is resolved inside the worktree and checked, because it is model-authored.
    */
@@ -492,23 +500,27 @@ export class AgentSessionRunner {
     name: string,
     path: string,
     note: string,
-  ): Promise<string> {
+  ): Promise<PublishResult> {
+    const refuse = (message: string): PublishResult => ({ stored: false, message });
+
     const resolved = resolve(worktree, path);
     if (!resolved.startsWith(`${resolve(worktree)}/`)) {
-      return `\`${path}\` is outside your working directory; nothing was stored.`;
+      return refuse(`\`${path}\` is outside your working directory; nothing was stored.`);
     }
 
     let contents: Buffer;
     try {
       contents = await readFile(resolved);
     } catch {
-      return `Could not read \`${path}\`; nothing was stored.`;
+      return refuse(`Could not read \`${path}\`; nothing was stored.`);
     }
 
     try {
       await this.options.store.writeArtifact(spec.id, name, contents);
     } catch (error) {
-      return `${error instanceof Error ? error.message : String(error)}. Nothing was stored — summarise it instead.`;
+      return refuse(
+        `${error instanceof Error ? error.message : String(error)}. Nothing was stored — summarise it instead.`,
+      );
     }
 
     await this.options.store.appendJournal(
@@ -517,7 +529,10 @@ export class AgentSessionRunner {
       0,
       `**Artifact:** \`${name}\` (${contents.byteLength} bytes) — ${note}`,
     );
-    return `Stored \`${name}\` (${contents.byteLength} bytes). Tasks that declare this one as a blocker will find it in their artifacts directory.`;
+    return {
+      stored: true,
+      message: `Stored \`${name}\` (${contents.byteLength} bytes). Tasks that declare this one as a blocker will find it in their artifacts directory.`,
+    };
   }
 
   /**
