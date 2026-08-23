@@ -5261,3 +5261,217 @@ test("a rejected claim still pushes the evidence its gate published", async () =
 
   await retire(EVIDENCE);
 });
+
+test("a question's options are pushed with it and offered in the notification", async () => {
+  // The option TEXT has to reach the state repo, because that is the only place a button
+  // press can look it up: a `custom_id` holds 100 characters and the task id has spent most
+  // of them (DESIGN.md §7).
+  const ASKED = asTaskId("SMOKE-OPTIONS-1");
+  await seedTask(ASKED);
+
+  const offered: (readonly string[] | undefined)[] = [];
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: (spec) => {
+        if (spec.id !== ASKED) return Promise.reject(new Error("session not under test"));
+        return Promise.resolve({
+          reason: "ask-human" as const,
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "Which migration path?",
+          questionOptions: ["Use the existing one", "Write a new one"],
+          summary: "needs a decision",
+        });
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: {
+      notify: (notification) => {
+        if (notification.kind === "question") offered.push(notification.options);
+        return Promise.resolve();
+      },
+    },
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const asked = await waitForCommit(`chore(${ASKED}): awaiting human input`, 30_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(asked !== undefined, "the question was never pushed");
+  assert.equal(
+    await blobAt(asked, `tasks/${ASKED}/questions/000-options.json`),
+    `${JSON.stringify(["Use the existing one", "Write a new one"], null, 2)}\n`,
+  );
+  assert.deepEqual(offered, [["Use the existing one", "Write a new one"]]);
+
+  await retire(ASKED);
+});
+
+test("pressing an option lands exactly where the same text typed by hand lands", async () => {
+  // THE constraint. One answer path, not two: a button press resolves to the stored option
+  // text and then goes through `applyAnswer` unchanged. Asserted by COMPARING the two
+  // resulting states rather than by checking each against a list — a second path that
+  // diverges later would still satisfy two separate sets of assertions.
+  const PRESSED = asTaskId("SMOKE-OPTIONS-2");
+  const TYPED = asTaskId("SMOKE-OPTIONS-3");
+  const OPTION = "Use the existing migration path";
+
+  const store = new StateStore(statePath, stateGit);
+  for (const task of [PRESSED, TYPED]) {
+    await seedTask(task);
+    await store.pull("origin", config.stateRepo.branch);
+    await store.writeQuestion(task, 4, "Which migration path?", [OPTION, "Write a new one"]);
+    await store.writeState({
+      ...seed,
+      id: task,
+      status: "awaiting-human",
+      sessions: 4,
+      progress: { lastProgressSession: 1, noProgressStreak: 3 },
+    });
+    await store.commitAndPush(`chore(${task}): awaiting human`, "origin", "main");
+  }
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const pressed = await inbox.submit({ kind: "answer-option", task: PRESSED, option: 0 });
+  const typed = await inbox.submit({ kind: "answer", task: TYPED, text: OPTION });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(pressed, typed, "the two paths must report the same outcome");
+
+  const answerOf = (task: TaskId): Promise<string | undefined> =>
+    new Git(origin)
+      .tryRun("show", `main:tasks/${task}/questions/004-answer.md`)
+      .then((shown) => (shown.code === 0 ? shown.stdout : undefined));
+
+  assert.equal(await answerOf(PRESSED), `${OPTION}\n`, "the full option text, untruncated");
+  assert.equal(await answerOf(PRESSED), await answerOf(TYPED));
+
+  // Journals differ only by the task id they were written for, so compare with it removed.
+  const anonymise = (task: TaskId, journal: string): string => journal.split(task).join("<task>");
+  assert.equal(
+    anonymise(PRESSED, await pushedJournal(PRESSED)),
+    anonymise(TYPED, await pushedJournal(TYPED)),
+  );
+
+  // Same for the state, whose timestamps and id are the only fields that may differ. The
+  // streak reset is the one that matters: it is what stops an answered task parking again
+  // before it has run.
+  const forget = (state: TaskState | undefined): unknown =>
+    state === undefined ? undefined : { ...state, id: "<task>", updatedAt: "<at>", createdAt: "<at>" };
+  assert.equal((await pushedState(PRESSED))?.progress.noProgressStreak, 0);
+  assert.deepEqual(forget(await pushedState(PRESSED)), forget(await pushedState(TYPED)));
+
+  await retire(PRESSED);
+  await retire(TYPED);
+});
+
+test("an option index the stored question does not have is refused, and writes nothing", async () => {
+  // A button lives in the channel forever, so a press can arrive against a question that
+  // has been superseded — or against one that never had options at all. Answering it would
+  // write SOMEBODY ELSE'S choice into the answer file, which the next session then obeys.
+  const STALE = asTaskId("SMOKE-OPTIONS-4");
+  await seedTask(STALE);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  await store.writeQuestion(STALE, 4, "Which migration path?", ["the existing one"]);
+  await store.writeState({
+    ...seed,
+    id: STALE,
+    status: "awaiting-human",
+    sessions: 4,
+    progress: { lastProgressSession: 1, noProgressStreak: 3 },
+  });
+  await store.commitAndPush(`chore(${STALE}): awaiting human`, "origin", "main");
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "answer-option", task: STALE, option: 1 });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(
+    outcome.kind === "refused" ? outcome.reason : "",
+    /no longer offer/,
+    "the refusal has to say why, or the human presses it again",
+  );
+
+  const answer = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${STALE}/questions/004-answer.md`,
+  );
+  assert.notEqual(answer.code, 0, "nothing may be written for an option that does not exist");
+  assert.equal(
+    (await pushedState(STALE))?.status,
+    "awaiting-human",
+    "the task must stay parked on the question it asked",
+  );
+
+  await retire(STALE);
+});
