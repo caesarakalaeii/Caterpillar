@@ -22,7 +22,13 @@
 import type { Notification, Notifier } from "../notify/discord.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { Git } from "../state/git.ts";
-import { collectDay, type ChangeReader, type DayDigest } from "./collect.ts";
+import type { AttributionReport, FleetIdentity } from "./attribution.ts";
+import {
+  collectDay,
+  type AuthorshipReader,
+  type ChangeReader,
+  type DayDigest,
+} from "./collect.ts";
 import { dueWindows, type DayBoundary, type DigestWindow } from "./day.ts";
 import { renderDigest, summaryLine } from "./render.ts";
 import type { Summariser } from "./summarise.ts";
@@ -55,6 +61,12 @@ export interface DailyDigestOptions {
   readonly branch: string;
   /** Reads the code a task produced, when this runner holds the mirror. */
   readonly changes?: ChangeReader;
+  /** Reads who authored the window's commits. Absent means no authorship section. */
+  readonly authorship?: AuthorshipReader;
+  /** The fleet's commit identity (§9.7), so authorship can tell it from a person's. */
+  readonly identity?: FleetIdentity;
+  /** Counts the window's authorship. Called only for a day that was actually published. */
+  readonly onAttributed?: (report: AttributionReport) => void;
   /** Writes the prose. Absent means a facts-only digest, which is a complete one. */
   readonly summariser?: Summariser;
   /** Counts published digests, by outcome. */
@@ -139,12 +151,15 @@ export class DailyDigest {
   }
 
   private async publish(window: DigestWindow, signal?: AbortSignal): Promise<void> {
-    const { git, store, logger, boundary, runner, branch, changes } = this.options;
+    const { git, store, logger, boundary, runner, branch, changes, authorship, identity } =
+      this.options;
 
     const digest = await collectDay({
       git,
       window,
       ...(changes === undefined ? {} : { changes }),
+      ...(authorship === undefined ? {} : { authorship }),
+      ...(identity === undefined ? {} : { identity }),
     });
 
     const summary = await this.narrate(digest, signal);
@@ -178,6 +193,9 @@ export class DailyDigest {
       quiet: digest.quiet,
     });
     this.options.onPublished?.(window.date, digest.quiet);
+    // After the push, like `onPublished` and for its reason: these are counters of what was
+    // published, and a day whose commit failed was not.
+    if (digest.attribution !== undefined) this.options.onAttributed?.(digest.attribution);
 
     await this.announce(digest, body);
   }

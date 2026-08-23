@@ -10,7 +10,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ARTIFACT_BYTES } from "../state/store.ts";
-import { AUTHOR_STANDARDS, TEST_FIRST_STANDARD, WRITING_STANDARD } from "./standards.ts";
+import {
+  AUTHOR_STANDARDS,
+  TEST_FIRST_STANDARD,
+  WRITING_STANDARD,
+  parseRepoStandards,
+} from "./standards.ts";
 import {
   asTaskId,
   asWorkspaceName,
@@ -67,6 +72,37 @@ test("test-first reaches every session that can write code", () => {
   for (const kind of ["implement", "remediation"] as const) {
     assert.ok(systemPromptFor(kind).includes(TEST_FIRST_STANDARD), kind);
   }
+});
+
+test("an implementation session is given its repos' own standards", () => {
+  // Spliced here and into the lenses from the same parse, so the author cannot be held to
+  // a repo rule the council was not given, or the reverse (§12.2).
+  const standards = parseRepoStandards("acme/web", "## tests: Rule\n\nCover the error path.\n");
+
+  const prompt = systemPromptFor("implement", standards);
+  assert.ok(prompt.startsWith(SYSTEM_PROMPT));
+  assert.ok(prompt.includes("Cover the error path."));
+  assert.ok(prompt.includes("acme/web"));
+});
+
+test("a session whose repos supply nothing gets the prompt unchanged", () => {
+  for (const kind of ["implement", "remediation", "brainstorm"] as const) {
+    assert.equal(systemPromptFor(kind, []), systemPromptFor(kind));
+  }
+});
+
+test("a brainstorm is not given repo standards", () => {
+  // It writes a plan, not code. The rules are for the sessions that implement its tasks,
+  // and those read them from the repo themselves.
+  const standards = parseRepoStandards("acme/web", "## tests: Rule\n\nCover the error path.\n");
+
+  assert.equal(systemPromptFor("brainstorm", standards), BRAINSTORM_SYSTEM_PROMPT);
+});
+
+test("a remediation session is held to its repos' standards too", () => {
+  const standards = parseRepoStandards("acme/web", "## design: Rule\n\nNo new dependencies.\n");
+
+  assert.ok(systemPromptFor("remediation", standards).includes("No new dependencies."));
 });
 
 /**

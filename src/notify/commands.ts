@@ -23,6 +23,14 @@ import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task
 
 export type Command =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
+  /**
+   * One of the choices the open question offered, pressed as a button (DESIGN.md §7).
+   *
+   * Carries the option's INDEX, because that is all a `custom_id` has room for once the
+   * task id is in it. The supervisor resolves it against the options stored beside the
+   * question and answers with the text the agent wrote.
+   */
+  | { readonly kind: "answer-option"; readonly task: TaskId; readonly option: number }
   /** List tasks, optionally filtered. Served from the snapshot, never from git. */
   | { readonly kind: "list"; readonly status?: TaskStatus; readonly page?: number }
   | { readonly kind: "show"; readonly task: TaskId }

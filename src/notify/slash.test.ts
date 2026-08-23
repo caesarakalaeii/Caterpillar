@@ -73,6 +73,38 @@ test("the Answer button opens a modal rather than writing anything", () => {
   );
 });
 
+test("an option button becomes an answer-option command carrying the index", () => {
+  // The index and not the text: the text is stored beside the question, because a
+  // `custom_id` holds 100 characters and the task id has spent most of them.
+  const customId = encodeCustomId({ verb: "opt", task: TASK, arg: "2" });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+    { kind: "run", command: { kind: "answer-option", task: TASK, option: 2 } },
+  );
+});
+
+test("an option button with no usable index is ignored, never answered as option 0", () => {
+  // `arg` is free-form text off the wire. Defaulting it would answer the question with
+  // whatever the first option happens to be, which is a choice the human did not make.
+  for (const arg of ["", "first", "-1", "1.5"]) {
+    const customId = encodeCustomId({ verb: "opt", task: TASK, arg });
+    assert.ok(customId !== undefined);
+    const intent = parseInteraction(
+      interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+    );
+    assert.equal(intent.kind, "ignored", `\`${arg}\` was not refused`);
+  }
+
+  const bare = encodeCustomId({ verb: "opt", task: TASK });
+  assert.ok(bare !== undefined);
+  assert.equal(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: bare } })).kind,
+    "ignored",
+  );
+});
+
 test("an autocompleted task id is still validated", () => {
   // Autocomplete is a SUGGESTION, not a constraint: Discord submits whatever was typed,
   // and the id becomes a directory name under `tasks/`.

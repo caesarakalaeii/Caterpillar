@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -22,10 +22,13 @@ import {
 } from "../domain/task.ts";
 import type { Commit } from "./tdd.ts";
 import { prLenses, SABOTAGE_LENS } from "./lenses.ts";
+import { parseRepoStandards } from "../agent/standards.ts";
 import type { PrepareOptions, PrepareResult } from "./sabotage.ts";
 import {
   evidenceRoot,
   planPrompt,
+  reviewLenses,
+  reviewLensesFor,
   reviewerPlan,
   reviewPrompt,
   sabotageAbstentionFor,
@@ -233,6 +236,69 @@ test("a refusal reaches the body as a reason and needs no cleanup", async () => 
   const seen = await withSabotageCopy(prepare, prepareOptions(), async (copy) => copy);
 
   assert.deepEqual(seen, { ok: false, reason: "no disk" });
+});
+
+test("the council convenes its lenses carrying the repos' own standards", () => {
+  // The half of §12.2 the council owns. `review()` needs a provider, a worktree and five
+  // concurrent sessions to reach, so the decision is extracted here for the same reason
+  // `reviewerPlan` is: drop the standards at the call site and every review still runs,
+  // still passes, and silently stops grading the rules a repository shipped.
+  const standards = parseRepoStandards("acme/widget", "## tests: Rule\n\nCover the error path.\n");
+
+  const graded = reviewLenses(undefined, false, standards).filter((lens) =>
+    lens.prompt.includes("Cover the error path."),
+  );
+
+  assert.deepEqual(
+    graded.map((lens) => lens.key),
+    ["tests"],
+  );
+});
+
+test("the council's lenses are read from the checkout it is reviewing", async () => {
+  // The one line `reviewLenses` cannot pin: that the standards `review()` READ are the ones
+  // it HANDS to the splice. Blanking that argument left the whole suite green while the
+  // council read every repo's file and then graded against none of it — the author held to
+  // all of it, the reviewers to nothing, which is the exact asymmetry §12.2 forbids.
+  //
+  // `reviewLensesFor` takes the checkout instead of a standards list, so there is no
+  // argument at the call site left to empty.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-council-"));
+  after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, ".caterpillar"), { recursive: true });
+  await writeFile(join(root, ".caterpillar/standards.md"), "## tests: Rule\n\nCover the retry.\n");
+
+  const lenses = await reviewLensesFor(
+    SPEC.repos,
+    { root, siblings: new Map() },
+    undefined,
+    false,
+  );
+
+  assert.deepEqual(
+    lenses.filter((lens) => lens.prompt.includes("Cover the retry.")).map((lens) => lens.key),
+    ["tests"],
+  );
+});
+
+test("a configured lens set is still given the repos' standards", () => {
+  // `options.lenses` exists so a caller can convene its own council. It must not be a way
+  // to convene one that grades against less than the author was handed.
+  const standards = parseRepoStandards("acme/widget", "## design: Rule\n\nNo new deps.\n");
+  const only = prLenses(false).filter((lens) => lens.key === "design");
+
+  assert.match(reviewLenses(only, false, standards)[0]?.prompt ?? "", /No new deps\./);
+});
+
+test("the sabotage lens joins or sits out exactly as it did before repo standards", () => {
+  assert.deepEqual(
+    reviewLenses(undefined, true, []).map((lens) => lens.key),
+    ["correctness", "design", "tests", "fit", "sabotage"],
+  );
+  assert.deepEqual(
+    reviewLenses(undefined, false, []).map((lens) => lens.key),
+    ["correctness", "design", "tests", "fit"],
+  );
 });
 
 /* ─────────────────── artifacts as evidence the council can see (§12.1) ───────────────── */

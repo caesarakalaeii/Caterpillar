@@ -224,7 +224,11 @@ const identity = (value: unknown): CommitIdentity => {
   const fault = identityFault(email);
   if (fault !== undefined) throw new ConfigError(`identity.email ${fault}`);
 
-  return { name, email };
+  // `identityFault` is deliberately NOT asked of the retired addresses. Nothing commits as
+  // one — they exist so the digest can recognise its own past work (§19) — and refusing a
+  // bare noreply address here would leave a deployment that already made that mistake
+  // unable to describe the history it has.
+  return { name, email, pastEmails: strings(raw["pastEmails"], "identity.pastEmails") };
 };
 
 const workspace = (name: string, value: unknown): WorkspaceProfile => {

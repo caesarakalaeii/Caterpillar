@@ -95,3 +95,144 @@ test("a branch with no commits on it is not reported as a change", async () => {
 
   assert.deepEqual(await reader.read(asTaskId("TASK-EMPTY"), [REPO]), []);
 });
+
+/* ------------------------------------------------------- authorship over a window */
+
+const FLEET = "316492202+caterpillar-agent[bot]@users.noreply.github.com";
+const WINDOW_START = new Date("2026-08-15T16:00:00Z");
+const WINDOW_END = new Date("2026-08-16T16:00:00Z");
+
+/**
+ * A mirror with one commit by the fleet and one by a person inside the window, plus one
+ * of each outside it. Committer dates, because that is what the digest's own window
+ * filters on (`collect.ts` uses `--before`) and what a rebase resets to the moment the
+ * fleet actually pushed.
+ */
+const authoredMirror = async (): Promise<Git> => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-authorship-"));
+  roots.push(root);
+
+  const git = new Git(root);
+  await git.run("init", "--quiet", "--initial-branch=main");
+
+  const commit = async (
+    email: string,
+    name: string,
+    when: string,
+    file: string,
+    body: string,
+  ): Promise<void> => {
+    await writeFile(join(root, file), body, "utf8");
+    await git.run("add", "-A");
+    await git
+      .withEnv({
+        GIT_AUTHOR_NAME: name,
+        GIT_AUTHOR_EMAIL: email,
+        GIT_AUTHOR_DATE: when,
+        GIT_COMMITTER_NAME: name,
+        GIT_COMMITTER_EMAIL: email,
+        GIT_COMMITTER_DATE: when,
+      })
+      .run("commit", "-m", `touch ${file}`);
+  };
+
+  await commit(FLEET, "caterpillar-agent[bot]", "2026-08-14T10:00:00Z", "before.ts", "1\n");
+  await commit(FLEET, "caterpillar-agent[bot]", "2026-08-16T09:00:00Z", "fleet.ts", "1\n2\n3\n");
+  await commit("dev@example.invalid", "A Person", "2026-08-16T10:00:00Z", "human.ts", "1\n");
+  await commit(FLEET, "caterpillar-agent[bot]", "2026-08-17T10:00:00Z", "after.ts", "1\n");
+
+  return git;
+};
+
+test("authorship reports every commit in the window with its author and line counts", async () => {
+  const git = await authoredMirror();
+  const reader = new MirrorChangeReader({ localMirror: () => git });
+
+  const read = await reader.readAuthorship([REPO], WINDOW_START, WINDOW_END);
+
+  assert.deepEqual(read.unavailable, []);
+  assert.deepEqual(
+    read.commits.map((entry) => ({
+      repo: entry.repo,
+      email: entry.authorEmail,
+      lines: entry.insertions + entry.deletions,
+    })),
+    [
+      { repo: "acme/widget", email: FLEET, lines: 3 },
+      { repo: "acme/widget", email: "dev@example.invalid", lines: 1 },
+    ],
+    "the commits before and after the window are not in it",
+  );
+});
+
+test("a repo with no mirror on this runner is named as unreadable, not reported empty", async () => {
+  // The §19 rule, applied to authorship: a runner that never worked this repo has no
+  // history for it, and a repo with zero commits in it is a different fact entirely.
+  const reader = new MirrorChangeReader({ localMirror: () => undefined });
+
+  const read = await reader.readAuthorship([REPO], WINDOW_START, WINDOW_END);
+
+  assert.deepEqual(read.commits, []);
+  assert.deepEqual(read.unavailable, ["acme/widget"]);
+});
+
+test("a mirror whose window is empty is readable and simply has no commits", async () => {
+  // The other half of the same distinction: this runner CAN see the repo, and nothing was
+  // committed in it. That must not be reported as an unreadable repo.
+  const git = await authoredMirror();
+  const reader = new MirrorChangeReader({ localMirror: () => git });
+
+  const read = await reader.readAuthorship(
+    [REPO],
+    new Date("2026-08-01T00:00:00Z"),
+    new Date("2026-08-02T00:00:00Z"),
+  );
+
+  assert.deepEqual(read.commits, []);
+  assert.deepEqual(read.unavailable, []);
+});
+
+test("a commit that is only on a forge's own ref is not counted as authorship", async () => {
+  // A mirror fetches `+refs/*:refs/*`, so on GitHub it carries `refs/pull/*` too. Those
+  // hold the heads of pull requests that were closed without merging and of branches that
+  // were force-pushed over — code nobody landed. Counting it would report work that does
+  // not exist in the repository.
+  const git = await authoredMirror();
+  const head = await git.run("rev-parse", "HEAD");
+  await git.run("update-ref", "refs/pull/7/head", head);
+  await git.run("checkout", "--quiet", "--detach", head);
+  await writeFile(join(await git.run("rev-parse", "--show-toplevel"), "abandoned.ts"), "1\n");
+  await git.run("add", "-A");
+  await git
+    .withEnv({
+      GIT_AUTHOR_NAME: "caterpillar-agent[bot]",
+      GIT_AUTHOR_EMAIL: FLEET,
+      GIT_AUTHOR_DATE: "2026-08-16T11:00:00Z",
+      GIT_COMMITTER_NAME: "caterpillar-agent[bot]",
+      GIT_COMMITTER_EMAIL: FLEET,
+      GIT_COMMITTER_DATE: "2026-08-16T11:00:00Z",
+    })
+    .run("commit", "-m", "abandoned");
+  await git.run("update-ref", "refs/pull/7/head", await git.run("rev-parse", "HEAD"));
+  await git.run("checkout", "--quiet", "main");
+
+  const read = await new MirrorChangeReader({ localMirror: () => git }).readAuthorship(
+    [REPO],
+    WINDOW_START,
+    WINDOW_END,
+  );
+
+  assert.equal(read.commits.length, 2, "the two commits on branches, and not the abandoned one");
+});
+
+test("a commit reachable from two refs is counted once", async () => {
+  // A merged task branch is reachable from both `agent/<task>` and the default branch. The
+  // fleet's share would be inflated by every branch that was kept if this double-counted.
+  const git = await authoredMirror();
+  await git.run("branch", "agent/TASK-MERGED", "main");
+  const reader = new MirrorChangeReader({ localMirror: () => git });
+
+  const read = await reader.readAuthorship([REPO], WINDOW_START, WINDOW_END);
+
+  assert.equal(read.commits.length, 2);
+});

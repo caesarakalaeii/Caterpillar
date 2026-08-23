@@ -8,7 +8,7 @@
  *                truth on recovery. `journal.md` is the legacy single-file form and is
  *                still read, never written and never deleted.
  *   handoff.md   OVERWRITTEN each session — the baton, deliberately bounded
- *   questions/   NNN-question.md / NNN-answer.md
+ *   questions/   NNN-question.md / NNN-answer.md / NNN-options.json
  *   sessions/    NNN.jsonl.gz — pi transcripts
  *
  * The journal grows; handoff.md does not. That asymmetry is the point: an
@@ -366,6 +366,22 @@ const journalShardName = (session: number, at: Date, runner: string): string => 
   const stamp = at.toISOString().replace(/[-:]/g, "").replace(/\.(\d{3})Z$/, "$1Z");
   return `${String(session).padStart(4, "0")}-${stamp}-${runner}.md`;
 };
+
+/** The sidecar holding one question's enumerated choices, if it offered any. */
+const optionsFileName = (index: number): string => `${String(index).padStart(3, "0")}-options.json`;
+
+/**
+ * The question a task is currently parked on.
+ *
+ * `options` is present only when the agent enumerated choices (DESIGN.md §7). It is what a
+ * one-press answer resolves against: the button carries an index into this list, because a
+ * `custom_id` has no room for the text.
+ */
+export interface PendingQuestion {
+  readonly index: number;
+  readonly question: string;
+  readonly options?: readonly string[];
+}
 
 /**
  * Every top-level directory the supervisor writes, and therefore the broadest thing a
@@ -1425,7 +1441,7 @@ export class StateStore {
   }
 
   /** Unanswered question, if the task is parked waiting on one. */
-  async pendingQuestion(task: TaskId): Promise<{ readonly index: number; readonly question: string } | undefined> {
+  async pendingQuestion(task: TaskId): Promise<PendingQuestion | undefined> {
     const dir = join(this.taskDir(task), "questions");
     if (!existsSync(dir)) return undefined;
     const files = await readdir(dir);
@@ -1437,7 +1453,34 @@ export class StateStore {
     const answer = `${String(index).padStart(3, "0")}-answer.md`;
     if (files.includes(answer)) return undefined;
 
-    return { index, question: await readFile(join(dir, last), "utf8") };
+    const options = await this.questionOptions(task, index);
+    return {
+      index,
+      question: await readFile(join(dir, last), "utf8"),
+      ...(options === undefined ? {} : { options }),
+    };
+  }
+
+  /**
+   * The choices a question offered, when it offered any.
+   *
+   * Undefined covers three cases on purpose — no sidecar, an unreadable one, and one whose
+   * contents are not a list of strings — because the answer to all three is the same: offer
+   * the free-text path only. The question is the record and the sidecar is a convenience, so
+   * a half-written file must cost the buttons rather than the ability to answer at all.
+   */
+  private async questionOptions(task: TaskId, index: number): Promise<readonly string[] | undefined> {
+    const path = join(this.taskDir(task), "questions", optionsFileName(index));
+    if (!existsSync(path)) return undefined;
+
+    try {
+      const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+      if (!Array.isArray(parsed)) return undefined;
+      if (!parsed.every((entry): entry is string => typeof entry === "string")) return undefined;
+      return parsed.length === 0 ? undefined : parsed;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1498,12 +1541,31 @@ export class StateStore {
     );
   }
 
-  async writeQuestion(task: TaskId, index: number, question: string): Promise<void> {
+  /**
+   * Record a question, and the enumerated choices it offers if it offers any.
+   *
+   * The options go in a sidecar rather than into the markdown, because they are read back
+   * by a button press and parsed — a list embedded in agent-authored prose would have to be
+   * recovered from it, and the recovery would be a guess.
+   */
+  async writeQuestion(
+    task: TaskId,
+    index: number,
+    question: string,
+    options?: readonly string[],
+  ): Promise<void> {
     return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "questions");
       await mkdir(dir, { recursive: true });
       const name = `${String(index).padStart(3, "0")}-question.md`;
       await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+      if (options !== undefined && options.length > 0) {
+        await writeFile(
+          join(dir, optionsFileName(index)),
+          `${JSON.stringify(options, null, 2)}\n`,
+          "utf8",
+        );
+      }
     });
   }
 

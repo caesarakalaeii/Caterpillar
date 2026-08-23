@@ -46,6 +46,7 @@ test("every intent in the union survives the round trip unchanged", async () => 
 
   const intents = [
     { kind: "answer", task: TASK, text: "hello" },
+    { kind: "answer-option", task: TASK, option: 2 },
     { kind: "park", task: TASK },
     { kind: "resume", task: TASK },
     { kind: "merge", task: TASK },
@@ -141,6 +142,13 @@ test("an intent missing a required field is refused rather than half-applied", a
   // the state repo — a commit nobody can interpret and a human who thinks they replied.
   await redis.rpush(INBOX_KEY, JSON.stringify({ id: "a", intent: { kind: "answer", task: TASK } }));
   await redis.rpush(INBOX_KEY, JSON.stringify({ id: "b", intent: { kind: "park" } }));
+  // An option index that is not a whole number would be looked up in the stored option list
+  // and miss, which is a refusal the human never asked for. It is a malformed request, and a
+  // malformed request is dropped here.
+  await redis.rpush(
+    INBOX_KEY,
+    JSON.stringify({ id: "d", intent: { kind: "answer-option", task: TASK, option: "first" } }),
+  );
   await redis.rpush(
     INBOX_KEY,
     JSON.stringify({

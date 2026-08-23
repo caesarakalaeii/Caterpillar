@@ -48,7 +48,8 @@ export const TEXT_INPUT_STYLE = {
 export const EPHEMERAL = 1 << 6;
 
 export const CUSTOM_ID_LIMIT = 100;
-const BUTTONS_PER_ROW = 5;
+/** Exported because a caller building a row from a list has to bound the list itself. */
+export const BUTTONS_PER_ROW = 5;
 const ROWS_PER_MESSAGE = 5;
 /** Discord's limits on the modal frame. Over either is a 400. */
 const MODAL_TITLE_LIMIT = 45;
@@ -92,8 +93,12 @@ export interface Modal {
  * Kept short deliberately — every character spends the 100 a `custom_id` has, and the
  * task id needs most of them. `res` is `/resume`: a park notification is the one message
  * whose entire content is "a human has to act", and the act is always the same one.
+ *
+ * `opt` is one enumerated answer to a question, and its `arg` is the option's INDEX rather
+ * than its text — the text is stored beside the question in the state repo, because an
+ * option long enough to be worth a button is long enough to break the 100.
  */
-export type Verb = "ans" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no" | "done";
+export type Verb = "ans" | "opt" | "park" | "merge" | "res" | "back" | "plan-ok" | "plan-no" | "done";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -143,7 +148,7 @@ export const decodeCustomId = (raw: string): ButtonAction | undefined => {
 // Parallel to `Verb` by hand, and it has to stay that way: `isVerb` is a runtime check and
 // the union is erased, so a verb added to one and not the other type-checks and then decodes
 // as "unrecognised button" in front of whoever pressed it.
-const VERBS: readonly string[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
+const VERBS: readonly string[] = ["ans", "opt", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
 
