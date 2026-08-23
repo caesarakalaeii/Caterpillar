@@ -73,6 +73,24 @@ test("a task with no review history keeps the field absent, not undefined", () =
   assert.equal("review" in (back?.[0] ?? {}), false);
 });
 
+test("the acceptance criteria survive the round trip", () => {
+  // With Redis configured the process that opens the `/amend` modal is the standalone bot,
+  // which holds no state repo: this key is the only place it can learn what a task currently
+  // has to satisfy. A field dropped here is a modal pre-filled with nothing, submitted as a
+  // whole replacement list.
+  const back = deserialise(serialise([summary({ acceptance: ["npm run check", "npm test"] })]));
+  assert.deepEqual(back?.[0]?.acceptance, ["npm run check", "npm test"]);
+});
+
+test("a criteria list that is not a list of strings is dropped, not half-read", () => {
+  // Half a replacement list is worse than none: the modal would offer it as the whole gate.
+  const raw = JSON.stringify([{ ...summary(), acceptance: ["npm test", 7] }]);
+  const back = deserialise(raw);
+
+  assert.equal(back?.length, 1, "the task itself must survive");
+  assert.equal(back?.[0]?.acceptance, undefined);
+});
+
 test("a malformed review record costs the history, not the task", () => {
   // The review history is the least important thing a summary carries. Dropping the whole
   // task to protect it would take it out of the autocomplete that names it.

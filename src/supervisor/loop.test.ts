@@ -6,7 +6,7 @@
  * the losing step was a CAS against a ref that had already been deleted.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -6182,6 +6182,146 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
+});
+
+test("an amendment on a parked task is appended, journalled and reported back", async () => {
+  // The gate a human amends is the gate the verifier then runs, so the assertion that
+  // matters is the FILE. An outcome saying "amended" over a directory nobody wrote is the
+  // hand-edited spec.md this mechanism replaces, with extra steps.
+  const AMENDED = asTaskId("SMOKE-AMEND-1");
+  await seedTask(AMENDED, { status: "parked" });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: AMENDED,
+    acceptance: ["npm run check", "npm test"],
+    why: "the glob can never match the literal directory it mandates",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "amended", JSON.stringify(outcome));
+  assert.equal(outcome.kind === "amended" ? outcome.index : undefined, 1);
+  // Both halves of the change, so the human sees what they just did rather than being told
+  // that it worked.
+  assert.deepEqual(outcome.kind === "amended" ? outcome.removed : undefined, ["true"]);
+  assert.deepEqual(outcome.kind === "amended" ? outcome.added : undefined, [
+    "npm run check",
+    "npm test",
+  ]);
+
+  await store.pull("origin", config.stateRepo.branch);
+  const amendments = await store.listAmendments(AMENDED);
+  assert.equal(amendments.length, 1, JSON.stringify(amendments));
+  assert.deepEqual(amendments[0]?.acceptance, ["npm run check", "npm test"]);
+  assert.equal(amendments[0]?.author, "ada", "the record has to say who decided");
+  // The effective gate, which is what the verifier reads next.
+  assert.deepEqual((await store.readSpec(AMENDED)).acceptance, ["npm run check", "npm test"]);
+  // And the filed document is untouched: it is the record of what the task was asked to do.
+  assert.deepEqual((await store.readBaseSpec(AMENDED)).acceptance, ["true"]);
+
+  const journal = await pushedJournal(AMENDED);
+  assert.match(journal, /the glob can never match the literal directory it mandates/);
+  assert.match(journal, /npm run check/, "the journal names what was added");
+  assert.match(journal, /`true`/, "and what was removed");
+  assert.match(journal, /ada/);
+});
+
+test("a second amendment appends 002 and leaves 001 exactly as it was", async () => {
+  // An amendment can be as broken as the criterion it replaced — a criterion written as an
+  // escaped regex for a matcher that is not a regex — so re-amending is the correction path
+  // and there is deliberately no way to edit the last one. That only works if the earlier
+  // record survives byte for byte: the directory listing IS the audit trail.
+  const TWICE = asTaskId("SMOKE-AMEND-2");
+  await seedTask(TWICE, { status: "parked" });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+
+  const first = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: TWICE,
+    acceptance: ["npx vitest run src\\/widget\\/.*"],
+    why: "the repo-wide gate fails on files this branch never touches",
+    author: "ada",
+  });
+  assert.equal(first.kind, "amended", JSON.stringify(first));
+  await store.pull("origin", config.stateRepo.branch);
+  const asWritten = await readFile(
+    join(statePath, "tasks", TWICE, "amendments", "001.yaml"),
+    "utf8",
+  );
+
+  const second = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: TWICE,
+    acceptance: ["npx vitest run src/widget"],
+    why: "vitest 4 matches a filter with includes(), not as a regex",
+    author: "ada",
+  });
+
+  assert.equal(second.kind, "amended", JSON.stringify(second));
+  assert.equal(second.kind === "amended" ? second.index : undefined, 2);
+
+  await store.pull("origin", config.stateRepo.branch);
+  const amendments = await store.listAmendments(TWICE);
+  assert.deepEqual(
+    amendments.map((amendment) => amendment.index),
+    [1, 2],
+  );
+  assert.equal(
+    await readFile(join(statePath, "tasks", TWICE, "amendments", "001.yaml"), "utf8"),
+    asWritten,
+    "an earlier amendment is never rewritten",
+  );
+  // The highest number wins entirely — not a merge across the two.
+  assert.deepEqual((await store.readSpec(TWICE)).acceptance, ["npx vitest run src/widget"]);
+});
+
+test("amending a running task writes nothing at all", async () => {
+  // Refused rather than queued for later. A criterion that changes under a session already
+  // grading itself against the old list is worse than a refusal a human can act on now.
+  const BUSY = asTaskId("SMOKE-AMEND-3");
+  await seedTask(BUSY, { status: "running" });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: BUSY,
+    acceptance: ["npm test"],
+    why: "the gate is impossible",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "not-amendable", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-amendable" ? outcome.reason : "",
+    /cancel/i,
+    "a refusal a human cannot act on is a refusal that wastes the trip",
+  );
+
+  // NOT merely "the outcome said refused". Both halves of the write are asserted absent,
+  // because a refusal that journalled anyway leaves the task carrying a decision nobody
+  // made — and the next session would read it.
+  await store.pull("origin", config.stateRepo.branch);
+  assert.deepEqual(await store.listAmendments(BUSY), []);
+  assert.equal(await pushedJournal(BUSY), "", "nothing may be journalled either");
+  assert.deepEqual((await store.readSpec(BUSY)).acceptance, ["true"]);
+});
+
+test("amending a task that is not in the state repo says so", async () => {
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: asTaskId("SMOKE-AMEND-NONE"),
+    acceptance: ["npm test"],
+    why: "nothing to amend",
+    author: "ada",
+  });
+
+  assert.deepEqual(outcome, { kind: "unknown-task" });
 });
 
 /**
