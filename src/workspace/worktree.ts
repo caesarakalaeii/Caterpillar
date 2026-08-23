@@ -437,16 +437,131 @@ export class WorktreeManager {
     await mkdir(join(path, ".."), { recursive: true });
     const git = this.git.at(mirror);
 
-    const exists = await git.revParse(`refs/heads/${branch}`);
-    if (exists === undefined) {
-      const head = await git.run("symbolic-ref", "--short", "HEAD");
-      await git.run("worktree", "add", "-b", branch, path, head);
+    const start = await this.startPoint(repo, mirror, task, branch);
+    if (start.creating) {
+      await git.run("worktree", "add", "-b", branch, path, start.commit);
     } else {
       await git.run("worktree", "add", path, branch);
     }
 
     await this.configureShared(path);
     await this.configureTask(path, task);
+  }
+
+  /**
+   * Where a brand-new worktree for `branch` must start, and whether the branch is ours to
+   * create.
+   *
+   * This is the whole of the GH-96 fix, so it is worth saying what went wrong. Sessions 2
+   * and 3 of that task pushed eighteen commits to `agent/<task>`. Session 7 started with no
+   * local branch of that name, so the old code here took the `-b` path from the mirror's
+   * default branch and the agent found an empty task — it re-implemented everything from
+   * scratch and only discovered the duplicate when its push was refused as non-fast-forward.
+   * A human then had to choose between two independent implementations of one task.
+   *
+   * The local ref cannot be trusted for this, and that is by design elsewhere:
+   * `MIRROR_REFSPECS` excludes `^refs/heads/agent/*`, so a mirror never fetches an agent
+   * branch back and a mirror that does not already have one will never learn of it. Every
+   * route to a missing or stale local ref therefore ends in the same place — a runner that
+   * has never worked this task, a reaped worktree, a mirror re-cloned after a failed fetch,
+   * or the branch reset GH-95 reported. So the REMOTE is asked, once, on the create path.
+   *
+   * Three outcomes, and the third is the point:
+   *
+   *   - no remote branch: the local ref if there is one, otherwise the default branch. The
+   *     behaviour that was always right for a task nobody has pushed.
+   *   - remote ahead of the local ref, or no local ref: start at the remote tip.
+   *   - local ref carrying commits the remote tip does not: THROW. Nothing here can choose
+   *     safely between two divergent histories — forcing the local ref to the remote would
+   *     discard commits that exist nowhere else, and starting on the local ref is the
+   *     silent-drift failure this exists to stop. A session that refuses to start leaves
+   *     both histories intact and says so in the task's journal.
+   */
+  private async startPoint(
+    repo: RepoRef,
+    mirror: string,
+    task: TaskId,
+    branch: string,
+  ): Promise<{ readonly commit: string; readonly creating: boolean }> {
+    const git = this.git.at(mirror);
+    const local = await git.revParse(`refs/heads/${branch}`);
+    const remote = await this.fetchAgentBranch(mirror, task, branch);
+
+    if (remote === undefined) {
+      if (local !== undefined) return { commit: local, creating: false };
+      return { commit: await git.run("symbolic-ref", "--short", "HEAD"), creating: true };
+    }
+
+    if (local === undefined) return { commit: remote, creating: true };
+    if (local === remote) return { commit: local, creating: false };
+
+    const contained = await git.tryRun("merge-base", "--is-ancestor", local, remote);
+    if (contained.code !== 0) {
+      throw new Error(
+        `refusing to start ${task} on ${repo.owner}/${repo.name}: the local ${branch} ` +
+          `(${local}) has commits that origin/${branch} (${remote}) does not, and this ` +
+          `runner cannot tell which history is the work. Reconcile the two by hand.`,
+      );
+    }
+
+    // Fast-forward only — the `--is-ancestor` check above is what makes `-f` safe here, and
+    // it is why that check is not merely advisory. Nothing holds the branch: a worktree
+    // that did would have taken the reuse path at the top of `addWorktreeLocked`.
+    await git.run("branch", "-f", branch, remote);
+    return { commit: remote, creating: false };
+  }
+
+  /**
+   * The remote's tip of `branch`, fetched into `refs/remotes/origin/<branch>`. Undefined
+   * when the remote does not have it, or when the fetch could not be made.
+   *
+   * Fetched from `origin`'s URL rather than from the remote NAME, which is the one
+   * non-obvious line here. A mirror's `remote.origin.fetch` is `+refs/*:refs/*`, and git
+   * applies a configured refspec OPPORTUNISTICALLY alongside an explicit one — so `git
+   * fetch origin +refs/heads/agent/X:refs/remotes/origin/agent/X` also force-updates the
+   * local `refs/heads/agent/X`. That resurrects the refusal this module already carries two
+   * exclusions for:
+   *
+   *   fatal: refusing to fetch into branch 'refs/heads/agent/X' checked out at ...
+   *
+   * and it would clobber a divergent local branch before `startPoint` ever got to look at
+   * it. Suppressing it with `^refs/heads/agent/X` does not work either: a negative refspec
+   * matches the SOURCE side, so it removes the mapping we asked for as well. Naming a URL
+   * leaves no configured remote to apply, so exactly one ref moves.
+   *
+   * The URL is read from the mirror's config rather than rebuilt by `cloneUrl`, because the
+   * mirror is the authority on where it came from: `syncMirrorLocked` clones from
+   * `cloneUrl`, but nothing stops an operator re-pointing a mirror, and a test fixture's
+   * origin is a local path.
+   *
+   * Never throws. This runs at the top of every fresh checkout, including the progress
+   * probe's and the verifier's on a repo whose credential service has already been closed
+   * (§9.2), and on a task whose branch nobody has ever pushed. A fetch that cannot be made
+   * means "the remote has nothing to say", which returns the caller to the behaviour it had
+   * before this existed rather than failing a session that could have run.
+   */
+  private async fetchAgentBranch(
+    mirror: string,
+    task: TaskId,
+    branch: string,
+  ): Promise<string | undefined> {
+    const tracking = `refs/remotes/origin/${branch}`;
+    const git = this.git.at(mirror);
+    const url = await git.tryRun("config", "--get", "remote.origin.url");
+    if (url.code !== 0) return undefined;
+
+    const fetched = await git.tryRun(
+      ...this.credentialArgs(task),
+      "fetch",
+      "--no-tags",
+      url.stdout.trim(),
+      `+refs/heads/${branch}:${tracking}`,
+    );
+    // A remote with no such branch is a fetch FAILURE ("couldn't find remote ref"), not an
+    // empty success, so the stale tracking ref a previous session left must not be read as
+    // the current tip — the branch may have been deleted by a merge.
+    if (fetched.code !== 0) return undefined;
+    return git.revParse(tracking);
   }
 
   /**
