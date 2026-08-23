@@ -504,16 +504,22 @@ export class WorktreeManager {
    * has never worked this task, a reaped worktree, a mirror re-cloned after a failed fetch,
    * or the branch reset GH-95 reported. So the REMOTE is asked, once, on the create path.
    *
-   * Three outcomes, and the third is the point:
+   * Four outcomes, and the last is the point:
    *
    *   - no remote branch: the local ref if there is one, otherwise the default branch. The
    *     behaviour that was always right for a task nobody has pushed.
    *   - remote ahead of the local ref, or no local ref: start at the remote tip.
-   *   - local ref carrying commits the remote tip does not: THROW. Nothing here can choose
-   *     safely between two divergent histories — forcing the local ref to the remote would
-   *     discard commits that exist nowhere else, and starting on the local ref is the
-   *     silent-drift failure this exists to stop. A session that refuses to start leaves
-   *     both histories intact and says so in the task's journal.
+   *   - local ref ahead of the remote tip: start on the local ref. It already contains
+   *     everything the remote has, so nothing can be lost by resuming on it, and this state
+   *     is routine — the prompt asks for many small commits and leaves pushing to the
+   *     agent, so a session killed between a commit and a push leaves the branch here. The
+   *     reuse path treats it the same way (`merge --ff-only` onto an ancestor is a no-op),
+   *     and the two paths must not disagree about one repository state.
+   *   - neither ref contains the other: THROW. Nothing here can choose safely between two
+   *     divergent histories — forcing the local ref to the remote would discard commits
+   *     that exist nowhere else, and starting on the local ref is the silent-drift failure
+   *     this exists to stop. A session that refuses to start leaves both histories intact
+   *     and says so in the task's journal.
    */
   private async startPoint(
     repo: RepoRef,
@@ -540,13 +546,21 @@ export class WorktreeManager {
     if (local === undefined) return { commit: remote, creating: true };
     if (local === remote) return { commit: local, creating: false };
 
+    // Both directions, because one answer cannot tell the two apart: `--is-ancestor local
+    // remote` is non-zero for a divergence AND for a local ref that is merely ahead, and
+    // only the first of those is unresolvable. Asking the second question costs a process
+    // and saves parking a task that has nothing to reconcile.
     const contained = await git.tryRun("merge-base", "--is-ancestor", local, remote);
     if (contained.code !== 0) {
-      throw new Error(
-        `refusing to start ${task} on ${repo.owner}/${repo.name}: the local ${branch} ` +
-          `(${local}) has commits that origin/${branch} (${remote}) does not, and this ` +
-          `runner cannot tell which history is the work. Reconcile the two by hand.`,
-      );
+      const ahead = await git.tryRun("merge-base", "--is-ancestor", remote, local);
+      if (ahead.code !== 0) {
+        throw new Error(
+          `refusing to start ${task} on ${repo.owner}/${repo.name}: the local ${branch} ` +
+            `(${local}) and origin/${branch} (${remote}) have diverged, and this runner ` +
+            `cannot tell which history is the work. Reconcile the two by hand.`,
+        );
+      }
+      return { commit: local, creating: false };
     }
 
     // Fast-forward only — the `--is-ancestor` check above is what makes `-f` safe here, and
