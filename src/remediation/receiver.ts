@@ -41,6 +41,26 @@ export interface FiringAlert {
   readonly annotations: readonly LabelPair[];
 }
 
+/**
+ * One alert Alertmanager says has STOPPED firing (DESIGN.md §20).
+ *
+ * Its own type rather than a flag on `FiringAlert`, and much smaller than one, because a
+ * resolution is a different event with different consumers: it can never become a task, so
+ * none of the fields a task's goal is rendered from — labels, annotations, the generator
+ * URL, the severity — has a reader. The three fields here are all the post-merge
+ * re-verification needs: which alert, which firing of it, and when it stopped.
+ *
+ * A flag would have put an unusable `FiringAlert` through `renderAlertSpec`'s type and left
+ * every reader to remember the check.
+ */
+export interface AlertResolution {
+  readonly alertname: string;
+  /** Lowercase hex, validated exactly as a firing alert's is: it becomes a file name. */
+  readonly fingerprint: string;
+  /** `endsAt`, verbatim from Alertmanager, clipped and stripped like any other value. */
+  readonly endsAt?: string;
+}
+
 /** A sanitized key/value pair. Both sides are strings, capped, control-free. */
 export interface LabelPair {
   readonly key: string;
@@ -56,6 +76,16 @@ export interface LabelPair {
 export interface AlertSink {
   /** True when the alert was queued; false when the queue is full and it was dropped. */
   submit(alert: FiringAlert): boolean;
+  /**
+   * True when the resolution was queued; false when the queue is full and it was dropped.
+   *
+   * A dropped resolution costs more than a dropped firing alert and is worth knowing about
+   * for that reason: Alertmanager sends a resolution ONCE, where it re-sends a firing alert
+   * for as long as it fires. So a re-verification that loses this one reports the alert as
+   * unverifiable rather than cleared — which is the honest answer, and is why losing it is
+   * survivable rather than a correctness bug.
+   */
+  resolve(resolution: AlertResolution): boolean;
 }
 
 /** How the receiver dealt with one delivery. Mirrored into the metric's `outcome` label. */
@@ -65,7 +95,17 @@ export type AlertOutcome =
   | "refused-no-policy"
   | "refused-max-open"
   | "malformed"
-  | "unauthorized";
+  | "unauthorized"
+  /**
+   * Alertmanager said the alert has stopped firing (§20).
+   *
+   * Counted rather than merely logged because it is the evidence a post-merge
+   * re-verification rests on: a fleet whose `resolved` series is flat while alerts keep
+   * firing and clearing has a `send_resolved: false` receiver or a broken route, and the
+   * symptom of that otherwise is every remediation task reporting "could not be
+   * re-verified" with nothing to point at.
+   */
+  | "resolved";
 
 /** Told about every decision, so an operator can count refusals without reading logs. */
 export interface AlertObserver {
@@ -217,7 +257,8 @@ export const fencedBlock = (pairs: readonly LabelPair[]): string => {
 const defuse = (value: string): string => value.replace(/`/g, "'");
 
 /**
- * One member of `alerts[]` → a `FiringAlert`, or a reason it was skipped.
+ * One member of `alerts[]` → a `FiringAlert`, an `AlertResolution`, or a reason it was
+ * skipped.
  *
  * Returns the reason rather than throwing, because ONE malformed member must not fail the
  * whole delivery: Alertmanager groups alerts, a 400 makes it retry the entire group, and
@@ -225,17 +266,23 @@ const defuse = (value: string): string => value.replace(/`/g, "'");
  */
 export const parseAlert = (
   raw: unknown,
-): { readonly alert: FiringAlert } | { readonly skipped: string } => {
+):
+  | { readonly alert: FiringAlert }
+  | { readonly resolution: AlertResolution }
+  | { readonly skipped: string } => {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     return { skipped: "not an object" };
   }
   const member = raw as Record<string, unknown>;
 
   const status = member["status"];
-  if (status === "resolved") return { skipped: "resolved" };
-  // Anything that is not explicitly firing is not acted on. An absent status from a
-  // sender that is not Alertmanager must not be read as "firing" by default.
-  if (status !== "firing") return { skipped: `status is ${JSON.stringify(status)}` };
+  // Anything that is not explicitly one of the two is acted on in neither way. An absent
+  // status from a sender that is not Alertmanager must not be read as "firing" by default,
+  // and must not be read as "resolved" either — that would record an alert as having
+  // stopped when nothing said so.
+  if (status !== "firing" && status !== "resolved") {
+    return { skipped: `status is ${JSON.stringify(status)}` };
+  }
 
   const labels = sanitizeLabels(member["labels"]);
   const annotations = sanitizeLabels(member["annotations"]);
@@ -250,6 +297,17 @@ export const parseAlert = (
   // id, so a fingerprint that is not one is a payload choosing a path (§20).
   if (!isAlertFingerprint(fingerprint)) {
     return { skipped: `fingerprint '${scrub(fingerprintRaw, 64)}' is not lowercase hex` };
+  }
+
+  if (status === "resolved") {
+    const endsAt = member["endsAt"];
+    return {
+      resolution: {
+        alertname,
+        fingerprint,
+        ...(typeof endsAt === "string" ? { endsAt: scrub(endsAt, 64) } : {}),
+      },
+    };
   }
 
   const severity = labels.find((pair) => pair.key === "severity")?.value;
@@ -279,6 +337,8 @@ export interface Delivery {
   readonly skipped: readonly string[];
   /** Accepted alerts the sink had no room for. Re-delivered while they keep firing. */
   readonly dropped: readonly FiringAlert[];
+  /** Alerts this delivery said had STOPPED firing, and the sink accepted (§20). */
+  readonly resolved: readonly AlertResolution[];
 }
 
 /**
@@ -293,7 +353,7 @@ export const handleAlertRequest = (
   request: AlertRequest,
   options: { readonly token: string; readonly sink: AlertSink },
 ): Delivery => {
-  const nothing = { accepted: [], skipped: [], dropped: [] } as const;
+  const nothing = { accepted: [], skipped: [], dropped: [], resolved: [] } as const;
 
   // Answered BEFORE the auth gate, exactly as in `web/server.ts`: the kubelet probes this
   // pod directly and never through the Ingress, so a probe that gets 401 would restart a
@@ -341,6 +401,7 @@ export const handleAlertRequest = (
 
   const accepted: FiringAlert[] = [];
   const dropped: FiringAlert[] = [];
+  const resolved: AlertResolution[] = [];
   const skipped: string[] = [];
   // Capped. A megabyte of body holds thousands of minimal alert objects, and each one that
   // is skipped costs a log line; a grouping this large is a misconfigured Alertmanager
@@ -351,6 +412,14 @@ export const handleAlertRequest = (
     const parsed = parseAlert(member);
     if ("skipped" in parsed) {
       skipped.push(parsed.skipped);
+      continue;
+    }
+    if ("resolution" in parsed) {
+      // A full queue is reported as a skip rather than as a drop, because a resolution is
+      // delivered ONCE and there is nothing to re-deliver: the caller's log line is the
+      // only place the loss is visible.
+      if (options.sink.resolve(parsed.resolution)) resolved.push(parsed.resolution);
+      else skipped.push(`resolution for ${parsed.resolution.alertname} dropped: queue full`);
       continue;
     }
     if (options.sink.submit(parsed.alert)) accepted.push(parsed.alert);
@@ -368,10 +437,14 @@ export const handleAlertRequest = (
   // delivery WAS handled, there is simply nothing to remediate, and any other status makes
   // Alertmanager retry a payload it will send again identically.
   return {
-    reply: text(202, `accepted ${accepted.length} firing alert(s)`),
+    reply: text(
+      202,
+      `accepted ${accepted.length} firing alert(s), ${resolved.length} resolution(s)`,
+    ),
     accepted,
     skipped,
     dropped,
+    resolved,
   };
 };
 
@@ -424,7 +497,13 @@ const serve = async (
     // A failure here belongs to one delivery, never to the process: Alertmanager will
     // retry, and the supervisor has tasks to run either way.
     options.logger.error("remediation.failed", errorFields(error));
-    delivery = { reply: text(500, "the receiver failed to handle this delivery"), accepted: [], skipped: [], dropped: [] };
+    delivery = {
+      reply: text(500, "the receiver failed to handle this delivery"),
+      accepted: [],
+      skipped: [],
+      dropped: [],
+      resolved: [],
+    };
   }
 
   report(options, delivery, request);
@@ -458,7 +537,15 @@ const report = (options: ReceiverOptions, delivery: Delivery, request: IncomingM
     // Every skipped member says why. One malformed alert in a batch is invisible
     // otherwise — the delivery still answers 202, which is the point of skipping it.
     logger.warn("remediation.skipped", { reason });
-    if (reason !== "resolved") metrics?.observe("", "malformed");
+    metrics?.observe("", "malformed");
+  }
+
+  for (const resolution of delivery.resolved) {
+    logger.info("remediation.resolved", {
+      alertname: resolution.alertname,
+      fingerprint: resolution.fingerprint,
+    });
+    metrics?.observe(resolution.alertname, "resolved");
   }
 
   for (const alert of delivery.dropped) {
