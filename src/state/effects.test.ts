@@ -22,7 +22,7 @@ import {
   effectRequestId,
   isEffectRequestId,
   prunableEffects,
-  type EffectRecord,
+  type EffectAge,
 } from "./effects.ts";
 import { Git } from "./git.ts";
 import { StateStore } from "./store.ts";
@@ -88,14 +88,7 @@ test("a request id that could climb out of the effects directory is refused", ()
   }
 });
 
-const record = (requestId: string, at: string): EffectRecord => ({
-  requestId,
-  task: TASK,
-  verb: "task_note",
-  at,
-  runner: "pod-7f3a",
-  result: null,
-});
+const record = (requestId: string, at: string): EffectAge => ({ requestId, at });
 
 test("nothing is prunable while a task is under the cap", () => {
   const records = Array.from({ length: EFFECTS_KEPT }, (_, n) =>
@@ -121,7 +114,7 @@ test("a record with no timestamp is pruned before one that has a timestamp", () 
   const dated = Array.from({ length: EFFECTS_KEPT }, (_, n) =>
     record(`task_note-${n}`, new Date(Date.UTC(2026, 7, 13, 9, n)).toISOString()),
   );
-  const undated: EffectRecord = { ...record("task_note-old", ""), at: undefined as never };
+  const undated: EffectAge = { requestId: "task_note-old" };
 
   assert.deepEqual(prunableEffects([...dated, undated]), ["task_note-old"]);
 });

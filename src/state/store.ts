@@ -31,6 +31,15 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import {
+  EFFECTS_KEPT,
+  effectFileName,
+  isEffectRequestId,
+  prunableEffects,
+  type EffectAge,
+  type EffectRecord,
+  type EffectVerb,
+} from "./effects.ts";
 import { GitError, type Git } from "./git.ts";
 import { Serial } from "./serial.ts";
 import {
@@ -1884,6 +1893,106 @@ export class StateStore {
     const path = join(this.taskDir(task), "artifacts", name);
     if (!existsSync(path)) return undefined;
     return readFile(path);
+  }
+
+  /**
+   * What one control-plane effect returned when it landed, or nothing (DESIGN.md §4.4).
+   *
+   * A READ, so it takes no mutex, and it must never throw: the record is a fast path that
+   * lets a replayed verb skip a side effect it already performed, and a missing, truncated
+   * or hand-mangled file has to cost a repeated attempt rather than a crashed session. An
+   * unreadable record is therefore indistinguishable from an absent one, on purpose.
+   *
+   * `T` is the caller's claim about what it wrote, not a checked fact — the file is JSON
+   * from a previous deploy of this same code. Consumers treat it as a hint: `open_pr` still
+   * asks the forge, because if the record and the forge disagree the forge wins.
+   */
+  async recordedEffect<T>(task: TaskId, requestId: string): Promise<EffectRecord<T> | undefined> {
+    if (!isEffectRequestId(requestId)) return undefined;
+    const path = join(this.effectsDir(task), effectFileName(requestId));
+    if (!existsSync(path)) return undefined;
+
+    try {
+      return JSON.parse(await readFile(path, "utf8")) as EffectRecord<T>;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Record that one effect landed, so a replay of the same call can skip it.
+   *
+   * ONE FILE per effect, named by the request id. That is the same shape as the journal's
+   * shards and for the same reason (§4.1): two runners recording the same task write
+   * different paths, so their commits commute and both rebase. A single per-task ledger
+   * file would put back the one conflict class §4.3 was written about.
+   *
+   * Called by the supervisor after the effect, never by the agent — the state repo is not
+   * agent-writable (§9.3), which is why this lives here and not in a tool.
+   *
+   * Pruning happens here rather than in housekeeping because this is the only moment the
+   * directory grows, and a cap enforced anywhere else is a cap that depends on a loop
+   * having run.
+   */
+  async recordEffect<T>(
+    task: TaskId,
+    requestId: string,
+    verb: EffectVerb,
+    result: T,
+  ): Promise<void> {
+    return this.write(`tasks/${task}`, async () => {
+      const name = effectFileName(requestId);
+      const dir = this.effectsDir(task);
+      await mkdir(dir, { recursive: true });
+
+      const record: EffectRecord<T> = {
+        requestId,
+        task,
+        verb,
+        at: new Date().toISOString(),
+        runner: this.runnerId,
+        result,
+      };
+      // Atomic for `readState`'s reason (§4.2): another runner's `recordedEffect` may read
+      // this path at any moment, and a truncate-then-write is a window where it reads half
+      // a file. Here that would only cost a duplicated effect, which is the whole thing
+      // this record exists to prevent.
+      await writeAtomic(join(dir, name), `${JSON.stringify(record, null, 2)}\n`);
+
+      await this.pruneEffects(task);
+    });
+  }
+
+  /**
+   * Delete the oldest effect records over `EFFECTS_KEPT`.
+   *
+   * Private and called only from inside `recordEffect`'s write, so it neither takes the
+   * mutex (that would deadlock — `Serial` is re-entrant-hostile) nor records a pathspec of
+   * its own: the removal is inside the same `tasks/<id>` unit, and `git add -A <dir>` picks
+   * up a deletion as readily as a creation.
+   *
+   * A record that cannot be read is counted as prunable rather than skipped: it can never
+   * answer a replay, so keeping it would let unreadable files hold the cap open forever.
+   */
+  private async pruneEffects(task: TaskId): Promise<void> {
+    const dir = this.effectsDir(task);
+    const names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+    if (names.length <= EFFECTS_KEPT) return;
+
+    const records: EffectAge[] = [];
+    for (const name of names) {
+      const requestId = name.slice(0, -".json".length);
+      const record = await this.recordedEffect(task, requestId);
+      records.push({ requestId, ...(record === undefined ? {} : { at: record.at }) });
+    }
+
+    for (const requestId of prunableEffects(records)) {
+      await rm(join(dir, effectFileName(requestId)), { force: true });
+    }
+  }
+
+  private effectsDir(task: TaskId): string {
+    return join(this.taskDir(task), "effects");
   }
 
   /**

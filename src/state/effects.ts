@@ -164,13 +164,26 @@ export const effectFileName = (requestId: string): string => {
  * definition older than anything the current deploy wrote — keeping it in preference to a
  * dated one would make the cap unable to evict its oldest entries at all.
  */
-export const prunableEffects = (records: readonly EffectRecord[]): readonly string[] => {
+export const prunableEffects = (records: readonly EffectAge[]): readonly string[] => {
   if (records.length <= EFFECTS_KEPT) return [];
 
   const byAge = [...records].sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
   return byAge.slice(0, records.length - EFFECTS_KEPT).map((record) => record.requestId);
 };
 
+/**
+ * All `prunableEffects` needs of a record: which one it is, and how old.
+ *
+ * Narrower than `EffectRecord` because the store has to weigh files it could NOT read — an
+ * unreadable record can never answer a replay, so it must be a prune candidate, and asking
+ * the caller to invent a verb and a runner for it would be asking it to write a lie.
+ */
+export interface EffectAge {
+  readonly requestId: string;
+  /** ISO 8601, or absent on a record written before the field existed. */
+  readonly at?: string;
+}
+
 /** ISO timestamps sort chronologically as strings; anything unusable sorts first. */
-const sortKey = (record: EffectRecord): string =>
+const sortKey = (record: EffectAge): string =>
   typeof record.at === "string" && record.at !== "" ? record.at : "";
