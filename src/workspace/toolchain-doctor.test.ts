@@ -131,6 +131,32 @@ test("a fault names the near miss where one exists", async () => {
   assert.match(fault ?? "", /lua5_1/);
 });
 
+test("a dotted attribute path is let through, not refused", async () => {
+  // `generatedFlake` interpolates package names into `with pkgs; [ … ]`, where
+  // `python3Packages.requests` is legal nix and builds today. The expression here cannot
+  // ASK about it — `pkgs ? ${name}` with a dot means a nested attribute, which is not the
+  // same question — so this is a name the check cannot evaluate, and the file's own rule
+  // for that is to fail open. Refusing it would reject a declaration the resolver handles.
+  const nix: NixEval = {
+    evaluate: () => assert.fail("a name the expression cannot express must not be evaluated"),
+  };
+  const doctor = new ToolchainDoctor({ config, nix });
+  assert.equal(
+    await doctor.fault({ mode: "nix", packages: ["python3Packages.requests"] }),
+    undefined,
+  );
+});
+
+test("a package list is still checked when another entry is a dotted path", async () => {
+  // Failing open on the dotted name must not blind the check to the rest of the list.
+  const doctor = new ToolchainDoctor({ config, nix: fakeNix(["lua5_1", "python3Packages"]) });
+  const fault = await doctor.fault({
+    mode: "nix",
+    packages: ["python3Packages.requests", "lua51"],
+  });
+  assert.match(fault ?? "", /lua5_1/);
+});
+
 test("mode inherit is a no-op, never a refusal", async () => {
   // Nothing to check, and nothing may be run to check it: `inherit` declares no packages.
   const nix: NixEval = {
