@@ -1301,6 +1301,24 @@ export class Supervisor {
       const state = await store.readState(id).catch(() => undefined);
       if (state === undefined) continue;
       records.push({ id, state });
+      // A streak this replica published for a task that has since finished ANYWHERE.
+      //
+      // `transition` drops the series too, and that stays the fast path — but it only
+      // reaches the process that performed the terminal transition. The gauge is
+      // per-process and in memory while a task migrates between replicas across sessions,
+      // so the pod that published the streak is routinely not the pod that finishes the
+      // task: pod A hands off at streak 2, pod B takes it `done` and removes the series
+      // from its own registry where nothing ever set it, and pod A keeps reporting 2 for
+      // the life of the process. `caterpillar_no_progress_streak >= 2` does not aggregate
+      // over `pod`, so that orphan alerts about settled work until someone restarts the
+      // pod.
+      //
+      // Here because this is the only pass that reads every task's COMMITTED state on
+      // every poll in every replica — the same property that makes the presence below
+      // fleet-wide rather than a report on this one. `Metric.remove` is silent on a label
+      // set that was never reported, so this costs a map lookup per terminal task and says
+      // nothing about tasks this replica never touched.
+      if (isTerminal(state.status)) this.deps.metrics.noProgress.remove({ task: id });
     }
 
     // Awaited: with Redis configured this is a write over the network, and a floating
@@ -3950,8 +3968,13 @@ export class Supervisor {
    *
    * `caterpillar_no_progress_streak >= 2` is an alerting rule, so a stale sample is not
    * cosmetic: it pages somebody about a task that is fine. Dropping the series when a
-   * task ENDS is the other half, and belongs to `transition` rather than here — that is
-   * the funnel every status change goes through.
+   * task ENDS is the other half, and it takes two places rather than one:
+   *
+   *   - `transition`, the funnel every status change goes through, for the process that
+   *     takes the task terminal itself;
+   *   - `survey`, for every OTHER replica, because the gauge is per-process while a task
+   *     migrates between replicas across sessions — so the pod holding the streak is
+   *     routinely not the pod that finishes the task.
    */
   private publishNoProgress(task: TaskId, streak: number): void {
     this.deps.metrics.noProgress.set({ task }, streak);
