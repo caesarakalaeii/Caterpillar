@@ -206,3 +206,43 @@ test("a later session is measured against the previous session's head", async ()
   assert.equal(advanced.committed, true);
   assert.equal(advanced.headOid, second);
 });
+
+test("the probe counts every commit on the branch, not this session's own", async () => {
+  // Feeds `commitNote`, whose whole job is to stop a resumed session mistaking existing
+  // work for none. GH-96's sessions 4-7 each added nothing while eighteen commits sat on
+  // the branch, so a per-session delta would have reported zero on exactly the sessions
+  // that needed the total.
+  const { root, git } = await fixture();
+  await commit(git, "session one, first commit");
+  const head = await commit(git, "session one, second commit");
+
+  // A LATER session that adds nothing of its own: the count must still be two.
+  const evidence = await probeFor(root).probe(
+    spec,
+    stateWith({ lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: head }),
+  );
+
+  assert.equal(evidence.committed, false, "this session added nothing");
+  assert.equal(evidence.commits, 2, "but the branch carries both of the previous session's");
+});
+
+test("the probe reports no commit count when it cannot resolve a fork point", async () => {
+  // Absent must stay distinguishable from zero: `commitNote` says nothing at all for a
+  // count it does not have, and would otherwise assert an empty branch to the next
+  // session. A worktree whose mirror carries no default branch is the reachable case.
+  const { root, git } = await fixture();
+  await commit(git, "the work");
+  // Break the mirror's HEAD, which is what `branchPoint` resolves the base from.
+  await new Git(join(root, "mirrors", REPO.host, REPO.owner, `${REPO.name}.git`), HERMETIC).run(
+    "symbolic-ref",
+    "HEAD",
+    "refs/heads/no-such-branch",
+  );
+
+  const evidence = await probeFor(root).probe(
+    spec,
+    stateWith({ lastProgressSession: 0, noProgressStreak: 0 }),
+  );
+
+  assert.equal(evidence.commits, undefined);
+});

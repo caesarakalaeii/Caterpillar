@@ -5755,3 +5755,68 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
 });
+
+test("a session that ends without a verb still journals what is on the branch", async (t) => {
+  // GH-96's second defect, the one that turned a lost branch into a duplicate
+  // implementation. Sessions 2-3 committed and pushed 18 commits. Sessions 4-7 each ended
+  // without reaching a control-plane verb, and their journal entries said so and nothing
+  // else — so the journal that session 7 read reported that nothing had ever happened. It
+  // believed the journal and implemented the whole task again.
+  //
+  // Asserted on the PUSHED journal, because the next session reads the remote and a shard
+  // written but not pushed is a shard no other runner will ever see.
+  const NO_VERB = asTaskId("BRANCH-NOTE-1");
+  await seedTask(NO_VERB);
+
+  const sessions = hangingSessions();
+  t.after(sessions.stop);
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    // What the probe sees in a worktree carrying a previous session's work: this session
+    // added nothing of its own, and eighteen commits are on the branch.
+    progress: {
+      probe: () =>
+        Promise.resolve({
+          committed: false,
+          acceptanceImproved: false,
+          stepCompleted: false,
+          commits: 18,
+          headOid: "c320ff4a7d1e2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+        }),
+    },
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: sessions.runner,
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await until(() => sessions.started.includes(NO_VERB));
+
+  // The exit GH-96's sessions 4-7 had: context ran out, no verb, and a summary that says
+  // as much and nothing about the branch.
+  sessions.finish(NO_VERB, {
+    reason: "handoff",
+    usage: EMPTY_USAGE,
+    contextTokens: 150_000,
+    summary: "Session ended without a control-plane decision.",
+  });
+
+  await until(async () => (await pushedState(NO_VERB))?.sessions === 1);
+  controller.abort();
+  sessions.stop();
+  await running.catch(() => undefined);
+
+  const journal = await pushedJournal(NO_VERB);
+  assert.match(
+    journal,
+    /18 commits on `agent\/BRANCH-NOTE-1`/,
+    `the entry must state what is on the branch, got:\n${journal}`,
+  );
+  assert.match(journal, /tip `c320ff4`/, "and the tip, so a session can go and read them");
+
+  await retire(NO_VERB);
+});

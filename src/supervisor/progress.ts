@@ -12,6 +12,7 @@
 import type {
   ProgressRecord,
   SessionExitReason,
+  TaskId,
   TaskLimits,
   TaskState,
 } from "../domain/task.ts";
@@ -33,10 +34,66 @@ export interface ProgressEvidence {
    * that made a productive first session look like a stall.
    */
   readonly baselineOid?: string;
+  /**
+   * How many commits the task branch carries beyond its fork point — the STANDING total,
+   * not this session's delta.
+   *
+   * The total rather than the delta because of what it is for: `commitNote` puts it in the
+   * journal so a resumed session cannot mistake work that exists for work that does not,
+   * and GH-96's sessions 4-7 each added nothing while eighteen commits sat on the branch.
+   * A delta would have read as zero on every one of them, which is what the journal already
+   * said.
+   *
+   * Absent when the probe could not count — a repo it cannot read, or a fork point this
+   * worktree does not carry. Absent is not zero, and `commitNote` keeps them apart.
+   */
+  readonly commits?: number;
 }
 
 export const madeProgress = (evidence: ProgressEvidence): boolean =>
   evidence.committed || evidence.acceptanceImproved || evidence.stepCompleted;
+
+/** How much of an oid a human reads before they stop. Matches `git log --abbrev-commit`. */
+const ABBREVIATED_OID = 7;
+
+/**
+ * The journal's sentence about what is on the task branch, or nothing to say.
+ *
+ * This exists because of what a journal entry looked like when a session died without
+ * reaching a control-plane verb. GH-96's sessions 2-3 committed and pushed 18 commits;
+ * sessions 4-7 each recorded "without a control-plane decision" and no more, so the
+ * journal that session 7 read said nothing had happened. It believed the journal and
+ * re-implemented the entire task, discovering the truth only when `git push` was refused
+ * as non-fast-forward. Two independent implementations of one task reached the remote.
+ *
+ * Derived from the PROBE's evidence and never from the agent's summary, which is the whole
+ * point: the summary is the part of the entry that a dying session fails to write and the
+ * only part that can be wrong about the repository. `recordSession` has this evidence
+ * already — it probes on every session, whatever the exit reason.
+ *
+ * Says "on the branch" rather than "pushed". The probe runs after the session's credential
+ * lease has closed (§9.2), so this runner cannot reach the remote to check, and the mirror
+ * keeps no remote-tracking ref for `agent/*` (see `MIRROR_REFSPECS`). Naming the branch is
+ * what makes the line actionable anyway: a session handed the branch name and a count can
+ * run `git log` itself, and since `WorktreeManager.ensureSessionCheckout` now guarantees
+ * the worktree is at or ahead of the remote tip, what is on the branch is everything that
+ * was pushed.
+ *
+ * Absent evidence produces no line. A `commits` the probe could not count is not a branch
+ * with nothing on it, and a journal that says "0 commits" in every entry of every session
+ * that only read code buries the one entry this sentence exists for.
+ */
+export const commitNote = (task: TaskId, evidence: ProgressEvidence): string | undefined => {
+  const { commits, headOid } = evidence;
+  if (commits === undefined || commits === 0 || headOid === undefined) return undefined;
+
+  const plural = commits === 1 ? "commit" : "commits";
+  return (
+    `**Work on the branch:** ${commits} ${plural} on \`agent/${task}\`, ` +
+    `tip \`${headOid.slice(0, ABBREVIATED_OID)}\`. ` +
+    "Read them before writing anything — they may already be the task."
+  );
+};
 
 /**
  * Exit reasons that are neither progress nor a stall, so the streak is left alone.
