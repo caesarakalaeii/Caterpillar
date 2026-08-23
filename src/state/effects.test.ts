@@ -10,7 +10,11 @@
  *     different paths and their commits still rebase (§4.1's argument for the journal).
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
 import {
   EFFECTS_KEPT,
@@ -20,9 +24,22 @@ import {
   prunableEffects,
   type EffectRecord,
 } from "./effects.ts";
+import { Git } from "./git.ts";
+import { StateStore } from "./store.ts";
 
 const TASK = asTaskId("GH-acme-widget-98");
 const OTHER = asTaskId("GH-acme-widget-99");
+
+const roots: string[] = [];
+after(async () => {
+  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+});
+
+const store = async (runner = "pod-7f3a"): Promise<StateStore> => {
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-effects-"));
+  roots.push(root);
+  return new StateStore(root, new Git(root), undefined, runner);
+};
 
 test("a request id is the same for the same task, verb and arguments", () => {
   const args = { summary: "landed the schema" };
@@ -107,4 +124,86 @@ test("a record with no timestamp is pruned before one that has a timestamp", () 
   const undated: EffectRecord = { ...record("task_note-old", ""), at: undefined as never };
 
   assert.deepEqual(prunableEffects([...dated, undated]), ["task_note-old"]);
+});
+
+test("an effect that has not been recorded reads as absent", async () => {
+  const subject = await store();
+  const id = effectRequestId(TASK, "done", { summary: "landed" });
+
+  assert.equal(await subject.recordedEffect(TASK, id), undefined);
+});
+
+test("a recorded effect replays its result", async () => {
+  // The whole point: a pod killed between the side effect and the state write comes back,
+  // recomputes the same id, and is handed what the first call returned.
+  const subject = await store();
+  const id = effectRequestId(TASK, "open_pr", { head: "agent/x", base: "main" });
+
+  await subject.recordEffect(TASK, id, "open_pr", { number: 7, url: "https://x.invalid/7" });
+
+  const replayed = await subject.recordedEffect<{ number: number }>(TASK, id);
+  assert.equal(replayed?.result.number, 7);
+  assert.equal(replayed?.verb, "open_pr");
+  assert.equal(replayed?.runner, "pod-7f3a");
+  assert.ok(replayed?.at !== undefined && replayed.at !== "");
+});
+
+test("one effect is one file, so two runners never write the same path", async () => {
+  // §4.1's argument for the sharded journal, applied here: two runners recording the same
+  // task must touch disjoint paths or one of their commits can never rebase.
+  const subject = await store();
+  const done = effectRequestId(TASK, "done", { summary: "landed" });
+  const note = effectRequestId(TASK, "task_note", { text: "progress" });
+
+  await subject.recordEffect(TASK, done, "done", null);
+  await subject.recordEffect(TASK, note, "task_note", null);
+
+  const files = await readdir(join(roots.at(-1) as string, "tasks", TASK, "effects"));
+  assert.deepEqual(files.sort(), [effectFileName(done), effectFileName(note)].sort());
+});
+
+test("one task's record is not another task's", async () => {
+  const subject = await store();
+  const id = effectRequestId(TASK, "task_note", { text: "progress" });
+  await subject.recordEffect(TASK, id, "task_note", null);
+
+  assert.equal(await subject.recordedEffect(OTHER, id), undefined);
+});
+
+test("a request id that is not one path segment is refused", async () => {
+  const subject = await store();
+
+  await assert.rejects(
+    () => subject.recordEffect(TASK, "../escape", "done", null),
+    /not a usable effect request id/,
+  );
+  assert.equal(await subject.recordedEffect(TASK, "../escape"), undefined);
+});
+
+test("an unreadable record reads as absent rather than throwing", async () => {
+  // The record is a fast path, never an authority. A half-written or hand-mangled file
+  // must cost a repeated attempt, not a crashed session.
+  const subject = await store();
+  const id = effectRequestId(TASK, "done", { summary: "landed" });
+  await subject.recordEffect(TASK, id, "done", null);
+
+  const path = join(roots.at(-1) as string, "tasks", TASK, "effects", effectFileName(id));
+  await writeFile(path, "{ not json", "utf8");
+
+  assert.equal(await subject.recordedEffect(TASK, id), undefined);
+});
+
+test("recording an effect prunes the task back under the cap", async () => {
+  const subject = await store();
+  const ids: string[] = [];
+  for (let n = 0; n <= EFFECTS_KEPT; n += 1) {
+    const id = effectRequestId(TASK, "task_note", { text: `note ${n}` });
+    ids.push(id);
+    await subject.recordEffect(TASK, id, "task_note", null);
+  }
+
+  const dir = join(roots.at(-1) as string, "tasks", TASK, "effects");
+  assert.equal((await readdir(dir)).length, EFFECTS_KEPT);
+  // The newest survives — it is the one a live session could still replay.
+  assert.ok(existsSync(join(dir, effectFileName(ids.at(-1) as string))));
 });
