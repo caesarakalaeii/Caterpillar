@@ -275,6 +275,45 @@ test("a submitted modal answers the task the button came from", async () => {
   assert.equal(posted(calls).length, 1);
 });
 
+test("an option button queues the answer itself, with no modal in between", async () => {
+  // The whole point of the feature: one press, no typing. So it goes straight to the inbox,
+  // where a modal submission ends up, rather than opening one.
+  const customId = encodeCustomId({ verb: "opt", task: TASK, arg: "1" });
+  assert.ok(customId !== undefined);
+  const { bridge, inbox, calls } = harness();
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.component,
+      data: { custom_id: customId },
+      message: {
+        id: "m1",
+        content: "**GH-acme-widget-42** needs input",
+        components: [
+          { type: 1, components: [{ type: 2, style: 1, label: "Write a new one", custom_id: customId }] },
+        ],
+      },
+    }),
+  );
+
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+  const queued = await inbox.drain();
+  assert.deepEqual(
+    queued.map((request) => ({ ...request, settle: undefined })),
+    [{ kind: "answer-option", task: TASK, option: 1, settle: undefined }],
+  );
+  for (const request of queued) request.settle({ kind: "applied", index: 3 });
+  await handled;
+
+  // And the buttons it was pressed on are disabled, so the same answer cannot be sent twice.
+  const ack = callback(calls);
+  assert.equal(ack.body["type"], RESPONSE.updateMessage);
+  const data = ack.body["data"] as {
+    readonly components: readonly { readonly components: readonly { readonly disabled?: boolean }[] }[];
+  };
+  assert.equal(data.components[0]?.components[0]?.disabled, true);
+});
+
 test("autocomplete answers from the snapshot, ranked so a waiting task comes first", async () => {
   const { bridge, calls } = harness();
 
