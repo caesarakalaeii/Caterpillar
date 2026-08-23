@@ -314,6 +314,8 @@ state-repo/
   tasks/
     TASK-123/
       spec.md                  # immutable: goal, acceptance criteria, repos, requires
+      amendments/
+        001.yaml               # append-only: replaces `acceptance` only — see §12.3
       state.json               # mutable control record
       journal/                 # append-only: ONE FILE per entry — the audit trail
         0007-20260813T094100123Z-pod-7f3a.md
@@ -327,7 +329,9 @@ state-repo/
       artifacts/
 ```
 
-`spec.md` is written once and never edited by the agent. The journal is append-only —
+`spec.md` is written once and never edited — not by the agent and not by a human. The
+only thing that can change afterwards is the acceptance list, and it changes by *adding*
+a file rather than by editing that one (§12.3). The journal is append-only —
 it is the audit trail. `handoff.md` is deliberately *overwritten*: it holds only what the
 next session needs, so it cannot grow without bound.
 
@@ -3791,6 +3795,60 @@ to pick; refusing would let any repo in a workspace veto every multi-repo task t
 Read per session and per round rather than cached, because the file is on the branch the
 task is working: a session that adds a rule is held to it, and so is the council reviewing
 that very change.
+
+### 12.3 An acceptance criterion is amended, never rewritten
+
+`spec.md` is immutable and stays immutable: rewriting the spec of a running task changes
+its completion gate mid-flight, and the file is also the record of what the task was
+actually asked to do. But a declared criterion can turn out to be **unsatisfiable**, and
+when it does, the gate is wrong and no amount of work inside a session fixes it. Three
+real ones in one morning: a repo-wide `npm run lint` demanded of a 42-line feature branch;
+a `git ls-files 'src/app/overlays/[id]/...'` glob where `[id]` is a wildmatch character
+class, so it could never match the literal directory it mandated; and a repo-wide
+`prettier --check`. Two of those tasks had already been rejected twice on the same
+impossible line.
+
+The only lever available was to hand-edit the immutable file in the state repo. That is
+the thing immutability exists to stop, so the supported lever is an **amendment**:
+
+```
+tasks/<id>/amendments/001.yaml
+```
+
+```yaml
+acceptance:
+  - npm test -- src/widget
+why: the repo-wide lint predates this branch and fails on files it does not touch
+author: operator
+at: 2026-08-19T09:14:02.113Z
+```
+
+Five decisions, each of which is the interesting part:
+
+- **`readSpec` returns the EFFECTIVE spec** — the base document with the newest
+  amendment's acceptance list applied. There is deliberately no opt-in
+  `readEffectiveSpec`, because an opt-in method is a rule every future call site has to
+  remember, and the site that forgets is the one where the verifier runs a criterion a
+  human already amended away. That is precisely the failure this mechanism exists to
+  prevent, so the seam is the one that cannot be forgotten. `readBaseSpec` is there for a
+  reader that genuinely wants the document as filed, and says so.
+- **The highest number wins entirely.** Not merged across amendments, not applied in
+  sequence. Merging would resurrect a criterion an earlier amendment deliberately removed,
+  and the author of amendment 3 has no way to know it was doing that.
+- **A whole-list replacement, not a positional patch.** "Replace entry 2" is unreadable
+  six months later without the original file open beside it. The full list *is* the gate,
+  written out, in the record that changed it.
+- **Append-only, so the file list is the audit trail.** Nothing rewrites or deletes an
+  earlier amendment; `writeAmendment` allocates the next number from the highest one on
+  disk. `why` is required for the same reason: an amendment nobody explained is a
+  hand-edited `spec.md` with extra steps.
+- **Only `acceptance`.** A file naming `repos`, `workspace`, `requires`, `toolchain`,
+  `kind` or the prose goal is refused by name, loudly, rather than partly applied.
+  `repos` is the forge token's scope, which makes it a §9.1 blast-radius decision and not
+  a chat command; the rest decide where and how the task runs; and a wrong prose goal
+  deserves a fresh task with clean history rather than an overlay that makes the filed
+  document a lie. An amendment also cannot empty the list, for the reason gate 1 exists
+  at all: a task with nothing the supervisor can run could never be closed.
 
 ---
 
