@@ -573,15 +573,30 @@ test("task_note with different text is a different effect", async () => {
   assert.deepEqual(tracker.comments, ["first", "second"]);
 });
 
-test("publish_artifact stores once for the same arguments", async () => {
-  const { ctx, stored } = withLedger();
+test("a replay whose file has gone is handed the recorded result", async () => {
+  // The case the record exists for: a pod is killed after the artifact landed, and the
+  // fresh worktree does not carry the file the agent generated. Re-reading it refuses, and
+  // without the record the verb would fail over work that already landed.
+  const base = harness();
+  const ledger = new FakeLedger();
+  const attempts: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: ledger,
+    publish: async (name, path) => {
+      attempts.push(name);
+      return attempts.length === 1
+        ? { stored: true, message: `Stored \`${name}\` (12 bytes).` }
+        : { stored: false, message: `Could not read \`${path}\`; nothing was stored.` };
+    },
+  };
   const tools = controlTools(ctx);
   const params = { name: "scan.json", path: "out/scan.json", note: "sublevel scan" };
 
   const first = await call(tools, "publish_artifact", params);
   const second = await call(tools, "publish_artifact", params);
 
-  assert.deepEqual(stored, ["scan.json"]);
+  assert.match(first, /Stored `scan\.json` \(12 bytes\)/);
   assert.equal(second, first, "a replay hands back what the first call returned");
 });
 

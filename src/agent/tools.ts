@@ -515,13 +515,25 @@ export const publishArtifactTool = (
       return text("Artifacts are not available for this task; nothing was stored.");
     }
 
-    // Skipped on a replay, and the reason is the CAP rather than the write: a task may hold
-    // ten artifacts (§17), and a replayed publish of a file the agent has since deleted from
-    // its worktree would fail the verb over work that already landed.
-    const landed = await alreadyLanded<string>(ctx.effects, "publish_artifact", params);
-    if (landed !== undefined) return text(landed.result);
-
+    // The record is consulted only AFTER a refusal, unlike every other skipping verb. The
+    // effect here is a file write, which is already idempotent — storing the same bytes
+    // under the same name twice is the same end state, so there is no duplicate to
+    // suppress. What the record is for is the case the skip was introduced for: a replay
+    // after a restart, where the file the agent published has gone from its fresh worktree
+    // and re-reading it would fail the verb over work that already landed.
+    //
+    // Checking FIRST would be wrong, because overwriting an existing name is a supported
+    // operation (`StateStore.writeArtifact` guards the §17 count cap with
+    // `!existing.includes(name)` to allow exactly that). An agent that regenerates a file
+    // and republishes it under the same name, path and note would get no store and the
+    // previous call's byte count — a stale record yielding a wrong answer rather than a
+    // duplicate attempt, which is the one thing effects.ts says must never happen.
     const result = await publish(params.name, params.path, params.note);
+    if (!result.stored) {
+      const landed = await alreadyLanded<string>(ctx.effects, "publish_artifact", params);
+      if (landed !== undefined) return text(landed.result);
+    }
+
     // Only a stored artifact is an effect. A refusal has to stay retryable, or the agent
     // that summarises the file it was told to summarise is handed the old refusal again.
     if (result.stored) {
