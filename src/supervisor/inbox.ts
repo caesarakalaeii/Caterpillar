@@ -110,6 +110,23 @@ export type ChatOutcome =
   | { readonly kind: "forced-done" }
   /** Forcing was refused — a `running` task, which has to be cancelled first. */
   | { readonly kind: "not-forceable"; readonly reason: string }
+  /**
+   * A task's acceptance criteria were replaced — `/amend` (DESIGN.md §12.3).
+   *
+   * `removed` and `added` are the two ends of the diff, carried so the reply can say what
+   * the human just changed rather than that something changed. An amendment can be as wrong
+   * as the criterion it replaced, and re-amending is the only correction path, so the human
+   * has to be able to see the mistake without opening the state repo.
+   */
+  | {
+      readonly kind: "amended";
+      /** The `NNN` of the record written, so the audit trail can be named. */
+      readonly index: number;
+      readonly removed: readonly string[];
+      readonly added: readonly string[];
+    }
+  /** Amending was refused — a `running` task, which has to be cancelled first. */
+  | { readonly kind: "not-amendable"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
 
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
@@ -167,6 +184,24 @@ export type ChatIntent =
       readonly topic: string;
       readonly repos: readonly string[];
       readonly threadId: string;
+      readonly author: string;
+    }
+  /**
+   * Replace a task's acceptance criteria — `/amend` (DESIGN.md §12.3).
+   *
+   * `acceptance` is the WHOLE replacement list, which is what the amendment record holds:
+   * a positional patch against an immutable file is unreadable six months later without
+   * that file open beside it.
+   *
+   * `why` and `author` both travel for `force-done`'s reason — they go into the record and
+   * into the journal, and nothing downstream can reconstruct either, because the loop never
+   * sees Discord.
+   */
+  | {
+      readonly kind: "amend";
+      readonly task: TaskId;
+      readonly acceptance: readonly string[];
+      readonly why: string;
       readonly author: string;
     };
 
