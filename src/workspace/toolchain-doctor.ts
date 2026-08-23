@@ -79,7 +79,7 @@ const ATTRIBUTE = /^[A-Za-z0-9_+-]+$/;
  * outcome for both is the same — not evaluated, not refused — so a second pattern to
  * tell them apart would be a distinction this function does not act on.
  */
-export const checkablePackages = (
+const checkablePackages = (
   packages: readonly string[],
 ): { readonly checkable: readonly string[]; readonly skipped: readonly string[] } => {
   const checkable: string[] = [];
