@@ -141,8 +141,9 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/state/git.ts` | Typed git CLI wrapper. |
 | `src/state/lease.ts` | Git-ref CAS leasing + fencing heartbeat (§5). |
 | `src/state/store.ts` | Task directories: spec, state, journal, handoff (§4). |
+| `src/state/effects.ts` | Request ids and retention for the per-task effect record, so every control verb survives being replayed (§4.4). |
 | `src/forge/` | `Forge` interface + GitHub App and Forgejo/Codeberg (§9.1, §9.4). `reach.ts` / `catalog.ts` answer whether a named repo can be reached, and offer the ones that can (§9.1.1). `mergeability.ts` decides merge-versus-enqueue and summarises conflicts — pure, no IO (§12.3). |
-| `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). |
+| `src/tracker/` | `Tracker` interface + Vikunja and GitHub Issues (§9.5). `mirror.ts` is the lifecycle mirror itself: at most once, and never fatal. |
 | `src/credential/` | Credential service + git helper protocol (§9.2). |
 | `src/secrets/load.ts` | Mounted SOPS secrets → forge factories and trackers. |
 | `src/workspace/worktree.ts` | Bare mirrors + per-task worktrees, and reaping the finished ones (§3.1). |
@@ -257,8 +258,11 @@ awkward, the change is probably wrong.
    wanted (§4.1).
 6. **The tracker is a view; git is authoritative.** Lifecycle mirroring happens after
    the state repo is written and pushed, and a mirroring failure only logs — an
-   unreachable tracker must never fail a task. Discord is a view on the same terms: a
-   failed notification logs `notify.failed` and never rewrites the state it announces.
+   unreachable tracker must never fail a task. It must not DOUBLE one either: the
+   mirror is keyed in the task's effect record, so a pod killed between the comment and
+   the state write replays the transition without commenting twice (§4.4). Discord is a
+   view on the same terms: a failed notification logs `notify.failed` and never rewrites
+   the state it announces.
 7. **A task is never blamed for the provider.** When the model provider refuses — spend
    limit, rate limit, outage, expired credential — the task returns to `ready` untouched,
    its progress record is not written, and the **runner** backs off on a doubling

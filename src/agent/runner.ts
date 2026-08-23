@@ -53,7 +53,14 @@ import { newestHumanComment, renderReviewGuidance } from "./review-guidance.ts";
 import { readRepoStandards, repoCheckoutsOf } from "./standards.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
-import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
+import { effectRequestId, type EffectVerb } from "../state/effects.ts";
+import {
+  toolsForKind,
+  type ControlSink,
+  type EffectLedger,
+  type PublishResult,
+  type ToolContext,
+} from "./tools.ts";
 
 void _gzipSync;
 
@@ -207,6 +214,10 @@ export class AgentSessionRunner {
         repos: spec.repos,
         control,
         publish: (name, path, note) => this.publishArtifact(spec, worktree, name, path, note),
+        // Bound to THIS task, like `publish`: the record lives in the state repo, which no
+        // task credential can reach (§9.3), so it is the supervisor that reads and writes it
+        // and a tool is handed nothing that could name another task's record.
+        effects: this.effectLedger(spec),
         ...(tracker !== undefined ? { tracker } : {}),
         ...(spec.tracker !== undefined ? { trackerRef: spec.tracker } : {}),
         ...(cluster === undefined
@@ -451,11 +462,41 @@ export class AgentSessionRunner {
   }
 
   /**
+   * This task's effect record, as the control verbs may reach it (DESIGN.md §4.4).
+   *
+   * The request id is computed here rather than by the tool so the two halves cannot drift:
+   * `landed` and `record` derive it from the same task, verb and arguments, and an id
+   * computed differently at the two call sites would be an idempotency check that never
+   * matches — which looks exactly like one that is working.
+   *
+   * Writes land on disk and wait for the supervisor's next commit, like every other write a
+   * session makes. Within a session that is enough — a second `task_note` reads the file the
+   * first one wrote. Across a pod restart the record is only as good as the last push, and
+   * that is the bound the design accepts: a lost record costs a repeated effect, never a
+   * wrong one.
+   */
+  private effectLedger(spec: TaskSpec): EffectLedger {
+    const { store } = this.options;
+    const idFor = (verb: EffectVerb, args: unknown): string =>
+      effectRequestId(spec.id, verb, args);
+
+    return {
+      landed: async <T>(verb: EffectVerb, args: unknown) => {
+        const record = await store.recordedEffect<T>(spec.id, idFor(verb, args));
+        return record === undefined ? undefined : { result: record.result };
+      },
+      record: (verb, args, result) => store.recordEffect(spec.id, idFor(verb, args), verb, result),
+    };
+  }
+
+  /**
    * Store one artifact for this task (DESIGN.md §17).
    *
    * Every refusal comes back as TEXT the agent can act on rather than as a thrown error:
    * a file that is too big is a prompt to summarise, and an exception here would end the
-   * session over something the agent could have fixed in its next turn.
+   * session over something the agent could have fixed in its next turn. `stored` is what
+   * distinguishes those refusals from a success, because they are otherwise both prose —
+   * and a refusal recorded as a landed effect (§4.4) would be replayed forever.
    *
    * The path is resolved inside the worktree and checked, because it is model-authored.
    */
@@ -465,23 +506,27 @@ export class AgentSessionRunner {
     name: string,
     path: string,
     note: string,
-  ): Promise<string> {
+  ): Promise<PublishResult> {
+    const refuse = (message: string): PublishResult => ({ stored: false, message });
+
     const resolved = resolve(worktree, path);
     if (!resolved.startsWith(`${resolve(worktree)}/`)) {
-      return `\`${path}\` is outside your working directory; nothing was stored.`;
+      return refuse(`\`${path}\` is outside your working directory; nothing was stored.`);
     }
 
     let contents: Buffer;
     try {
       contents = await readFile(resolved);
     } catch {
-      return `Could not read \`${path}\`; nothing was stored.`;
+      return refuse(`Could not read \`${path}\`; nothing was stored.`);
     }
 
     try {
       await this.options.store.writeArtifact(spec.id, name, contents);
     } catch (error) {
-      return `${error instanceof Error ? error.message : String(error)}. Nothing was stored — summarise it instead.`;
+      return refuse(
+        `${error instanceof Error ? error.message : String(error)}. Nothing was stored — summarise it instead.`,
+      );
     }
 
     await this.options.store.appendJournal(
@@ -490,7 +535,10 @@ export class AgentSessionRunner {
       0,
       `**Artifact:** \`${name}\` (${contents.byteLength} bytes) — ${note}`,
     );
-    return `Stored \`${name}\` (${contents.byteLength} bytes). Tasks that declare this one as a blocker will find it in their artifacts directory.`;
+    return {
+      stored: true,
+      message: `Stored \`${name}\` (${contents.byteLength} bytes). Tasks that declare this one as a blocker will find it in their artifacts directory.`,
+    };
   }
 
   /**

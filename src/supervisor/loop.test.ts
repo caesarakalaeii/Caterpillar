@@ -38,6 +38,7 @@ import type { Council } from "../review/council.ts";
 import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
+import { effectRequestId } from "../state/effects.ts";
 import { StateStore, type AlertRefusal } from "../state/store.ts";
 import { removeTempTree } from "../testing/tempdir.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
@@ -6147,7 +6148,8 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   // also why the name of this test is not "closed": `parked` releases the item and comments
   // on it, and closing an issue is reserved for `completed` and the gates it stands for.
   const MIRRORED = asTaskId("SMOKE-FORCE-5");
-  await seedTask(MIRRORED, { status: "parked" }, ["github.com/acme/widget"], {
+  // `sessions` is named rather than defaulted because the effect record is keyed on it.
+  await seedTask(MIRRORED, { status: "parked", sessions: 3 }, ["github.com/acme/widget"], {
     kind: "github-issues",
     id: "42",
     container: "acme/widget",
@@ -6182,6 +6184,19 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
+
+  // And it is recorded, so a pod killed between this comment and the push that follows it
+  // does not comment twice on the way back (§4.4). `/done` cannot be replayed through the
+  // inbox — a second one reads `done` and answers `finished` — so the record is the only
+  // observable evidence that the mirror is keyed at all.
+  const recorded = await new StateStore(statePath, stateGit).recordedEffect(
+    MIRRORED,
+    effectRequestId(MIRRORED, "tracker.parked", {
+      transition: mirrored,
+      occurrence: "3",
+    }),
+  );
+  assert.ok(recorded, "the forced-done mirror must be recorded against the session index");
 });
 
 /**

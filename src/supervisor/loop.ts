@@ -61,6 +61,7 @@ import {
 import { ToolchainError, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { ReapResult } from "../workspace/worktree.ts";
 import type { WorkspaceUsage } from "../workspace/usage.ts";
+import { effectRequestId } from "../state/effects.ts";
 import type { StateStore } from "../state/store.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import { intakeDue, intakeRef, type IntakePass } from "../intake/ingest.ts";
@@ -85,6 +86,7 @@ import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { Forge, ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
+import { mirrorTransition, type MirrorLedger } from "../tracker/mirror.ts";
 import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
 import { AlertReverifier } from "./verifier.ts";
@@ -1620,7 +1622,12 @@ export class Supervisor {
           inFlight: this.slots.size,
           concurrency: config.concurrency,
         });
-        await this.mirror(spec, { kind: "claimed", runner: lease.runner });
+        // The lease token, not `state.sessions`: the session index does not advance across a
+        // park that recorded no session, so a re-claim after a resume hashed to the previous
+        // claim and the mirror was skipped — leaving the item without `agent-wip`. Every
+        // claim pushes a new lease commit, so the oid is distinct per claim and stable
+        // within one, which is exactly the replay window (§4.4).
+        await this.mirror(spec, { kind: "claimed", runner: lease.runner }, lease.oid);
       } catch (error) {
         // Contained per CLAIM, for `startSlot`'s reason one step earlier: at N slots a
         // throw here would abandon the tasks already claimed in this same pass, which have
@@ -2334,7 +2341,9 @@ export class Supervisor {
         // OUTSIDE the unit, both of them. The tracker and Discord are views, git is
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
-        await this.mirror(spec, { kind: "question", question });
+        // The question index, which advances per question asked and so already separates
+        // two questions with identical text.
+        await this.mirror(spec, { kind: "question", question }, String(index));
         await this.notifyTask(state, {
           kind: "question",
           task: spec.id,
@@ -2449,7 +2458,7 @@ export class Supervisor {
           prUrl,
           merged: merge.merged,
         });
-        await this.mirror(spec, { kind: "completed", prUrl });
+        await this.mirror(spec, { kind: "completed", prUrl }, String(reviewed.state.sessions));
         await this.notifyTask(reviewed.state, {
           kind: "done",
           task: spec.id,
@@ -3299,11 +3308,21 @@ export class Supervisor {
         // Outside the unit, both of them, exactly as every other outcome in this class does
         // it: the tracker and Discord are views of what git already says, and holding the
         // state checkout across a network round trip stalls every other slot's writes.
+        // The session index, as every other post-session verdict uses (§4.4). A verdict
+        // reached twice for one task is not reachable from here anyway: `settle` drops the
+        // `verify` block before returning, so a replay after a pod kill gets `undefined`
+        // and never mirrors. What the token buys is the case a `/resume` opens — a second
+        // fix, re-verified to the same sentence — where the index has advanced.
+        const occurrence = String(state.sessions);
         if (cleared) {
-          await this.mirror(spec, { kind: "completed", prUrl: state.pr?.url ?? "(merged)" });
+          await this.mirror(
+            spec,
+            { kind: "completed", prUrl: state.pr?.url ?? "(merged)" },
+            occurrence,
+          );
           await this.reapTask(spec, "done");
         } else {
-          await this.mirror(spec, { kind: "parked", reason: line });
+          await this.mirror(spec, { kind: "parked", reason: line }, occurrence);
         }
         await this.notifyTask(state, {
           kind: "alert-reverified",
@@ -3553,7 +3572,7 @@ export class Supervisor {
       await this.transition(lease, state, "parked");
       await this.push(lease, `chore(${spec.id}): parked`);
     });
-    await this.mirror(spec, { kind: "parked", reason });
+    await this.mirror(spec, { kind: "parked", reason }, String(state.sessions));
     // `notifyTask`, not `notify`. This was the ONE task-scoped notification that dropped the
     // thread, and it was the one that could least afford to: every other outcome of a review
     // round reaches the thread through `notifyTask`, so a plan sent back for the third time
@@ -4395,12 +4414,20 @@ export class Supervisor {
         return undefined;
       });
       if (spec !== undefined) {
-        await this.mirror(spec, {
-          kind: "parked",
-          reason:
-            `Forced done by ${request.author} without verification — the acceptance gates ` +
-            `were bypassed. Reason: ${request.reason}`,
-        });
+        // The session index, as the other post-session transitions use. Forcing a task done
+        // is terminal — a second `/done` reads `done` and answers `finished` — so the only
+        // replay this can see is a pod killed between the push above and this comment,
+        // which comes back at the same index and collapses (§4.4).
+        await this.mirror(
+          spec,
+          {
+            kind: "parked",
+            reason:
+              `Forced done by ${request.author} without verification — the acceptance gates ` +
+              `were bypassed. Reason: ${request.reason}`,
+          },
+          String(state.sessions),
+        );
       }
 
       return { kind: "forced-done" };
@@ -4483,44 +4510,53 @@ export class Supervisor {
   /**
    * Mirror a lifecycle change into the task's tracker (DESIGN.md §9.5).
    *
-   * Always after the authoritative git write — the lease CAS for a claim, the state
-   * push for everything else. The tracker is a VIEW, git wins when they disagree, and
-   * that ordering is why a failure here only logs: an unreachable Vikunja must never
-   * fail a task, and the next transition overwrites the view anyway.
+   * The policy itself is `tracker/mirror.ts` — it is four rules about a view of git, and
+   * rules that can only be observed by running a poll loop are rules without a test. This
+   * supplies what only the supervisor has: the workspace's tracker, and the effect record
+   * that stops a replayed mirror commenting twice (§4.4).
    *
-   * Handoffs are deliberately not mirrored: a multi-hour task would otherwise become
-   * twenty comments of noise.
+   * `occurrence` is what tells a REPLAY of one mirror from a genuinely new lifecycle event:
+   * the transition arguments alone do not, because `claimed` carries only the pod name.
+   * `claimed` passes the LEASE TOKEN (a claim is a lease commit) and the post-session
+   * transitions pass the session index. See `MirrorRequest.occurrence`.
    */
-  private async mirror(spec: TaskSpec, transition: TrackerTransition): Promise<void> {
-    const ref = spec.tracker;
-    if (ref === undefined) return;
-
+  private mirror(spec: TaskSpec, transition: TrackerTransition, occurrence: string): Promise<void> {
     const tracker = this.deps.trackers?.get(spec.workspace);
-    if (tracker === undefined) return;
+    return mirrorTransition({
+      task: spec.id,
+      workspace: spec.workspace,
+      transition,
+      occurrence,
+      logger: this.deps.logger,
+      ledger: this.mirrorLedger(spec.id),
+      ...(spec.tracker === undefined ? {} : { ref: spec.tracker }),
+      ...(tracker === undefined ? {} : { tracker }),
+    });
+  }
 
-    if (tracker.kind !== ref.kind) {
-      // Config error: the workspace's tracker is not the one this task came from, so
-      // its ids mean something else entirely. Writing anyway would comment on an
-      // unrelated item.
-      this.deps.logger.error("tracker.kind-mismatch", {
-        task: spec.id,
-        workspace: spec.workspace,
-        specKind: ref.kind,
-        workspaceKind: tracker.kind,
-      });
-      return;
-    }
-
-    try {
-      await tracker.transition(ref, transition, spec.id);
-    } catch (error) {
-      this.deps.logger.warn("tracker.mirror-failed", {
-        task: spec.id,
-        tracker: tracker.kind,
-        transition: transition.kind,
-        ...errorFields(error),
-      });
-    }
+  /**
+   * The effect record for one task's tracker mirrors (DESIGN.md §4.4).
+   *
+   * The supervisor writes it, never the agent: the record lives in the state repo, which
+   * no task-scoped credential can reach (§9.3). The request id is derived in one place so
+   * the lookup and the write cannot compute it differently — an id that disagreed with
+   * itself would be a check that never matches, which is indistinguishable from one that
+   * works.
+   *
+   * The write is not pushed here. A mirror runs OUTSIDE the write-then-commit unit that
+   * precedes it (see each call site), so the record waits for whichever commit comes next —
+   * exactly as `transition("running")`'s `state.json` does. A record that never reaches the
+   * remote costs a duplicate comment, which is what the record is for and not what it
+   * guarantees; pushing here would put a git round trip in front of every lifecycle change.
+   */
+  private mirrorLedger(task: TaskId): MirrorLedger {
+    const { store } = this.deps;
+    return {
+      landed: async (verb, args) =>
+        (await store.recordedEffect(task, effectRequestId(task, verb, args))) !== undefined,
+      record: (verb, args) =>
+        store.recordEffect(task, effectRequestId(task, verb, args), verb, null),
+    };
   }
 
   /**

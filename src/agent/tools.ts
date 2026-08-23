@@ -36,6 +36,7 @@ import type { ClusterReader } from "../cluster/client.ts";
 import { NamespaceNotAllowedError } from "../cluster/guard.ts";
 import { DESCRIBABLE_KINDS } from "../cluster/redact.ts";
 import type { Forge, PrResult } from "../forge/types.ts";
+import type { EffectVerb } from "../state/effects.ts";
 import type { Tracker } from "../tracker/types.ts";
 import type { TrackerRef } from "../domain/task.ts";
 
@@ -70,6 +71,66 @@ export interface ControlSink {
 }
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: null });
+
+/**
+ * What `publish` did, and what to tell the agent about it.
+ *
+ * `stored` exists because every refusal here comes back as PROSE rather than a throw — a
+ * file too big for §17's cap is a prompt to summarise, and an exception would end the
+ * session over something the agent could fix in its next turn. Without the flag the tool
+ * cannot tell a refusal from a success, and it recorded the refusal as the effect's result:
+ * a replay then handed that refusal back forever and the file could never be stored.
+ */
+export interface PublishResult {
+  readonly stored: boolean;
+  /** What the agent is told, in either case. */
+  readonly message: string;
+}
+
+/**
+ * The task's effect record, as a tool may reach it (DESIGN.md §4.4).
+ *
+ * A narrow pair of callbacks rather than the store, for `publish`'s reason one field down:
+ * the record lives in the state repo, which no task credential can reach (§9.3), so it is
+ * the SUPERVISOR that reads and writes it. A tool gets exactly "has this already landed"
+ * and "note that it has", bound to one task, and cannot name another.
+ *
+ * `landed` answers a wrapper rather than the result itself because `undefined` is a legal
+ * result: a verb whose only outcome is that it happened records `null`, and "not recorded"
+ * and "recorded as nothing" must not collapse into one answer.
+ */
+export interface EffectLedger {
+  landed<T>(verb: EffectVerb, args: unknown): Promise<{ readonly result: T } | undefined>;
+  record<T>(verb: EffectVerb, args: unknown, result: T): Promise<void>;
+}
+
+/**
+ * The recorded result of this verb, or nothing — and never a throw.
+ *
+ * A ledger failure means the state repo could not be read, which says nothing about whether
+ * the effect landed. Treating that as "not landed" costs at worst a repeated side effect;
+ * treating it as an error would fail a verb over bookkeeping, which is the one outcome that
+ * is worse than acting twice.
+ */
+const alreadyLanded = async <T>(
+  effects: EffectLedger | undefined,
+  verb: EffectVerb,
+  args: unknown,
+): Promise<{ readonly result: T } | undefined> => {
+  if (effects === undefined) return undefined;
+  return effects.landed<T>(verb, args).catch(() => undefined);
+};
+
+/** Note that this verb landed. Swallows a ledger failure, for `alreadyLanded`'s reason. */
+const noteLanded = async <T>(
+  effects: EffectLedger | undefined,
+  verb: EffectVerb,
+  args: unknown,
+  result: T,
+): Promise<void> => {
+  if (effects === undefined) return;
+  await effects.record(verb, args, result).catch(() => undefined);
+};
 
 const OpenPrParams = Type.Object({
   title: Type.String({ description: "Pull request title" }),
@@ -155,7 +216,15 @@ export interface ToolContext {
    * A callback rather than the store itself: the tool must not be able to reach any task
    * but its own, and a bound function is the narrowest thing that expresses that.
    */
-  readonly publish?: (name: string, path: string, note: string) => Promise<string>;
+  readonly publish?: (name: string, path: string, note: string) => Promise<PublishResult>;
+  /**
+   * This task's effect record, when the supervisor gave the session one (DESIGN.md §4.4).
+   *
+   * Optional because a context without one must behave exactly as it did before: the CLI
+   * verifiers build a `ToolContext` with no state repo behind it, and an idempotency record
+   * that becomes a precondition is an outage rather than a safety net.
+   */
+  readonly effects?: EffectLedger;
   /**
    * Read-only cluster access for a `remediation` session (DESIGN.md §20).
    *
@@ -205,7 +274,13 @@ export const openPrTool = (ctx: ToolContext): AgentTool<typeof OpenPrParams, PrR
       );
     }
 
+    // The forge is asked even when the effect is on record, and that is the CONSTRAINT
+    // rather than an oversight (§4.4): a record must never be the authority on its own, and
+    // if it says a pull request exists and the forge says otherwise the forge wins. Asking
+    // is cheap here because `Forge.openPr` is already idempotent — it adopts the open PR for
+    // the branch — so this verb records for the audit trail and skips nothing.
     const pr = await ctx.forge.openPr(repo, params);
+    await noteLanded(ctx.effects, "open_pr", params, pr);
     const opened: TaskPullRequest = { ...pr, repo };
     // Replaced rather than appended, keyed on the repo: a session that retries after a failed
     // call must not leave the completion gate two numbers for one repository.
@@ -263,12 +338,22 @@ export const askHumanTool = (ctx: ToolContext): AgentTool<typeof AskHumanParams,
           `${options.length}. Narrow them down, or ask for prose instead.`,
       );
     }
+    // The signal is set whether or not this is a replay. It lives in memory and the record
+    // does not, so a resumed session that already asked must still STOP — one that recorded
+    // the verb and then declined to signal would keep running with nothing left to do.
+    //
+    // So the record here is write-only: nothing reads it back, and it is kept for the audit
+    // trail — which verbs a session actually reached, when the transcript is gone. The
+    // tracker comment and the `needs-human` label are made idempotent separately, by
+    // `mirrorTransition`'s own `tracker.question` record (§9.5); it does not consult this
+    // one.
     ctx.control.signal = {
       reason: "ask-human",
       summary: `asked: ${params.question}`,
       question: params.question,
       ...(options === undefined || options.length === 0 ? {} : { questionOptions: options }),
     };
+    await noteLanded(ctx.effects, "ask_human", params, null);
     return text("Question recorded. The session will now end and the task will park.");
   },
 });
@@ -287,6 +372,7 @@ export const handoffTool = (ctx: ToolContext): AgentTool<typeof HandoffParams, n
       summary: params.summary,
       ...(requires !== undefined && requires.length > 0 ? { requires } : {}),
     };
+    await noteLanded(ctx.effects, "handoff", params, null);
     return text("Handoff recorded. Write anything else the next session needs first.");
   },
 });
@@ -301,6 +387,7 @@ export const doneTool = (ctx: ToolContext): AgentTool<typeof DoneParams, null> =
   parameters: DoneParams,
   execute: async (_id, params: Static<typeof DoneParams>) => {
     ctx.control.signal = { reason: "done-claimed", summary: params.summary };
+    await noteLanded(ctx.effects, "done", params, null);
     return text("Completion claimed. The supervisor will now verify it.");
   },
 });
@@ -317,7 +404,18 @@ export const taskNoteTool = (ctx: ToolContext): AgentTool<typeof TaskNoteParams,
     if (tracker === undefined || trackerRef === undefined) {
       return text("No tracker is configured for this task; note not recorded.");
     }
+
+    // A comment IS the side effect, and a duplicate one is permanent: the tracker item is
+    // what a human reads, and two identical notes on it are indistinguishable from an agent
+    // that has lost track of what it has said. So this verb skips on a replay, unlike
+    // `open_pr` — there is no equivalent of "ask the forge" for a comment.
+    const landed = await alreadyLanded(ctx.effects, "task_note", params);
+    if (landed !== undefined) {
+      return text("That note is already on the tracker item; nothing was posted again.");
+    }
+
     await tracker.comment(trackerRef, params.text);
+    await noteLanded(ctx.effects, "task_note", params, null);
     return text("Note added to the tracker item.");
   },
 });
@@ -373,6 +471,7 @@ export const submitPlanTool = (ctx: ToolContext): AgentTool<typeof SubmitPlanPar
       reason: "plan-proposed",
       summary: `proposed ${params.tasks.length} task(s): ${params.title}`,
     };
+    await noteLanded(ctx.effects, "submit_plan", params, null);
     return text("Plan recorded. The session will end and the review council will read it.");
   },
 });
@@ -416,8 +515,31 @@ export const publishArtifactTool = (
       return text("Artifacts are not available for this task; nothing was stored.");
     }
 
-    const stored = await publish(params.name, params.path, params.note);
-    return text(stored);
+    // The record is consulted only AFTER a refusal, unlike every other skipping verb. The
+    // effect here is a file write, which is already idempotent — storing the same bytes
+    // under the same name twice is the same end state, so there is no duplicate to
+    // suppress. What the record is for is the case the skip was introduced for: a replay
+    // after a restart, where the file the agent published has gone from its fresh worktree
+    // and re-reading it would fail the verb over work that already landed.
+    //
+    // Checking FIRST would be wrong, because overwriting an existing name is a supported
+    // operation (`StateStore.writeArtifact` guards the §17 count cap with
+    // `!existing.includes(name)` to allow exactly that). An agent that regenerates a file
+    // and republishes it under the same name, path and note would get no store and the
+    // previous call's byte count — a stale record yielding a wrong answer rather than a
+    // duplicate attempt, which is the one thing effects.ts says must never happen.
+    const result = await publish(params.name, params.path, params.note);
+    if (!result.stored) {
+      const landed = await alreadyLanded<string>(ctx.effects, "publish_artifact", params);
+      if (landed !== undefined) return text(landed.result);
+    }
+
+    // Only a stored artifact is an effect. A refusal has to stay retryable, or the agent
+    // that summarises the file it was told to summarise is handed the old refusal again.
+    if (result.stored) {
+      await noteLanded(ctx.effects, "publish_artifact", params, result.message);
+    }
+    return text(result.message);
   },
 });
 

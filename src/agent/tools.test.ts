@@ -25,14 +25,19 @@ import type {
   PrResult,
   ReviewComment,
 } from "../forge/types.ts";
+import type { EffectVerb } from "../state/effects.ts";
+import type { TrackerRef } from "../domain/task.ts";
+import type { Tracker, TrackerItem } from "../tracker/types.ts";
 import {
   brainstormTools,
   clusterTools,
   controlTools,
   remediationTools,
+  submitPlanTool,
   toolsForKind,
   type ClusterReadOutcome,
   type ControlSink,
+  type EffectLedger,
   type ToolContext,
 } from "./tools.ts";
 
@@ -476,4 +481,304 @@ test("a bare repo name is accepted — the host is not the agent's to type", asy
   });
 
   assert.deepEqual(forge.prCalls, [SIBLING]);
+});
+
+/**
+ * A ledger backed by a map, counting what it was asked (DESIGN.md §4.4).
+ *
+ * The real one writes the state repo, which a tool cannot reach (§9.3); this is the same
+ * seam the supervisor fills, so the tests can assert on the property that matters — a
+ * replayed verb does not perform its side effect twice — without a git checkout.
+ */
+class FakeLedger implements EffectLedger {
+  readonly recorded = new Map<string, unknown>();
+  readonly lookups: string[] = [];
+
+  private key(verb: EffectVerb, args: unknown): string {
+    return `${verb}:${JSON.stringify(args)}`;
+  }
+
+  async landed<T>(verb: EffectVerb, args: unknown): Promise<{ readonly result: T } | undefined> {
+    const key = this.key(verb, args);
+    this.lookups.push(key);
+    if (!this.recorded.has(key)) return undefined;
+    return { result: this.recorded.get(key) as T };
+  }
+
+  async record<T>(verb: EffectVerb, args: unknown, result: T): Promise<void> {
+    this.recorded.set(this.key(verb, args), result);
+  }
+}
+
+/** A tracker that counts comments. Everything else on the interface is unreachable here. */
+class CountingTracker implements Tracker {
+  readonly kind = "github-issues";
+  readonly comments: string[] = [];
+
+  async listAgentItems(): Promise<readonly TrackerItem[]> {
+    return [];
+  }
+  async comment(_ref: TrackerRef, text: string): Promise<void> {
+    this.comments.push(text);
+  }
+  async create(): Promise<TrackerRef> {
+    throw new Error("a tool must not file a tracker item");
+  }
+  async transition(): Promise<void> {}
+}
+
+const TRACKER_REF: TrackerRef = { kind: "github-issues", id: "98" };
+
+interface LedgerHarness extends Harness {
+  readonly ledger: FakeLedger;
+  readonly tracker: CountingTracker;
+  readonly stored: string[];
+}
+
+const withLedger = (): LedgerHarness => {
+  const base = harness();
+  const ledger = new FakeLedger();
+  const tracker = new CountingTracker();
+  const stored: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: ledger,
+    tracker,
+    trackerRef: TRACKER_REF,
+    publish: async (name) => {
+      stored.push(name);
+      return { stored: true, message: `Stored ${name}.` };
+    },
+  };
+  return { ...base, ctx, ledger, tracker, stored };
+};
+
+test("task_note posted twice with the same text comments once", async () => {
+  // A pod killed between the comment and the state write comes back and repeats the call.
+  // Without a record that is two identical comments on the tracker item, forever.
+  const { ctx, tracker } = withLedger();
+  const tools = controlTools(ctx);
+
+  await call(tools, "task_note", { text: "rebased onto main" });
+  const second = await call(tools, "task_note", { text: "rebased onto main" });
+
+  assert.deepEqual(tracker.comments, ["rebased onto main"]);
+  assert.match(second, /already/i, "the reply must say the note was already recorded");
+});
+
+test("task_note with different text is a different effect", async () => {
+  const { ctx, tracker } = withLedger();
+  const tools = controlTools(ctx);
+
+  await call(tools, "task_note", { text: "first" });
+  await call(tools, "task_note", { text: "second" });
+
+  assert.deepEqual(tracker.comments, ["first", "second"]);
+});
+
+test("a replay whose file has gone is handed the recorded result", async () => {
+  // The case the record exists for: a pod is killed after the artifact landed, and the
+  // fresh worktree does not carry the file the agent generated. Re-reading it refuses, and
+  // without the record the verb would fail over work that already landed.
+  const base = harness();
+  const ledger = new FakeLedger();
+  const attempts: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: ledger,
+    publish: async (name, path) => {
+      attempts.push(name);
+      return attempts.length === 1
+        ? { stored: true, message: `Stored \`${name}\` (12 bytes).` }
+        : { stored: false, message: `Could not read \`${path}\`; nothing was stored.` };
+    },
+  };
+  const tools = controlTools(ctx);
+  const params = { name: "scan.json", path: "out/scan.json", note: "sublevel scan" };
+
+  const first = await call(tools, "publish_artifact", params);
+  const second = await call(tools, "publish_artifact", params);
+
+  assert.match(first, /Stored `scan\.json` \(12 bytes\)/);
+  assert.equal(second, first, "a replay hands back what the first call returned");
+});
+
+test("republishing changed contents under one name stores them", async () => {
+  // `StateStore.writeArtifact` guards the count cap with `!existing.includes(name)`
+  // precisely so an overwrite is allowed: regenerating a file and publishing it again
+  // under the same name is a supported operation. Keyed on the ARGUMENTS alone the second
+  // call is a replay, so the new contents are silently dropped and the agent is handed the
+  // first call's message — a stale record producing a WRONG ANSWER rather than a duplicate
+  // attempt, which is the one outcome effects.ts says must never happen.
+  const base = harness();
+  const published: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: new FakeLedger(),
+    publish: async (name) => {
+      published.push(name);
+      return { stored: true, message: `Stored \`${name}\` (${published.length} bytes).` };
+    },
+  };
+  const tools = controlTools(ctx);
+  const params = { name: "scan.json", path: "scan.json", note: "the sublevel scan" };
+
+  await call(tools, "publish_artifact", params);
+  const second = await call(tools, "publish_artifact", params);
+
+  assert.deepEqual(published, ["scan.json", "scan.json"], "the second publish must reach the store");
+  assert.match(second, /2 bytes/, "the agent must be told about the contents it just stored");
+});
+
+test("a refused publish_artifact is not recorded, so the agent can fix it and retry", async () => {
+  // `publish` answers refusals in PROSE rather than throwing — a file too big to store is a
+  // prompt to summarise, not an error. Recording one would replay the refusal forever and
+  // the agent would never be able to store the file it just fixed.
+  const base = harness();
+  const ledger = new FakeLedger();
+  const attempts: string[] = [];
+  const ctx: ToolContext = {
+    ...base.ctx,
+    effects: ledger,
+    publish: async (name, path) => {
+      attempts.push(name);
+      return attempts.length === 1
+        ? { stored: false, message: `Could not read \`${path}\`; nothing was stored.` }
+        : { stored: true, message: `Stored ${name}.` };
+    },
+  };
+  const tools = controlTools(ctx);
+  const params = { name: "scan.json", path: "out/scan.json", note: "sublevel scan" };
+
+  const refused = await call(tools, "publish_artifact", params);
+  assert.match(refused, /nothing was stored/);
+  assert.equal(ledger.recorded.size, 0, "a refusal is not an effect that landed");
+
+  const stored = await call(tools, "publish_artifact", params);
+  assert.match(stored, /Stored scan\.json/);
+  assert.deepEqual(attempts, ["scan.json", "scan.json"]);
+});
+
+test("open_pr asks the forge even when the effect is on record", async () => {
+  // The constraint: a record must never be the authority on its own. If it says a PR was
+  // opened and the forge says otherwise, the forge wins — and `Forge.openPr` already adopts
+  // an existing pull request, so asking twice is cheap and asking is the only way to be right.
+  const { ctx, forge, control } = withLedger();
+  const tools = controlTools(ctx);
+  const params = { title: "t", body: "b", head: "agent/T-1", base: "main" };
+
+  await call(tools, "open_pr", params);
+  await call(tools, "open_pr", params);
+
+  assert.deepEqual(forge.prCalls, [REPO, REPO]);
+  assert.equal(control.prs?.length, 1, "the gate still sees one PR for one repo");
+});
+
+test("a replayed done still ends the session", async () => {
+  // The sink is in memory and the record is not. A session that claimed done, lost the
+  // state write and came back must still stop — a recorded verb that no longer signalled
+  // would leave the session running with nothing left to do.
+  const { ctx, control, ledger } = withLedger();
+  await ledger.record("done", { summary: "landed the schema" }, null);
+
+  await call(controlTools(ctx), "done", { summary: "landed the schema" });
+
+  assert.equal(control.signal?.reason, "done-claimed");
+  assert.equal(control.signal?.summary, "landed the schema");
+});
+
+test("a replayed ask_human still parks the session", async () => {
+  const { ctx, control, ledger } = withLedger();
+  await ledger.record("ask_human", { question: "which host?" }, null);
+
+  await call(controlTools(ctx), "ask_human", { question: "which host?" });
+
+  assert.equal(control.signal?.reason, "ask-human");
+  assert.equal(control.signal?.question, "which host?");
+});
+
+test("a replayed handoff still hands off, and keeps its capabilities", async () => {
+  const { ctx, control, ledger } = withLedger();
+  const args = { summary: "schema is in", requires: ["gpu"] };
+  await ledger.record("handoff", args, null);
+
+  await call(controlTools(ctx), "handoff", args);
+
+  assert.equal(control.signal?.reason, "blocked");
+  assert.deepEqual(control.signal?.requires, ["gpu"]);
+});
+
+test("a replayed submit_plan still ends the brainstorm with its plan", async () => {
+  const { ctx, control, ledger } = withLedger();
+  const plan = {
+    title: "Split the migration",
+    summary: "Three tasks.",
+    tasks: [],
+  };
+  await ledger.record("submit_plan", plan, null);
+
+  await call([submitPlanTool(ctx) as AgentTool], "submit_plan", plan);
+
+  assert.equal(control.signal?.reason, "plan-proposed");
+  assert.equal(control.plan?.title, "Split the migration");
+});
+
+test("every control verb is recorded, so the session's effects are auditable", async () => {
+  const { ctx, ledger } = withLedger();
+  const tools = controlTools(ctx);
+
+  await call(tools, "open_pr", { title: "t", body: "b", head: "h", base: "main" });
+  await call(tools, "ask_human", { question: "q" });
+  await call(tools, "handoff", { summary: "s" });
+  await call(tools, "done", { summary: "s" });
+  await call(tools, "task_note", { text: "n" });
+  await call(tools, "publish_artifact", { name: "a.json", path: "a.json", note: "n" });
+
+  const verbs = [...ledger.recorded.keys()].map((key) => key.split(":")[0]);
+  assert.deepEqual(verbs.sort(), [
+    "ask_human",
+    "done",
+    "handoff",
+    "open_pr",
+    "publish_artifact",
+    "task_note",
+  ]);
+});
+
+test("a context with no ledger behaves exactly as it did before", async () => {
+  // A CLI verifier and a runner mid-rollout construct a context without one. The verbs must
+  // still work: an idempotency record is an optimisation, and an optimisation that becomes a
+  // precondition is an outage.
+  const base = harness();
+  const tracker = new CountingTracker();
+  const ctx: ToolContext = { ...base.ctx, tracker, trackerRef: TRACKER_REF };
+  const tools = controlTools(ctx);
+
+  await call(tools, "task_note", { text: "n" });
+  await call(tools, "task_note", { text: "n" });
+  await call(tools, "done", { summary: "s" });
+
+  assert.deepEqual(tracker.comments, ["n", "n"], "without a record there is nothing to check");
+  assert.equal(base.control.signal?.reason, "done-claimed");
+});
+
+test("a ledger that throws does not fail the verb", async () => {
+  // The state repo is remote and git can fail. A verb that could not be recorded has still
+  // happened, and turning that into a tool error would park a task over bookkeeping.
+  const base = harness();
+  const tracker = new CountingTracker();
+  const ctx: ToolContext = {
+    ...base.ctx,
+    tracker,
+    trackerRef: TRACKER_REF,
+    effects: {
+      landed: () => Promise.reject(new Error("state repo unreachable")),
+      record: () => Promise.reject(new Error("state repo unreachable")),
+    },
+  };
+
+  const text = await call(controlTools(ctx), "task_note", { text: "n" });
+
+  assert.deepEqual(tracker.comments, ["n"]);
+  assert.match(text, /Note added/);
 });
