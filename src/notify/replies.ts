@@ -64,9 +64,13 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       // This wording exists for `/answer`, which is a command and does expect a reply.
       return `Sent to the session working **${task}**. It reads it at the end of its current step.`;
     case "finished":
+      // Says the task is done and NOT how it got there. Since `/done`, a `done` task may
+      // have been forced by hand with both §12 gates skipped and nothing merged, and this
+      // one reply answers both kinds — so the old "it passed every gate and merged" would
+      // be a verified-completion claim about a task nobody verified.
       return (
-        `**${task}** is \`done\` — it passed every gate and merged, so there is nothing to ` +
-        `send back to. \`/brainstorm\` is how new work starts from here.`
+        `**${task}** is \`done\`, so there is nothing to send back to. Its journal has the ` +
+        `record of how it got there. \`/brainstorm\` is how new work starts from here.`
       );
     case "not-waiting":
       return (

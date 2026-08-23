@@ -67,7 +67,7 @@ export interface JudgeOptions {
  * which is the exact failure it exists to catch. Raise it when you add tests — `npm
  * test` prints the number it saw, and a run below this refuses rather than passing.
  */
-export const EXPECTED_TEST_COUNT = 1566;
+export const EXPECTED_TEST_COUNT = 1567;
 
 /**
  * `# tests 1449` and friends. The count is the last such line, because a run over

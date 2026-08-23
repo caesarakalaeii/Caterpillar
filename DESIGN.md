@@ -3485,8 +3485,9 @@ Two independent gates, both required:
    a task may span several repos (§9.4.1), the work is one change, and half of it being green
    is not it passing. This checked `repos[0]` alone until §9.4.1's completion-path pass.
 
-Only then `status = done`, Discord gets the terminal message, and the supervisor closes the
-tracker item (§9.5). The agent participates in none of these three steps — it can only
+Only then `status = done` — except by a human's explicit decision, see *A human can write
+`done` past both gates* below — Discord gets the terminal message, and the supervisor closes
+the tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
 
 > **A missing interpreter makes this gate unsatisfiable, not failed.** Acceptance commands
