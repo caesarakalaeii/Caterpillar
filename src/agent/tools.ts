@@ -43,6 +43,13 @@ export interface ControlSignal {
   readonly reason: SessionExitReason;
   readonly summary: string;
   readonly question?: string;
+  /**
+   * The enumerated choices an `ask_human` question offers, when it is a choice (DESIGN.md §7).
+   *
+   * Each one becomes a button a human presses instead of retyping it. Capped at
+   * `MAX_QUESTION_OPTIONS` by the tool, because a Discord action row holds five buttons.
+   */
+  readonly questionOptions?: readonly string[];
   readonly requires?: readonly Capability[];
 }
 
@@ -77,10 +84,28 @@ const OpenPrParams = Type.Object({
   ),
 });
 
+/**
+ * Options a question may offer, and why the number is this one.
+ *
+ * A Discord action row holds five buttons and `row` throws above that (`notify/components.ts`),
+ * and the free-text Answer button rides in a row of its own — so five is what fits without
+ * spilling into a second row of choices, which would read as two questions.
+ */
+export const MAX_QUESTION_OPTIONS = 5;
+
 const AskHumanParams = Type.Object({
   question: Type.String({
     description: "The question. Be specific and include the options you see.",
   }),
+  options: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        `The answers to offer as one-press buttons, at most ${MAX_QUESTION_OPTIONS}. Set this ` +
+        "whenever the question is genuinely a choice between named alternatives, so the " +
+        "human presses one instead of retyping it. Leave it out for anything open-ended — " +
+        "prose belongs in `question`, not in a button label.",
+    }),
+  ),
 });
 
 const HandoffParams = Type.Object({
@@ -222,13 +247,26 @@ export const askHumanTool = (ctx: ToolContext): AgentTool<typeof AskHumanParams,
   description:
     "Ask the operator a question. This ENDS your session: the task parks, the lease " +
     "is released, and a fresh session resumes once the answer arrives. Record " +
-    "everything the next session needs in your question.",
+    "everything the next session needs in your question. When the question is a choice " +
+    `between named alternatives, list them in \`options\` (at most ${MAX_QUESTION_OPTIONS}) ` +
+    "so the human answers with one press; keep prose in `question` for everything else.",
   parameters: AskHumanParams,
   execute: async (_id, params: Static<typeof AskHumanParams>) => {
+    const options = params.options;
+    // A refusal the agent can act on rather than a truncation, for `open_pr`'s reason: the
+    // sixth option cannot be rendered at all, and dropping it silently would take a choice
+    // away from the human without either of us knowing which one.
+    if (options !== undefined && options.length > MAX_QUESTION_OPTIONS) {
+      return text(
+        `A question offers at most ${MAX_QUESTION_OPTIONS} options and this one offered ` +
+          `${options.length}. Narrow them down, or ask for prose instead.`,
+      );
+    }
     ctx.control.signal = {
       reason: "ask-human",
       summary: `asked: ${params.question}`,
       question: params.question,
+      ...(options === undefined || options.length === 0 ? {} : { questionOptions: options }),
     };
     return text("Question recorded. The session will now end and the task will park.");
   },
