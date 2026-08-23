@@ -2122,6 +2122,7 @@ export class Supervisor {
         [
           `**Exit:** ${outcome.reason}`,
           `**Context at exit:** ${outcome.contextTokens} tokens`,
+          ...committedLine(spec.id, evidence),
           "",
           outcome.summary,
         ].join("\n"),
