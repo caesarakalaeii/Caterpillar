@@ -40,6 +40,7 @@ import {
   EMPTY_USAGE,
   type ProposedPlan,
   type ProviderOutage,
+  type RepoRef,
   type TaskId,
   type TaskSpec,
   type TaskState,
@@ -51,11 +52,12 @@ import type { ControlSink } from "../agent/tools.ts";
 import type { LlmRuntime } from "../llm/models.ts";
 import { classifyProviderFailure } from "../llm/outage.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
-import type { WorktreeManager } from "../workspace/worktree.ts";
+import type { TaskCheckout, WorktreeManager } from "../workspace/worktree.ts";
 import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
-import { PLAN_LENSES, prLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
+import { PLAN_LENSES, prLenses, repoLenses, SABOTAGE_LENS, type Lens } from "./lenses.ts";
+import { readRepoStandards, repoCheckoutsOf, type RepoStandard } from "../agent/standards.ts";
 import {
   prepareSabotageCopy,
   SabotageExecutionEnv,
@@ -139,6 +141,41 @@ export const reviewerPlan = (input: ReviewerPlanInput): ReviewerPlan => {
     maxCommands: input.maxCommands,
   };
 };
+
+/**
+ * The reviewers to convene on a pull request, with the repos' own standards spliced in.
+ *
+ * Pure and exported for the same reason `reviewerPlan` is: `review()` needs a provider, a
+ * worktree and five concurrent sessions to reach, and this is the decision that has to be
+ * right — drop `standards` at the call site and every review still runs, still passes, and
+ * silently stops grading the rules a repository shipped (§12.2).
+ *
+ * `configured` is `options.lenses`, the seam a caller convenes its own council through. It
+ * goes through the splice too: a custom lens set must not become a way to grade against
+ * less than the author was handed.
+ */
+export const reviewLenses = (
+  configured: readonly Lens[] | undefined,
+  touchesSource: boolean,
+  standards: readonly RepoStandard[],
+): readonly Lens[] => repoLenses(configured ?? prLenses(touchesSource), standards);
+
+/**
+ * The reviewers for a checkout: read that checkout's repo standards, then splice them in.
+ *
+ * The read and the splice are one step on purpose. With them apart, `review()` held the
+ * standards in a local and passed them along, and emptying that one argument switched the
+ * reviewer half of §12.2 off with the whole suite green — the council reading every repo's
+ * file and grading against none of it, while the author was held to all of it. Taking the
+ * checkout instead of the list leaves no argument at the call site to empty.
+ */
+export const reviewLensesFor = async (
+  repos: readonly RepoRef[],
+  checkout: TaskCheckout,
+  configured: readonly Lens[] | undefined,
+  touchesSource: boolean,
+): Promise<readonly Lens[]> =>
+  reviewLenses(configured, touchesSource, await readRepoStandards(repoCheckoutsOf(repos, checkout)));
 
 /**
  * A round with the sabotage lens dropped, and the abstention that says why.
@@ -331,6 +368,17 @@ export class ReviewCouncil implements Council {
     const commits =
       base === undefined ? [] : await this.options.worktrees.commitsSince(checkout.root, base);
 
+    // The declared repos' own standards, read from the SAME checkout the session used, so
+    // the reviewers grade against the same text its author was handed (DESIGN.md §12.2).
+    // `touchesSource` is the "is there anything to break" question, already answered here
+    // for the evidence block the prompt carries.
+    const lenses = await reviewLensesFor(
+      spec.repos,
+      checkout,
+      this.options.lenses,
+      testFirstEvidence(commits).touchesSource,
+    );
+
     // Whatever the acceptance gate left behind, where the reviewers can read it. Never a
     // reason to fail the council: a review of the diff alone is what every round did until
     // now, and losing that over an unreadable file would trade a weaker review for none.
@@ -343,9 +391,7 @@ export class ReviewCouncil implements Council {
     });
 
     return this.convene(
-      // `touchesSource` is the "is there anything to break" question, already answered here
-      // for the evidence block the prompt carries.
-      this.options.lenses ?? prLenses(testFirstEvidence(commits).touchesSource),
+      lenses,
       checkout.root,
       reviewPrompt(spec, state, base, commits, evidence),
       spec,

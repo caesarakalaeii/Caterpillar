@@ -17,7 +17,7 @@ import type { TaskKind, TaskSpec, TaskState } from "../domain/task.ts";
 // The cap itself, not a transcription of it: a prompt that names a number the store no
 // longer enforces sends every agent hunting for a limit that does not exist.
 import { ARTIFACT_BYTES } from "../state/store.ts";
-import { AUTHOR_STANDARDS } from "./standards.ts";
+import { AUTHOR_STANDARDS, authorRepoStandards, type RepoStandard } from "./standards.ts";
 
 export interface PromptParts {
   readonly spec: TaskSpec;
@@ -183,15 +183,34 @@ If you do change code, everything else is unchanged: the supervisor runs the acc
 criteria, the pull request and CI are the other half of the gate, and \`done\` is still
 only a claim.`;
 
-/** The system prompt for a task of this kind. `implement` is the default and the base. */
-export const systemPromptFor = (kind: TaskKind | undefined): string => {
+const withRepoStandards = (prompt: string, standards: readonly RepoStandard[]): string => {
+  const block = authorRepoStandards(standards);
+  return block === "" ? prompt : `${prompt}\n\n${block}`;
+};
+
+/**
+ * The system prompt for a task of this kind. `implement` is the default and the base.
+ *
+ * `repoStandards` is whatever the declared repos ship in `.caterpillar/standards.md`
+ * (DESIGN.md §12.2). Appended rather than interleaved with `AUTHOR_STANDARDS`, so the
+ * fleet's own text is read first and the repo's arrives as an addition to it — and so the
+ * council, which splices the same sections into the owning lens, is quoting the identical
+ * rendering.
+ *
+ * A brainstorm gets none of it: it writes a plan, never a commit, and the sessions that
+ * implement its tasks read the file from the repo themselves.
+ */
+export const systemPromptFor = (
+  kind: TaskKind | undefined,
+  repoStandards: readonly RepoStandard[] = [],
+): string => {
   switch (kind) {
     case "brainstorm":
       return BRAINSTORM_SYSTEM_PROMPT;
     case "remediation":
-      return REMEDIATION_SYSTEM_PROMPT;
+      return withRepoStandards(REMEDIATION_SYSTEM_PROMPT, repoStandards);
     default:
-      return SYSTEM_PROMPT;
+      return withRepoStandards(SYSTEM_PROMPT, repoStandards);
   }
 };
 
