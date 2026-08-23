@@ -3102,10 +3102,17 @@ export class Supervisor {
     // policy, so an operator editing the entry mid-settle cannot move a deadline the journal
     // has already quoted.
     const settleSeconds = await this.settleWindowFor(spec);
-    if (!(await this.reverifier.begin(spec.id, settleSeconds))) return false;
-
     const window = settleWindowSeconds(settleSeconds);
-    await this.unit(async () => {
+
+    // `begin` is INSIDE the unit, and that is the same lesson `settleReverifications` records
+    // one method down. It writes the merge instant to `alerts/refusals/<fingerprint>.json`,
+    // and a commit made inside a unit stages the paths that unit wrote and nothing else
+    // (`StateStore.pending`) — so a `begin` outside it left the instant in the working tree
+    // and in no commit, where the next `pull`'s `clean -ffdq alerts` deleted it. The hold and
+    // the record that explains the hold have to land in one commit or they disagree in git.
+    const held = await this.unit(async () => {
+      if (!(await this.reverifier.begin(spec.id, settleSeconds))) return false;
+
       await store.appendJournal(
         spec.id,
         state.sessions,
@@ -3118,7 +3125,10 @@ export class Supervisor {
       // `ready`, not `done`. The filter in `claimUpTo` is what stops a session starting on it.
       await this.transition(lease, state, "ready");
       await this.push(lease, `chore(${spec.id}): re-verifying`);
+      return true;
     });
+
+    if (!held) return false;
 
     logger.info("task.reverifying", { task: spec.id, settleSeconds: window });
     return true;
