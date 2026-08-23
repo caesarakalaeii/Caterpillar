@@ -1622,7 +1622,7 @@ export class Supervisor {
           inFlight: this.slots.size,
           concurrency: config.concurrency,
         });
-        await this.mirror(spec, { kind: "claimed", runner: lease.runner });
+        await this.mirror(spec, { kind: "claimed", runner: lease.runner }, state.sessions);
       } catch (error) {
         // Contained per CLAIM, for `startSlot`'s reason one step earlier: at N slots a
         // throw here would abandon the tasks already claimed in this same pass, which have
@@ -2336,7 +2336,7 @@ export class Supervisor {
         // OUTSIDE the unit, both of them. The tracker and Discord are views, git is
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
-        await this.mirror(spec, { kind: "question", question });
+        await this.mirror(spec, { kind: "question", question }, index);
         await this.notifyTask(state, {
           kind: "question",
           task: spec.id,
@@ -2451,7 +2451,7 @@ export class Supervisor {
           prUrl,
           merged: merge.merged,
         });
-        await this.mirror(spec, { kind: "completed", prUrl });
+        await this.mirror(spec, { kind: "completed", prUrl }, reviewed.state.sessions);
         await this.notifyTask(reviewed.state, {
           kind: "done",
           task: spec.id,
@@ -3555,7 +3555,7 @@ export class Supervisor {
       await this.transition(lease, state, "parked");
       await this.push(lease, `chore(${spec.id}): parked`);
     });
-    await this.mirror(spec, { kind: "parked", reason });
+    await this.mirror(spec, { kind: "parked", reason }, state.sessions);
     // `notifyTask`, not `notify`. This was the ONE task-scoped notification that dropped the
     // thread, and it was the one that could least afford to: every other outcome of a review
     // round reaches the thread through `notifyTask`, so a plan sent back for the third time
@@ -4489,13 +4489,19 @@ export class Supervisor {
    * rules that can only be observed by running a poll loop are rules without a test. This
    * supplies what only the supervisor has: the workspace's tracker, and the effect record
    * that stops a replayed mirror commenting twice (§4.4).
+   *
+   * `occurrence` is the task's session index, which is what tells a REPLAY of one mirror
+   * from a genuinely new lifecycle event: the transition arguments alone do not, because
+   * `claimed` carries only the pod name and a task is claimed once per session. See
+   * `MirrorRequest.occurrence`.
    */
-  private mirror(spec: TaskSpec, transition: TrackerTransition): Promise<void> {
+  private mirror(spec: TaskSpec, transition: TrackerTransition, occurrence: number): Promise<void> {
     const tracker = this.deps.trackers?.get(spec.workspace);
     return mirrorTransition({
       task: spec.id,
       workspace: spec.workspace,
       transition,
+      occurrence,
       logger: this.deps.logger,
       ledger: this.mirrorLedger(spec.id),
       ...(spec.tracker === undefined ? {} : { ref: spec.tracker }),

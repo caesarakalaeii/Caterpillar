@@ -45,6 +45,23 @@ export interface MirrorRequest {
   /** The workspace's tracker. Absent on a runner with none configured. */
   readonly tracker?: Tracker;
   readonly transition: TrackerTransition;
+  /**
+   * Which occurrence of this transition it is — the task's session index at the call site.
+   *
+   * Lifecycle transitions RECUR with identical arguments, which is what separates them
+   * from a tool call inside one session. `claimed` carries only the runner id, and that is
+   * `RUNNER_ID`, the pod name: stable across restarts. Without a discriminator the second
+   * claim of a task by the same pod hashes to the first claim's request id and is skipped
+   * — and `claimed` is the only transition that removes `needs-human` and re-adds
+   * `agent-wip`, so the issue keeps advertising for help nobody needs (§9.5).
+   *
+   * The session index is the right grain because it is exactly the window a replay lives
+   * in: a pod killed between the comment and the state write comes back in the SAME
+   * session and must collapse, while a park answered by a human opens a new session and
+   * must mirror. It is not part of the `TrackerTransition` — the tracker has no use for
+   * it, it only keys the record.
+   */
+  readonly occurrence: number;
   readonly logger: Logger;
   /** Absent on a caller with no state repo behind it, which mirrors unconditionally. */
   readonly ledger?: MirrorLedger;
@@ -59,13 +76,25 @@ export interface MirrorRequest {
 const verbFor = (transition: TrackerTransition): EffectVerb => `tracker.${transition.kind}`;
 
 /**
+ * What the request id is hashed over: the transition, plus which occurrence of it this is.
+ *
+ * Separate from the transition passed to the tracker so that the two cannot drift — the
+ * tracker writes what §9.5 says, the record keys what distinguishes one attempt from the
+ * next.
+ */
+const effectArgs = (transition: TrackerTransition, occurrence: number): unknown => ({
+  transition,
+  occurrence,
+});
+
+/**
  * Mirror one transition, at most once. Never throws.
  *
  * Handoffs are deliberately not mirrored anywhere — a multi-hour task would otherwise
  * become twenty comments of noise — which is why there is no `handoff` transition to pass.
  */
 export const mirrorTransition = async (request: MirrorRequest): Promise<void> => {
-  const { task, ref, tracker, transition, logger, ledger } = request;
+  const { task, ref, tracker, transition, occurrence, logger, ledger } = request;
   if (ref === undefined || tracker === undefined) return;
 
   if (tracker.kind !== ref.kind) {
@@ -81,10 +110,11 @@ export const mirrorTransition = async (request: MirrorRequest): Promise<void> =>
   }
 
   const verb = verbFor(transition);
+  const args = effectArgs(transition, occurrence);
   // A ledger failure means the state repo could not be read, which says nothing about
   // whether the mirror landed. Mirroring anyway risks a duplicate comment; not mirroring
   // risks a lifecycle change nobody can see, and that is the more expensive mistake.
-  const already = await tryLanded(ledger, verb, transition, task, logger);
+  const already = await tryLanded(ledger, verb, args, task, logger);
   if (already) {
     logger.info("tracker.mirror-skipped", { task, tracker: tracker.kind, transition: transition.kind });
     return;
@@ -104,7 +134,7 @@ export const mirrorTransition = async (request: MirrorRequest): Promise<void> =>
     return;
   }
 
-  await ledger?.record(verb, transition).catch((error: unknown) => {
+  await ledger?.record(verb, args).catch((error: unknown) => {
     // The mirror LANDED. Failing here would undo nothing and hide the thing that worked;
     // the cost is that a replay may comment twice, which is what the record is for and not
     // what it guarantees.
@@ -119,17 +149,19 @@ export const mirrorTransition = async (request: MirrorRequest): Promise<void> =>
 const tryLanded = async (
   ledger: MirrorLedger | undefined,
   verb: EffectVerb,
-  transition: TrackerTransition,
+  args: unknown,
   task: TaskId,
   logger: Logger,
 ): Promise<boolean> => {
   if (ledger === undefined) return false;
   try {
-    return await ledger.landed(verb, transition);
+    return await ledger.landed(verb, args);
   } catch (error) {
+    // `verb` rather than the transition kind: it says the same thing (`tracker.parked`)
+    // and it is what the lookup that failed was keyed on.
     logger.warn("tracker.mirror-record-unreadable", {
       task,
-      transition: transition.kind,
+      verb,
       ...errorFields(error),
     });
     return false;
