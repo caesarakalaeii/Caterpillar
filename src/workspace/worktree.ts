@@ -637,6 +637,11 @@ export class WorktreeManager {
    * tolerates a network fault exactly as much as it tolerates a fresh task. `ls-remote`
    * exits 2 for a ref the remote does not have and 128 for a remote it could not read.
    *
+   * That costs a second round trip on the path where the branch DOES exist, and buys back a
+   * fetch on the two paths where it does not — an absent branch and an unreachable remote
+   * both stop at the `ls-remote`. `ls-remote` for one ref transfers a line, so the trade is
+   * one connection setup against being unable to state the invariant at all.
+   *
    * Fetched from `origin`'s URL rather than from the remote NAME, which is the one
    * non-obvious line here. A mirror's `remote.origin.fetch` is `+refs/*:refs/*`, and git
    * applies a configured refspec OPPORTUNISTICALLY alongside an explicit one — so `git

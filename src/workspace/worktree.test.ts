@@ -1300,6 +1300,35 @@ test("a session refuses to start when origin cannot be asked about its branch", 
   );
 });
 
+test("a checkout that did not ask for a reachable remote still gets one when origin is down", async () => {
+  // The other side of the test above, and the regression that strictness most easily
+  // causes. `ensureWorktree` is called by the progress probe, the verifier, the review
+  // council and the plan maintainer, all AFTER `clearActive()` has closed the credential
+  // service (§9.2) — so on a private repo their fetch cannot succeed, and a manager that
+  // threw would take verification down for every one of them. A task could then never
+  // complete, which is worse than the bug the strictness fixes.
+  //
+  // The default therefore has to be tolerance, and this pins it: same unreachable origin as
+  // the previous test, no `mustReachRemote`, and the checkout must still hand back the
+  // worktree with the local branch intact.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("TOLERANT-1");
+  const subject = manager(root);
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const before = (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim();
+  await rename(join(root, `${REPO.name}-origin.git`), join(root, "origin-moved-away.git"));
+
+  assert.equal(await subject.ensureWorktree(REPO, task), worktree);
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    before,
+    "a tolerant checkout must proceed on what is on disk, not fail on a silent remote",
+  );
+});
+
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
   // Feeds `review/tdd.ts`, whose whole subject is the ORDER — so oldest-first is the
   // contract, not a detail. `git log` defaults to newest-first, which would invert every
