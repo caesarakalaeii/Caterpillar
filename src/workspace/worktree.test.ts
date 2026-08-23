@@ -4,7 +4,7 @@
  * mirror path was broken.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1261,6 +1261,43 @@ test("a worktree an agent moved off its own branch is left alone, not merged int
     "a worktree standing on another branch must not be fast-forwarded onto the task branch",
   );
   assert.equal((await after.run("rev-parse", "--abbrev-ref", "HEAD")).trim(), "wandered");
+});
+
+test("a session refuses to start when origin cannot be asked about its branch", async () => {
+  // The hole the rest of this fix leaves open, and it is GH-96 by another route. Every
+  // question this module asks about `origin/agent/<task>` is asked with a fetch, and a fetch
+  // reports "the remote has no such branch" and "I could not reach the remote at all" as the
+  // same plain non-zero. `fetchAgentBranch` therefore answers `undefined` to both, and the
+  // reuse path reads that as "nothing pushed" and hands the worktree over as it found it.
+  //
+  // So one expired credential, one DNS blip, one throttled forge is enough to start a
+  // session on the base with eighteen commits sitting upstream — the exact outcome the
+  // invariant says must be impossible, reached without any local ref being wrong.
+  //
+  // Tolerating it is not an option a caller inside a live credential lease needs. The
+  // reason `fetchAgentBranch` cannot throw is the POST-session callers, which run after
+  // `clearActive()` (§9.2) and must not fail verification over a fetch they never needed.
+  // The session-start caller is the opposite case: it holds the lease, so a remote it
+  // cannot reach is a fault to report, not a silence to read as an answer.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("UNREACHABLE-1");
+  const subject = manager(root);
+
+  // A worktree that exists, so the reuse path runs and the mirror is not synced. Then
+  // another runner pushes, and only then does origin become unreachable — the pushed work
+  // is real and the remote is the only place that knows about it.
+  await subject.ensureWorktree(REPO, task);
+  await pushAgentBranch(root, REPO, task, "work this runner cannot see\n");
+  await rename(join(root, `${REPO.name}-origin.git`), join(root, "origin-moved-away.git"));
+
+  await assert.rejects(
+    () => subject.ensureTaskCheckout([REPO], task, { mustReachRemote: true }),
+    (error: unknown) =>
+      error instanceof Error && new RegExp(`agent/${task}`).test(error.message),
+    "a session-start checkout must refuse rather than guess that nothing was pushed",
+  );
 });
 
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
