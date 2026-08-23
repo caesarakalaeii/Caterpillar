@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId, type TrackerRef } from "../domain/task.ts";
-import { TrackerScopeError } from "./types.ts";
+import { DEFAULT_CANDIDATE_LABEL, TrackerScopeError } from "./types.ts";
 import {
   GitHubIssuesApiError,
   GitHubIssuesTracker,
@@ -325,6 +325,127 @@ test("label lookups are cached per repo across transitions", async () => {
   await subject.transition(REF, { kind: "parked", reason: "done for now" }, TASK);
 
   assert.equal(paths(calls).filter((p) => p.includes("/labels?")).length, 1);
+});
+
+test("create POSTs to the repo's issues route and carries title, body and labels", async () => {
+  const { fetch, calls } = stub((_method, path) => {
+    if (path.includes("/labels?")) return [{ name: DEFAULT_CANDIDATE_LABEL }];
+    return { number: 77, html_url: "https://gh/acme/widget/issues/77" };
+  });
+
+  const ref = await tracker(fetch).create({
+    title: "Crash on empty spec",
+    body: "Steps to reproduce…",
+    container: "acme/widget",
+    labels: [DEFAULT_CANDIDATE_LABEL],
+  });
+
+  assert.deepEqual(
+    paths(calls).filter((p) => !p.includes("/labels?")),
+    ["POST repos/acme/widget/issues"],
+  );
+  assert.deepEqual(calls.at(-1)?.body, {
+    title: "Crash on empty spec",
+    body: "Steps to reproduce…",
+    labels: ["agent-candidate"],
+  });
+  assert.deepEqual(ref, { kind: "github-issues", id: "77", container: "acme/widget" });
+});
+
+test("a filed issue never carries the ingest label that would mint it as a task", async () => {
+  // Self-amplifying if it did: intake would turn the report into a running task on the
+  // next pass, which could file another report.
+  const { fetch, calls } = stub((_method, path) =>
+    path.includes("/labels?")
+      ? [{ name: "agent" }, { name: DEFAULT_CANDIDATE_LABEL }]
+      : { number: 77 },
+  );
+
+  await tracker(fetch).create({
+    title: "t",
+    body: "b",
+    container: "acme/widget",
+    labels: [DEFAULT_CANDIDATE_LABEL],
+  });
+
+  const applied = (calls.at(-1)?.body as { labels: readonly string[] }).labels;
+  assert.deepEqual(applied, ["agent-candidate"]);
+  assert.ok(!applied.includes("agent"));
+});
+
+test("the ref create returns round-trips back through comment", async () => {
+  // A ref that cannot address the item afterwards makes the report unreachable.
+  const { fetch, calls } = stub((_method, path) =>
+    path.includes("/labels?") ? [{ name: DEFAULT_CANDIDATE_LABEL }] : { number: 77 },
+  );
+  const subject = tracker(fetch);
+
+  const ref = await subject.create({
+    title: "t",
+    body: "b",
+    container: "acme/widget",
+    labels: [DEFAULT_CANDIDATE_LABEL],
+  });
+  await subject.comment(ref, "a follow-up");
+
+  assert.equal(paths(calls).at(-1), "POST repos/acme/widget/issues/77/comments");
+});
+
+test("a label the repo lacks is dropped and reported, and the issue is still filed", async () => {
+  // A dropped label is recoverable by hand; a lost report is not. GitHub would have
+  // silently created the label — the same vocabulary-inventing failure addLabel refuses.
+  const { fetch, calls } = stub((_method, path) =>
+    path.includes("/labels?") ? [{ name: "bug" }] : { number: 77 },
+  );
+  const omitted: string[][] = [];
+
+  const ref = await tracker(fetch).create({
+    title: "t",
+    body: "b",
+    container: "acme/widget",
+    labels: [DEFAULT_CANDIDATE_LABEL, "bug"],
+    onLabelsOmitted: (labels) => omitted.push([...labels]),
+  });
+
+  assert.deepEqual(ref, { kind: "github-issues", id: "77", container: "acme/widget" });
+  assert.deepEqual(omitted, [["agent-candidate"]]);
+  assert.deepEqual(calls.at(-1)?.body, { title: "t", body: "b", labels: ["bug"] });
+  // Nothing tries to create the missing label.
+  assert.ok(!paths(calls).includes("POST repos/acme/widget/labels"));
+});
+
+test("create surfaces a missing permission as a scope error on its own route", async () => {
+  const { fetch } = stub((_method, path) => {
+    if (path.includes("/labels?")) return [{ name: DEFAULT_CANDIDATE_LABEL }];
+    return new Response('{"message":"Resource not accessible"}', { status: 403 });
+  });
+
+  await assert.rejects(
+    () =>
+      tracker(fetch).create({
+        title: "t",
+        body: "b",
+        container: "acme/widget",
+        labels: [DEFAULT_CANDIDATE_LABEL],
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof TrackerScopeError);
+      assert.equal(error.route, "repos/acme/widget/issues");
+      assert.equal(error.requiredScope, "issues");
+      return true;
+    },
+  );
+});
+
+test("create refuses a request whose container is not an owner/name slug", async () => {
+  const { fetch, calls } = stub(() => null);
+
+  await assert.rejects(
+    () =>
+      tracker(fetch).create({ title: "t", body: "b", container: "widget", labels: [] }),
+    /is not an 'owner\/name' repo slug/,
+  );
+  assert.equal(calls.length, 0);
 });
 
 test("a ref without an owner/name container is rejected as ambiguous", async () => {
