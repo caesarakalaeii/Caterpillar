@@ -81,14 +81,17 @@ test("handoff fires once the estimate crosses the threshold", () => {
  * and the reason it is made here rather than in `budget.ts`: this is the class that knows
  * how big the window is and what a token is worth in it.
  */
-test("the output ceiling is a share of the window, not a fixed number of lines", () => {
-  const small = new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 });
+test("a small window allows a smaller single tool result than a large one", () => {
+  const small = new ContextBudget({ contextWindow: 60_000, thresholdFraction: 0.5 });
   const large = new ContextBudget({ contextWindow: 1_000_000, thresholdFraction: 0.7 });
 
   assert.ok(
-    large.outputCeiling().maxBytes > small.outputCeiling().maxBytes,
-    "a bigger window must allow a bigger single tool result",
+    small.outputCeiling().maxBytes < large.outputCeiling().maxBytes,
+    "the window must be able to lower the ceiling",
   );
+  // And never to RAISE it: a large window does not buy more than the built-in cap, or the
+  // window would be a way to get around `outputCeiling`'s clamp.
+  assert.equal(large.outputCeiling().maxBytes, MAX_OUTPUT_BYTES);
 });
 
 test("one command can never spend the whole handoff budget", () => {

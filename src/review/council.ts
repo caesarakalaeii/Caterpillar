@@ -50,7 +50,6 @@ import type { LlmRuntime } from "../llm/models.ts";
 import { classifyProviderFailure } from "../llm/outage.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
-import { outputCeiling } from "../agent/budget.ts";
 import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
@@ -441,6 +440,12 @@ export class ReviewCouncil implements Council {
         ...(sabotageCopy === undefined ? {} : { sabotageCopy }),
         maxCommands: config.limits.sabotageMaxCommands,
       });
+      // One budget for the reviewer's session and for its shell's output ceiling: the
+      // ceiling is measured against this threshold (§6.4), so two of them could disagree.
+      const budget = new ContextBudget({
+        contextWindow: llm.model.contextWindow,
+        thresholdFraction: config.handoff.thresholdFraction,
+      });
       const envOptions = {
         cwd: plan.cwd,
         shellPath: toolchain.shell,
@@ -449,7 +454,7 @@ export class ReviewCouncil implements Council {
         // The output ceiling too, and for the same reason as the timeout: a reviewer runs
         // the same `npm test` in the same worktree with the same window to spend, and it is
         // this shell that has already demonstrated it will do so (§6.4).
-        output: outputCeiling({
+        output: budget.outputCeiling({
           maxLines: config.limits.commandOutputMaxLines,
           maxBytes: config.limits.commandOutputMaxBytes,
         }),
@@ -494,10 +499,7 @@ export class ReviewCouncil implements Council {
         systemPrompt: `${lens.prompt}\n\nYour working directory is ${plan.cwd}.`,
         initialPrompt: prompt,
         tools,
-        budget: new ContextBudget({
-          contextWindow: llm.model.contextWindow,
-          thresholdFraction: config.handoff.thresholdFraction,
-        }),
+        budget,
         control,
         // A reviewer cut off by the council deadline reaches the `sink.decision ===
         // undefined` branch below and is recorded as an ABSTENTION, which is the honest

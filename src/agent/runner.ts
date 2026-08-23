@@ -40,7 +40,6 @@ import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import type { Logger } from "../obs/log.ts";
 import type { LiveSession } from "../obs/live.ts";
-import { outputCeiling } from "./budget.ts";
 import { BoundedExecutionEnv } from "./exec.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
@@ -198,6 +197,12 @@ export class AgentSessionRunner {
       // wrapping each command would put quoting between the model and its own shell.
       const toolchain = await this.options.toolchain.resolve(spec, worktree);
       const limits = this.options.config.limits;
+      // Built before the shell rather than beside the session, because the shell's output
+      // ceiling is measured against this budget's own threshold (§6.4).
+      const budget = new ContextBudget({
+        contextWindow: llm.model.contextWindow,
+        thresholdFraction: this.options.config.handoff.thresholdFraction,
+      });
       const execContext: ExecContext = {
         // Bounded, not bare. pi's bash tool leaves the timeout to the model and defaults
         // to none, so this is where a command that never returns stops being able to hold
@@ -209,9 +214,10 @@ export class AgentSessionRunner {
           shellEnv: toolchain.env,
           timeoutSeconds: limits.commandTimeoutSeconds,
           // And bounded in what it RETURNS, which is the other half of §6.4: a wide `grep`
-          // cannot hold the lease, but it can spend the window the handoff threshold below
-          // exists to protect.
-          output: outputCeiling({
+          // cannot hold the lease, but it can spend the window the handoff threshold exists
+          // to protect. Through the budget, so the configured number is capped a second time
+          // by what this model's window can actually afford.
+          output: budget.outputCeiling({
             maxLines: limits.commandOutputMaxLines,
             maxBytes: limits.commandOutputMaxBytes,
           }),
@@ -245,11 +251,6 @@ export class AgentSessionRunner {
         // tested without running a session (§20).
         ...toolsForKind(spec.kind, toolContext),
       ];
-
-      const budget = new ContextBudget({
-        contextWindow: llm.model.contextWindow,
-        thresholdFraction: this.options.config.handoff.thresholdFraction,
-      });
 
       const prompt = buildPrompt({
         spec,
