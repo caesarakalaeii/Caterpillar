@@ -373,12 +373,36 @@ const parseIntent = (value: unknown): ChatIntent | undefined => {
       if (id === undefined || typeof raw["text"] !== "string") return undefined;
       return { kind: "answer", task: id, text: raw["text"] };
     }
+    case "answer-option": {
+      const id = task();
+      const option = raw["option"];
+      // A whole number, not merely a number: the index is looked up in the stored option
+      // list, and a fractional one would miss and be reported to the human as a stale
+      // button they had in fact pressed correctly.
+      if (id === undefined || typeof option !== "number" || !Number.isSafeInteger(option)) {
+        return undefined;
+      }
+      if (option < 0) return undefined;
+      return { kind: "answer-option", task: id, option };
+    }
     case "park":
     case "resume":
     case "merge": {
       const id = task();
       if (id === undefined) return undefined;
       return { kind: raw["kind"], task: id };
+    }
+    case "force-done": {
+      // Not folded into the group above: `/done` carries a reason and an author, and both
+      // are the whole audit trail for a `done` that skipped both §12 gates. A blank one
+      // must be refused here rather than journalled as an empty string.
+      const id = task();
+      const { reason, author } = raw;
+      if (id === undefined || typeof reason !== "string" || reason.trim().length === 0) {
+        return undefined;
+      }
+      if (typeof author !== "string" || author.trim().length === 0) return undefined;
+      return { kind: "force-done", task: id, reason, author };
     }
     case "brainstorm": {
       const { topic, repos, threadId, author } = raw;
@@ -422,6 +446,8 @@ const OUTCOME_KINDS: ReadonlySet<string> = new Set([
   "not-parkable",
   "cancelling",
   "not-mergeable",
+  "forced-done",
+  "not-forceable",
   "failed",
 ]);
 

@@ -148,3 +148,105 @@ test("two runners keep their own series, because they have their own disks", asy
   assert.match(rendered, /caterpillar_work_bytes\{runner="pod-a",category="tasks"\} 300/);
   assert.match(rendered, /caterpillar_work_bytes\{runner="pod-b",category="tasks"\} 900/);
 });
+
+test("one attribution report becomes counters a dashboard can compute the share from", async () => {
+  // The whole point of the metric: the digest's prose is not parseable, and an operator who
+  // wants the trend on a graph must be able to get it without reading the paragraph.
+  const metrics = new AgentMetrics();
+
+  metrics.recordAttribution("pod-7f3a", {
+    repos: [
+      {
+        repo: "acme/widget",
+        fleet: { commits: 3, lines: 90 },
+        human: { commits: 1, lines: 10 },
+        fleetCommitShare: 0.75,
+        fleetLineShare: 0.9,
+      },
+    ],
+    total: {
+      fleet: { commits: 3, lines: 90 },
+      human: { commits: 1, lines: 10 },
+      fleetCommitShare: 0.75,
+      fleetLineShare: 0.9,
+    },
+    unavailable: [],
+    measured: true,
+  });
+
+  const rendered = metrics.render();
+  assert.match(
+    rendered,
+    /caterpillar_digest_authored_lines_total\{runner="pod-7f3a",repo="acme\/widget",author="fleet"\} 90/,
+  );
+  assert.match(
+    rendered,
+    /caterpillar_digest_authored_lines_total\{runner="pod-7f3a",repo="acme\/widget",author="human"\} 10/,
+  );
+  assert.match(
+    rendered,
+    /caterpillar_digest_authored_commits_total\{runner="pod-7f3a",repo="acme\/widget",author="fleet"\} 3/,
+  );
+  assert.match(
+    rendered,
+    /caterpillar_digest_authored_commits_total\{runner="pod-7f3a",repo="acme\/widget",author="human"\} 1/,
+  );
+});
+
+test("a repo whose history could not be read is counted as unreadable, not as zero lines", async () => {
+  // The §19 rule reaching the metrics. A repo reporting 0 fleet lines every day is
+  // indistinguishable on a graph from one the fleet genuinely stopped working, and the
+  // difference is whether anyone should go looking for a mirror.
+  const metrics = new AgentMetrics();
+
+  metrics.recordAttribution("pod-7f3a", {
+    repos: [],
+    total: { fleet: { commits: 0, lines: 0 }, human: { commits: 0, lines: 0 } },
+    unavailable: ["acme/gadget"],
+    measured: false,
+  });
+
+  const rendered = metrics.render();
+  assert.match(
+    rendered,
+    /caterpillar_digest_authorship_unreadable_total\{runner="pod-7f3a",repo="acme\/gadget"\} 1/,
+  );
+  assert.doesNotMatch(
+    rendered,
+    /caterpillar_digest_authored_lines_total\{[^}]*repo="acme\/gadget"/,
+    "an unreadable repo must not appear as a zero-line series",
+  );
+});
+
+test("counters accumulate across days rather than restating one window", async () => {
+  // A counter that went back to a single window's value would read to Prometheus as a
+  // process restart, and every `rate()` over it would show a spike that did not happen.
+  const metrics = new AgentMetrics();
+  const day = {
+    repos: [
+      {
+        repo: "acme/widget",
+        fleet: { commits: 1, lines: 5 },
+        human: { commits: 0, lines: 0 },
+        fleetCommitShare: 1,
+        fleetLineShare: 1,
+      },
+    ],
+    total: {
+      fleet: { commits: 1, lines: 5 },
+      human: { commits: 0, lines: 0 },
+      fleetCommitShare: 1,
+      fleetLineShare: 1,
+    },
+    unavailable: [],
+    measured: true,
+  };
+
+  metrics.recordAttribution("pod-7f3a", day);
+  metrics.recordAttribution("pod-7f3a", day);
+
+  assert.match(
+    metrics.render(),
+    /caterpillar_digest_authored_lines_total\{runner="pod-7f3a",repo="acme\/widget",author="fleet"\} 10/,
+  );
+});

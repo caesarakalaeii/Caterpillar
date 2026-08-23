@@ -462,6 +462,13 @@ export interface SessionOutcome {
   readonly contextTokens: number;
   /** Set when reason is `ask-human`. */
   readonly question?: string;
+  /**
+   * The enumerated choices the question offers, when it is a choice (DESIGN.md §7).
+   *
+   * Only ever set alongside `question`. They are stored beside it in the state repo so a
+   * human can answer by pressing one instead of retyping it.
+   */
+  readonly questionOptions?: readonly string[];
   /** Set when reason is `blocked` — the capabilities the task now needs. */
   readonly requires?: readonly Capability[];
   /** Set when reason is `error` or `provider-unavailable`. */

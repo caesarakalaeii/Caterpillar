@@ -296,7 +296,7 @@ const originDetail = (origin: TaskOrigin | undefined): Html => {
 /* ------------------------------------------------------------------- intake */
 
 /**
- * The fourth and fifth intake paths, on one page (DESIGN.md §14, §20).
+ * The intake paths that refuse things, on one page (DESIGN.md §14, §20, §22).
  *
  * The page exists because a REFUSAL was invisible: a warn line in one pod's stdout, a JSON
  * file in the state repo, and a comment on a tracker item nobody is watching. A fleet whose
@@ -311,12 +311,13 @@ const originDetail = (origin: TaskOrigin | undefined): Html => {
  */
 export const intakePage = (view: IntakeView): Html => html`<main>
   <div class="page-head">
-    <div class="eyebrow">state repo · intake/ and alerts/</div>
+    <div class="eyebrow">state repo · intake/, alerts/ and schedules/</div>
     <h1>Intake</h1>
     <p class="sub">
-      What the tracker and the alert receiver have been asked to turn into tasks, and what
-      they refused. A refusal is durable: it is a file in the state repo and a comment on
-      the item, and it is what stops the same item being commented on every poll.
+      What the tracker, the alert receiver and the clock have been asked to turn into tasks,
+      and what they refused. A refusal is durable: it is a file in the state repo and, where
+      there is somebody to tell, a comment on the item — which is what stops the same item
+      being commented on every poll.
     </p>
   </div>
 
@@ -370,6 +371,42 @@ export const intakePage = (view: IntakeView): Html => html`<main>
   </section>
 
   <section>
+    <h2>Scheduled work</h2>
+    ${schedulePanel(view)}
+    <p class="crumb">
+      One file per schedule under <code>schedules/</code> in the state repo, each carrying its
+      trigger, its repos, its prompt and its acceptance commands. Adding one is a commit, not
+      a redeploy, and a malformed one is refused on the intake pass rather than at the hour it
+      would have fired.
+    </p>
+  </section>
+
+  <section>
+    <h2>Occurrences</h2>
+    ${
+      view.occurrences.length === 0
+        ? html`<p class="empty">
+            No occurrence has been settled${
+              view.scheduling
+                ? raw(" yet")
+                : html` on this runner — <code>schedule.enabled</code> is false here, so it
+                  fires none of them`
+            }. Every occurrence is recorded, including the ones a precheck skipped, so an
+            empty ledger means nothing has come due.
+          </p>`
+        : html`<table class="ledger">
+            <thead><tr><th>schedule</th><th>occurrence</th><th>outcome</th><th>task</th><th class="num">at</th></tr></thead>
+            <tbody>${view.occurrences.map(occurrenceRow)}</tbody>
+          </table>`
+    }
+    <p class="crumb">
+      Filed under <code>schedules/occurrences/&lt;schedule&gt;-&lt;occurrence&gt;.json</code>.
+      A <strong>skipped</strong> occurrence is one whose precheck exited non-zero: no session
+      was spent, which is the whole point of the gate.
+    </p>
+  </section>
+
+  <section>
     <h2>Is anything listening</h2>
     <dl class="grid">
       <div>
@@ -406,6 +443,89 @@ export const intakePage = (view: IntakeView): Html => html`<main>
     </p>
   </section>
 </main>`;
+
+/**
+ * The schedules, their parse errors, and whether this runner fires any of them (§22).
+ *
+ * The errors come FIRST and are a panel rather than a row, for `policyPanel`'s reason: a
+ * schedule that will not parse is the likeliest explanation for scheduled work that never
+ * happens, and it is the one an operator cannot get at any other way — the intake pass logs
+ * it into a stream nobody is reading.
+ */
+const schedulePanel = (view: IntakeView): Html => html`${
+  view.scheduleErrors.length === 0
+    ? raw("")
+    : html`<div class="panel" data-status="failed">
+        <h3>${view.scheduleErrors.length} file(s) under schedules/ are not schedules</h3>
+        ${view.scheduleErrors.map(
+          (error) => html`<p><span class="id">${error.schedule}</span> — ${error.message}</p>`,
+        )}
+        <p class="crumb">
+          These fire nothing and refuse nothing else: one schedule per file, so a typo costs
+          that schedule alone.
+        </p>
+      </div>`
+}
+${
+  view.schedules.length === 0
+    ? html`<p class="empty">
+        No schedule in the state repo. A schedule is a file under <code>schedules/</code>
+        carrying a cron expression, a named IANA timezone, the repos, the prompt and the
+        acceptance commands — which are required, because work that cannot be verified as
+        done cannot be scheduled either.
+      </p>`
+    : html`<table class="ledger">
+        <thead>
+          <tr><th>schedule</th><th>trigger</th><th>workspace</th><th>precheck</th><th class="num">max open</th></tr>
+        </thead>
+        <tbody>${view.schedules.map(scheduleRow)}</tbody>
+      </table>`
+}
+${
+  view.scheduling
+    ? raw("")
+    : html`<p class="crumb">
+        This runner fires none of them: <code>schedule.enabled</code> is false. Another
+        replica may — exactly one runner in the fleet wins each occurrence.
+      </p>`
+}`;
+
+const scheduleRow = (schedule: IntakeView["schedules"][number]): Html => html`<tr
+  data-status="${schedule.enabled ? "running" : "parked"}"
+>
+  <td class="title">
+    ${schedule.id}
+    <div class="id">${schedule.enabled ? "enabled" : "disabled"}</div>
+  </td>
+  <td>
+    <span class="id">${schedule.trigger.cron}</span>
+    <div class="id">${schedule.trigger.timeZone}</div>
+  </td>
+  <td><span class="id">${schedule.workspace}</span></td>
+  <td>${
+    schedule.precheck === undefined
+      ? html`<span class="id">none</span>`
+      : html`<span class="id">${schedule.precheck.command}</span>`
+  }</td>
+  <td class="num">${schedule.maxOpenTasks}</td>
+</tr>`;
+
+const occurrenceRow = (record: IntakeView["occurrences"][number]): Html => html`<tr
+  data-status="${record.outcome === "fired" ? "running" : "parked"}"
+>
+  <td class="title">${record.schedule}</td>
+  <td><span class="id">${record.occurrence}</span></td>
+  <td>
+    ${record.outcome}
+    ${record.detail === undefined ? raw("") : html`<div class="prose">${record.detail}</div>`}
+  </td>
+  <td>${
+    record.task === undefined
+      ? html`<span class="id">none</span>`
+      : html`<a href="/tasks/${record.task}">${record.task}</a>`
+  }</td>
+  <td class="num">${record.at === undefined ? raw("—") : timeTag(record.at)}</td>
+</tr>`;
 
 const passPanel = (view: IntakeView): Html => {
   const pass = view.pass;
@@ -711,10 +831,16 @@ export const taskPage = (detail: TaskDetail): Html => {
         ? raw("")
         : html`<section>
             <h2>Artifacts</h2>
+            <p class="sub">
+              What this task published for the tasks after it, and what its acceptance gate
+              rendered while it ran — a screenshot, a trace, a report. Each one downloads;
+              nothing here is shown on this page, because these are bytes an agent wrote
+              and this is the origin that serves every transcript.
+            </p>
             <div class="chips">
               ${detail.artifacts.map(
                 (name) =>
-                  html`<a class="chip" href="/tasks/${detail.id}/artifacts/${name}">${name}</a>`,
+                  html`<a class="chip" download href="/tasks/${detail.id}/artifacts/${name}">${name}</a>`,
               )}
             </div>
           </section>`

@@ -85,7 +85,7 @@ import type { ChatDrainer } from "../redis/inbox.ts";
 import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
-import type { ChatOutcome, ChatRequest } from "./inbox.ts";
+import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
 
@@ -215,6 +215,18 @@ export interface Digester {
   maybePublish(now: Date, signal?: AbortSignal): Promise<void>;
 }
 
+/** Scheduled work (§22). Implemented by `ScheduleRunner`. */
+export interface Scheduler {
+  /**
+   * Fire whatever occurrence is due, if this runner wins its claim. Called on every
+   * housekeeping pass; does nothing on almost all of them.
+   *
+   * The signal is the pod's, and it reaches a precheck: a bounded command is still a
+   * command, and a shutdown must not wait for one to finish.
+   */
+  maybeFire(now: Date, signal?: AbortSignal): Promise<void>;
+}
+
 export interface SupervisorDeps {
   readonly config: RunnerConfig;
   readonly store: StateStore;
@@ -275,6 +287,11 @@ export interface SupervisorDeps {
    * shared channel and a shared repo, so a runner has to be told to publish one.
    */
   readonly digest?: Digester;
+  /**
+   * Scheduled work (§22). Optional, and off by default for the digest's reason: firing an
+   * occurrence writes tasks into the shared state repo, so a runner has to be told to.
+   */
+  readonly schedule?: Scheduler;
   /**
    * The Alertmanager receiver's queue and the thing that empties it (§20). Optional and
    * off by default: without `remediation.enabled` there is no listener to fill it.
@@ -681,6 +698,7 @@ export class Supervisor {
     await this.applyChatRequests();
     await this.maybeIngest();
     await this.drainAlerts();
+    await this.maybeSchedule(signal);
     await this.maybeDigest(signal);
 
     // AFTER the writes above, so the snapshot a human reads includes what this pass just
@@ -1138,6 +1156,30 @@ export class Supervisor {
   }
 
   /**
+   * Fire whatever scheduled work is due (DESIGN.md §22).
+   *
+   * On the housekeeping loop and NOT the work loop, which is the whole reason this needs no
+   * listener and no second process: an occurrence that comes due while a session is running
+   * must still become a task, and the work loop is blocked for as long as the session takes.
+   * Ahead of the cooldown gate for intake's reason — creating a task spends no tokens, and a
+   * queue that keeps filling while the provider is down is the correct behaviour.
+   *
+   * Failures never propagate. `ScheduleRunner` already releases its claims and swallows its
+   * own errors; this catch is for the one thing it cannot handle, itself throwing, because a
+   * schedule must never be the reason the fleet stops working the tasks it already has.
+   */
+  private async maybeSchedule(signal: AbortSignal): Promise<void> {
+    const { schedule, logger } = this.deps;
+    if (schedule === undefined) return;
+
+    try {
+      await schedule.maybeFire(new Date(), signal);
+    } catch (error) {
+      logger.warn("schedule.pass-failed", errorFields(error));
+    }
+  }
+
+  /**
    * Publish the day's digest, if one is due (DESIGN.md §19).
    *
    * Ahead of the cooldown gate, like intake, and for the same reason: a day that has ended
@@ -1301,6 +1343,24 @@ export class Supervisor {
       const state = await store.readState(id).catch(() => undefined);
       if (state === undefined) continue;
       records.push({ id, state });
+      // A streak this replica published for a task that has since finished ANYWHERE.
+      //
+      // `transition` drops the series too, and that stays the fast path — but it only
+      // reaches the process that performed the terminal transition. The gauge is
+      // per-process and in memory while a task migrates between replicas across sessions,
+      // so the pod that published the streak is routinely not the pod that finishes the
+      // task: pod A hands off at streak 2, pod B takes it `done` and removes the series
+      // from its own registry where nothing ever set it, and pod A keeps reporting 2 for
+      // the life of the process. `caterpillar_no_progress_streak >= 2` does not aggregate
+      // over `pod`, so that orphan alerts about settled work until someone restarts the
+      // pod.
+      //
+      // Here because this is the only pass that reads every task's COMMITTED state on
+      // every poll in every replica — the same property that makes the presence below
+      // fleet-wide rather than a report on this one. `Metric.remove` is silent on a label
+      // set that was never reported, so this costs a map lookup per terminal task and says
+      // nothing about tasks this replica never touched.
+      if (isTerminal(state.status)) this.deps.metrics.noProgress.remove({ task: id });
     }
 
     // Awaited: with Redis configured this is a write over the network, and a floating
@@ -2176,9 +2236,17 @@ export class Supervisor {
         // that answers this question is the same task on the same branch, and it will be
         // claimed by this runner as often as not. Deleting the checkout while a human
         // types would buy disk for exactly as long as it takes them to answer.
-        logger.info("task.awaiting-human", { task: spec.id, questionIndex: index });
+        // The option TEXT is not logged either, for the same reason as the question, and it
+        // goes to the state repo rather than into the Discord button: a `custom_id` holds 100
+        // characters, so the button can only carry an index into this list.
+        const options = outcome.questionOptions;
+        logger.info("task.awaiting-human", {
+          task: spec.id,
+          questionIndex: index,
+          ...(options === undefined ? {} : { options: options.length }),
+        });
         await this.unit(async () => {
-          await store.writeQuestion(spec.id, index, question);
+          await store.writeQuestion(spec.id, index, question, options);
           await this.transition(lease, state, "awaiting-human");
           await this.push(lease, `chore(${spec.id}): awaiting human input`);
         });
@@ -2186,7 +2254,13 @@ export class Supervisor {
         // authoritative, and holding the state checkout across a network round trip to
         // either would block every other slot's writes on an unrelated service.
         await this.mirror(spec, { kind: "question", question });
-        await this.notifyTask(state, { kind: "question", task: spec.id, question, phase: state.phase });
+        await this.notifyTask(state, {
+          kind: "question",
+          task: spec.id,
+          question,
+          phase: state.phase,
+          ...(options === undefined ? {} : { options }),
+        });
         return true;
       }
 
@@ -3261,12 +3335,16 @@ export class Supervisor {
     switch (request.kind) {
       case "answer":
         return this.applyAnswer(request);
+      case "answer-option":
+        return this.applyAnswerOption(request);
       case "park":
         return this.applyPark(request);
       case "resume":
         return this.applyResume(request);
       case "merge":
         return this.applyMerge(request);
+      case "force-done":
+        return this.applyForceDone(request);
       case "brainstorm":
         return this.applyBrainstorm(request);
     }
@@ -3399,6 +3477,51 @@ export class Supervisor {
   }
 
   /**
+   * One of the question's own options, pressed as a button (§7).
+   *
+   * This method does exactly one thing: turn an index into the text the agent offered. It
+   * then hands that text to `applyAnswer`, which is what writes the answer file, the journal
+   * entry and the streak reset. There is deliberately no second answer path — the two would
+   * agree on the day they were written and drift apart afterwards, and the divergence would
+   * show up as a session reading an answer nobody remembers giving.
+   *
+   * A refusal rather than a guess when the index is out of range. A button stays in the
+   * Discord channel forever, so a press can arrive against a question that has since been
+   * answered and superseded, or against one that never had options. Writing option 1 of a
+   * different question would put a choice the human did not make where the next session
+   * reads it as theirs.
+   */
+  private async applyAnswerOption(
+    request: ChatRequest & { readonly kind: "answer-option" },
+  ): Promise<ChatOutcome> {
+    const { store, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+
+    const pending =
+      state.status === "awaiting-human" ? await store.pendingQuestion(request.task) : undefined;
+    const chosen = pending?.options?.[request.option];
+    if (chosen === undefined) {
+      logger.info("answer.option-stale", {
+        task: request.task,
+        option: request.option,
+        ...(pending === undefined ? {} : { questionIndex: pending.index }),
+      });
+      return {
+        kind: "refused",
+        reason:
+          `**${request.task}** no longer offers that option — the question it belonged to has ` +
+          `moved on. Read the current one and answer it in prose.`,
+      };
+    }
+
+    // The INTENT, without the request's `settle`: this method's caller settles what is
+    // returned, and an answer path that could settle a second time would report twice.
+    return this.applyAnswer({ kind: "answer", task: request.task, text: chosen });
+  }
+
+  /**
    * Everything a human types at a task, routed by what the task is currently doing.
    *
    * One entry point deliberately: in a task's own thread every message is this request
@@ -3416,7 +3539,7 @@ export class Supervisor {
    * notification, a verdict notification and `/task` were all telling the human to "say what
    * to change in this thread". Three surfaces documented a path that ended in a `return`.
    */
-  private async applyAnswer(request: ChatRequest & { readonly kind: "answer" }): Promise<ChatOutcome> {
+  private async applyAnswer(request: ChatIntent & { readonly kind: "answer" }): Promise<ChatOutcome> {
     const { store, config, logger } = this.deps;
 
     const state = await store.tryReadState(request.task);
@@ -3502,7 +3625,7 @@ export class Supervisor {
    *   says which of the two happened rather than letting a human find out by watching.
    */
   private async applyGuidance(
-    request: ChatRequest & { readonly kind: "answer" },
+    request: ChatIntent & { readonly kind: "answer" },
     state: TaskState,
   ): Promise<ChatOutcome> {
     const { store, leases, logger } = this.deps;
@@ -3825,6 +3948,114 @@ export class Supervisor {
   }
 
   /**
+   * Mark a task `done` by human decision, both §12 gates BYPASSED — `/done`.
+   *
+   * Not a variant of `applyMerge`, and the difference is the point. `/merge` is an override
+   * of the COUNCIL: it merges through the reviewer identity, so it refuses without a PR and
+   * without a reviewer identity, and the gates before it have already passed. This is an
+   * override of the whole of §12, for the case where the task is OBSOLETE rather than
+   * finished — there is nothing to verify, often nothing on a branch at all, and no honest
+   * way to record it as verified. So nothing is merged, no PR is required, and the journal
+   * says who decided and why.
+   *
+   * What it must never do is leave a record that reads as a verified `done`. Hence the
+   * journal entry rather than a bare status write, and hence `parked` for the tracker
+   * (`mirror` below): `completed` carries a `prUrl` this command may not have, and it is the
+   * transition that means the gates passed.
+   *
+   * `running` is refused rather than raced. The session holds the lease, so the write would
+   * either lose its compare-and-swap or land under an agent still working the task — and
+   * `/cancel` already exists to stop one, at a turn boundary, without either.
+   */
+  private async applyForceDone(
+    request: ChatRequest & { readonly kind: "force-done" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.status === "running") {
+      return {
+        kind: "not-forceable",
+        reason:
+          "it is running right now — `/cancel` it first, then force it done once it has " +
+          "parked. Writing over a live session would race the lease it holds.",
+      };
+    }
+    if (state.status === "done") return { kind: "finished" };
+
+    const lease = await leases.claim(request.task);
+    // Unclaimable means another runner holds it, which is what `running` looks like from
+    // here — the stored status can be stale, and this is the one case where it matters.
+    if (lease === undefined) {
+      return {
+        kind: "not-forceable",
+        reason:
+          "another runner is working it right now — `/cancel` it first, then force it done " +
+          "once it has parked.",
+      };
+    }
+
+    try {
+      const handle = heldLease(lease);
+      await this.unit(async () => {
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          [
+            `**Forced done** by ${request.author}, from \`${state.status}\`.`,
+            "",
+            `Reason: ${request.reason}`,
+            "",
+            "The §12 acceptance gates were **BYPASSED**: no acceptance command was run, no " +
+              "CI result was read, and no pull request was merged. This task is done by " +
+              "human decision, not by verification.",
+          ].join("\n"),
+        );
+        await this.transition(handle, state, "done");
+        await this.push(handle, `chore(${request.task}): forced done from chat`);
+      });
+      logger.warn("task.forced-done", {
+        task: request.task,
+        previous: state.status,
+        author: request.author,
+        reason: request.reason,
+      });
+
+      // After the push, never before: the tracker is a VIEW and git wins when they
+      // disagree. `parked` rather than `completed` — see the note above. Both adapters
+      // answer it with a comment and by dropping the wip label, so the item is released
+      // and the reason is on it; neither CLOSES it, because closing is reserved for
+      // `completed` and §12 (`tracker/github-issues.ts`). A task forced done did not pass
+      // §12, so an item left open with the reason on it is the honest view — and closing it
+      // needs a transition of its own, which is a change to `Tracker` and not to this.
+      //
+      // A spec that will not read is logged rather than swallowed: the `done` is already
+      // pushed, so the only consequence left is a tracker item nobody updated, and that is
+      // exactly the kind of divergence that has to be findable afterwards.
+      const spec = await store.readSpec(request.task).catch((error: unknown) => {
+        logger.warn("task.forced-done.spec-unreadable", {
+          task: request.task,
+          ...errorFields(error),
+        });
+        return undefined;
+      });
+      if (spec !== undefined) {
+        await this.mirror(spec, {
+          kind: "parked",
+          reason:
+            `Forced done by ${request.author} without verification — the acceptance gates ` +
+            `were bypassed. Reason: ${request.reason}`,
+        });
+      }
+
+      return { kind: "forced-done" };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
    * Post to the human signal channel (DESIGN.md §11). Never throws.
    *
    * Same reasoning as `mirror`, and the same ordering: always after the authoritative
@@ -3950,8 +4181,13 @@ export class Supervisor {
    *
    * `caterpillar_no_progress_streak >= 2` is an alerting rule, so a stale sample is not
    * cosmetic: it pages somebody about a task that is fine. Dropping the series when a
-   * task ENDS is the other half, and belongs to `transition` rather than here — that is
-   * the funnel every status change goes through.
+   * task ENDS is the other half, and it takes two places rather than one:
+   *
+   *   - `transition`, the funnel every status change goes through, for the process that
+   *     takes the task terminal itself;
+   *   - `survey`, for every OTHER replica, because the gauge is per-process while a task
+   *     migrates between replicas across sessions — so the pod holding the streak is
+   *     routinely not the pod that finishes the task.
    */
   private publishNoProgress(task: TaskId, streak: number): void {
     this.deps.metrics.noProgress.set({ task }, streak);

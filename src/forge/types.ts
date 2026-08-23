@@ -44,6 +44,21 @@ export interface CheckStatus {
   readonly conclusion: CheckConclusion;
   /** Human-readable detail for the journal and Discord. */
   readonly summary: string;
+  /**
+   * The ref itself does not exist, which is why there is no signal.
+   *
+   * Always paired with `conclusion: "none"` — a ref that is not there reports nothing, and
+   * that is exactly what `none` means. The flag exists because "nothing ran on this branch"
+   * and "this branch is gone" are different facts with the same verdict, and only the second
+   * one describes a task whose work has landed: merging a pull request through the GitHub UI
+   * deletes the head branch by default. `BS-1540288291008684052-04` was merged that way and
+   * then spent nine sessions unable to reach any verdict at all.
+   *
+   * A flag rather than a fifth `CheckConclusion` because the verdict is the same; a flag
+   * rather than a sentence in `summary` because a gate must read a fact, not prose written
+   * for a human. Absent means "the ref was there", which is what every other path reports.
+   */
+  readonly refAbsent?: boolean;
 }
 
 /**

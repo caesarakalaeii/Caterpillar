@@ -9,9 +9,13 @@
  * Gate 2 is here too, since it learned to count. It checked `repos[0]` alone, so a task spanning
  * two repos passed on the strength of the primary while the sibling's CI was red — or absent
  * entirely. The work is one change and half of it being green is not it passing.
+ *
+ * And the evidence a gate leaves behind, at the bottom. `acceptance: ["npx playwright test"]`
+ * is the honest end-to-end test for a change that renders something, and it was impossible
+ * while a gate could only return an exit code.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -26,9 +30,10 @@ import {
   type TaskState,
 } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
+import { ARTIFACT_BYTES, ARTIFACT_COUNT } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
-import { AcceptanceVerifier } from "./verifier.ts";
+import { AcceptanceVerifier, type EvidenceStore } from "./verifier.ts";
 
 /**
  * Who the resolved environment commits as. Any address will do here — what the
@@ -294,6 +299,81 @@ test("a repo with no CI still passes, and says so once per repo", async () => {
   assert.match(result.detail, /acceptance criteria alone/);
 });
 
+/* ─────────────────── the branch is gone because the work landed ─────────────────── */
+
+/**
+ * A forge whose ref does not exist — the shape both forges report for a deleted branch.
+ *
+ * `BS-1540288291008684052-04`'s work was merged by hand through the GitHub UI, which
+ * deletes the head branch by default. Nine sessions later the task was still parked, with
+ * every acceptance criterion passing on the default branch, because the gate could not be
+ * run at all: `checks` threw and the session died before it could reach a verdict.
+ */
+const absentRefForge = (): WorkspaceBindings => {
+  const forge = {
+    kind: "stub",
+    checks: (_repo: RepoRef, ref: string) =>
+      Promise.resolve({
+        conclusion: "none" as const,
+        summary: `ref '${ref}' does not exist`,
+        refAbsent: true,
+      }),
+    revoke: () => Promise.resolve(),
+  } as unknown as Forge;
+
+  return {
+    forges: new Map([
+      [asWorkspaceName("test"), { forTask: () => Promise.resolve(forge) }],
+    ]) as never,
+    trackers: new Map(),
+  };
+};
+
+test("a task whose branch is gone reaches a verdict instead of crashing", async () => {
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings: absentRefForge(),
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, true, result.detail);
+  assert.notEqual(result.pending, true);
+});
+
+test("a gone branch is reported as work that landed, not as a repo without CI", async () => {
+  // The two are both `none` and they are not the same event. "Completion rests on
+  // acceptance criteria alone where CI is absent" is a true sentence about a repo that
+  // configured no CI and a false one about a merged pull request whose CI ran and passed
+  // — it sends a reader looking for a missing workflow that was never missing.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" }, {
+    bindings: absentRefForge(),
+  });
+
+  const result = await verifier.verify(specWith(["true"]), stateWithPr);
+
+  assert.match(result.detail, /branch no longer exists/);
+  assert.match(result.detail, /merged/, "the reader has to be told why it is gone");
+  assert.doesNotMatch(
+    result.detail,
+    /acceptance criteria alone/,
+    "that warning is about a repo with no CI, which this is not",
+  );
+});
+
+test("an existing ref that simply reported nothing keeps the no-CI warning", async () => {
+  // The other half of the distinction, and the reason it needs a flag rather than a
+  // conclusion: a repo with no CI must not start reading as a landed change.
+  const worktree = await scratch();
+  const { bindings } = ciForge({ "o/r": "none" });
+  const result = await ciVerifier(worktree, bindings).verify(specWith(["true"]), stateWithPr);
+
+  assert.equal(result.passed, true, result.detail);
+  assert.match(result.detail, /acceptance criteria alone/);
+  assert.doesNotMatch(result.detail, /branch no longer exists/);
+});
+
 /**
  * The pending-CI regression. BS-...-07 was parked with a green branch and an open PR
  * because a CI run that had not finished was reported as a failed gate, the completion
@@ -488,4 +568,188 @@ test("a not-found failure still fails the gate", async () => {
   const result = await verifier.verify(specWith(["definitely-not-a-real-binary"]), state);
 
   assert.equal(result.passed, false);
+});
+
+/* ─────────────────────── evidence a gate leaves behind (§12) ─────────────────────── */
+
+/**
+ * A recording stand-in for the state repo's artifact side.
+ *
+ * `StateStore` satisfies `EvidenceStore` structurally, so this is the whole surface the
+ * verifier is given — no git, no mutex, no clone. The caps are enforced here rather than
+ * asserted about, because it is the store that owns them (§17) and a fake that let
+ * everything through would test the wrong half.
+ */
+const evidenceStore = (
+  limits: { readonly bytes?: number; readonly count?: number } = {},
+): {
+  readonly store: EvidenceStore;
+  readonly stored: Map<string, Buffer>;
+} => {
+  const stored = new Map<string, Buffer>();
+  const maxBytes = limits.bytes ?? ARTIFACT_BYTES;
+  const maxCount = limits.count ?? ARTIFACT_COUNT;
+
+  return {
+    stored,
+    store: {
+      writeArtifact: (_task, name, contents) => {
+        if (contents.byteLength > maxBytes) {
+          return Promise.reject(
+            new Error(`'${name}' is ${contents.byteLength} bytes; the limit is ${maxBytes}`),
+          );
+        }
+        if (!stored.has(name) && stored.size >= maxCount) {
+          return Promise.reject(new Error(`already has ${stored.size} artifacts`));
+        }
+        stored.set(name, contents);
+        return Promise.resolve();
+      },
+    },
+  };
+};
+
+/** A verifier that collects evidence, with the evidence directory under the test's control. */
+const evidenceVerifier = (
+  worktree: string,
+  evidence: EvidenceStore,
+  evidenceDir: string,
+): AcceptanceVerifier =>
+  new AcceptanceVerifier({
+    worktrees: {
+      ensureWorktree: () => Promise.resolve(worktree),
+    } as unknown as WorktreeManager,
+    bindings: { forges: new Map(), trackers: new Map() },
+    toolchain: new ToolchainResolver({
+      logger: SILENT_LOGGER,
+      config: DEFAULT_TOOLCHAIN_CONFIG,
+      tasksDir: worktree,
+      identity: TEST_IDENTITY,
+      baseEnv: { PATH: process.env["PATH"] ?? "/usr/bin:/bin" },
+    }),
+    evidence: { store: evidence, dir: () => evidenceDir },
+  });
+
+test("a gate is told where to leave evidence", async () => {
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store, stored } = evidenceStore();
+
+  await evidenceVerifier(worktree, store, dir).verify(
+    specWith([`test "$CATERPILLAR_EVIDENCE_DIR" = ${dir} && echo shot > "$CATERPILLAR_EVIDENCE_DIR/shot.png"`]),
+    state,
+  );
+
+  assert.deepEqual([...stored.keys()], ["shot.png"]);
+  assert.equal(String(stored.get("shot.png")).trim(), "shot");
+});
+
+test("the evidence directory exists before the gate runs", async () => {
+  // A gate cannot be asked to create it: `npx playwright test` writes where its config
+  // says and fails if the parent is missing, which would read as a broken test run.
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store, stored } = evidenceStore();
+
+  const result = await evidenceVerifier(worktree, store, dir).verify(
+    specWith(['test -d "$CATERPILLAR_EVIDENCE_DIR" && cp /dev/null "$CATERPILLAR_EVIDENCE_DIR/empty.txt"']),
+    state,
+  );
+
+  assert.match(result.detail, new RegExp(NO_PR), "the gate itself must have passed");
+  assert.deepEqual([...stored.keys()], ["empty.txt"]);
+});
+
+test("a FAILED gate's evidence is published too", async () => {
+  // The whole point. A screenshot matters most when the gate went red, and the old
+  // behaviour — nothing at all — threw away the one thing that explains the failure.
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store, stored } = evidenceStore();
+
+  const result = await evidenceVerifier(worktree, store, dir).verify(
+    specWith(['echo broken > "$CATERPILLAR_EVIDENCE_DIR/diff.png"; exit 1']),
+    state,
+  );
+
+  assert.equal(result.passed, false);
+  assert.deepEqual([...stored.keys()], ["diff.png"]);
+  assert.match(result.detail, /diff\.png/, "the failure has to name the evidence it left");
+});
+
+test("evidence over the cap is named and refused, never silently dropped", async () => {
+  // §17's caps are the design. The failure has to be legible: an operator reading the
+  // journal must be able to tell "too big to commit" from "the gate wrote nothing".
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store, stored } = evidenceStore({ bytes: 16 });
+
+  const result = await evidenceVerifier(worktree, store, dir).verify(
+    specWith([`printf '%0.s-' {1..64} > "$CATERPILLAR_EVIDENCE_DIR/huge.png"`]),
+    state,
+  );
+
+  assert.equal(stored.size, 0);
+  assert.match(result.detail, /huge\.png/);
+  assert.match(result.detail, /64 bytes/, "how big it was");
+  assert.match(result.detail, /the limit is 16/, "and what the limit is");
+});
+
+test("evidence over the cap does not change the verdict", async () => {
+  // An image is evidence, never the pass condition. A gate that exited 0 and wrote a
+  // 4 MB screenshot has passed; a gate that exited 1 and wrote a small one has not.
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store } = evidenceStore({ bytes: 4 });
+
+  const passed = await evidenceVerifier(worktree, store, dir).verify(
+    specWith(['echo far-too-big > "$CATERPILLAR_EVIDENCE_DIR/big.png"']),
+    state,
+  );
+
+  // Gate 1 passed, so the only thing left to refuse is gate 2's missing PR. The oversized
+  // file is reported alongside it rather than instead of it.
+  assert.match(passed.detail, new RegExp(NO_PR));
+  assert.match(passed.detail, /big\.png/);
+  assert.doesNotMatch(passed.detail, /Acceptance criteria failed/);
+});
+
+test("a gate that leaves nothing behind says nothing about evidence", async () => {
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  const { store, stored } = evidenceStore();
+
+  const result = await evidenceVerifier(worktree, store, dir).verify(
+    specWith(["echo nope >&2; exit 3"]),
+    state,
+  );
+
+  assert.equal(stored.size, 0);
+  assert.doesNotMatch(result.detail, /evidence/i);
+});
+
+test("evidence from a previous run is not republished as this run's", async () => {
+  // The directory lives on the PVC beside the worktree and survives between sessions, so
+  // a stale screenshot would otherwise be offered to the council as evidence about a diff
+  // it predates.
+  const worktree = await scratch();
+  const dir = join(await scratch(), "evidence");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "stale.png"), "from last session", "utf8");
+  const { store, stored } = evidenceStore();
+
+  await evidenceVerifier(worktree, store, dir).verify(specWith(["true"]), state);
+
+  assert.deepEqual([...stored.keys()], []);
+});
+
+test("a verifier with no evidence collaborator behaves exactly as before", async () => {
+  // The seam is optional: a runner wired without it must not start failing gates, and
+  // `CATERPILLAR_EVIDENCE_DIR` must be absent rather than empty so `test -d` is honest.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(specWith(['test -z "$CATERPILLAR_EVIDENCE_DIR"']), state);
+
+  assert.equal(result.detail, NO_PR);
 });

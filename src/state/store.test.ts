@@ -143,6 +143,159 @@ test("writeSpec refuses to overwrite an existing spec", async () => {
   assert.deepEqual((await subject.readSpec(SPEC.id)).acceptance, SPEC.acceptance);
 });
 
+test("readSpec on a task with no amendments returns the spec as filed", async () => {
+  // The no-amendment path is the overwhelmingly common one, and the overlay must be
+  // invisible on it: every existing caller reads `readSpec` and none of them knows
+  // amendments exist.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  assert.deepEqual(await subject.readSpec(SPEC.id), SPEC);
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+  assert.deepEqual(await subject.listAmendments(SPEC.id), []);
+});
+
+test("readSpec applies an amendment's acceptance list and changes nothing else", async () => {
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  await subject.writeAmendment(SPEC.id, {
+    acceptance: ["npm test -- src/widget"],
+    why: "a repo-wide lint on a 42-line branch is not this task's gate",
+    author: "operator",
+  });
+
+  assert.deepEqual(await subject.readSpec(SPEC.id), {
+    ...SPEC,
+    acceptance: ["npm test -- src/widget"],
+  });
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+});
+
+test("readSpec takes the highest-numbered amendment wholesale, not a merge", async () => {
+  // Whole-list replacement is the contract. A merge across amendments would resurrect a
+  // criterion an earlier amendment removed, which is the failure the feature exists to
+  // prevent.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  for (const acceptance of [["first"], ["second", "second-b"], ["third"]]) {
+    await subject.writeAmendment(SPEC.id, { acceptance, why: "because", author: "operator" });
+  }
+
+  assert.deepEqual((await subject.readSpec(SPEC.id)).acceptance, ["third"]);
+  assert.deepEqual(await subject.readBaseSpec(SPEC.id), SPEC);
+});
+
+test("writeAmendment allocates 001, 002, 003 and overwrites none of them", async () => {
+  // The file list IS the audit trail (§12.3), so a reused number would erase the reasoning
+  // a human recorded for an earlier decision.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  for (const why of ["first reason", "second reason", "third reason"]) {
+    await subject.writeAmendment(SPEC.id, { acceptance: ["true"], why, author: "operator" });
+  }
+
+  assert.deepEqual(
+    (await readdir(join(subject.taskDir(SPEC.id), "amendments"))).sort(),
+    ["001.yaml", "002.yaml", "003.yaml"],
+  );
+  assert.deepEqual(
+    (await subject.listAmendments(SPEC.id)).map((a) => ({ index: a.index, why: a.why })),
+    [
+      { index: 1, why: "first reason" },
+      { index: 2, why: "second reason" },
+      { index: 3, why: "third reason" },
+    ],
+  );
+});
+
+test("an amendment records its author and an ISO timestamp", async () => {
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+
+  const written = await subject.writeAmendment(SPEC.id, {
+    acceptance: ["npm test"],
+    why: "the glob could never match",
+    author: "operator#4242",
+  });
+
+  assert.equal(written.author, "operator#4242");
+  assert.match(written.at, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+  assert.deepEqual(await subject.listAmendments(SPEC.id), [written]);
+});
+
+test("writing an amendment leaves spec.md byte-identical", async () => {
+  // The whole point: the immutable file is never touched, so `readBaseSpec` and the git
+  // history keep saying what was actually filed.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const path = join(subject.taskDir(SPEC.id), "spec.md");
+  const before = await readFile(path);
+
+  await subject.writeAmendment(SPEC.id, {
+    acceptance: ["true"],
+    why: "unsatisfiable as filed",
+    author: "operator",
+  });
+
+  assert.deepEqual(await readFile(path), before);
+});
+
+test("an amendment naming a forbidden key is refused rather than partly applied", async () => {
+  // `repos` is a credential scope (§9.1) and the goal is the task's identity. Neither is a
+  // chat command, so a file carrying one is rejected loudly — including its `acceptance`,
+  // which is what "not partly applied" means.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const dir = join(subject.taskDir(SPEC.id), "amendments");
+  await mkdir(dir, { recursive: true });
+
+  for (const [name, forbidden] of [
+    ["001.yaml", "repos:\n  - github.com/acme/other"],
+    ["002.yaml", "goal: something else entirely"],
+  ] as const) {
+    await writeFile(
+      join(dir, name),
+      [
+        "acceptance:",
+        "  - npm test",
+        "why: unsatisfiable as filed",
+        "author: operator",
+        "at: 2026-08-19T00:00:00.000Z",
+        forbidden,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await assert.rejects(subject.listAmendments(SPEC.id), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, new RegExp(forbidden.split(":")[0] as string));
+      return true;
+    });
+    await assert.rejects(subject.readSpec(SPEC.id), /amendment/);
+    await rm(join(dir, name));
+  }
+});
+
+test("an amendment with no reason is refused", async () => {
+  // `why` is the whole audit value of the record. An amendment nobody explained is a
+  // hand-edited spec.md with extra steps.
+  const subject = await store();
+  await subject.writeSpec(SPEC);
+  const dir = join(subject.taskDir(SPEC.id), "amendments");
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, "001.yaml"),
+    "acceptance:\n  - npm test\nauthor: operator\nat: 2026-08-19T00:00:00.000Z\n",
+    "utf8",
+  );
+
+  await assert.rejects(subject.listAmendments(SPEC.id), /why/);
+});
+
 test("hasTask reports what listTasks would claim", async () => {
   const subject = await store();
   assert.equal(await subject.hasTask(SPEC.id), false);
@@ -530,6 +683,46 @@ test("the question history reads back paired with its answers", async () => {
 test("a task that was never asked anything has no question history", async () => {
   const subject = await store();
   assert.deepEqual(await subject.listQuestions(asTaskId("TASK-quiet")), []);
+});
+
+test("the options a question offered are stored beside it and read back in order", async () => {
+  // The option TEXT lives here rather than in the Discord button that offers it: a
+  // `custom_id` holds 100 characters, so the button can only carry an INDEX into this list.
+  const subject = await store();
+  const task = asTaskId("TASK-options");
+  await subject.writeQuestion(task, 3, "which migration path?", ["the existing one", "a new one"]);
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 3,
+    question: "which migration path?\n",
+    options: ["the existing one", "a new one"],
+  });
+});
+
+test("a question asked without options reads back without them", async () => {
+  const subject = await store();
+  const task = asTaskId("TASK-no-options");
+  await subject.writeQuestion(task, 1, "what is the retention policy?");
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 1,
+    question: "what is the retention policy?\n",
+  });
+});
+
+test("a corrupt options sidecar leaves the question answerable in prose", async () => {
+  // The sidecar is a convenience; the question is the record. A half-written file must cost
+  // the buttons, never the ability to answer at all — which is the one thing the task is
+  // waiting for.
+  const { subject, root } = await storeAt();
+  const task = asTaskId("TASK-bad-options");
+  await subject.writeQuestion(task, 2, "which one?", ["a", "b"]);
+  await writeFile(join(root, "tasks", task, "questions", "002-options.json"), "{ not json");
+
+  assert.deepEqual(await subject.pendingQuestion(task), {
+    index: 2,
+    question: "which one?\n",
+  });
 });
 
 test("every council verdict is kept, not just the last", async () => {
@@ -1436,4 +1629,194 @@ test("state.json is replaced atomically, so a concurrent reader never sees half 
 
   await Promise.all([...readers, writers]);
   assert.equal(torn, undefined, `a reader saw a partial file: ${String(torn)}`);
+});
+
+test("listSchedules reads every schedule, and one bad file costs only itself", async () => {
+  // The whole point of one file per schedule (§22): a fleet with four schedules and one
+  // typo must keep firing the other three. A single document could not do that.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "schedules"), { recursive: true });
+
+  const write = (name: string, body: string): Promise<void> =>
+    writeFile(join(root, "schedules", name), body, "utf8");
+
+  const good = [
+    "version: 1",
+    "trigger:",
+    '  cron: "0 9 * * 1-5"',
+    "  timezone: Europe/Berlin",
+    "workspace: primary",
+    "repos:",
+    "  - github.com/acme/widget",
+    "prompt: audit the dependencies",
+    "acceptance:",
+    "  - npm test",
+    "",
+  ].join("\n");
+
+  await write("deps-audit.yaml", good);
+  await write("stale-branches.yaml", good.replace("0 9 * * 1-5", "0 7 * * 1"));
+  await write("broken.yaml", good.replace("acceptance:", "acceptence:"));
+  // Not a schedule at all, and not an error either: an operator's notes must not read as
+  // a malformed schedule.
+  await write("README.md", "these are the schedules\n");
+
+  const listed = await subject.listSchedules();
+
+  assert.deepEqual(
+    listed.schedules.map((schedule) => schedule.id),
+    ["deps-audit", "stale-branches"],
+  );
+  assert.equal(listed.errors.length, 1);
+  assert.equal(listed.errors[0]?.schedule, "broken");
+  assert.match(listed.errors[0]?.message ?? "", /unknown key/);
+});
+
+test("a state repo with no schedules/ has no schedules and no errors", async () => {
+  // The housekeeping loop calls this every pass and most state repos have never heard of
+  // schedules — a throw there would log a failure every thirty seconds (§20's reasoning
+  // for a missing `alerts/policy.yaml`, verbatim).
+  const subject = await store();
+
+  assert.deepEqual(await subject.listSchedules(), { schedules: [], errors: [] });
+});
+
+test("a file name that is not a schedule id is refused rather than read", async () => {
+  // The name becomes a task id and a git ref component, and it is read off a directory
+  // listing — so a file somebody dropped in by hand must not become either.
+  const { subject, root } = await storeAt();
+  await mkdir(join(root, "schedules"), { recursive: true });
+  await writeFile(join(root, "schedules", "not a schedule.yaml"), "version: 1\n", "utf8");
+
+  const listed = await subject.listSchedules();
+
+  assert.deepEqual(listed.schedules, []);
+  assert.equal(listed.errors.length, 1);
+  assert.match(listed.errors[0]?.message ?? "", /identifier/);
+});
+
+test("an occurrence record persists, and says which schedule and instant it is about", async () => {
+  // The ledger is what makes a SKIPPED occurrence visible. A precheck that never passes
+  // is otherwise indistinguishable from a schedule nobody is polling.
+  const subject = await store();
+
+  assert.equal(await subject.readScheduleRecord("deps-audit", "2026-08-17T0700Z"), undefined);
+
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "precheck exited 1",
+  });
+
+  const record = await subject.readScheduleRecord("deps-audit", "2026-08-17T0700Z");
+  assert.equal(record?.outcome, "skipped");
+  assert.equal(record?.detail, "precheck exited 1");
+  assert.ok(!Number.isNaN(Date.parse(record?.at ?? "")), "it carries a parseable timestamp");
+
+  assert.deepEqual((await subject.listScheduleRecords()).map((r) => r.occurrence), [
+    "2026-08-17T0700Z",
+  ]);
+});
+
+test("a schedule id or occurrence that is not one is never joined into a path", async () => {
+  // Both halves of the file name are checked, not trusted: `..` is a legal directory name
+  // that resolves out of `schedules/`.
+  const subject = await store();
+
+  for (const [schedule, occurrence] of [
+    ["../escape", "2026-08-17T0700Z"],
+    ["deps-audit", "../../etc/passwd"],
+    ["deps-audit", "not-an-occurrence"],
+  ] as const) {
+    await assert.rejects(
+      subject.writeScheduleRecord(schedule, occurrence, {
+        schedule,
+        occurrence,
+        outcome: "skipped",
+      }),
+      /cannot be filed/,
+      `'${schedule}' / '${occurrence}' must be refused`,
+    );
+    assert.equal(await subject.readScheduleRecord(schedule, occurrence), undefined);
+  }
+});
+
+test("open tasks are counted per schedule using the one notion of terminal", async () => {
+  // `maxOpenTasks` exists so a weekly audit whose last task is still in review does not
+  // open a second one saying the same thing — `countOpenAlertTasks`'s rule (§20), applied
+  // to a schedule, and counted from the task tree rather than from the ledger so a task
+  // deleted by hand frees its slot.
+  const subject = await store();
+
+  const task = async (id: string, status: TaskState["status"]): Promise<void> => {
+    await subject.writeState({
+      id: asTaskId(id),
+      status,
+      phase: "implementing",
+      requires: [],
+      sessions: 0,
+      limits: { maxSessions: 20 },
+      usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+      progress: { lastProgressSession: 0, noProgressStreak: 0 },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  await task("SCHED-deps-audit-2026-08-17T0700Z", "running");
+  await task("SCHED-deps-audit-2026-08-18T0700Z", "ready");
+  await task("SCHED-deps-audit-2026-08-19T0700Z", "done");
+  await task("SCHED-deps-audit-2026-08-20T0700Z", "parked");
+  await task("SCHED-stale-branches-2026-08-17T0500Z", "running");
+
+  assert.equal(await subject.countOpenScheduleTasks("deps-audit"), 2);
+  assert.equal(await subject.countOpenScheduleTasks("stale-branches"), 1);
+  assert.equal(await subject.countOpenScheduleTasks("nothing-here"), 0);
+});
+
+test("commitAndPush stages occurrence records, and pull sweeps unpushed ones", async () => {
+  // The alert rule (§20) applied to the schedule ledger. Without `schedules` in the
+  // `git add` list a record is written locally and never pushed, so a deploy loses the
+  // fleet's account of what fired. Without it in the `git clean` list a record whose
+  // commit never landed says "settled" on this runner and nowhere else — and the operator
+  // reading `/intake` on another runner sees an occurrence that never happened.
+  const { store: subject, bare, other, root } = await sharedStateRepo();
+
+  await subject.writeScheduleRecord("deps-audit", "2026-08-17T0700Z", {
+    schedule: "deps-audit",
+    occurrence: "2026-08-17T0700Z",
+    outcome: "skipped",
+    detail: "precheck exited 1",
+  });
+  await subject.commitAndPush("chore(schedules): record an occurrence", "origin", "main");
+
+  const listed = await bare.run("ls-tree", "-r", "--name-only", "main");
+  assert.match(listed, /^schedules\/occurrences\/deps-audit-2026-08-17T0700Z\.json$/m);
+
+  // Force the reset path with a record on disk that reached no commit. The other clone
+  // has to move main first, or nothing needs resetting.
+  await other.run("pull", "--quiet", "--ff-only", "origin", "main");
+  await other.run("commit", "--quiet", "--allow-empty", "-m", "remote moves on");
+  await other.run("push", "--quiet", "origin", "HEAD:main");
+
+  const orphan = join(root, "schedules", "occurrences", "deps-audit-2026-08-18T0700Z.json");
+  // Written PAST the store, like the alert case: going through `writeScheduleRecord`
+  // would mark the tree dirty and the pull would correctly decline.
+  await writeFile(
+    orphan,
+    '{"schedule":"deps-audit","occurrence":"2026-08-18T0700Z","outcome":"fired"}\n',
+    "utf8",
+  );
+
+  assert.equal(await subject.pull("origin", "main"), "pulled");
+  assert.equal(
+    existsSync(orphan),
+    false,
+    "an unpushed occurrence record must not outlive the branch it was written on",
+  );
+  assert.ok(
+    existsSync(join(root, "schedules", "occurrences", "deps-audit-2026-08-17T0700Z.json")),
+    "the pushed one is tracked, so the sweep leaves it alone",
+  );
 });

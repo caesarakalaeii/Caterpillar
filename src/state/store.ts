@@ -8,7 +8,7 @@
  *                truth on recovery. `journal.md` is the legacy single-file form and is
  *                still read, never written and never deleted.
  *   handoff.md   OVERWRITTEN each session — the baton, deliberately bounded
- *   questions/   NNN-question.md / NNN-answer.md
+ *   questions/   NNN-question.md / NNN-answer.md / NNN-options.json
  *   sessions/    NNN.jsonl.gz — pi transcripts
  *
  * The journal grows; handoff.md does not. That asymmetry is the point: an
@@ -53,6 +53,14 @@ import {
   parsePolicy,
   type AlertPolicy,
 } from "../remediation/policy.ts";
+import {
+  isScheduleId,
+  parseSchedule,
+  ScheduleParseError,
+  SCHEDULE_TASK_PREFIX,
+  type Schedule,
+} from "../schedule/definition.ts";
+import { isOccurrenceId } from "../schedule/occurrence.ts";
 
 /**
  * What the supervisor remembers about one firing alert (DESIGN.md §20).
@@ -72,6 +80,41 @@ export interface AlertRefusal {
   readonly task?: TaskId;
   /** Stamped by the writer, for an operator wondering how long this has been so. */
   readonly at?: string;
+}
+
+/** What became of one occurrence of one schedule. */
+export type ScheduleOutcome = "fired" | "skipped" | "refused";
+
+/**
+ * The ledger entry for one occurrence (DESIGN.md §22).
+ *
+ * Written for a FIRED occurrence as well as a skipped one, and that is what makes the
+ * skipped ones legible: "the precheck said no" and "nothing is polling this schedule" are
+ * the same silence otherwise, and the first is the normal case for a schedule whose whole
+ * job is to notice something occasionally.
+ *
+ * Durable and pushed rather than in memory, for the reason §14.2 gives about Keel rolling
+ * the pod on every push to main: an in-memory note of "already handled 09:00" is emptied
+ * by a deploy, and the claim ref is the only thing that then stops a second task.
+ */
+export interface ScheduleRecord {
+  readonly schedule: string;
+  /** `YYYY-MM-DDTHHMMZ`, as `occurrenceId` renders it. */
+  readonly occurrence: string;
+  readonly outcome: ScheduleOutcome;
+  /** The task this occurrence produced, when it produced one. */
+  readonly task?: TaskId;
+  /** Why it was skipped or refused — a precheck's exit code, a parse error. Human-facing. */
+  readonly detail?: string;
+  /** Stamped by the writer. */
+  readonly at?: string;
+}
+
+/** Every schedule that parsed, and the ones that did not, from one pass over the tree. */
+export interface ScheduleListing {
+  readonly schedules: readonly Schedule[];
+  /** One entry per file that could not be read as a schedule. Shown on `/intake`. */
+  readonly errors: readonly { readonly schedule: string; readonly message: string }[];
 }
 
 /**
@@ -139,6 +182,53 @@ export class SpecParseError extends Error {
   }
 }
 
+/**
+ * One append-only amendment to a task's acceptance criteria (DESIGN.md §12.3).
+ *
+ * `acceptance` is a WHOLE-LIST replacement rather than a positional patch. A positional
+ * diff against an immutable file reads as noise six months later — "replace entry 2"
+ * means nothing without the file open beside it — whereas the full list is the gate,
+ * written out, in the record that changed it.
+ *
+ * Amendments are never merged and never applied in sequence: the highest-numbered one
+ * wins entirely. Merging would resurrect a criterion an earlier amendment deliberately
+ * removed, and there is no way for the writer of amendment 3 to know it was doing that.
+ *
+ * `why` is required. Without it the record is a hand-edited `spec.md` with extra steps.
+ */
+export interface AcceptanceAmendment {
+  /** The `NNN` in the file name, as a number. Monotonically increasing from 1. */
+  readonly index: number;
+  /** The complete replacement acceptance list. */
+  readonly acceptance: readonly string[];
+  /** Why the criteria as filed could not stand. Human-facing, and load-bearing. */
+  readonly why: string;
+  /** Who decided — an operator handle, or the subsystem that filed it. */
+  readonly author: string;
+  /** ISO 8601, stamped by the writer. */
+  readonly at: string;
+}
+
+/**
+ * The keys an amendment file may carry.
+ *
+ * Everything else is refused rather than ignored. `repos` is the forge token's scope, so
+ * changing it is a §9.1 blast-radius decision and not a chat command; `workspace`,
+ * `requires`, `toolchain` and `kind` decide where and how the task runs; and a wrong
+ * prose goal deserves a fresh task with clean history rather than an overlay that makes
+ * the filed document a lie. A file naming one of those is a human asking for something
+ * this mechanism does not do, and answering it with a silent partial application would be
+ * worse than refusing.
+ */
+const AMENDMENT_KEYS: readonly string[] = ["acceptance", "why", "author", "at"];
+
+export class AmendmentParseError extends Error {
+  constructor(task: TaskId, file: string, detail: string) {
+    super(`amendment ${file} for ${task} is invalid: ${detail}`);
+    this.name = "AmendmentParseError";
+  }
+}
+
 interface SpecFrontMatter {
   readonly workspace?: unknown;
   readonly kind?: unknown;
@@ -183,6 +273,82 @@ const requireStringArray = (
     }
     return entry;
   });
+};
+
+/**
+ * One `amendments/NNN.yaml` document.
+ *
+ * Strict in both directions: an unknown key is a refusal (see `AMENDMENT_KEYS`), and a
+ * missing or mistyped known key is too. This file replaces the completion gate of a task
+ * that may already be running, so a field this cannot make sense of must stop the read
+ * rather than be dropped — a partially applied amendment is a gate nobody wrote.
+ */
+const parseAmendment = (
+  value: unknown,
+  task: TaskId,
+  file: string,
+  index: number,
+): AcceptanceAmendment => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new AmendmentParseError(task, file, "not a mapping");
+  }
+
+  const forbidden = Object.keys(value).filter((key) => !AMENDMENT_KEYS.includes(key));
+  if (forbidden.length > 0) {
+    throw new AmendmentParseError(
+      task,
+      file,
+      `an amendment may only replace \`acceptance\` — refusing \`${forbidden.join("`, `")}\`. ` +
+        "Changing repos, workspace, requires, toolchain, kind or the goal needs a new task, " +
+        "not an amendment",
+    );
+  }
+
+  const raw = value as {
+    readonly acceptance?: unknown;
+    readonly why?: unknown;
+    readonly author?: unknown;
+    readonly at?: unknown;
+  };
+
+  if (!Array.isArray(raw.acceptance)) {
+    throw new AmendmentParseError(task, file, "`acceptance` must be a list");
+  }
+  const acceptance = raw.acceptance.map((entry, at) => {
+    if (typeof entry !== "string") {
+      throw new AmendmentParseError(
+        task,
+        file,
+        `\`acceptance[${at}]\` must be a string, got ${typeof entry} ` +
+          `(${JSON.stringify(entry)}) — quote it if YAML is coercing it`,
+      );
+    }
+    return entry;
+  });
+  if (acceptance.length === 0) {
+    // Same rule as `readSpec`: a task with no machine-checkable criteria can never satisfy
+    // §12, so an amendment that emptied the list would make the task uncloseable.
+    throw new AmendmentParseError(
+      task,
+      file,
+      "`acceptance` must list at least one command — an amendment cannot leave a task " +
+        "with nothing the supervisor can run",
+    );
+  }
+
+  for (const field of ["why", "author", "at"] as const) {
+    if (typeof raw[field] !== "string" || raw[field] === "") {
+      throw new AmendmentParseError(task, file, `\`${field}\` must be a non-empty string`);
+    }
+  }
+
+  return {
+    index,
+    acceptance,
+    why: raw.why as string,
+    author: raw.author as string,
+    at: raw.at as string,
+  };
 };
 
 /** `host/owner/name` or `owner/name` (host defaults to github.com). */
@@ -244,6 +410,22 @@ const journalShardName = (session: number, at: Date, runner: string): string => 
   return `${String(session).padStart(4, "0")}-${stamp}-${runner}.md`;
 };
 
+/** The sidecar holding one question's enumerated choices, if it offered any. */
+const optionsFileName = (index: number): string => `${String(index).padStart(3, "0")}-options.json`;
+
+/**
+ * The question a task is currently parked on.
+ *
+ * `options` is present only when the agent enumerated choices (DESIGN.md §7). It is what a
+ * one-press answer resolves against: the button carries an index into this list, because a
+ * `custom_id` has no room for the text.
+ */
+export interface PendingQuestion {
+  readonly index: number;
+  readonly question: string;
+  readonly options?: readonly string[];
+}
+
 /**
  * Every top-level directory the supervisor writes, and therefore the broadest thing a
  * commit may stage.
@@ -257,7 +439,7 @@ const journalShardName = (session: number, at: Date, runner: string): string => 
  * the two lists answer different questions — this one is "what may this commit carry", that
  * one is "what may a refresh destroy".
  */
-const WRITABLE_TREE: readonly string[] = ["tasks", "intake", "digests", "alerts"];
+const WRITABLE_TREE: readonly string[] = ["tasks", "intake", "digests", "alerts", "schedules"];
 
 /** What `pull` moved aside, and where it put it. */
 export interface SalvagedCommits {
@@ -710,7 +892,32 @@ export class StateStore {
     return entries.filter((e) => e.isDirectory()).map((e) => asTaskId(e.name));
   }
 
+  /**
+   * The EFFECTIVE spec: `spec.md` with the newest acceptance amendment applied (§12.3).
+   *
+   * This is the seam every caller already uses, and that is deliberate. An opt-in
+   * `readEffectiveSpec` would be a rule each future call site has to remember, and the
+   * site that forgot would be the one where the verifier ran a criterion a human had
+   * already amended away — exactly the failure amendments exist to prevent. A caller that
+   * genuinely wants the document as filed asks for `readBaseSpec` and says so.
+   */
   async readSpec(task: TaskId): Promise<TaskSpec> {
+    const base = await this.readBaseSpec(task);
+    // Highest number wins ENTIRELY: no merge, no sequential application. See
+    // `AcceptanceAmendment`.
+    const newest = (await this.listAmendments(task)).at(-1);
+    if (newest === undefined) return base;
+    return { ...base, acceptance: newest.acceptance };
+  }
+
+  /**
+   * The spec exactly as filed, with no amendment overlay.
+   *
+   * For a reader that needs the original document rather than the current gate — a page
+   * showing what intake actually wrote, or a diff against an amendment. Not for the
+   * verifier: see `readSpec`.
+   */
+  async readBaseSpec(task: TaskId): Promise<TaskSpec> {
     const raw = await readFile(join(this.taskDir(task), "spec.md"), "utf8");
     const match = FRONT_MATTER.exec(raw);
     if (match === null) throw new SpecParseError(task, "missing YAML front matter");
@@ -781,11 +988,17 @@ export class StateStore {
    * Refuses to overwrite. `spec.md` is immutable, and rewriting the spec of a task that
    * is already running would change its acceptance criteria mid-flight.
    *
+   * When a criterion turns out to be unsatisfiable, the supported route is an
+   * AMENDMENT — `writeAmendment`, which appends `amendments/NNN.yaml` and leaves this
+   * file untouched. Hand-editing `spec.md` in the state repo is not it: it destroys the
+   * record of what the task was actually asked to do, and it is what amendments exist to
+   * replace.
+   *
    * The front matter is serialised with the YAML library rather than concatenated,
    * because the goal is tracker prose: a human can paste `---` or `acceptance:` into an
    * issue body, and hand-built front matter would let that terminate the block early and
    * silently redefine the completion gate. The goal goes strictly after the closing
-   * delimiter, where `readSpec`'s regex takes everything remaining as prose.
+   * delimiter, where `readBaseSpec`'s regex takes everything remaining as prose.
    */
   async writeSpec(spec: TaskSpec): Promise<void> {
     return this.write(`tasks/${spec.id}`, async () => {
@@ -824,6 +1037,92 @@ export class StateStore {
 
       await mkdir(dir, { recursive: true });
       await writeFile(path, `---\n${frontMatter}---\n\n${spec.goal.trim()}\n`, "utf8");
+    });
+  }
+
+  private amendmentDir(task: TaskId): string {
+    return join(this.taskDir(task), "amendments");
+  }
+
+  /**
+   * Every acceptance amendment for a task, oldest first (DESIGN.md §12.3).
+   *
+   * Ordered by number so a caller can take `.at(-1)` for the effective one and `.length`
+   * for how many times the gate has been argued with. Read-only — the numbering rule
+   * stays with `writeAmendment`, as it does for `questions/` and `reviews/`.
+   *
+   * NOT defensive about an unreadable file, unlike `listIntakeRejections`: that listing
+   * feeds a page where one bad record must not cost the rest, whereas this one decides
+   * what the supervisor runs. Skipping a malformed amendment here would silently fall
+   * back to a criterion a human had already amended away.
+   */
+  async listAmendments(task: TaskId): Promise<readonly AcceptanceAmendment[]> {
+    const dir = this.amendmentDir(task);
+    if (!existsSync(dir)) return [];
+
+    const files = (await readdir(dir))
+      .flatMap((name) => {
+        const digits = /^(\d+)\.yaml$/.exec(name)?.[1];
+        return digits === undefined ? [] : [{ name, index: Number.parseInt(digits, 10) }];
+      })
+      .sort((a, b) => a.index - b.index);
+
+    return Promise.all(
+      files.map(async ({ name, index }) =>
+        parseAmendment(parseYaml(await readFile(join(dir, name), "utf8")), task, name, index),
+      ),
+    );
+  }
+
+  /**
+   * Append one acceptance amendment, allocating the next number (DESIGN.md §12.3).
+   *
+   * Append-only: this never rewrites or removes an earlier file, so the directory listing
+   * IS the audit trail of every time the gate was changed and why. The number comes from
+   * the highest one already on disk, which is the same allocation `writeVerdict` and
+   * `writeQuestion` get from their callers — taken here rather than passed in because a
+   * caller that guessed wrong would overwrite somebody's recorded reasoning.
+   *
+   * `spec.md` is not touched. That is the point.
+   */
+  async writeAmendment(
+    task: TaskId,
+    amendment: {
+      readonly acceptance: readonly string[];
+      readonly why: string;
+      readonly author: string;
+    },
+  ): Promise<AcceptanceAmendment> {
+    return this.write(`tasks/${task}`, async () => {
+      const existing = await this.listAmendments(task);
+      const index = (existing.at(-1)?.index ?? 0) + 1;
+      const record: AcceptanceAmendment = {
+        index,
+        acceptance: [...amendment.acceptance],
+        why: amendment.why,
+        author: amendment.author,
+        at: new Date().toISOString(),
+      };
+
+      const dir = this.amendmentDir(task);
+      await mkdir(dir, { recursive: true });
+      const name = `${String(index).padStart(3, "0")}.yaml`;
+      await writeFile(
+        join(dir, name),
+        stringifyYaml({
+          // `index` is the file name and is deliberately not duplicated inside: two places
+          // saying the same number is two places that can disagree.
+          acceptance: [...record.acceptance],
+          why: record.why,
+          author: record.author,
+          at: record.at,
+        }),
+        "utf8",
+      );
+
+      // Read back rather than trusted, for `writeSpec`'s reason: a record this store
+      // cannot parse would be a gate nothing can read, discovered by the verifier.
+      return parseAmendment(parseYaml(await readFile(join(dir, name), "utf8")), task, name, index);
     });
   }
 
@@ -1021,6 +1320,146 @@ export class StateStore {
     return out;
   }
 
+  /**
+   * Every schedule in the state repo, and every file that failed to be one (§22).
+   *
+   * BOTH, in one answer, because they are needed together: the housekeeping pass fires the
+   * ones that parsed and the intake pass shows the ones that did not. A method that threw
+   * on the first bad file would stop a fleet's scheduled work over one typo, which is the
+   * failure the per-file layout exists to prevent.
+   *
+   * A missing `schedules/` is an empty listing rather than an error — the poll loop calls
+   * this every pass and most state repos have never heard of schedules (`readAlertPolicy`'s
+   * reasoning, §20).
+   *
+   * READ ONLY. There is no `writeSchedule`, for the reason there is no `writeAlertPolicy`:
+   * a schedule is authored and committed by a human, which is what keeps "what work happens
+   * unattended" outside the fleet's own reach. The only thing under `schedules/` the
+   * supervisor writes is the occurrence ledger.
+   */
+  async listSchedules(): Promise<ScheduleListing> {
+    const dir = join(this.root, "schedules");
+    if (!existsSync(dir)) return { schedules: [], errors: [] };
+
+    const schedules: Schedule[] = [];
+    const errors: { schedule: string; message: string }[] = [];
+
+    for (const name of (await readdir(dir)).sort()) {
+      // `.yaml` only. An operator's `README.md` beside their schedules is notes, not a
+      // malformed schedule, and reporting it as one would make the errors list unreadable.
+      if (!name.endsWith(".yaml")) continue;
+      const id = name.slice(0, -".yaml".length);
+
+      try {
+        // The id comes from a DIRECTORY LISTING, so it is validated before it is used: it
+        // becomes a task id and a git ref component, and nothing here wrote the file name.
+        if (!isScheduleId(id)) {
+          throw new ScheduleParseError(
+            id,
+            `'${id}' is not a schedule identifier — the file name becomes a task id and a ` +
+              `git ref component, so it must be letters, digits, \`-\` and \`_\` only`,
+          );
+        }
+        schedules.push(parseSchedule(id, await readFile(join(dir, name), "utf8")));
+      } catch (error) {
+        errors.push({
+          schedule: id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return { schedules, errors };
+  }
+
+  private scheduleRecordPath(schedule: string, occurrence: string): string {
+    return join(this.root, "schedules", "occurrences", `${schedule}-${occurrence}.json`);
+  }
+
+  /** What became of one occurrence, or nothing if this runner has never settled it. */
+  async readScheduleRecord(
+    schedule: string,
+    occurrence: string,
+  ): Promise<ScheduleRecord | undefined> {
+    if (!isScheduleId(schedule) || !isOccurrenceId(occurrence)) return undefined;
+    const path = this.scheduleRecordPath(schedule, occurrence);
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(await readFile(path, "utf8")) as ScheduleRecord;
+  }
+
+  async writeScheduleRecord(
+    schedule: string,
+    occurrence: string,
+    record: ScheduleRecord,
+  ): Promise<void> {
+    return this.write("schedules/occurrences", async () => {
+      // Both halves become a file name, and neither is written by this class: the schedule
+      // id is read off a directory listing and the occurrence is computed from a document
+      // an operator wrote. `..` is a legal directory name that resolves out of `schedules/`.
+      if (!isScheduleId(schedule) || !isOccurrenceId(occurrence)) {
+        throw new Error(
+          `'${schedule}' / '${occurrence}' cannot be filed as a schedule occurrence`,
+        );
+      }
+      await mkdir(join(this.root, "schedules", "occurrences"), { recursive: true });
+      await writeFile(
+        this.scheduleRecordPath(schedule, occurrence),
+        `${JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2)}\n`,
+        "utf8",
+      );
+    });
+  }
+
+  /**
+   * The whole occurrence ledger, oldest file name first, for the `/intake` page.
+   *
+   * Defensive in `listAlertRefusals`'s way: one unreadable record must not cost the whole
+   * listing, because a page that renders nothing looks exactly like a fleet that has never
+   * fired a schedule.
+   */
+  async listScheduleRecords(): Promise<readonly ScheduleRecord[]> {
+    const dir = join(this.root, "schedules", "occurrences");
+    if (!existsSync(dir)) return [];
+
+    const out: ScheduleRecord[] = [];
+    for (const name of (await readdir(dir)).sort()) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        out.push(JSON.parse(await readFile(join(dir, name), "utf8")) as ScheduleRecord);
+      } catch {
+        continue;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * How many tasks this schedule has open right now (§22).
+   *
+   * "Open" is `!isTerminal(status)` — the supervisor's one notion of task status, and
+   * deliberately not a second one invented here. A `parked` task counts as closed, exactly
+   * as it does for an alert (§20): it is waiting on a human, and the next occurrence is the
+   * nudge that should be allowed to open fresh work rather than be suppressed by a task
+   * nobody is working on.
+   *
+   * Counted from the TASK TREE rather than from the ledger, because a schedule's task ids
+   * carry the schedule's name (`SCHED-<schedule>-<occurrence>`) and a task deleted by hand
+   * should free its slot rather than wedge the schedule forever. The alert path has to join
+   * through its ledger only because a fingerprint is a hash and does not carry its name.
+   */
+  async countOpenScheduleTasks(schedule: string): Promise<number> {
+    if (!isScheduleId(schedule)) return 0;
+    const prefix = `${SCHEDULE_TASK_PREFIX}${schedule}-`;
+
+    let open = 0;
+    for (const task of await this.listTasks()) {
+      if (!task.startsWith(prefix)) continue;
+      const state = await this.tryReadState(task).catch(() => undefined);
+      if (state !== undefined && !isTerminal(state.status)) open += 1;
+    }
+    return open;
+  }
+
   async readState(task: TaskId): Promise<TaskState> {
     const raw = await readFile(join(this.taskDir(task), "state.json"), "utf8");
     return JSON.parse(raw) as TaskState;
@@ -1185,7 +1624,7 @@ export class StateStore {
   }
 
   /** Unanswered question, if the task is parked waiting on one. */
-  async pendingQuestion(task: TaskId): Promise<{ readonly index: number; readonly question: string } | undefined> {
+  async pendingQuestion(task: TaskId): Promise<PendingQuestion | undefined> {
     const dir = join(this.taskDir(task), "questions");
     if (!existsSync(dir)) return undefined;
     const files = await readdir(dir);
@@ -1197,7 +1636,34 @@ export class StateStore {
     const answer = `${String(index).padStart(3, "0")}-answer.md`;
     if (files.includes(answer)) return undefined;
 
-    return { index, question: await readFile(join(dir, last), "utf8") };
+    const options = await this.questionOptions(task, index);
+    return {
+      index,
+      question: await readFile(join(dir, last), "utf8"),
+      ...(options === undefined ? {} : { options }),
+    };
+  }
+
+  /**
+   * The choices a question offered, when it offered any.
+   *
+   * Undefined covers three cases on purpose — no sidecar, an unreadable one, and one whose
+   * contents are not a list of strings — because the answer to all three is the same: offer
+   * the free-text path only. The question is the record and the sidecar is a convenience, so
+   * a half-written file must cost the buttons rather than the ability to answer at all.
+   */
+  private async questionOptions(task: TaskId, index: number): Promise<readonly string[] | undefined> {
+    const path = join(this.taskDir(task), "questions", optionsFileName(index));
+    if (!existsSync(path)) return undefined;
+
+    try {
+      const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+      if (!Array.isArray(parsed)) return undefined;
+      if (!parsed.every((entry): entry is string => typeof entry === "string")) return undefined;
+      return parsed.length === 0 ? undefined : parsed;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -1258,12 +1724,31 @@ export class StateStore {
     );
   }
 
-  async writeQuestion(task: TaskId, index: number, question: string): Promise<void> {
+  /**
+   * Record a question, and the enumerated choices it offers if it offers any.
+   *
+   * The options go in a sidecar rather than into the markdown, because they are read back
+   * by a button press and parsed — a list embedded in agent-authored prose would have to be
+   * recovered from it, and the recovery would be a guess.
+   */
+  async writeQuestion(
+    task: TaskId,
+    index: number,
+    question: string,
+    options?: readonly string[],
+  ): Promise<void> {
     return this.write(`tasks/${task}`, async () => {
       const dir = join(this.taskDir(task), "questions");
       await mkdir(dir, { recursive: true });
       const name = `${String(index).padStart(3, "0")}-question.md`;
       await writeFile(join(dir, name), `${question.trim()}\n`, "utf8");
+      if (options !== undefined && options.length > 0) {
+        await writeFile(
+          join(dir, optionsFileName(index)),
+          `${JSON.stringify(options, null, 2)}\n`,
+          "utf8",
+        );
+      }
     });
   }
 
@@ -1760,7 +2245,12 @@ export class StateStore {
     // while existing nowhere in git, so no other runner agrees and no operator can see
     // why the notification stopped (§20). `policy.yaml` is tracked, so the sweep cannot
     // touch it.
-    for (const path of ["tasks", "intake", "alerts"]) {
+    //
+    // `schedules/` is swept on the same terms and for the same reason (§22): an occurrence
+    // record whose commit never landed says "this occurrence is settled" on one runner and
+    // nowhere else, so the ledger a human reads disagrees with the ledger that stopped the
+    // work. The operator's `schedules/*.yaml` are tracked, so the sweep cannot touch them.
+    for (const path of ["tasks", "intake", "alerts", "schedules"]) {
       if (existsSync(join(this.root, path))) await this.git.run("clean", "-ffdq", path);
     }
     return true;

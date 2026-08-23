@@ -410,6 +410,53 @@ test("a repo the task does not have is refused in prose, and the refusal says wh
   assert.match(text, /acme\/widget, acme\/widget-extension/, "it must name what IS allowed");
 });
 
+test("ask_human carries enumerated options through to the control signal", async () => {
+  // The options are what become one-press buttons in Discord (§7). They travel on the
+  // signal because the supervisor, not the tool, owns the state repo the text is stored in.
+  const { ctx, control } = harness();
+
+  await call(controlTools(ctx), "ask_human", {
+    question: "Which migration path?",
+    options: ["Use the existing one", "Write a new one"],
+  });
+
+  assert.equal(control.signal?.reason, "ask-human");
+  assert.deepEqual(control.signal?.questionOptions, ["Use the existing one", "Write a new one"]);
+});
+
+test("ask_human without options leaves the signal carrying none", async () => {
+  const { ctx, control } = harness();
+
+  await call(controlTools(ctx), "ask_human", { question: "What is the retention policy?" });
+
+  assert.equal(control.signal?.questionOptions, undefined);
+});
+
+test("more than five options is refused at the tool boundary, not truncated", async () => {
+  // Five is Discord's buttons-per-row limit (`row` throws above it), so a sixth option
+  // cannot be rendered at all. Truncating would silently drop a choice the human should
+  // have had; the refusal is text the model can act on inside the same turn, like `open_pr`'s.
+  const { ctx, control } = harness();
+
+  const text = await call(controlTools(ctx), "ask_human", {
+    question: "Which one?",
+    options: ["a", "b", "c", "d", "e", "f"],
+  });
+
+  assert.equal(control.signal, undefined, "a refused question must not end the session");
+  assert.match(text, /at most 5/);
+  assert.match(text, /6/, "the refusal should say how many were offered");
+});
+
+test("the ask_human description tells the agent when to use options", () => {
+  const { ctx } = harness();
+  const ask = controlTools(ctx).find((tool) => tool.name === "ask_human");
+  assert.ok(ask !== undefined);
+
+  assert.match(ask.description, /options/);
+  assert.match(ask.description, /prose/, "it must say what NOT to enumerate");
+});
+
 test("a bare repo name is accepted — the host is not the agent's to type", async () => {
   // `spec.repos` is one workspace, so one forge and one host (§3.1). Demanding `github.com/`
   // in front of what every other surface calls `owner/name` is friction with nothing behind it.

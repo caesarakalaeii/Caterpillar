@@ -12,7 +12,7 @@ import { asTaskId } from "../domain/task.ts";
 import { parseCommand } from "./commands.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, type Interaction } from "./interactions.ts";
-import { ANSWER_FIELD, COMMANDS, parseInteraction, repoChoices } from "./slash.ts";
+import { ANSWER_FIELD, COMMANDS, DONE_REASON_FIELD, parseInteraction, repoChoices } from "./slash.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
 
@@ -70,6 +70,38 @@ test("the Answer button opens a modal rather than writing anything", () => {
   assert.deepEqual(
     parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
     { kind: "open-answer-modal", task: TASK },
+  );
+});
+
+test("an option button becomes an answer-option command carrying the index", () => {
+  // The index and not the text: the text is stored beside the question, because a
+  // `custom_id` holds 100 characters and the task id has spent most of them.
+  const customId = encodeCustomId({ verb: "opt", task: TASK, arg: "2" });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+    { kind: "run", command: { kind: "answer-option", task: TASK, option: 2 } },
+  );
+});
+
+test("an option button with no usable index is ignored, never answered as option 0", () => {
+  // `arg` is free-form text off the wire. Defaulting it would answer the question with
+  // whatever the first option happens to be, which is a choice the human did not make.
+  for (const arg of ["", "first", "-1", "1.5"]) {
+    const customId = encodeCustomId({ verb: "opt", task: TASK, arg });
+    assert.ok(customId !== undefined);
+    const intent = parseInteraction(
+      interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+    );
+    assert.equal(intent.kind, "ignored", `\`${arg}\` was not refused`);
+  }
+
+  const bare = encodeCustomId({ verb: "opt", task: TASK });
+  assert.ok(bare !== undefined);
+  assert.equal(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: bare } })).kind,
+    "ignored",
   );
 });
 
@@ -142,6 +174,92 @@ test("/cancel parks", () => {
     parseInteraction(interaction({ data: { name: "cancel", options: [{ name: "task", value: TASK }] } })),
     { kind: "run", command: { kind: "park", task: TASK } },
   );
+});
+
+test("/done carries the reason a human gave for forcing it", () => {
+  // The reason is the whole audit trail: `/done` bypasses both §12 gates, so a forced
+  // completion with no stated cause is a task that reads as verified and is not.
+  assert.deepEqual(
+    parseInteraction(
+      interaction({
+        data: {
+          name: "done",
+          options: [
+            { name: "task", value: TASK },
+            { name: "reason", value: "  the feature was dropped from the roadmap  " },
+          ],
+        },
+      }),
+    ),
+    {
+      kind: "run",
+      command: {
+        kind: "force-done",
+        task: TASK,
+        reason: "the feature was dropped from the roadmap",
+      },
+    },
+  );
+});
+
+test("/done with no reason is refused rather than written", () => {
+  const intent = parseInteraction(
+    interaction({
+      data: { name: "done", options: [{ name: "task", value: TASK }, { name: "reason", value: "  " }] },
+    }),
+  );
+
+  assert.equal(intent.kind, "run");
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+  assert.match(command?.kind === "malformed" ? command.reason : "", /reason/);
+});
+
+test("the Mark done button opens a modal rather than forcing anything", () => {
+  // A button cannot carry the reason, and the reason is required — so the click has to
+  // ask for it. Nothing is written by the click itself.
+  const customId = encodeCustomId({ verb: "done", task: TASK });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+    { kind: "open-done-modal", task: TASK },
+  );
+});
+
+test("the Mark done modal produces the same command as /done", () => {
+  const customId = encodeCustomId({ verb: "done", task: TASK });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(
+      interaction({
+        type: INTERACTION.modalSubmit,
+        data: {
+          custom_id: customId,
+          components: [{ components: [{ custom_id: DONE_REASON_FIELD, value: " obsolete " }] }],
+        },
+      }),
+    ),
+    { kind: "run", command: { kind: "force-done", task: TASK, reason: "obsolete" } },
+  );
+});
+
+test("a Mark done modal submitted with no reason is refused", () => {
+  const customId = encodeCustomId({ verb: "done", task: TASK });
+  assert.ok(customId !== undefined);
+
+  const intent = parseInteraction(
+    interaction({
+      type: INTERACTION.modalSubmit,
+      data: {
+        custom_id: customId,
+        components: [{ components: [{ custom_id: DONE_REASON_FIELD, value: "   " }] }],
+      },
+    }),
+  );
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
 });
 
 test("a client that submits the suggestion's LABEL still names the task", () => {
@@ -408,6 +526,16 @@ test("in a thread a command needs no task id — the thread is the id", () => {
   }
 });
 
+test("/done in a task's own thread needs only the reason", () => {
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ data: { name: "done", options: [{ name: "reason", value: "obsolete" }] } }),
+      { thread: TASK },
+    ),
+    { kind: "run", command: { kind: "force-done", task: TASK, reason: "obsolete" } },
+  );
+});
+
 test("an explicit id beats the thread's own task", () => {
   // `/answer` from inside a thread is how a different task is answered without leaving it
   // (§7.1), and the same has to hold for every other command or the option is a lie.
@@ -454,6 +582,7 @@ test("every command that names one task can be told which by its thread", () => 
     ["resume", "task"],
     ["cancel", "task"],
     ["task", "id"],
+    ["done", "task"],
   ]);
   for (const command of COMMANDS) {
     const name = command["name"] as string;

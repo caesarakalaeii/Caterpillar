@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -24,8 +24,13 @@ import type { RepoReach } from "../forge/reach.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { Git } from "../state/git.ts";
 import { StateStore } from "../state/store.ts";
-import type { Tracker, TrackerItem, TrackerTransition } from "../tracker/types.ts";
-import { Ingester, intakeDue, intakeRef } from "./ingest.ts";
+import type {
+  Tracker,
+  TrackerCreateRequest,
+  TrackerItem,
+  TrackerTransition,
+} from "../tracker/types.ts";
+import { Ingester, intakeDue, intakeRef, type ToolchainCheck } from "./ingest.ts";
 
 const WORKSPACE = asWorkspaceName("primary");
 const roots: string[] = [];
@@ -41,7 +46,7 @@ const HERMETIC: NodeJS.ProcessEnv = {
 };
 
 /** A real state repo with a real origin, so pushes can be asserted on the remote. */
-const stateRepo = async (): Promise<{ store: StateStore; origin: Git }> => {
+const stateRepo = async (): Promise<{ store: StateStore; origin: Git; root: string }> => {
   const root = await mkdtemp(join(tmpdir(), "caterpillar-intake-"));
   const originPath = await mkdtemp(join(tmpdir(), "caterpillar-intake-origin-"));
   roots.push(root, originPath);
@@ -59,7 +64,7 @@ const stateRepo = async (): Promise<{ store: StateStore; origin: Git }> => {
   await git.run("commit", "--quiet", "-m", "seed");
   await git.run("push", "--quiet", "origin", "HEAD:main");
 
-  return { store: new StateStore(root, git), origin };
+  return { store: new StateStore(root, git), origin, root };
 };
 
 class FakeTracker implements Tracker {
@@ -90,6 +95,11 @@ class FakeTracker implements Tracker {
     return Promise.resolve();
   }
 
+  create(_request: TrackerCreateRequest): Promise<TrackerRef> {
+    // Intake only ever READS from a tracker; filing is a supervisor path elsewhere.
+    return Promise.reject(new Error("FakeTracker does not file items"));
+  }
+
   transition(_ref: TrackerRef, _t: TrackerTransition, _task: TaskId): Promise<void> {
     return Promise.resolve();
   }
@@ -109,6 +119,7 @@ const ingesterFor = (
   store: StateStore,
   trackers: ReadonlyMap<WorkspaceName, Tracker>,
   forges?: ReadonlyMap<WorkspaceName, RepoReach>,
+  toolchainDoctor?: ToolchainCheck,
 ): Ingester =>
   new Ingester({
     store,
@@ -119,6 +130,7 @@ const ingesterFor = (
     logger: SILENT_LOGGER,
     maxSessionsPerTask: 20,
     ...(forges === undefined ? {} : { forges }),
+    ...(toolchainDoctor === undefined ? {} : { toolchainDoctor }),
   });
 
 /** A forge that can reach everything except the repos it is told about. */
@@ -311,11 +323,15 @@ test("a pass reports what it saw, not only what it created", async () => {
   const tracker = new FakeTracker([item(VALID, "1"), item("no block here", "2")]);
   const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]));
 
+  // Whole-object comparisons, so a field added to `IntakePass` has to be accounted for
+  // here rather than quietly ignored: the counts are what a page and a metric read.
   assert.deepEqual(await subject.ingest("origin", "main"), {
     seen: 2,
     created: 1,
     rejected: 1,
     failed: 0,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 
   // Second pass: both items still come back from the tracker, and neither does anything.
@@ -324,6 +340,8 @@ test("a pass reports what it saw, not only what it created", async () => {
     created: 0,
     rejected: 0,
     failed: 0,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 });
 
@@ -339,6 +357,8 @@ test("a tracker that cannot be listed is counted, not silently dropped", async (
     created: 0,
     rejected: 0,
     failed: 1,
+    schedules: 0,
+    schedulesInvalid: 0,
   });
 });
 
@@ -525,4 +545,130 @@ test("a forge that cannot answer lets the item through rather than refusing it",
   );
 
   assert.equal((await subject.ingest("origin", "main")).created, 1, "fail open, as everywhere");
+});
+
+test("a malformed schedule is refused on the intake pass, not at 09:00", async () => {
+  // §22: a schedule that cannot be parsed must be reported while somebody is looking at
+  // the commit that introduced it. Discovered at firing time instead, the symptom is a
+  // runner that wakes up, finds nothing it can do and says so to nobody.
+  const { store, root } = await stateRepo();
+  const good = [
+    "version: 1",
+    "trigger:",
+    '  cron: "0 9 * * 1-5"',
+    "  timezone: Europe/Berlin",
+    "workspace: primary",
+    "repos:",
+    "  - github.com/acme/widget",
+    "prompt: audit the dependencies",
+    "acceptance:",
+    "  - npm test",
+    "",
+  ].join("\n");
+
+  await mkdir(join(root, "schedules"), { recursive: true });
+  await writeFile(join(root, "schedules", "deps-audit.yaml"), good, "utf8");
+  await writeFile(
+    join(root, "schedules", "broken.yaml"),
+    good.replace("acceptance:", "acceptence:"),
+    "utf8",
+  );
+
+  const warnings: { readonly event: string; readonly fields: Record<string, unknown> }[] = [];
+  const subject = new Ingester({
+    store,
+    trackers: new Map(),
+    scopes: new Map(),
+    logger: {
+      ...SILENT_LOGGER,
+      warn: (event, fields) => warnings.push({ event, fields: fields ?? {} }),
+    },
+    maxSessionsPerTask: 20,
+  });
+
+  const pass = await subject.ingest("origin", "main");
+
+  assert.equal(pass.schedulesInvalid, 1, "one file, and only the broken one");
+  assert.equal(pass.schedules, 1, "the schedule that parsed is counted too");
+  assert.deepEqual(
+    warnings.map((entry) => entry.event),
+    ["intake.schedule-invalid"],
+  );
+  assert.equal(warnings[0]?.fields["schedule"], "broken");
+  assert.match(String(warnings[0]?.fields["reason"]), /unknown key/);
+});
+
+/* ------------------------------------------------------ the toolchain doctor */
+
+/** An item declaring a nix toolchain with one named package. */
+const withToolchain = (packages: readonly string[]): string =>
+  [
+    "```agent",
+    "toolchain:",
+    "  mode: nix",
+    "  packages:",
+    ...packages.map((name) => `    - ${name}`),
+    "acceptance:",
+    '  - "npm test"',
+    "```",
+  ].join("\n");
+
+test("an item whose toolchain names an unresolvable package is refused once", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: async () => "`lua51` — did you mean `lua5_1`?",
+  });
+
+  const pass = await subject.ingest("origin", "main");
+  assert.equal(pass.created, 0);
+  assert.equal(pass.rejected, 1);
+  assert.deepEqual(await store.listTasks(), []);
+  assert.match(tracker.comments[0]?.text ?? "", /lua5_1/);
+
+  // Suppressed like every other refusal (§14.2), or the item collects a comment per poll.
+  await subject.ingest("origin", "main");
+  assert.equal(tracker.comments.length, 1, "one comment, however many passes run");
+});
+
+test("a doctor that cannot evaluate lets the item through", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  // A runner with no nix, or an evaluation that timed out. Not evidence of a bad name.
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: async () => undefined,
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "fail open, as everywhere");
+  assert.equal(tracker.comments.length, 0);
+});
+
+test("a doctor that throws lets the item through", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(withToolchain(["lua51"]))]);
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: () => Promise.reject(new Error("nix exploded")),
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1, "a throw refuses nothing");
+  assert.equal(tracker.comments.length, 0);
+});
+
+test("an item declaring no toolchain is never handed to the doctor", async () => {
+  const { store } = await stateRepo();
+  const tracker = new FakeTracker([item(VALID)]);
+  // Counted rather than `assert.fail()`ed. A throw from inside the doctor lands in
+  // `toolchainReason`'s catch, which fails open by design and swallows it — so the
+  // obvious version of this test passed even with the `declared === undefined` guard
+  // deleted, which is the one thing it exists to detect.
+  let calls = 0;
+  const subject = ingesterFor(store, new Map([[WORKSPACE, tracker]]), undefined, {
+    fault: () => {
+      calls += 1;
+      return Promise.resolve(undefined);
+    },
+  });
+
+  assert.equal((await subject.ingest("origin", "main")).created, 1);
+  assert.equal(calls, 0, "an item with no toolchain must not reach the doctor");
 });

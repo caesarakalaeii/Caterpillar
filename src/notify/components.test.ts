@@ -9,6 +9,7 @@ import { test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
 import {
   answerModal,
+  doneModal,
   BUTTON_STYLE,
   button,
   COMPONENT,
@@ -19,6 +20,7 @@ import {
   linkButton,
   row,
   rows,
+  type Verb,
 } from "./components.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
@@ -111,6 +113,29 @@ test("acknowledging a click disables every button on the message", () => {
       assert.equal((component as { readonly disabled?: boolean }).disabled, true);
     }
   }
+});
+
+test("every verb the type allows also decodes at runtime", () => {
+  // The union and the `VERBS` array behind `isVerb` are parallel by hand, so a verb added
+  // to one and not the other type-checks and then decodes as "unrecognised button" in
+  // front of whoever pressed it.
+  const verbs: readonly Verb[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
+  for (const verb of verbs) {
+    const encoded = encodeCustomId({ verb, task: TASK });
+    assert.ok(encoded !== undefined, verb);
+    assert.deepEqual(decodeCustomId(encoded), { verb, task: TASK }, verb);
+  }
+});
+
+test("the Mark done modal carries the task and asks for a reason", () => {
+  const modal = doneModal(TASK, "reason");
+  assert.ok(modal !== undefined);
+  assert.deepEqual(decodeCustomId(modal.custom_id), { verb: "done", task: TASK });
+
+  const field = modal.components[0]?.components[0];
+  assert.equal(field?.custom_id, "reason");
+  assert.equal(field?.type, COMPONENT.textInput);
+  assert.equal((field as { readonly required?: boolean }).required, true);
 });
 
 test("the answer modal carries the task it will answer", () => {

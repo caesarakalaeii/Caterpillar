@@ -327,6 +327,18 @@ export class GitHubApiError extends Error {
   }
 }
 
+/**
+ * Did this settled request fail because the ref it named is not there?
+ *
+ * 404 and 422 both, because GitHub is not consistent about which one an unknown ref gets:
+ * the check-runs endpoint answers 422 `No commit found for SHA: <ref>` while others answer
+ * 404, and a deleted branch is the same fact either way. Nothing wider — see `checks`.
+ */
+const isUnknownRef = (settled: PromiseSettledResult<unknown>): boolean =>
+  settled.status === "rejected" &&
+  settled.reason instanceof GitHubApiError &&
+  (settled.reason.status === 404 || settled.reason.status === 422);
+
 class GitHubAppForge implements Forge {
   readonly kind = "github";
   private cached: GitCredential | undefined;
@@ -441,16 +453,44 @@ class GitHubAppForge implements Forge {
    * Queries check-runs AND the legacy combined status: GitHub Actions reports via
    * check-runs, while many external CI services still only post statuses. Consulting
    * one alone silently reports "no CI" for half the ecosystem.
+   *
+   * **A ref that does not exist reports no signal; it is not a transport failure.** GitHub
+   * answers 422 `No commit found for SHA: <ref>` (sometimes 404) for a branch that has been
+   * deleted, which is what merging a pull request through the UI does by default. This threw,
+   * so the one question being asked failed the whole session:
+   * `BS-1540288291008684052-04` landed as `caesarakalaeii/all-chat#748`, and every session
+   * after it died here with all of its acceptance criteria passing on the default branch.
+   * `conclusion: "none"` is already the vocabulary for "nothing reported for this ref", and a
+   * ref that is not there reports nothing.
+   *
+   * Narrow deliberately, in two directions. Only 422 and 404 — a 500 genuinely is a broken
+   * API and must never be read as "no CI", because the gate passes on `none`. And only when
+   * BOTH endpoints say they cannot find it: one of them failing while the other answers
+   * normally is a statement about that request rather than about a missing branch, and half
+   * the CI signal must not be dropped on it silently.
    */
   async checks(repo: RepoRef, ref: string): Promise<CheckStatus> {
     assertInScope(repo, this.allowed);
 
-    const [runs, combined] = await Promise.all([
+    const [runs, combined] = await Promise.allSettled([
       this.checkRuns(repo, ref),
       this.api<CombinedStatusResponse>(repo, `/repos/${repo.owner}/${repo.name}/commits/${ref}/status`),
     ]);
 
-    return summarise(runs, combined);
+    if (isUnknownRef(runs) && isUnknownRef(combined)) {
+      return {
+        conclusion: "none",
+        summary: `ref '${ref}' does not exist, so it reports no checks or statuses`,
+        refAbsent: true,
+      };
+    }
+
+    // The first rejection, and it is the original error rather than a summary: a 500 or a
+    // truncated check-run list is what the caller needs to read.
+    if (runs.status === "rejected") throw runs.reason;
+    if (combined.status === "rejected") throw combined.reason;
+
+    return summarise(runs.value, combined.value);
   }
 
   /**

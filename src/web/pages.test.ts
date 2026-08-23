@@ -9,8 +9,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { render } from "./html.ts";
-import { bytes, fleetPage, intakePage, runnerPage } from "./pages.ts";
-import type { DiskView, FleetView, IntakeView, RunnerExport } from "./view.ts";
+import { bytes, fleetPage, intakePage, runnerPage, taskPage } from "./pages.ts";
+import type { DiskView, FleetView, IntakeView, RunnerExport, TaskDetail } from "./view.ts";
 import { asTaskId, asWorkspaceName } from "../domain/task.ts";
 
 const EXPORT: RunnerExport = {
@@ -148,6 +148,10 @@ const INTAKE: IntakeView = {
   policy: [],
   policyMissing: true,
   receiver: { enabled: false, port: 8081, clusterEnabled: false, namespaces: [] },
+  schedules: [],
+  scheduleErrors: [],
+  occurrences: [],
+  scheduling: false,
 };
 
 test("the intake page escapes an alert annotation that tries to be markup", async () => {
@@ -275,4 +279,118 @@ test("the fleet page carries one line saying when intake last ran", async () => 
     }),
   );
   assert.match(skipped, /another runner served this interval/);
+});
+
+test("the intake page shows a malformed schedule, and says which runner fires them", async () => {
+  // A schedule that will not parse is refused when it is committed (§22) — and until this
+  // page showed it, that refusal was a warn line in one pod's stdout. The other half is
+  // the switch: a fleet where nothing has `schedule.enabled` fires nothing, and an empty
+  // occurrence ledger is exactly what that looks like.
+  const page = render(
+    intakePage({
+      ...INTAKE,
+      scheduling: false,
+      schedules: [],
+      scheduleErrors: [
+        {
+          schedule: "deps-audit",
+          message: "schedules/deps-audit.yaml is invalid: `acceptance` must list at least one command",
+        },
+      ],
+      occurrences: [],
+    }),
+  );
+
+  assert.match(page, /deps-audit/);
+  assert.match(page, /must list at least one command/);
+  assert.match(page, /<code>schedule\.enabled<\/code> is false/);
+});
+
+test("a skipped occurrence is shown with its reason, so a quiet schedule is legible", async () => {
+  // The whole point of recording a skip: "the precheck said no" and "nothing is polling
+  // this schedule" produce the same number of tasks, and only the ledger tells them apart.
+  const page = render(
+    intakePage({
+      ...INTAKE,
+      scheduling: true,
+      schedules: [
+        {
+          id: "deps-audit",
+          version: 1,
+          trigger: { cron: "0 9 * * 1-5", timeZone: "Europe/Berlin" },
+          workspace: asWorkspaceName("primary"),
+          repos: [{ host: "github.com", owner: "acme", name: "widget" }],
+          prompt: "audit the dependencies",
+          acceptance: ["npm test"],
+          requires: [],
+          enabled: true,
+          maxOpenTasks: 1,
+        },
+      ],
+      occurrences: [
+        {
+          schedule: "deps-audit",
+          occurrence: "2026-08-17T0700Z",
+          outcome: "skipped",
+          detail: "exit 1: <script>alert('x')</script>",
+          at: "2026-08-17T07:00:04.000Z",
+        },
+      ],
+    }),
+  );
+
+  assert.match(page, /0 9 \* \* 1-5/);
+  assert.match(page, /Europe\/Berlin/);
+  assert.match(page, /skipped/);
+  assert.doesNotMatch(page, /<script>alert/, "a precheck's output is untrusted like any other");
+});
+
+/**
+ * The artifacts section, now that a gate's rendered output arrives through it.
+ *
+ * `web/server.test.ts` already pins the response — `application/octet-stream`, as an
+ * attachment, because agent-authored bytes rendered as a document on the origin that also
+ * serves every transcript would be script (invariant 8). What is pinned here is the other
+ * end of the same rule: the LINK must not invite a browser to navigate to those bytes.
+ */
+const detailWith = (artifacts: readonly string[]): TaskDetail => ({
+  id: asTaskId("TASK-9"),
+  title: "TASK-9",
+  state: {
+    id: asTaskId("TASK-9"),
+    status: "done",
+    phase: "verifying",
+    requires: [],
+    sessions: 1,
+    limits: { maxSessions: 20 },
+    usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    progress: { lastProgressSession: 1, noProgressStreak: 0 },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  },
+  questions: [],
+  verdicts: [],
+  artifacts,
+  sessions: [1],
+});
+
+test("an artifact link downloads rather than navigating to agent-authored bytes", () => {
+  const rendered = render(taskPage(detailWith(["shot.png"])));
+
+  assert.match(rendered, /href="\/tasks\/TASK-9\/artifacts\/shot\.png"/);
+  assert.match(rendered, /download/, "a browser must save it, not open it on this origin");
+});
+
+test("the artifacts section says these are downloads and where they came from", () => {
+  // An operator looking at `shot.png` in a list of chips has no way to know whether
+  // clicking it renders a page. The answer is no, deliberately, and the page should say
+  // so rather than leave the reader to find out by clicking.
+  const rendered = render(taskPage(detailWith(["shot.png"])));
+
+  assert.match(rendered, /acceptance gate/i);
+  assert.match(rendered, /download/i);
+});
+
+test("a task with no artifacts gets no artifacts section", () => {
+  assert.doesNotMatch(render(taskPage(detailWith([]))), /Artifacts/);
 });

@@ -40,6 +40,9 @@ const OPTION_INTEGER = 4;
 /** The modal's single field. Its id is ours to choose and must round-trip on submit. */
 export const ANSWER_FIELD = "text";
 
+/** The `/done` modal's single field. Same contract as `ANSWER_FIELD`. */
+export const DONE_REASON_FIELD = "reason";
+
 const STATUSES: readonly TaskStatus[] = [
   "ready",
   "running",
@@ -151,6 +154,27 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
       },
     ],
   },
+  {
+    name: "done",
+    description: "Mark a task done by hand, without merging and without checking the gates",
+    options: [
+      {
+        name: "task",
+        description: "Task id. Optional in a task's own thread.",
+        type: OPTION_STRING,
+        required: false,
+        autocomplete: true,
+      },
+      {
+        // Required, and the one option here that cannot be defaulted from anywhere: a
+        // forced completion with no stated cause is a `done` nobody can audit.
+        name: "reason",
+        description: "Why it is done without being verified — obsolete, superseded, …",
+        type: OPTION_STRING,
+        required: true,
+      },
+    ],
+  },
 ];
 
 
@@ -163,6 +187,8 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
 export type Intent =
   | { readonly kind: "run"; readonly command: Command }
   | { readonly kind: "open-answer-modal"; readonly task: TaskId }
+  /** The Mark done button: the reason it requires has to be typed somewhere. */
+  | { readonly kind: "open-done-modal"; readonly task: TaskId }
   /**
    * A box being typed into. `field` says WHICH box, because the two are answered from
    * different places: a task id from the in-memory snapshot, a repo from the workspace's
@@ -355,6 +381,11 @@ const fromCommand = (interaction: Interaction, context: InteractionContext): Int
       const task = taskOption(interaction, "task", context);
       return isTaskId(task) ? { kind: "run", command: { kind: "resume", task } } : malformed(task);
     }
+    case "done": {
+      const task = taskOption(interaction, "task", context);
+      if (!isTaskId(task)) return malformed(task);
+      return forceDone(task, optionValue(interaction, "reason"));
+    }
     case "brainstorm": {
       const topic = optionValue(interaction, "topic")?.trim() ?? "";
       const repo = optionValue(interaction, "repo")?.trim() ?? "";
@@ -392,12 +423,24 @@ const fromComponent = (interaction: Interaction): Intent => {
   switch (action.verb) {
     case "ans":
       return { kind: "open-answer-modal", task: action.task };
+    case "opt": {
+      // `arg` is text off the wire, so an index that is not a non-negative whole number is
+      // ignored rather than coerced. Defaulting to 0 would answer the question with whatever
+      // the first option happens to be, which is a choice the human never made.
+      const option = Number(action.arg);
+      if (action.arg === undefined || action.arg === "" || !Number.isSafeInteger(option) || option < 0) {
+        return { kind: "ignored", reason: "option button without a usable index" };
+      }
+      return { kind: "run", command: { kind: "answer-option", task: action.task, option } };
+    }
     case "park":
       return { kind: "run", command: { kind: "park", task: action.task } };
     case "merge":
       return { kind: "run", command: { kind: "merge", task: action.task } };
     case "res":
       return { kind: "run", command: { kind: "resume", task: action.task } };
+    case "done":
+      return { kind: "open-done-modal", task: action.task };
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }
@@ -406,13 +449,33 @@ const fromComponent = (interaction: Interaction): Intent => {
 const fromModal = (interaction: Interaction): Intent => {
   const customId = interaction.data?.custom_id;
   const action = customId === undefined ? undefined : decodeCustomId(customId);
-  if (action === undefined || action.verb !== "ans") {
-    return { kind: "ignored", reason: "unrecognised modal" };
+  if (action === undefined) return { kind: "ignored", reason: "unrecognised modal" };
+
+  if (action.verb === "done") {
+    return forceDone(action.task, modalValue(interaction, DONE_REASON_FIELD));
   }
+  if (action.verb !== "ans") return { kind: "ignored", reason: "unrecognised modal" };
 
   const text = modalValue(interaction, ANSWER_FIELD)?.trim() ?? "";
   if (text.length === 0) return malformed(`An answer for \`${action.task}\` cannot be empty.`);
   return { kind: "run", command: { kind: "answer", task: action.task, text } };
+};
+
+/**
+ * `/done` and its modal, which differ only in where the reason came from.
+ *
+ * Shared so the refusal cannot drift between them: an empty reason has to be refused on
+ * both paths, or the button becomes the way to force a task done without saying why.
+ */
+const forceDone = (task: TaskId, rawReason: string | undefined): Intent => {
+  const reason = rawReason?.trim() ?? "";
+  if (reason.length === 0) {
+    return malformed(
+      `Forcing \`${task}\` done skips both acceptance gates, so it needs a \`reason\` — ` +
+        `say what makes it done without being verified.`,
+    );
+  }
+  return { kind: "run", command: { kind: "force-done", task, reason } };
 };
 
 const isStatus = (value: string): value is TaskStatus =>

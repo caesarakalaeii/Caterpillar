@@ -13,6 +13,7 @@
  * The two halves stay independent: an unsealed webhook costs notifications, not replies,
  * and a missing bot token costs buttons, not the channel.
  */
+import type { TaskId } from "../domain/task.ts";
 import {
   messagePayload,
   type MessageOptions,
@@ -22,6 +23,7 @@ import {
   renderParts,
 } from "./discord.ts";
 import { type FetchLike, postJson } from "./http.ts";
+import { MessageIndex, taskFromContent } from "./messages.ts";
 import type { ThreadIndex } from "./threads.ts";
 
 export const API_BASE = "https://discord.com/api/v10";
@@ -40,6 +42,15 @@ export interface BotOptions {
   readonly fetch?: FetchLike;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly apiBase?: string;
+  /**
+   * Where a task-scoped message this bot posts is remembered, for reply targeting (§7.3).
+   *
+   * Absent is the production shape: one is created here, and every reader goes through
+   * `taskForMessage` on this same instance — the notifier and the bridge share one
+   * `DiscordBot` (`index.ts:loadDiscord`), so they share the index without wiring. It is
+   * injectable only so a test can seed it and assert on what was recorded.
+   */
+  readonly messages?: MessageIndex;
 }
 
 export interface PostedMessage {
@@ -50,10 +61,12 @@ export interface PostedMessage {
 export class DiscordBot {
   private readonly options: BotOptions;
   private readonly apiBase: string;
+  private readonly messages: MessageIndex;
 
   constructor(options: BotOptions) {
     this.options = options;
     this.apiBase = options.apiBase ?? API_BASE;
+    this.messages = options.messages ?? new MessageIndex();
   }
 
   get channelId(): string {
@@ -77,12 +90,18 @@ export class DiscordBot {
    *
    * `channelId` overrides the configured channel — a thread IS a channel, so posting
    * into one is the same call with a different id.
+   *
+   * `task` names what the message is ABOUT, and is what makes a later reply to it
+   * placeable (§7.3). Every caller that knows a task passes it; the brainstorm's opening
+   * message and the honest "I cannot place this thread" reply do not, because neither is
+   * about a task that exists yet.
    */
   async postMessage(options: {
     readonly content: string;
     readonly channelId?: string;
     readonly components?: MessageOptions["components"];
     readonly flags?: number;
+    readonly task?: TaskId;
   }): Promise<PostedMessage> {
     const channelId = options.channelId ?? this.options.channelId;
     const response = await this.post(
@@ -95,7 +114,53 @@ export class DiscordBot {
     );
 
     const body = (await response.json().catch(() => ({}))) as { readonly id?: string };
-    return { id: body.id ?? "", channelId };
+    const id = body.id ?? "";
+    // An empty id means Discord accepted the post and told us nothing useful about it.
+    // Recording it would make every such message collide on one key.
+    if (options.task !== undefined && id.length > 0) this.messages.record(id, options.task);
+    return { id, channelId };
+  }
+
+  /**
+   * The task a message is about, from the in-memory index alone. Costs nothing.
+   *
+   * The first tier of reply targeting (§7.3). Undefined for a message this process did not
+   * post, one posted before a restart, or one evicted — `taskForFetchedMessage` is the
+   * fallback for all three, and rank is the fallback for that.
+   */
+  taskForMessage(messageId: string): TaskId | undefined {
+    return this.messages.taskFor(messageId);
+  }
+
+  /**
+   * The task a message is about, by reading the message back from Discord.
+   *
+   * The second tier, and the one that survives a restart: a live thread whose question was
+   * posted by a previous process — or, in the split deployment (§7), by the supervisor
+   * rather than by the process holding the index — is still placeable, because every
+   * task-scoped message opens with its id in bold.
+   *
+   * Best-effort, like `parentChannel`: a message the bot cannot see, a malformed body and a
+   * body whose text names no task all resolve to undefined, because the caller's fallback
+   * is the same for all three.
+   */
+  async taskForFetchedMessage(channelId: string, messageId: string): Promise<TaskId | undefined> {
+    const response = await postJson({
+      url: `${this.apiBase}/channels/${channelId}/messages/${messageId}`,
+      // Never sent: `postJson` drops the body for a GET, because `fetch` refuses one with a
+      // synchronous throw (`http.ts:BODILESS_METHODS`). Written as `""` to match
+      // `parentChannel`, the call that taught that lesson.
+      body: "",
+      what: "message lookup",
+      method: "GET",
+      headers: { authorization: `Bot ${this.options.token}` },
+      ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+      ...(this.options.sleep === undefined ? {} : { sleep: this.options.sleep }),
+    }).catch(() => undefined);
+    if (response === undefined) return undefined;
+
+    const body = (await response.json().catch(() => ({}))) as { readonly content?: string };
+    return body.content === undefined ? undefined : taskFromContent(body.content);
   }
 
   /**
@@ -296,6 +361,11 @@ export class BotNotifier implements Notifier {
         // A thread IS a channel, so posting into one is the same call with a different id.
         ...(target.threadId === undefined ? {} : { channelId: target.threadId }),
         ...(part.components === undefined ? {} : { components: part.components }),
+        // What makes a reply to this notification placeable (§7.3). Tested with `in` rather
+        // than against a list of kinds, because two of them — a digest, which is about the
+        // fleet, and a refused alert, which never became a task — legitimately name none,
+        // and a list would have to be revisited every time a kind is added.
+        ...("task" in notification ? { task: notification.task } : {}),
       });
     }
   }

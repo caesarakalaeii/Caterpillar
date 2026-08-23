@@ -314,6 +314,8 @@ state-repo/
   tasks/
     TASK-123/
       spec.md                  # immutable: goal, acceptance criteria, repos, requires
+      amendments/
+        001.yaml               # append-only: replaces `acceptance` only — see §12.3
       state.json               # mutable control record
       journal/                 # append-only: ONE FILE per entry — the audit trail
         0007-20260813T094100123Z-pod-7f3a.md
@@ -327,7 +329,9 @@ state-repo/
       artifacts/
 ```
 
-`spec.md` is written once and never edited by the agent. The journal is append-only —
+`spec.md` is written once and never edited — not by the agent and not by a human. The
+only thing that can change afterwards is the acceptance list, and it changes by *adding*
+a file rather than by editing that one (§12.3). The journal is append-only —
 it is the audit trail. `handoff.md` is deliberately *overwritten*: it holds only what the
 next session needs, so it cannot grow without bound.
 
@@ -1278,6 +1282,17 @@ Nothing is running while you think. You reply:
 The bridge commits `questions/NNN-answer.md` and flips `status = ready`. The next poll
 claims it into a fresh session that reads the answer from the task directory.
 
+**Options are buttons** (amended when they were built). `options` is capped at five, which is
+Discord's buttons-per-row limit, and refused above it rather than truncated: an option that
+cannot be rendered is a choice the human is never offered. The text is written to
+`questions/NNN-options.json` beside the question and the button's `custom_id` carries only the
+INDEX — a `custom_id` holds 100 characters and a tracker-derived task id has spent most of them.
+Pressing one resolves the index against that file and then goes through the ordinary answer
+path, so a press produces the same answer file, journal entry and `noProgressStreak` reset as a
+typed `!answer`; an index the stored question does not have is refused, because a button
+outlives the question it was posted under. The free-text button is always offered as well:
+"none of these" is always a possible answer.
+
 **How the bridge is built** (amended when it was): a Discord **gateway websocket, in the
 supervisor process** — not the separate `discord-bridge` Deployment §10 anticipated, and
 not a public interactions endpoint. §6 has runners polling outward precisely so a machine
@@ -1457,6 +1472,26 @@ exact moment its park notification asked the human to type in it. A thread is no
 the only thing behind it is `done`, and nothing is swallowed because a message to a parked task
 is guidance the loop acts on. `/cancel` still archives, which is a stronger statement than
 unbinding and the one the human actually made.
+
+**A REPLY names its own task; rank is only what is left when nothing else does.** The rank rule
+above picks ONE owner for a shared thread, and for an ordinary message that is the best answer
+available. For a Discord *reply* it is not: the payload carries
+`message_reference.message_id`, and the message it names is one the bot posted about exactly
+one task — so a reply to child `-03`'s question can be placed exactly, instead of being filed
+against whichever sibling outranks it. Three tiers, in order, and each covers what the one
+before it cannot. An **in-memory index** of message → task, populated as the bot posts and
+bounded oldest-first, answers the common case at no request cost. A **REST read** of the
+referenced message, parsing the leading `**<task-id>**` every task-scoped message opens with
+and confirming it against the snapshot, covers what the index cannot hold: a message from
+before a restart, and — in the split of §7 — a notification the *supervisor* posted, since the
+process holding the index is not the process that sends them. Neither tier alone is enough,
+which is why both exist: index-only loses targeting for every live thread across a rollout,
+REST-only cannot place a message Discord will not show us and spends a request per reply.
+When both fail, the rank rule still decides — and the reply then **says which task it was
+filed against**. That note is not decoration. Answering the wrong sibling silently is the
+failure this whole path removes, and where the system cannot avoid guessing, a visible
+attribution is the only thing that lets a human catch it. It rides even on a steer, which is
+otherwise acknowledged with a reaction alone, because a reaction cannot name a task.
 
 **`/resume` brings back `parked` AND `failed`, but never `done`.** `failed` was left out
 of the original command, and it was an oversight rather than a decision — the argument for
@@ -2157,6 +2192,75 @@ the toolchain of the session that triggered it.
   through to the inherited environment would hand the agent a shell missing the exact tool
   the task is about, and it would spend a session and a few dollars discovering that.
 
+#### A declared toolchain is checked before the task exists
+
+Parking on nix's own error is the right answer once a task exists, and it is an expensive
+way to learn about a typo. `toolchain.packages` is free text: §14.1 checks that the block
+is *shaped* right — `mode` is one of two words, `packages` is a non-empty list of strings —
+and nothing checked that the names in it resolve. So `lua51` (the attribute is **`lua5_1`**)
+passed intake, became a task, was claimed, and failed inside the session in
+`nix print-dev-env`. A session spent on a missing underscore.
+
+This is §9.1.1 with a different exit code, so it gets the same answer: ask at the door.
+`workspace/toolchain-doctor.ts` evaluates `pkgs ? <attr>` against the configured pin for
+each declared name and, **only when one is missing**, a prefix-filtered `attrNames` for the
+near miss — one evaluation, because the candidate list is wanted only when the answer is
+bad. It **evaluates and does not build**: nothing is substituted or compiled. Measured
+against the shipped pin on a warm store, ~0.5s.
+
+**The ceiling is 30s and is a bound on intake, not on nix.** Not
+`toolchain.timeoutSeconds`, which is 900 because it bounds a devShell build that may
+compile from source. Intake runs on the supervisor's own thread of control, once per
+interval, over every labelled item — so an item whose evaluation hangs stalls every item
+behind it, and at 900s one cold nixpkgs fetch would hold up a pass for fifteen minutes. A
+cold fetch was measured at ~45s and therefore exceeds the ceiling: it fails open and is
+checked on a later pass once the store is warm, which is the right trade, because the worst
+case is an unchecked item and that is precisely the behaviour that existed before.
+
+**It fails open, and that is the load-bearing half.** Every answer that is not "nix ran and
+said no" lets the item through: no nix on the runner, an evaluation that timed out, a pin
+that could not be fetched, output that would not parse. A nix evaluation that times out is
+not evidence that an attribute is wrong, exactly as a 500 from GitHub is not evidence that
+an App was uninstalled (§9.1.1). Getting this backwards would be worse than having no check
+at all: on a runner without nix *every* declared toolchain is unevaluable, so a strict
+check would refuse every item that had bothered to declare one — and suppress each refusal
+durably (§14.2).
+
+A missing attribute is reported by an evaluation that **succeeds**, which is what makes the
+distinction clean: a non-zero exit from `nix eval` always means the question could not be
+answered, never that the answer was no.
+
+Two details worth keeping:
+
+- **The near miss is ranked by a squashed comparison first**, then by bounded edit distance —
+  the same idea as §9.1.1, tuned for attributes rather than slugs. `_`, `-` and `.` are
+  separators nixpkgs uses inconsistently (`nodejs_22`, `lua5_1`, `gcc-unwrapped`) and nobody
+  remembers which, so squashing is what finds `lua5_1` for `lua51`. Prefix matches are
+  deliberately *not* ranked, which is where it parts company with `rankRepos`:
+  `lua51Packages` contains the whole query and is a set of lua modules rather than the
+  interpreter the author meant.
+- **A name that is not a bare attribute is skipped, not refused.** The name is interpolated
+  into a nix expression this process then evaluates, so only `[A-Za-z0-9_+-]+` is ever put
+  there. `.` is excluded with the rest, because `pkgs ? ${a.b}` asks about a *nested*
+  attribute and the answer would not mean what it is read as meaning.
+
+  But unaskable is not invalid, and an earlier version got this wrong: it *refused* a dotted
+  path on the stated reasoning that "nix would reject it too". Nix does not.
+  `generatedFlake` interpolates declared names into `with pkgs; [ … ]`, where
+  `python3Packages.requests` is legal and builds today — so intake was refusing toolchains
+  the resolver handles. Such a name is now skipped and the rest of the list is still
+  checked, which is the same fail-open rule the section above applies to a missing nix: no
+  evidence, no refusal. Validating per segment with `builtins.hasAttrByPath` was considered
+  and rejected — it would commit the doctor to reasoning about nested attribute sets to
+  catch a typo inside a package set, rarer than the false refusal it replaced.
+
+`mode: inherit` declares no packages and is a no-op, not a refusal — as is `mode: nix` with
+no `packages`, where the repo's own nix expression decides and the repo is not checked out
+at intake.
+
+Provenance: `orca vm recipe doctor`, which validates a per-workspace environment recipe
+without provisioning it.
+
 ---
 
 ## 9. Credentials & security
@@ -2791,6 +2895,13 @@ because a numeric id names exactly one account: it is either yours or it does no
 Only that domain is checked; a runner pushing to Codeberg has no github noreply address
 to get wrong and must not be made to invent an id prefix that means nothing there.
 
+**An identity that has changed leaves history behind it.** `identity.pastEmails` lists the
+addresses this deployment used to commit as, and nothing ever commits as one — they exist so
+the daily digest's authorship split (§19) recognises the fleet's own past work instead of
+inventing a contributor for it. The refusal above is deliberately not applied to them: it
+exists to stop an address AUTHORING anything, and a deployment that already made this
+mistake must still be able to describe the history it has.
+
 The deployed value is the author App's own bot account,
 `caterpillar-agent[bot] <316492202+caterpillar-agent[bot]@users.noreply.github.com>` —
 which is what GitHub already stamps on the merge commits that App makes (§12.1), so the
@@ -3020,6 +3131,9 @@ journal entry so the next session sees it at all.
 | `caterpillar_work_entry_bytes{runner,category,name}` | gauge | the largest few tasks and mirrors, capped |
 | `caterpillar_work_partial{runner}` | gauge | 1 when the walk hit its deadline |
 | `caterpillar_work_measured_timestamp_seconds{runner}` | gauge | how stale the four above are |
+| `caterpillar_digest_authored_lines_total{runner,repo,author}` | counter | `fleet` vs `human` lines in a digest window — §19 |
+| `caterpillar_digest_authored_commits_total{runner,repo,author}` | counter | the same split at commit level |
+| `caterpillar_digest_authorship_unreadable_total{runner,repo}` | counter | windows where a repo's history could not be read |
 
 `kind` on the reaping pair is the label that earns them their place. A healthy runner reaps
 almost everything `targeted`, so a `swept` series that keeps climbing says the supervisor's
@@ -3128,6 +3242,31 @@ cosmetic: it pages somebody about work that is over. Every forgiveness now publi
 the streak, because it is the record of why the task parked, but the gauge stops claiming
 there is a session to measure. Removed rather than zeroed: 0 is a real reading, meaning a
 task that is making progress.
+
+**And removing it in `transition` alone was not enough, because the gauge is per-process
+and tasks are not.** `transition` runs in whichever process performed the terminal
+transition; the sample lives in that process's registry. A task migrates between replicas
+across sessions — 19 tasks in the state repo carry journal shards written by two to four
+different runners — so the pod that published the streak is routinely not the pod that
+finishes the task. Pod A hands off at streak 2, pod B takes the task `done` and removes the
+series from its own registry where nothing ever set it, and pod A goes on reporting 2 until
+somebody restarts it. The rule does not aggregate over `pod`, so one orphan is enough to
+keep `CaterpillarTaskThrashing` firing about merged work. `survey` therefore drops the
+series for every task it reads as terminal: it is the one pass that reads every task's
+committed state on every poll in **every** replica, which is the same property that makes
+the fleet presence it publishes fleet-wide. `transition`'s removal is kept as the fast path
+for the common case, where the pod that finishes a task is the pod that was running it.
+
+This is what fired on `BS-1540288291008684052-02` on 2026-08-21, and the task itself was
+fine: session 1 committed all three commits, sessions 2 and 3 committed nothing because
+there was nothing left to commit, and session 3's completion claim passed the gate and the
+council and merged. The streak of 2 was truthful, the task never parked, and §11.1 scored
+all three sessions correctly. The alert nevertheless fired for 36 hours, on pods whose
+image predated the `transition` fix, because CI was billing-blocked and the image carrying
+that fix was never built. That is the other lesson, and it is not a code one: a fix to an
+in-memory gauge changes nothing until a new image is built AND rolled out, so an alert on a
+stale gauge keeps creating remediation tasks in the meantime. Check the running image's
+digest against the commit you believe fixes it before reading the metric as a live defect.
 
 **A commit is proven per-session, against a baseline.** The baseline is the branch head
 recorded at the end of the previous session, and on a FIRST session — where no such head
@@ -3399,6 +3538,22 @@ red result, and `awaitChecks` never got to use its 20-minute budget because `sum
 returned `failure` on the first poll rather than `pending`. The next useful move is not
 another local run: it is reading the job log, which needs someone who can open the URL.
 
+**A seventh, and it is the case where ONE leg red really was about the version — but about
+its npm, not its node.** `BS-1540375555520598126-05` had a completion claim rejected with
+`failing: check (26)` alone, on a tree whose four acceptance commands all passed locally.
+The rule above says a single red leg reproducing nowhere is a race; the exception is that
+`setup-node` installs the npm bundled with the node, so the two matrix legs differ in npm
+as well. Node 22 carries npm 10, node 26 carries npm 12, and npm 12 hard-fails `npm ci` on
+the lockfile root entry drift that npm 10 and 11 only silently rewrite — the same drift
+#123 had just reconciled on `main`. So the leg died in the install step, before `npm test`
+ran at all, which is consistent with the fast verdict the fourth note describes. Merging
+`main` was the fix. **What to check first on a one-leg red, before reaching for the race
+explanation: whether the two legs differ in a tool the node version drags along.** Note
+that the theory could not be executed here — no npm 12 exists on any container in reach,
+and npm 10 and 11 both accept the old lockfile — so it stays a strong inference rather than
+a reproduction, and the confirmation available was a whole-suite run on node 22 and node 24
+against the merged tree.
+
 The rule all of them share: **when a task parks for no progress, suspect the sessions
 before the detector** — and check what the acceptance list actually runs before believing
 a story about why it failed. Widening the streak limit here would have hidden every one of
@@ -3477,9 +3632,32 @@ Two independent gates, both required:
    a task may span several repos (§9.4.1), the work is one change, and half of it being green
    is not it passing. This checked `repos[0]` alone until §9.4.1's completion-path pass.
 
-Only then `status = done`, Discord gets the terminal message, and the supervisor closes the
-tracker item (§9.5). The agent participates in none of these three steps — it can only
+Only then `status = done` — except by a human's explicit decision, see *A human can write
+`done` past both gates* below — Discord gets the terminal message, and the supervisor closes
+the tracker item (§9.5). The agent participates in none of these three steps — it can only
 *claim* completion, which triggers verification.
+
+> **A branch that is gone reads as no CI signal, and on a task with a pull request that
+> means the work landed.** Merging through the GitHub UI deletes the head branch by default,
+> and the checks endpoint then answers `422 No commit found for SHA: <ref>`. That was read as
+> a transport failure and thrown, which failed the whole *session* rather than the one
+> question being asked — so the task could not reach a verdict at all, in any session, ever.
+> `BS-1540288291008684052-04` landed as `caesarakalaeii/all-chat#748` and was still parked
+> nine sessions later with every acceptance criterion passing on the default branch.
+>
+> A ref that does not exist reports nothing, and `conclusion: "none"` is already the word for
+> that. Narrowly: only 404 and 422, and only when *both* check endpoints say they cannot find
+> the ref. A 500 genuinely is a broken API and must keep throwing, because gate 2 passes on
+> `none` — reading an outage as "nothing ran" would pass a task whose CI was never consulted.
+>
+> Gate 2 then distinguishes the two `none`s, because they are different events with the same
+> verdict. The gate's loop runs once per pull request the task *has*, so `refAbsent` inside it
+> means the work reached a pull request and the branch it came from was deleted afterwards.
+> Nothing in the fleet deletes a task branch — so a human did, and a human does that when the
+> change has landed. It passes, and it says so in those words. The standing "completion rests
+> on acceptance criteria alone where CI is absent" warning is *not* used here: that sentence
+> is true of a repo which configured no CI and false of a merged pull request whose CI ran, and
+> it would send a reader looking for a workflow that was never missing.
 
 > **A missing interpreter makes this gate unsatisfiable, not failed.** Acceptance commands
 > run in the runner's container, so a toolchain absent from it fails every task that needs
@@ -3498,6 +3676,78 @@ tracker item (§9.5). The agent participates in none of these three steps — it
 > **Consequence: a runner must be able to evaluate a flake.** The supervisor image is Alpine
 > and ships no `nix`, so flake-provided acceptance commands cannot run there until it does.
 > That is the prerequisite for this approach, and it is not yet met.
+
+**A gate can leave evidence, and the exit code still decides.** "A shell command that exits
+0" is the right primitive and it cannot express what a change *renders*. A task that alters
+a page, a component or a layout can pass every gate — acceptance green, CI green, council
+satisfied reading the diff — and be visibly wrong, because nothing in the pipeline ever
+looked at it. That is also the honest answer to "why can't you write an end-to-end test for
+this": until now, because a gate could not produce or return an image.
+
+So gate 1 creates an empty directory, names it in **`CATERPILLAR_EVIDENCE_DIR`**, runs the
+commands, and publishes whatever they left there as §17 artifacts — **whether the gate
+passed or failed.** A repo whose `flake.nix` provides Playwright writes
+`acceptance: ["npx playwright test"]` and the fleet gates on rendered output, with no new
+subsystem in the supervisor.
+
+Five properties, and each is a decision rather than an accident:
+
+- **Failure is when the image matters most.** Publishing only on success would discard the
+  evidence in the one case that needs explaining. The failure text names what it collected.
+- **It is never the pass condition.** Nothing in the collection path returns a verdict. An
+  image is evidence for a human and for the council; the command's exit code is the whole
+  gate. A green gate that wrote a 4 MB screenshot has passed; a red one that wrote a tidy
+  small one has not.
+- **The directory is emptied first, and lives outside the checkout.** The per-task scratch
+  survives between sessions by design (§6.2), so a screenshot from three sessions ago would
+  otherwise be published as evidence about a diff it predates — worse than none, because it
+  looks current. And a file inside the worktree is a file in `git status`: the next session
+  to run `git add -A` would commit a screenshot into the pull request.
+- **Over the cap is refused, and legibly.** See §17 — the bytes do not land, but the size
+  and the limit are reported, because "too big to commit" and "the gate wrote nothing" must
+  not read the same way in a journal.
+- **The browser environment is decided once, in `workspace/toolchain.ts`.** A browser needs
+  a writable cache directory and it needs a sandbox decision, and neither is something a
+  task should discover for itself. `XDG_CACHE_HOME` points at `<paths.tasks>/.cache`,
+  created before the first task command runs, shared across tasks and reserved against a
+  devShell the same way `HOME` is: that is the variable Playwright resolves its browser
+  registry from on Linux when `PLAYWRIGHT_BROWSERS_PATH` is unset, and npm, pip and nix
+  honour it too. Shared rather than per-task because a browser bundle is a few hundred
+  megabytes and the per-task directory is reaped when the task finishes, so a per-task cache
+  would never amortise one download. An operator's own value wins; the container sets none.
+
+  **No privileges are asked for and no sandbox is disabled.** Worth stating because the
+  obvious next step — `--privileged`, or `CAP_SYS_ADMIN` in the pod's securityContext — is a
+  large permission for a small reason. `playwright-core` launches the `chromium` channel
+  with `--no-sandbox` on Linux of its own accord, so the browser a flake provides runs as
+  is. A repo that genuinely wants the real sandbox needs a runner configured for it, and
+  that is a machine property — which makes it `requires` (§8), not something the resolver
+  can grant.
+
+**A human can write `done` past both gates, and the record has to say so.** A task can be
+*obsolete* rather than finished — superseded, descoped, or answering a question nobody is
+asking any more — and until `/done` there was no way to say that. `/merge` is the closest
+thing and it is not this: it merges the PR under the reviewer identity, so it refuses with
+no PR and with no reviewer identity configured, and it is an override of the *council*
+rather than of the gates. Obsolete work has nothing to merge and often nothing on a branch.
+
+So `/done task:<id> reason:<text>` writes `status = done` and merges nothing. `reason` is
+required on both the command and the button's modal, because a forced completion with no
+stated cause is unauditable — and the journal entry names who forced it, quotes the reason,
+and says the gates were **BYPASSED**. It must never read as a task that was verified; that
+is the whole point of the entry, and `loop.test.ts` asserts the words `passed` and
+`verified` appear nowhere in it.
+
+It is refused on `running`. The session holds the lease, so the write would either lose its
+compare-and-swap or land under an agent still working — `/cancel` stops one at a turn
+boundary and the force is available a poll later. `parked`, `failed` and `awaiting-human`
+are the statuses it is for.
+
+The tracker is mirrored through the **`parked`** transition, not `completed`. `completed`
+carries a `prUrl` this command may not have, and it is the transition that *means* the gates
+passed — it comments "acceptance criteria and CI verified" and closes the item. `parked`
+releases the item and puts the reason on it, which leaves the issue open and honest. Closing
+it needs a transition of its own (§9.5) and the reason above is why it cannot be this one.
 
 ### 12.1 The review council
 
@@ -3590,6 +3840,26 @@ review only appears when a reviewer identity exists: from the authoring App the 
 be refused by branch protection every time, and a button that always fails is worse than no
 button.
 
+**The reviewers are shown the gate's evidence, read-only.** An artifact the gate produced
+(§12) is staged into `<taskDir>/evidence-in/` before the round starts and the paths are
+named in every lens's prompt — which is the whole difference between an artifact being
+*stored* and it being *evidence*: a reviewer told "there are screenshots" and not where has
+been told nothing it can act on. No new tool; `read` handles text and `bash` handles the
+rest.
+
+Three things about it, for the same reasons the gate side has them. It is the task's **own**
+artifacts, not its blockers' — along a `blockedBy` edge an artifact is input to the next
+task's work (§17), here it is evidence about the change under review. The files are written
+**read-only** (`0o444`): four reviewers hold no writable tool but `sabotage` holds `write`
+and `edit`, and all five run concurrently, so a reviewer that edited the screenshot it was
+shown would change what the others are looking at mid-round. And it is staged **beside** the
+checkout, never inside it, so evidence never shows up as an uncommitted change in the shared
+worktree or in the sabotage copy of it. A round with nothing to show gets no directory and no
+section — "Evidence: none" would be carried by every task that renders nothing, and it reads
+as a finding about the change rather than a fact about the pipeline. Staging that fails is
+logged and the round proceeds on the diff alone, which is what every round did before this
+existed.
+
 Verdicts are written to `tasks/<id>/reviews/NNN-verdict.md`, numbered by session and never
 overwritten, and appended to the journal — the journal is what the next session actually
 reads, so a rejection has to arrive there as instructions rather than as a score.
@@ -3613,6 +3883,7 @@ the change author's guide to writing a description:
 | `TEST_FIRST_STANDARD` | the same | the `tests` lens |
 | `WRITING_STANDARD` | the same | the `design` lens |
 | `REVIEW_STANDARD` | **nobody** — see below | every PR lens |
+| a repo's `.caterpillar/standards.md` section | every implementation and remediation session on that repo | the lens its heading names — see *A repository's own standards* |
 
 `REVIEW_STANDARD` is the one asymmetry and it is deliberate. Its central sentence is
 Google's — *approve once the change definitely improves the overall health of the codebase,
@@ -3652,6 +3923,141 @@ review spend. That buys the one defect class both earlier gates are blind to *by
 construction*: a test weakened until the suite goes green passes acceptance and passes CI,
 because the suite is green precisely because the test stopped asking.
 
+#### A repository's own standards
+
+Everything above is the fleet's, and identical in every repository it is pointed at. A repo
+with house rules of its own had nowhere to put them **that the council would also read**:
+put them in `AGENTS.md` and the implementation agent reads them while the reviewers do not,
+which is precisely the asymmetry the paragraphs above exist to forbid.
+
+So: an optional `.caterpillar/standards.md` per repo, read from the task's checkout by
+`readRepoStandards`, spliced into the author's system prompt (`systemPromptFor`) **and**
+into the reviewer prompts (`repoLenses`) from the *same parse* and through the same
+renderer. One file read from the repo, and deliberately nothing else — no registry, no
+sharing links, no install flow, no content hashing, no versioned bundles. Those solve a
+distribution problem a self-hosted fleet does not have.
+
+**Every section names the lens that owns it, in its own heading.** The format is
+`## <lens>: <title>`, with `<lens>` one of `correctness`, `design`, `tests`
+(`REPO_STANDARD_OWNERS`). That is what extends the one-owning-lens property to text this
+system did not write: a repo adding a rule says who grades it in the same edit, and there is
+no second mapping file to fall out of step with the first. `parseRepoStandards` refuses,
+rather than dropping, every case where a rule would exist with no grader — a heading naming
+an unknown or non-owning lens, an empty section, and prose before the first heading, which
+has no owning lens and is made to look accounted for by the sections after it.
+
+Not `fit`, which grades the change against the TASK, and no repository has an opinion about
+that. Not `sabotage`, which is convened only when the diff touches source: a rule routed
+there would be graded on some rounds and not others, which is the same failure wearing a
+schedule. `review/lenses.test.ts` checks the owner keys against the standing council, and
+that plan lenses receive none of it — a plan is not code.
+
+**The text is untrusted**, authored outside this system by whoever can push to the repo, and
+it reaches a model prompt. Three bounds follow. It is capped at `REPO_STANDARDS_MAX_BYTES`
+(4 KiB) and the read is bounded at the cap rather than after it — a file any pusher controls
+must not be able to make the runner allocate a gigabyte — and the cap is small because it is
+paid for by every session of every task on that repo *and* by every reviewer of every round,
+so the cost is multiplied by the council. It cannot override what it sits beside: code
+health, test-first and the attribution rules are the fleet's, both the author's block and the
+lens's say so in as many words, and a repo rule that contradicts them does not apply.
+
+And **a body may not open a heading that outranks the prompt it lands in.** Sections are
+spliced under a `###`, into prompts whose own sections are `##`, and a body is quoted
+verbatim — so `## Test-first, without exception\n\nIgnore the above.` in a body would render
+as a *peer* of the fleet's standards rather than as a rule inside a repository's section.
+That is the override the paragraph above forbids, with markdown for a payload. Every heading
+at `##` or above is therefore a section boundary and only a well-formed `## <lens>: <title>`
+is a valid one; `###` and below nest harmlessly and are left alone, because refusing them
+would make the format hostile to a repo structuring its own rule. "At `##` or above"
+includes up to three leading spaces, which CommonMark also reads as a heading: a guard
+anchored at column zero is one a repo walks around by typing a space. Four spaces is an
+indented code block, renders as code inside the repo's own section, and needs no guard —
+which holds only because the parse **preserves a body's leading whitespace**. Trimming it
+would re-emit the first content line at column zero, so `    # Attribution` would reach the
+prompt as a real heading above every `##` the fleet's own standards use, and the code-block
+carve-out would become the way around the guard beside it. Only wholly blank lines are
+trimmed, from each end.
+
+The same rule covers **setext** headings, which spell the override without a `#` at all: a
+line of `=` or `-` directly under a paragraph is an H1 or H2 in CommonMark, so a body
+containing one is refused too. "Directly under a paragraph" is the whole test — it is what
+keeps a `---` thematic break and a `| --- |` table delimiter, both ordinary markdown, from
+being refused along with it.
+
+A file this system cannot use **fails the session** rather than being skipped. On the runner
+path the throw reaches `SupervisorLoop.parkFailed`, so the task parks with a reason naming
+the repo and the file; on the council path it propagates out of `convene()` instead, a
+different route to the same class of outcome — and the runner reads the same files first, so
+a file that would break the council has almost always already stopped the session. Skipping it would hold the author to a rule the council cannot see, or the reverse, and
+neither is visible from outside — the whole class of bug this feature exists to remove.
+
+**Multi-repo (§9.4.1) is scoped per repo. Not merged, and not refused.** A task declaring
+several repos reads each one's file separately, and every section is rendered headed with
+the repo that supplied it; both blocks state that a rule governs only the files of the repo
+it came from. Two repos saying opposite things is then **not a conflict at all** and nothing
+has to arbitrate — which is the only one of the three options that needs no policy, cannot
+surprise a repo by having another repo's rule applied to it, and does not make one repo's
+bad file block work on a sibling. Merging would need a precedence order nobody has a basis
+to pick; refusing would let any repo in a workspace veto every multi-repo task touching it.
+
+Read per session and per round rather than cached, because the file is on the branch the
+task is working: a session that adds a rule is held to it, and so is the council reviewing
+that very change.
+
+### 12.3 An acceptance criterion is amended, never rewritten
+
+`spec.md` is immutable and stays immutable: rewriting the spec of a running task changes
+its completion gate mid-flight, and the file is also the record of what the task was
+actually asked to do. But a declared criterion can turn out to be **unsatisfiable**, and
+when it does, the gate is wrong and no amount of work inside a session fixes it. Three
+real ones in one morning: a repo-wide `npm run lint` demanded of a 42-line feature branch;
+a `git ls-files 'src/app/overlays/[id]/...'` glob where `[id]` is a wildmatch character
+class, so it could never match the literal directory it mandated; and a repo-wide
+`prettier --check`. Two of those tasks had already been rejected twice on the same
+impossible line.
+
+The only lever available was to hand-edit the immutable file in the state repo. That is
+the thing immutability exists to stop, so the supported lever is an **amendment**:
+
+```
+tasks/<id>/amendments/001.yaml
+```
+
+```yaml
+acceptance:
+  - npm test -- src/widget
+why: the repo-wide lint predates this branch and fails on files it does not touch
+author: operator
+at: 2026-08-19T09:14:02.113Z
+```
+
+Five decisions, each of which is the interesting part:
+
+- **`readSpec` returns the EFFECTIVE spec** — the base document with the newest
+  amendment's acceptance list applied. There is deliberately no opt-in
+  `readEffectiveSpec`, because an opt-in method is a rule every future call site has to
+  remember, and the site that forgets is the one where the verifier runs a criterion a
+  human already amended away. That is precisely the failure this mechanism exists to
+  prevent, so the seam is the one that cannot be forgotten. `readBaseSpec` is there for a
+  reader that genuinely wants the document as filed, and says so.
+- **The highest number wins entirely.** Not merged across amendments, not applied in
+  sequence. Merging would resurrect a criterion an earlier amendment deliberately removed,
+  and the author of amendment 3 has no way to know it was doing that.
+- **A whole-list replacement, not a positional patch.** "Replace entry 2" is unreadable
+  six months later without the original file open beside it. The full list *is* the gate,
+  written out, in the record that changed it.
+- **Append-only, so the file list is the audit trail.** Nothing rewrites or deletes an
+  earlier amendment; `writeAmendment` allocates the next number from the highest one on
+  disk. `why` is required for the same reason: an amendment nobody explained is a
+  hand-edited `spec.md` with extra steps.
+- **Only `acceptance`.** A file naming `repos`, `workspace`, `requires`, `toolchain`,
+  `kind` or the prose goal is refused by name, loudly, rather than partly applied.
+  `repos` is the forge token's scope, which makes it a §9.1 blast-radius decision and not
+  a chat command; the rest decide where and how the task runs; and a wrong prose goal
+  deserves a fresh task with clean history rather than an overlay that makes the filed
+  document a lie. An amendment also cannot empty the list, for the reason gate 1 exists
+  at all: a task with nothing the supervisor can run could never be closed.
+
 ---
 
 ## 13. Agent tools
@@ -3686,7 +4092,7 @@ leave the supervisor, because Kubernetes RBAC cannot express "keys but not value
 
 ## 14. Task intake
 
-Five paths, all converging on a `spec.md`:
+Six paths, all converging on a `spec.md`:
 
 1. **GitHub issue** labelled `agent` → ingester renders a spec. (`primary`)
 2. **Vikunja task** labelled `agent` → ingester renders a spec. (`oss`)
@@ -3701,6 +4107,13 @@ Five paths, all converging on a `spec.md`:
    `alerts/policy.yaml`. The entry supplies the workspace, the repos and the acceptance
    commands verbatim — this path synthesises none of them. An unlisted alert is refused
    once, durably, rather than per delivery.
+6. **A clock** — a `schedules/<id>.yaml` in the state repo, fired on the housekeeping loop
+   when its cron expression comes due in its named IANA zone (§22). The second path with no
+   human in it at the moment it fires, and the only one that can decline to spend a session
+   at all: a schedule may declare a **precheck**, a bounded command whose non-zero exit
+   records a skipped occurrence instead of creating a task. Like path 5 it synthesises
+   nothing — the workspace, the repos, the prompt and the acceptance commands are the
+   operator's — and it is off until `schedule.enabled` says otherwise.
 
 Path 5 answers Alertmanager in milliseconds and enqueues in memory; the spec is written on
 the supervisor's own thread of control on the next poll, because the loop owns the state repo
@@ -3970,6 +4383,21 @@ A claim that *errors* is not a claim someone else won, and is treated as a win: 
 state-repo blip must not stop intake fleet-wide and silently. A duplicated pass is
 idempotent (`hasTask`); a skipped one is work nobody sees.
 
+**What gets refused.** Four questions are asked of an item, each one the first moment the
+answer is cheap, and all four refuse through the one path above — recorded, suppressed,
+commented once, visible on `/intake` (§14.5):
+
+- the body does not parse into a spec, or names no `acceptance` (§14.1);
+- its author does not have write access, so the body is not run as shell (§9.1);
+- it names a repo the workspace's credential cannot reach (§9.1.1);
+- its `toolchain.packages` names an attribute that does not exist in the pinned nixpkgs
+  (§8.1).
+
+The last two are *usability* checks and not security boundaries — `assertWorkspaceScope` is
+that — and both fail open: a forge that cannot be asked and a nix that cannot evaluate are
+the absence of evidence, and a refusal needs evidence. A repo or an attribute that is
+genuinely wrong is refused on the next pass instead.
+
 Ordering inside a single ingest is load-bearing: `state.json` is written first and
 `spec.md` last, because `spec.md` is the existence marker. A crash between the two leaves
 a task the claim loop skips and the next pass recreates cleanly; the reverse order would
@@ -4125,6 +4553,32 @@ can read them, and says so in the prompt. No new tool to read one — `read` and
 already work on a file. This reuses the dependency graph a plan already carries (§14.3),
 which means the plan agent controls artifact flow by declaring dependencies, and there is
 no second, parallel notion of "which task feeds which".
+
+**A second producer: the acceptance gate.** `publish_artifact` is not the only way in.
+Anything a §12 gate leaves in `CATERPILLAR_EVIDENCE_DIR` is committed here too, and it lands
+in the same directory under the same caps — one place a reader looks, one set of limits, one
+route serving it. The two differ only in audience: an agent's artifact is *input* for the
+tasks that declare this one as a blocker, and a gate's is *evidence* about this task's own
+change, read by a human on the web view and by the review council (§12.1).
+
+**Over the cap, a gate is refused in words rather than truncated.** A screenshot is not
+small, so this is the common case rather than the corner one, and it is where the caps stop
+being theoretical. The bytes do not land: every runner clones this repo and git keeps
+whatever reaches it forever, so a 4 MB PNG per failed session is paid for by every machine
+in the fleet in perpetuity. Truncating was rejected — half a PNG is not a smaller PNG, and a
+truncated trace is not a shorter trace, so the reader would be handed something that looks
+like evidence and is not. Instead the verdict's detail names the file, its size and the
+limit, so the journal distinguishes "too big to commit" from "the gate wrote nothing", and
+says what a repo can do about it: a lower resolution, a JPEG rather than a PNG, one
+screenshot rather than Playwright's whole output tree. An agent that hits the cap through
+`publish_artifact` is told to summarise; a gate that hits it is told to render less. The
+same refusal, aimed at what the caller can actually change.
+
+**On the web view an artifact is a download, never a document** — `application/octet-stream`
+as an attachment, with the link carrying `download` to agree with the header. That rule
+predates images and does not bend for them: these are agent-authored bytes on the origin
+that serves every transcript (§18, invariant 8). A screenshot is not exempt for being
+something a browser could render; being renderable is the hazard.
 
 ### 17.1 Large artifacts — designed, not built
 
@@ -4517,6 +4971,59 @@ saying the diff cannot be read from here — never `0 files changed`, which is a
 statement about a merged pull request rather than a smaller one. Nothing is fetched to
 close the gap: the digest reads what is already on disk, needs no credential, and cannot
 be the reason a repo gets cloned.
+
+### It says how much of the change is the fleet's, and which way that is going
+
+The rest of the digest answers "what moved today". After a month of running, the question an
+owner actually has is a different one: **what share of this repository's change is coming
+from the fleet, and is that share trending?** Nothing else the supervisor publishes can
+answer it, and everything needed to is already here — the digest measures changes from git
+and costs nothing to do so.
+
+So one more section, computed by a pure `digest/attribution.ts`: commits and lines, split
+into fleet and human, per repo, for this window and the one before it.
+
+**Authorship is decided by the ADDRESS.** Never by the display name. §9.7 exists because a
+forge resolves an address to an account; a display name is decoration, two people can share
+one, and a name match would credit one of them with the fleet's work. The address comes from
+config for the same reason §9.7 gives: it names the App installed for *this* deployment, so
+there is nothing correct to hardcode.
+
+**Which means the identity can change inside a window.** A deployment that reinstalls its
+App has commits under the retired address and the current one in the same day, and reading
+the retired half as a person's work invents a contributor and halves the reported share on
+exactly the day someone is most likely to look. `identity.pastEmails` is that list. It is
+read-only — nothing commits as one — which is why `identityFault` is not applied to it: a
+deployment that already made §9.7's mistake must still be able to describe the history it
+has.
+
+**A share is reported against the previous window, or not at all.** A single day's share
+says almost nothing — one human commit in a quiet day reads as 50% — and a direction says a
+lot. The baseline is `previousWindow`, recomputed from the calendar date rather than by
+subtracting the window's own length: consecutive windows meet exactly but are not equal in
+length, and 18:00 to 18:00 across a spring-forward is 23 hours. A window with no measured
+predecessor says so rather than reporting "flat", which would be a claim about a yesterday
+nobody measured.
+
+**And it inherits the mirror rule rather than reintroducing the bug.** This is the section
+where a silent zero would be most credible, because a percentage always looks like a
+measurement. A repo whose history this runner cannot read — a task branch lives in the
+mirror of the runner that worked it — is NAMED, exactly as its diff already is. So is a
+window in which nothing was committed, which is a different fact from one the fleet wrote
+none of. A share whose denominator is zero is absent, never printed as 0%.
+
+Two figures rather than one, because they disagree in ways that matter: a fleet that
+rewrites a file moves many lines in one commit, a person fixing a typo moves one line in
+one commit, and a report showing only lines would describe a reformatting run as having
+written the repository. Merges are excluded from both — a merge introduces no line, its
+commits are already counted, and on GitHub every merge is made by the author App (§12.1),
+so counting them would raise the fleet's share every time a *human's* branch landed.
+
+The prose is not the only output. `caterpillar_digest_authored_lines_total` and
+`caterpillar_digest_authored_commits_total` carry the same split by repo and author, and
+`caterpillar_digest_authorship_unreadable_total` carries the declared gap — so the trend is
+graphable over a fortnight without anyone parsing a paragraph, and a repo with no mirror on
+the publishing runner is distinguishable on a graph from one the fleet stopped working on.
 
 ### Three destinations, one document
 
@@ -4919,3 +5426,271 @@ to do about it rather than silently receiving nothing; `applyChatRequests` reads
 drains everything, routing an in-flight cancel to the session in process (§6.4). If a real
 selective pop is ever written, that flag flips and the branch disappears — but the flag
 must never be flipped without it.
+
+---
+
+## 22. Scheduled work
+
+A sixth intake path (§14): **a clock becomes a task**. "Every weekday at 09:00, audit the
+dependency updates in these repos" was not expressible anywhere in the system, and that is
+the shape of a large amount of real unattended work — dependency audits, code-quality
+sweeps, stale-branch cleanup, documentation drift. Every other path starts with somebody
+deciding something is worth doing now: a labelled item, a `/brainstorm`, a hand-committed
+spec, a firing alert. None of them is a calendar.
+
+```
+schedules/deps-audit.yaml  →  next occurrence  →  claim  →  precheck  →  spec.md
+       (state repo)          (pure, clock in)     (ref)     (exit 0?)   (kind: implement)
+                                                              │
+                                                            non-0 → skipped occurrence,
+                                                                    no session spent
+```
+
+Everything after the spec is identical to every other path: it is claimed, sessioned, gated
+by §12 and ends in a pull request.
+
+### It runs on the housekeeping loop and nowhere else
+
+No listener, no port, no second Deployment, no `CronJob`. The supervisor already has a loop
+that runs every `housekeepingSeconds` whether or not a session is in flight (§6.4), and
+"has an occurrence come due" is a question about a checkout this runner already has plus one
+`ls-remote`. A Kubernetes `CronJob` would have been a second scheduler with its own
+credential, its own image tag and no access to the leases; it would also be unable to fire
+for a runner on somebody's desk behind NAT, which the capability system exists to include.
+
+Housekeeping rather than the work loop, for `maybeDigest`'s reason: an occurrence that comes
+due while a session is running must still become a task, and the work loop is blocked for as
+long as the session takes.
+
+### `schedules/<id>.yaml`, one file per schedule
+
+```yaml
+version: 1
+trigger:
+  cron: "0 9 * * 1-5"           # required, five fields
+  timezone: Europe/Berlin       # required, a NAMED IANA zone
+workspace: primary              # required, a known workspace
+repos:                          # required, >= 1, host/owner/name
+  - github.com/acme/widget
+prompt: |                       # required — the goal handed to each session
+  Audit dependency updates across these repos…
+acceptance:                     # REQUIRED, >= 1 command (§12)
+  - npm test
+requires: []                    # optional, from KNOWN_CAPABILITIES
+precheck:                       # optional — the gate below
+  command: "npm outdated --json | grep -q ."
+  timeoutSeconds: 120
+enabled: true                   # optional, default true
+maxOpenTasks: 1                 # optional, default 1
+```
+
+**In the state repo, not this repo and not a ConfigMap**, for the reason §20 gives about
+`alerts/policy.yaml`: adding scheduled work must be a commit to the thing the supervisor
+already polls — reviewable, revertable, live on the next cycle — rather than a redeploy. The
+supervisor never writes one; there is no `writeSchedule`, which is what keeps "what work
+happens unattended" outside the fleet's own reach.
+
+**One file per schedule, unlike the alert policy's single list.** Two reasons, and both are
+about what an operator does with these: a schedule is edited on its own and a diff naming the
+file says which one changed, and a malformed schedule then costs itself alone. A single
+document would make one bad cron expression refuse every schedule in the fleet.
+
+**`acceptance` is required, so a schedule that cannot express machine-checkable completion
+may not exist** (§12). This is not a formality: an unattended task with no completion gate is
+one that accumulates sessions and can never be closed, and nobody is watching it happen.
+
+**`enabled: false` is a state a schedule may be in.** The alternative is deleting the file,
+which loses the prompt and the acceptance commands somebody wrote and makes turning the
+schedule back on a rewrite rather than an edit.
+
+### The cron dialect is the small one
+
+Five fields — minute, hour, day-of-month, month, day-of-week — with `*`, lists, ranges,
+steps and three-letter names. No `@daily`, no seconds field, no `L`, no `#`, no `?`. Each of
+those is a thing an operator would have to learn is supported here and not in the crontab
+they know, and none of them expresses work this fleet does.
+
+Two properties of the dialect are load-bearing and both are tested:
+
+- **`day-of-month` and `day-of-week` are a UNION when both are restricted.** `0 9 1 * 1` is
+  "the first of the month OR every Monday", which is what every cron implementation does and
+  what an author expects. Read as a conjunction it fires roughly a tenth as often, which is
+  the kind of wrong nobody notices for a month.
+- **An expression that can never fire is refused.** `0 9 31 2 *` matches no day of any year.
+  A schedule that silently never runs is indistinguishable from a fleet that is not
+  scheduling at all, so it is refused when the file is committed.
+
+### A named zone, and the occurrence maths is pure
+
+`schedule/occurrence.ts` takes `now` as a parameter and does no IO, exactly like
+`digest/day.ts` — which is what makes a DST boundary a test rather than a thing to wait a
+year for. This subsystem has two of them: a schedule can name an hour the clocks skip and
+an hour they repeat.
+
+A **named IANA zone, never a fixed offset**, for §19's reason inverted: `+02:00` is correct
+for five months of the year and an hour wrong for the other seven, and the wrongness is
+silent — the audit simply starts at 08:00 or 10:00. `isTimeZone` refuses an offset even
+though `Intl` accepts one.
+
+The search runs forward over WALL-CLOCK minutes and converts each candidate to an instant,
+rather than stepping in UTC, because the zone is the authority on what the clocks read. A
+wall-clock minute a spring-forward deleted resolves past the gap and fires once; a minute an
+autumn fall-back repeats yields one instant and fires once.
+
+**Catch-up is bounded twice.** `CATCH_UP_OCCURRENCES` is 1 and `MAX_LATENESS_MS` is six
+hours. The count alone is not a bound: "the previous occurrence" of an hourly schedule is an
+hour old and worth running, while the previous occurrence of a weekly one can be six days
+old, and firing a Monday audit on Saturday evening produces a task nobody asked for against
+a repo that has moved on. Keel rolls this pod on every push to main, so missing ONE
+occurrence is routine; missing five means nobody was home, and waking up to fire seven
+dependency audits at once turns an outage into a mess somebody has to clean up.
+
+### Exactly one runner fires each occurrence
+
+`refs/schedules/<id>/<occurrence>` is created by a compare-and-swap against an empty expected
+value, which exactly one push in the fleet can win — the mechanism §5 proved and §19 reused,
+for the same reason: every runner reaches 09:00 at the same instant and all of them can read
+the whole state repo. Nothing renews it and nothing steals it; an occurrence that has been
+served does not become unserved.
+
+The occurrence's name is the instant **in UTC** (`2026-08-17T0700Z`), not in the schedule's
+own zone. UTC is what makes two runners agree without talking, and it means an operator who
+edits the timezone does not make an occurrence that already fired look unfired.
+
+The ordering is **claim, then create, and release the claim if creating failed**, because the
+two failures are not symmetric. Firing twice is visible: two tasks, two branches, and a human
+who can see both. Firing never is silent: the ref says the occurrence is settled, no task
+exists, and nobody finds out until they wonder why the Monday audit stopped happening.
+
+**A failed CAS is never read as "someone else did it" without checking the ref.** A rejected
+push is also what a dead network looks like, and getting this backwards writes off an
+occurrence nobody fired.
+
+Inside the claim the order is `state.json`, then `spec.md`, then the ledger entry — and that
+last position is forced rather than chosen. A write that throws hands the claim back, and a
+`fired` record already on disk would stop this runner (and only this runner, since the record
+is unpushed) from ever retrying: the record means "settled, no retry needed", which is
+precisely what a released claim is not.
+
+That leaves one residual, stated rather than papered over: a process killed BETWEEN the two
+task writes holds the claim, has written no record, and leaves a task directory the claim loop
+skips because it has no `spec.md`. The occurrence does not fire, and nothing retries it — the
+next occurrence does. It is the narrowest window in the path (two local file writes with no
+network between them) and closing it would need the record and the task to be one atomic
+write, which git does not offer inside a working tree.
+
+Two cheaper, local answers come first, in this order: the occurrence ledger and
+`hasTask`. Both are files in a checkout this runner already has, so an occurrence that has
+already been settled costs no network at all — which matters because the question is asked
+on every housekeeping pass for as long as the occurrence is inside the catch-up window.
+
+### The precheck: a command instead of a session
+
+A bounded command, run in the task's toolchain environment **before a session is started**.
+Exit 0 and the occurrence becomes a task; anything else records a **skipped** occurrence and
+spends no session.
+
+This is the cheap answer to the residual §11.1 admits. Work whose only blocker is external
+state — no dependency updates this week, no stale branches, no drifted docs — currently costs
+a whole session to discover there was nothing to do, and §11.1 then scores that session
+honestly as no progress. Three of those park the task.
+
+It runs in the environment the **session** would have had: the first repo's worktree and the
+toolchain the resolver produces for the same spec (§8.1). A precheck answering from a shell
+without the package manager is not a fact about the repository.
+
+Four rules, each of which was a decision rather than an accident:
+
+- **A timeout is a "no".** The command runs on the housekeeping loop, which the chat drain,
+  intake, the digest and the survey share, so the bound is enforced rather than trusted —
+  and a check that cannot answer within its own budget has not established that there is
+  work. Firing on a timeout would make the slowest possible precheck the one that always
+  passes. `timeoutSeconds` is capped at 600: an operator who wrote an hour meant a session.
+- **A skipped occurrence KEEPS its claim.** The decision has been made; releasing it would
+  have the next pass re-run the command, every pass, until the hour elapsed.
+- **A precheck that could not be RUN releases the claim and records nothing.** "The worktree
+  is not on this volume" or "the flake would not build" is not evidence about the work, and
+  the runner that can answer may not be this one. Same for a schedule that declares a
+  precheck on a runner with no way to run one.
+- **Its output is recorded in the ledger.** A skip with no detail is indistinguishable from a
+  schedule nobody is polling.
+
+The precheck worktree is keyed on the SCHEDULE and not the occurrence
+(`SCHED-<id>-precheck`), so a daily schedule does not clone a fresh tree every morning for a
+check that is meant to be cheap. It is swept like any other orphaned worktree (§3.1).
+
+### `schedules/occurrences/<schedule>-<occurrence>.json`
+
+The ledger. Written for a **fired** occurrence as well as a skipped or refused one, and that
+is what makes the skipped ones legible: "the precheck said no" and "nothing is polling this
+schedule" both produce zero tasks, and only the record separates them.
+
+Durable and pushed rather than in memory, for §14.2's reason verbatim: Keel rolls the pod on
+every push to main, so an in-memory note of "already handled 09:00" is emptied by a deploy.
+Two consequences for `StateStore`, the same pair §20 records for `alerts/`:
+
+- `schedules` is in `commitAndPush`'s staging list. Without it the fleet's account of what
+  fired is written locally and lost on the next deploy.
+- `schedules` is in the reset path's `git clean` list. Without it a record whose commit never
+  landed says "settled" on one runner and nowhere else, so the ledger a human reads disagrees
+  with the ledger that stopped the work. The operator's `schedules/*.yaml` are tracked, so
+  the sweep cannot touch them.
+
+`maxOpenTasks` (default 1) is `alerts/policy.yaml`'s field for its reason: a weekly audit
+whose last task is still in review must not open a second one saying the same thing. "Open"
+is `!isTerminal(status)` — the supervisor's one notion of task status — so a **parked** task
+counts as closed, because it is waiting on a human and the next occurrence is the nudge that
+should be allowed to open fresh work. It is counted from the task tree rather than from the
+ledger, since `SCHED-<schedule>-<occurrence>` carries the schedule's name, so a task deleted
+by hand frees its slot.
+
+### `kind` is `implement`, deliberately
+
+There is no fourth task kind. A scheduled task writes code, opens a pull request and is
+gated by §12 exactly as a tracker-sourced one is, and nothing about its origin changes what
+the session must be told. `remediation` is a separate kind only because its brief is about a
+cluster it may read and must never write (§20); a schedule has no such brief.
+
+What the goal DOES carry, beyond the operator's prompt, is one paragraph saying that nobody
+is waiting and there may be nothing to do — because the failure mode of unattended work is a
+plausible pull request opened to have something to show for the session, and the review
+council reads for exactly that (§12.1).
+
+### Validated when committed, not when it fires
+
+A malformed schedule is refused on the **intake pass** and shown on `/intake`. The firing
+pass can only skip what it cannot parse, at 09:00, with nobody watching; the intake pass runs
+on a timer whose whole output is a report, and the moment a schedule becomes malformed is the
+commit that made it so — which is when somebody is looking.
+
+Nothing durable is written for a refusal and nothing is commented on: there is no tracker
+item and no author to tell. `IntakePass` carries `schedules` and `schedulesInvalid`, the
+supervisor logs `intake.schedule-invalid` once per bad file per pass naming the field, and
+the `/intake` page renders the message above the table of schedules that did parse — for
+`policyPanel`'s reason, since an empty table reads as "nothing has come due".
+
+### Off by default
+
+`schedule.enabled` defaults to false, like `digest.enabled` and `web.enabled`, and for the
+digest's reason: firing an occurrence writes tasks into the shared state repo, and a runner
+someone started on a workstation must not begin doing that because it was upgraded. The claim
+protocol makes a second firing runner harmless, not welcome. The `/intake` page says so out
+loud, because an empty occurrence ledger on a runner that fires nothing is otherwise
+indistinguishable from a scheduler that has broken.
+
+`caterpillar_schedule_occurrences_total{schedule,outcome}` counts what was settled.
+`outcome="skipped"` is the series it exists for: a schedule whose precheck never passes
+creates no tasks, and neither does one nobody is polling.
+
+### What is deliberately absent
+
+**No `@reboot`, and no "run it now" button.** An occurrence is a point on a calendar that
+every runner can compute; a manual trigger is a task, and the four other intake paths already
+create those.
+
+**No per-occurrence overrides.** A schedule that needs a different prompt on Fridays is two
+schedules, which the per-file layout makes cheap.
+
+**No catch-up beyond one occurrence, ever, and no configuration to widen it.** The bound is
+the design (see above), and an operator who wants a week of missed audits wants one audit
+that covers the week.

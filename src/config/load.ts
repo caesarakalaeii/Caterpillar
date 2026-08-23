@@ -29,6 +29,7 @@ import type {
   BotConfig,
   RemediationConfig,
   RunnerConfig,
+  ScheduleConfig,
   WebConfig,
   WorkspaceProfile,
 } from "./types.ts";
@@ -97,6 +98,7 @@ interface RawConfig {
   readonly intake?: { readonly intervalSeconds?: unknown };
   readonly web?: Record<string, unknown>;
   readonly digest?: Record<string, unknown>;
+  readonly schedule?: Record<string, unknown>;
   readonly cluster?: Record<string, unknown>;
   readonly remediation?: Record<string, unknown>;
   readonly redis?: Record<string, unknown>;
@@ -250,7 +252,11 @@ const identity = (value: unknown): CommitIdentity => {
   const fault = identityFault(email);
   if (fault !== undefined) throw new ConfigError(`identity.email ${fault}`);
 
-  return { name, email };
+  // `identityFault` is deliberately NOT asked of the retired addresses. Nothing commits as
+  // one — they exist so the digest can recognise its own past work (§19) — and refusing a
+  // bare noreply address here would leave a deployment that already made that mistake
+  // unable to describe the history it has.
+  return { name, email, pastEmails: strings(raw["pastEmails"], "identity.pastEmails") };
 };
 
 const workspace = (name: string, value: unknown): WorkspaceProfile => {
@@ -404,6 +410,17 @@ const webConfig = (web: Record<string, unknown>): WebConfig => ({
     "web.forwardedUserHeader",
     "remote-user",
   ).toLowerCase(),
+});
+
+/**
+ * Validate the `schedule` block (DESIGN.md §22).
+ *
+ * One field, and nothing to validate but its type — everything else about a schedule is in
+ * the state repo, where a malformed one is refused on the intake pass and shown on
+ * `/intake` rather than discovered at 09:00 by a runner with nothing useful to do.
+ */
+const scheduleConfig = (schedule: Record<string, unknown>): ScheduleConfig => ({
+  enabled: bool(schedule["enabled"], "schedule.enabled", false),
 });
 
 /**
@@ -702,6 +719,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     },
     web: webConfig(raw.web ?? {}),
     digest: digestConfig(raw.digest ?? {}),
+    schedule: scheduleConfig(raw.schedule ?? {}),
     cluster: clusterConfig(raw.cluster ?? {}),
     remediation: remediationConfig(raw.remediation ?? {}),
     redis: redisConfig(raw.redis ?? {}),

@@ -27,10 +27,13 @@ labelled `agent` became a task 23 seconds later and ran through to `done` and a 
 issue, including one round trip through `ask_human` when the agent hit a supervisor bug it
 could not work around.
 
-Work reaches it three ways: label a tracker item `agent` and intake renders a spec (§14);
-run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and then cut
-into wave-tagged tasks (§14.3); or commit a `tasks/<id>/spec.md` into the state repo by
-hand for full control over the acceptance criteria.
+Work reaches it four ways without a clock: label a tracker item `agent` and intake renders a
+spec (§14); run `/brainstorm` in Discord to refine an idea into a plan that is reviewed and
+then cut into wave-tagged tasks (§14.3); commit a `tasks/<id>/spec.md` into the state repo by
+hand for full control over the acceptance criteria; or let a firing Alertmanager alert become
+one (§20). And with a clock: commit a `schedules/<id>.yaml` and an occurrence of it becomes a
+task, gated by an optional precheck so a quiet week costs a command instead of a session
+(§22).
 
 To hand a GitHub issue or Vikunja task to the agent, label it `agent` and put an `agent`
 block in the body — `acceptance` is required, since a task with no machine-checkable
@@ -155,7 +158,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/exec.ts` | The agent's shell with a per-command time *and* output ceiling (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/review-guidance.ts` | Unresolved pull request review comments → a prompt section. Pure, no IO (§7.3). |
-| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against (§12.2). |
+| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
@@ -201,7 +204,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/view/server.ts` | The viewer's own front door, with every §18 rule re-asserted. |
 | `src/digest/day.ts` | Local day boundaries and DST. Pure, clock injected (§19). |
 | `src/digest/collect.ts` | A day's facts, diffed out of the state repo's history (§19). |
-| `src/digest/changes.ts` | Diffstat and commit subjects from local mirrors. No network (§19). |
+| `src/digest/changes.ts` | Diffstat, commit subjects and authorship from local mirrors. No network (§19). |
+| `src/digest/attribution.ts` | Fleet-versus-human authorship and its trend. Pure, no IO (§19). |
 | `src/digest/render.ts` | The one document Discord, git and the web view all get (§19). |
 | `src/digest/summarise.ts` | The prose paragraph. No tools, and never fails a digest (§19). |
 | `src/digest/publish.ts` | Claim the day, publish it, release the claim if that failed (§19). |
@@ -212,6 +216,10 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/remediation/policy.ts` | `alerts/policy.yaml` — which alerts may become tasks. Pure (§20). |
 | `src/remediation/receiver.ts` | The Alertmanager webhook. Answers fast, writes nothing, trusts nothing (§20). |
 | `src/remediation/queue.ts` | Firing alert → `spec.md`, on the loop's thread of control (§20). |
+| `src/schedule/occurrence.ts` | Cron + IANA zone → the next occurrence. Pure, clock injected (§22). |
+| `src/schedule/definition.ts` | `schedules/<id>.yaml` — one scheduled unit of work. Pure (§22). |
+| `src/schedule/precheck.ts` | The bounded command that decides whether to spend a session (§22). |
+| `src/schedule/run.ts` | Claim the occurrence, fire it, release the claim if that failed (§22). |
 | `src/redis/client.ts` | The nine-method Redis surface. The driver stops here (§21). |
 | `src/redis/guarded.ts` | The one place a Redis failure becomes a value instead of a throw (§21). |
 | `src/redis/inbox.ts` | Chat intents over a list, outcomes over a reply channel (§21). |
@@ -335,7 +343,13 @@ awkward, the change is probably wrong.
     trees, so `git diff` cannot tell them apart and only `git log` can. The supervisor
     reads that order and states it; `src/review/tdd.ts` reaches no verdict, and the one
     lens that does is told the carve-out — documentation, comments, formatting and pure
-    config have no behaviour to test (§12.2).
+    config have no behaviour to test (§12.2). **That holds for a repository's own rules
+    too.** A repo may ship `.caterpillar/standards.md`, and every section of it names the
+    lens that grades it in its own heading (`## <lens>: <title>`); a section naming no lens,
+    or one no council convenes, parks the task rather than becoming a rule nobody grades.
+    The text is untrusted — capped at 4 KiB, and it adds to code health, test-first and
+    attribution without being able to switch any of them off. A task spanning several repos
+    scopes each file to its own repo, so two repos disagreeing is not a conflict.
 16. **A session that cannot possibly succeed must not be started, and the environment the
     gate grades in must be one the acceptance list can satisfy.** Both halves come from a
     single park: `BS-…-07` hit the no-progress limit with a green branch and an open PR.
@@ -371,8 +385,8 @@ A read-only dashboard on `https://caterpillar.caes.ar`, behind the cluster's Aut
 what is running where, the fleet's logs, the messages of the sessions in flight, every
 stored transcript, and each task's spec, journal, questions, council verdicts and
 artifacts. `/intake` is where a **refusal** shows up: a labelled item that could not become
-a task, an alert that fired with no policy entry, and whether the alert receiver is
-listening at all.
+a task, an alert that fired with no policy entry, a schedule whose file will not parse, and
+whether the alert receiver and this runner's scheduler are switched on at all.
 
 Every runner serves it on its own port, in-cluster. In front of them sits
 **`caterpillar-view`** — the same image with a different command — which discovers the ready
@@ -469,14 +483,27 @@ others find it taken. A pod that was rolled through the cutoff still publishes w
 comes back — catch-up reaches back one day, so a runner returning after a week does not
 post seven digests at once.
 
-Two things it will tell you about itself rather than fake:
+**It also says how much of the change is yours.** One section splits the window's commits
+and lines into fleet and human, per repo, and shows the fleet's share against the previous
+window — because a single day's share says almost nothing and a direction says a lot. The
+split is by commit ADDRESS, never by display name, and the addresses come from `identity`
+(§9.7). If your deployment has changed identity, list the retired addresses in
+`identity.pastEmails` or the window that straddles the change reports the fleet's own work
+as a stranger's. The same numbers are counters —
+`caterpillar_digest_authored_lines_total{runner,repo,author}` and its commit-level twin —
+so the trend is graphable without parsing prose.
+
+Three things it will tell you about itself rather than fake:
 
 - **a missing paragraph says why** — a provider outage prints a line where the prose would
   have been, because a digest that silently lost it looks exactly like one that never had
   a summariser;
 - **a diff it cannot see says so** — a task branch lives in the mirror of the runner that
   worked it, so on another runner the digest names the repo it cannot read instead of
-  printing `0 files changed` about a merged pull request.
+  printing `0 files changed` about a merged pull request;
+- **a share it cannot measure is absent, not 0%** — same rule, and this is where breaking it
+  would be least visible, because a percentage always looks like a measurement. A repo with
+  no mirror here is named; a window with no commits says so.
 
 Enabling it needs nothing else: no new secret, no port, no Deployment. It runs on the
 existing poll loop and uses the notifier that is already configured.
@@ -573,6 +600,69 @@ in an order that matters. **`docs/remediation-runbook.md`** is the end-to-end gu
 order of operations, how to test the webhook by hand with `curl`, two worked
 `alerts/policy.yaml` entries, the three levers for turning it off in a hurry, and what to do
 about a 401, a 403 or an empty Loki result.
+
+## Work on a schedule
+
+The sixth intake path (§14, §22). "Every weekday at 09:00, audit the dependency updates in
+these repos" is a file in the state repo, and an occurrence of it becomes an ordinary task —
+claimed, sessioned, gated by §12, ending in a pull request.
+
+```json
+"schedule": { "enabled": true }
+```
+
+That is the whole of the runner's side of it. There is no new port, no new Deployment and no
+`CronJob`: the supervisor's housekeeping loop already runs every few seconds whether or not a
+session is in flight, and "has an occurrence come due" is a question about a checkout it
+already has.
+
+Everything else lives in the state repo, one file per schedule:
+
+```yaml
+# schedules/deps-audit.yaml
+version: 1
+trigger:
+  cron: "0 9 * * 1-5"           # five fields; no @daily, no seconds, no L or #
+  timezone: Europe/Berlin       # a NAMED zone, never +02:00
+workspace: primary
+repos:
+  - github.com/acme/widget
+prompt: |
+  Audit dependency updates across these repos. Open one PR per safe upgrade.
+acceptance:                     # required — a schedule that cannot express
+  - npm test                    # machine-checkable completion may not exist (§12)
+precheck:                       # optional: exit 0 to spend a session
+  command: "npm outdated --json | grep -q ."
+  timeoutSeconds: 120
+enabled: true                   # optional; false is how you turn one off
+maxOpenTasks: 1                 # optional
+```
+
+**The precheck is the part worth understanding.** Without one, every occurrence becomes a
+task, and a week with no dependency updates costs a full session to discover there was
+nothing to do — which the no-progress detector then scores honestly and, after three of them,
+parks (§11.1). With one, the command runs first, in the same worktree and the same nix
+environment the session would have had; a non-zero exit records a **skipped** occurrence and
+spends nothing. A timeout counts as non-zero, deliberately: a check that cannot answer in its
+own budget has not established that there is work.
+
+**Exactly one runner in the fleet fires each occurrence**, settled by the same
+compare-and-swap that claims a task — `refs/schedules/<id>/<occurrence>`. The claim is taken
+before the task is created and handed back if creating it failed, because firing twice is
+visible and firing never is silent.
+
+**Catch-up reaches back one occurrence and six hours.** A pod rolled through 09:00 (Keel rolls
+this one on every push to main) still owes that morning's audit; a pod that was off for a week
+does not owe seven of them.
+
+**A malformed schedule is refused when you commit it**, on the intake pass, and shown on
+`/intake` — not discovered at 09:00 by a runner that then has nothing useful to do. The same
+page carries the occurrence ledger, so a schedule that keeps skipping is legible instead of
+looking like a scheduler that stopped.
+
+Off by default, like the digest: firing an occurrence writes tasks into the shared state repo,
+and a runner someone started on a workstation must not begin doing that because it was
+upgraded.
 
 ## Turning on Redis
 
@@ -771,7 +861,8 @@ task worktree carries one configured identity:
 ```json
 "identity": {
   "name": "caterpillar-agent[bot]",
-  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com"
+  "email": "316492202+caterpillar-agent[bot]@users.noreply.github.com",
+  "pastEmails": []
 }
 ```
 
@@ -791,6 +882,13 @@ gh api users/<slug>%5Bbot%5D --jq .id
 
 which is a **different** number from the App id in the secret: the App id names the
 application, this names the account it commits as.
+
+**`pastEmails` is read-only history.** Nothing ever commits as one of them; they are there
+so the daily digest's authorship split (§19) recognises the fleet's own past work after you
+reinstall the App, rather than reporting it as a contributor who does not exist. The
+bare-noreply refusal above is deliberately not applied to them — it exists to stop an
+address *authoring* anything, and a deployment that already made that mistake still has to
+be able to describe the history it has.
 
 **And nothing it writes carries a second name.** No `Co-Authored-By` trailer, no "Generated
 with" footer, no 🤖, no model or tool name — in commit messages, PR titles and bodies,

@@ -20,6 +20,7 @@ import {
   EMPTY_USAGE,
   type RepoRef,
   type TaskState,
+  type ToolchainSpec,
   type TrackerRef,
   type WorkspaceName,
 } from "../domain/task.ts";
@@ -90,6 +91,10 @@ export interface IntakePass {
   readonly rejected: number;
   /** Trackers that could not be listed at all. */
   readonly failed: number;
+  /** Schedules in the state repo that parsed (DESIGN.md §22). */
+  readonly schedules: number;
+  /** Files under `schedules/` that are not schedules. Warned about once per pass. */
+  readonly schedulesInvalid: number;
 }
 
 /** What intake decided about one item. Mirrored into the metric's `outcome` label. */
@@ -136,6 +141,32 @@ export interface IngesterDeps {
    * Optional, and it fails open on a throw — see the refusal site for why.
    */
   readonly forges?: ReadonlyMap<WorkspaceName, RepoReach>;
+  /**
+   * Whether the packages a `toolchain` block declares resolve against the configured
+   * nixpkgs pin (DESIGN.md §8.1), narrowed to that one question.
+   *
+   * The same argument as `forges` one field up, with a different exit code. `spec.ts`
+   * checks that the block is SHAPED right; nothing checked that `lua51` is spelt
+   * `lua5_1`, so the answer arrived inside a session, from `nix print-dev-env`, after a
+   * runner had claimed the task.
+   *
+   * Optional, and it fails open on a throw and on "could not evaluate" alike — see the
+   * refusal site.
+   */
+  readonly toolchainDoctor?: ToolchainCheck;
+}
+
+/**
+ * The one question intake asks about a declared toolchain.
+ *
+ * An interface here rather than an import of `ToolchainDoctor`, for the reason
+ * `RepoInspector` exists in `workspace/toolchain.ts`: intake has no business knowing how
+ * nix is invoked, and a test needs to answer this without a nix store. `ToolchainDoctor`
+ * satisfies it structurally.
+ */
+export interface ToolchainCheck {
+  /** A refusal to put on the item, or undefined for "no objection" and "cannot tell". */
+  fault(declared: ToolchainSpec | undefined): Promise<string | undefined>;
 }
 
 /**
@@ -177,6 +208,7 @@ export class Ingester {
    */
   async ingest(remote: string, branch: string): Promise<IntakePass> {
     const { store, trackers, logger } = this.deps;
+    const schedules = await this.validateSchedules();
     let created = 0;
     let seen = 0;
     let rejected = 0;
@@ -222,7 +254,50 @@ export class Ingester {
         branch,
       );
     }
-    return { seen, created, rejected, failed };
+    return { seen, created, rejected, failed, ...schedules };
+  }
+
+  /**
+   * Read every schedule and report the ones that are not (DESIGN.md §22).
+   *
+   * HERE rather than in the firing pass, because the two answer to different audiences. The
+   * firing pass runs at 09:00 with nobody watching and can only skip what it cannot parse;
+   * intake runs on a timer whose whole output is a report, and the moment a schedule becomes
+   * malformed is the commit that made it so — which is when somebody is looking.
+   *
+   * It creates nothing and refuses nothing durably. There is no tracker item to comment on
+   * and no author to tell: a schedule is committed by an operator, so the report goes where
+   * an operator looks, which is this runner's log and the `/intake` page.
+   *
+   * Never throws. A state repo whose `schedules/` cannot be read must not stop the tracker
+   * pass that is the rest of this method.
+   */
+  private async validateSchedules(): Promise<{
+    readonly schedules: number;
+    readonly schedulesInvalid: number;
+  }> {
+    try {
+      const listing = await this.deps.store.listSchedules();
+      for (const error of listing.errors) {
+        // At WARN and once per pass. An operator who has just committed a broken schedule
+        // gets a line naming the file and the field; a fleet that has been carrying one for
+        // a week gets one line per interval per runner, which is the same rate intake
+        // already logs its own pass at.
+        this.deps.logger.warn("intake.schedule-invalid", {
+          schedule: error.schedule,
+          reason: error.message,
+        });
+      }
+      return {
+        schedules: listing.schedules.length,
+        schedulesInvalid: listing.errors.length,
+      };
+    } catch (error) {
+      this.deps.logger.warn("intake.schedules-unreadable", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { schedules: 0, schedulesInvalid: 0 };
+    }
   }
 
   /**
@@ -252,6 +327,32 @@ export class Ingester {
     } catch (error) {
       this.deps.logger.warn("intake.reach-unknown", {
         workspace,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * A refusal for an item whose declared toolchain cannot be produced, or undefined —
+   * which also covers "the check could not run".
+   *
+   * Those two are one answer for the same reason they are in `unreachableReason`: a nix
+   * that is absent, timed out, or could not fetch the pin has learnt nothing about the
+   * package name. Turning that into a refusal on a runner without nix would comment on
+   * every item in the backlog that declares a toolchain, and suppress each one durably
+   * (§14.2) — so the fleet's most careful items would be the ones it rejected.
+   */
+  private async toolchainReason(
+    declared: ToolchainSpec | undefined,
+  ): Promise<string | undefined> {
+    const doctor = this.deps.toolchainDoctor;
+    if (doctor === undefined || declared === undefined) return undefined;
+
+    try {
+      return await doctor.fault(declared);
+    } catch (error) {
+      this.deps.logger.warn("intake.toolchain-unknown", {
         error: error instanceof Error ? error.message : String(error),
       });
       return undefined;
@@ -368,6 +469,15 @@ export class Ingester {
     const unreachable = await this.unreachableReason(workspace, rendered.spec.repos);
     if (unreachable !== undefined) {
       return this.refuse(workspace, tracker, item, unreachable);
+    }
+
+    // And whether the environment it asks for can be produced at all (§8.1). Same door,
+    // same refusal path: a typo'd nixpkgs attribute is as much the author's to fix as a
+    // repo that does not exist, and discovering it here costs a comment instead of the
+    // session it used to cost.
+    const badToolchain = await this.toolchainReason(rendered.spec.toolchain);
+    if (badToolchain !== undefined) {
+      return this.refuse(workspace, tracker, item, badToolchain);
     }
 
     const now = new Date().toISOString();

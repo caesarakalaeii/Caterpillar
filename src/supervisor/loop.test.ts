@@ -23,6 +23,8 @@ import {
   type SessionOutcome,
   type TaskId,
   type TaskState,
+  type TrackerRef,
+  type WorkspaceName,
 } from "../domain/task.ts";
 import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
@@ -42,7 +44,8 @@ import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { InMemoryThreadBindings } from "../redis/threads.ts";
-import { type ChatOutcome, type ChatRequest } from "./inbox.ts";
+import { type ChatIntent, type ChatOutcome, type ChatRequest } from "./inbox.ts";
+import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { FleetActivity } from "../notify/activity.ts";
 import { TaskSnapshot } from "./snapshot.ts";
 import {
@@ -115,6 +118,8 @@ const seedTask = async (
   over: Partial<TaskState> = {},
   /** Repo slugs for the spec, primary first. One repo unless a test needs §9.4.1's plural. */
   repos: readonly string[] = ["github.com/acme/widget"],
+  /** The tracker item the task came from, for tests about what is mirrored back to it. */
+  tracker?: TrackerRef,
 ): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
@@ -127,6 +132,14 @@ const seedTask = async (
       ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
       '  - "true"',
+      ...(tracker === undefined
+        ? []
+        : [
+            "tracker:",
+            `  kind: ${tracker.kind}`,
+            `  id: "${tracker.id}"`,
+            ...(tracker.container === undefined ? [] : [`  container: ${tracker.container}`]),
+          ]),
       "---",
       "",
       "Prove the pipeline runs.",
@@ -193,6 +206,7 @@ const config: RunnerConfig = {
   // No web view in the loop's tests: these exercise the supervisor, and a listening
   // socket per fixture is a port collision waiting for a parallel run.
   digest: { enabled: false, hour: 18, timeZone: "Europe/Berlin", summarise: true },
+  schedule: { enabled: false },
   cluster: {
     enabled: false,
     namespaces: [],
@@ -872,12 +886,20 @@ test("a review comment on the pull request forgives a council round, once", asyn
 
   // The first rejection lands at round 1, not 3: the comment was newer than anything the
   // council had already been shown, so the count was cleared before it was incremented.
-  let firstRejection: TaskState | undefined;
+  //
+  // Read AT the commit rather than polling for it, per `waitForCommit`: `rounds === 1` is
+  // the state between the first rejection and the second, and the task goes straight back
+  // to `ready` and is re-claimed, so on a fast machine that window closes inside one poll
+  // interval. A poller that missed it reported the forgiveness as absent — the flake this
+  // replaces, seen on CI at 255ms where the same test takes ~1s locally.
+  const firstRejectionAt = await waitForCommit(
+    `chore(${REVIEWED}): review council requested changes`,
+    30_000,
+  );
   let parked: TaskState | undefined;
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const state = await pushedState(REVIEWED);
-    if (firstRejection === undefined && state?.review?.rounds === 1) firstRejection = state;
     if (state?.status === "parked") {
       parked = state;
       break;
@@ -888,7 +910,13 @@ test("a review comment on the pull request forgives a council round, once", asyn
   controller.abort();
   await running.catch(() => undefined);
 
-  assert.ok(firstRejection !== undefined, "the round count must be forgiven before it is raised");
+  assert.ok(firstRejectionAt !== undefined, "the round count must be forgiven before it is raised");
+  const firstRejection = await stateAt(firstRejectionAt, REVIEWED);
+  assert.equal(
+    firstRejection?.review?.rounds,
+    1,
+    "the round count must be forgiven before it is raised",
+  );
   assert.equal(
     firstRejection?.review?.commentSeen,
     "2026-08-20T10:00:00.000Z",
@@ -1832,6 +1860,80 @@ test("a task that reaches a terminal status stops reporting a no-progress streak
     metrics.render(),
     /caterpillar_no_progress_streak\{[^}]*task="ENDED-1"/,
     "a parked task must stop reporting a streak, or it alerts forever about settled work",
+  );
+});
+
+test("a replica drops a streak for a task another replica finished", async () => {
+  // The other half of the stale-gauge failure, and the half `transition` cannot reach.
+  //
+  // `transition` removes the series when THIS process takes a task terminal. But the
+  // gauge is per-process and in memory, while a task migrates between replicas across
+  // sessions — in the fleet's own state repo 19 tasks carry journal shards written by two
+  // to four different runners. So the pod that published the streak is routinely not the
+  // pod that finishes the task:
+  //
+  //   pod A runs session N, publishes streak 2, hands off, releases the lease
+  //   pod B claims session N+1, the task finishes, pod B removes the series from its OWN
+  //     registry — where nothing ever set it
+  //   pod A reports 2 for the life of the process
+  //
+  // `caterpillar_no_progress_streak >= 2` does not aggregate over `pod`, so pod A's orphan
+  // series fires CaterpillarTaskThrashing indefinitely. That is what kept the alert up for
+  // 36 hours on BS-1540288291008684052-02, whose three sessions all ran on caterpillar-1
+  // and whose streak of 2 was entirely truthful — the task went `done` at streak 2.
+  //
+  // Modelled as the state repo already holding the terminal status, because that is
+  // precisely what pod A sees: it never runs another session on the task and never calls
+  // `transition` for it, so `survey` — the one pass that reads every task's committed
+  // state on every poll in every replica — is the only place the truth arrives.
+  const ELSEWHERE = asTaskId("ELSEWHERE-1");
+  await seedTask(ELSEWHERE, {
+    status: "done",
+    sessions: 3,
+    progress: { lastProgressSession: 1, noProgressStreak: 2 },
+  });
+
+  const metrics = new AgentMetrics();
+  // What this replica's last session on the task left behind before handing it off.
+  metrics.noProgress.set({ task: ELSEWHERE }, 2);
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Nothing may claim a `done` task, so no session should run at all.
+    runner: { run: () => Promise.reject(new Error("a finished task must not be claimed")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics,
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const orphaned = /caterpillar_no_progress_streak\{[^}]*task="ELSEWHERE-1"/;
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline && orphaned.test(metrics.render())) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.doesNotMatch(
+    metrics.render(),
+    orphaned,
+    "a replica must stop reporting a streak for a task it can see has finished, or the " +
+      "alert outlives the work on whichever pod ran the second-to-last session",
   );
 });
 
@@ -3382,7 +3484,14 @@ test("intake keeps running while a session holds the runner", async () => {
     intake: {
       ingest: () => {
         passes += 1;
-        return Promise.resolve({ seen: 0, created: 0, rejected: 0, failed: 0 });
+        return Promise.resolve({
+          seen: 0,
+          created: 0,
+          rejected: 0,
+          failed: 0,
+          schedules: 0,
+          schedulesInvalid: 0,
+        });
       },
     },
   });
@@ -5112,4 +5221,597 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
 
   await retire(WAITING);
   await retire(RUNNING);
+});
+
+test("scheduled work is fired from the housekeeping loop, and a failing pass is not fatal", async () => {
+  // The schedule runs on the housekeeping loop (§22) — no new listener, no new port, no
+  // new Deployment. Two properties matter: it is reached on an ordinary pass, and it can
+  // never be the reason the loop stops. `ScheduleRunner` already swallows its own failures
+  // and hands its claims back; this is for the one thing it cannot handle, itself throwing.
+  const calls: Date[] = [];
+  const schedule = {
+    maybeFire: (now: Date): Promise<never> => {
+      calls.push(now);
+      return Promise.reject(new Error("the state repo rejected the push"));
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("unused")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    schedule,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && calls.length < 2) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(
+    calls.length >= 2,
+    `the loop must keep housekeeping after a schedule pass throws — it called it ${calls.length} time(s)`,
+  );
+});
+
+test("a rejected claim still pushes the evidence its gate published", async () => {
+  // The gate writes an artifact OUTSIDE any of the loop's write-then-commit units
+  // (`Supervisor.unit`), and inside a unit `StateStore` stages only the paths that unit
+  // wrote — not the whole writable tree. So whether a screenshot ever reaches the remote
+  // depends on the rejection unit happening to touch `tasks/<id>`, which it does because
+  // it journals the rejection under the same id.
+  //
+  // That is load-bearing and entirely invisible from either file. A future change that
+  // journals a rejection somewhere else, or narrows staging further, leaves the evidence
+  // on one runner's disk with nothing to say it was dropped — and a screenshot that never
+  // leaves the machine that produced it is the whole feature not working.
+  const EVIDENCE = asTaskId("SMOKE-EV-1");
+  await seedTask(EVIDENCE);
+
+  const store = new StateStore(statePath, stateGit);
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    // What `AcceptanceVerifier.collectEvidence` does, in the one respect this test is
+    // about: the artifact is on disk before the verdict is returned, and it is returned
+    // as a FAILURE — the case where the image matters most and where nothing else in the
+    // loop would have reason to commit it.
+    verifier: {
+      verify: async () => {
+        await store.writeArtifact(EVIDENCE, "shot.png", Buffer.from("pretend png"));
+        return { passed: false, detail: "the header still overlaps the nav" };
+      },
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.reject(new Error("the council must not run on a failed gate")),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const rejected = await waitForCommit(
+    `chore(${EVIDENCE}): completion claim rejected`,
+    30_000,
+  );
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(rejected !== undefined, "the rejection was never pushed");
+  assert.equal(
+    await blobAt(rejected, `tasks/${EVIDENCE}/artifacts/shot.png`),
+    "pretend png",
+    "the evidence must travel with the rejection that explains it",
+  );
+
+  await retire(EVIDENCE);
+});
+
+test("a question's options are pushed with it and offered in the notification", async () => {
+  // The option TEXT has to reach the state repo, because that is the only place a button
+  // press can look it up: a `custom_id` holds 100 characters and the task id has spent most
+  // of them (DESIGN.md §7).
+  const ASKED = asTaskId("SMOKE-OPTIONS-1");
+  await seedTask(ASKED);
+
+  const offered: (readonly string[] | undefined)[] = [];
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: (spec) => {
+        if (spec.id !== ASKED) return Promise.reject(new Error("session not under test"));
+        return Promise.resolve({
+          reason: "ask-human" as const,
+          usage: EMPTY_USAGE,
+          contextTokens: 100,
+          question: "Which migration path?",
+          questionOptions: ["Use the existing one", "Write a new one"],
+          summary: "needs a decision",
+        });
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: {
+      notify: (notification) => {
+        if (notification.kind === "question") offered.push(notification.options);
+        return Promise.resolve();
+      },
+    },
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const asked = await waitForCommit(`chore(${ASKED}): awaiting human input`, 30_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(asked !== undefined, "the question was never pushed");
+  assert.equal(
+    await blobAt(asked, `tasks/${ASKED}/questions/001-options.json`),
+    `${JSON.stringify(["Use the existing one", "Write a new one"], null, 2)}\n`,
+  );
+  assert.deepEqual(offered, [["Use the existing one", "Write a new one"]]);
+
+  await retire(ASKED);
+});
+
+test("pressing an option lands exactly where the same text typed by hand lands", async () => {
+  // THE constraint. One answer path, not two: a button press resolves to the stored option
+  // text and then goes through `applyAnswer` unchanged. Asserted by COMPARING the two
+  // resulting states rather than by checking each against a list — a second path that
+  // diverges later would still satisfy two separate sets of assertions.
+  const PRESSED = asTaskId("SMOKE-OPTIONS-2");
+  const TYPED = asTaskId("SMOKE-OPTIONS-3");
+  const OPTION = "Use the existing migration path";
+
+  const store = new StateStore(statePath, stateGit);
+  for (const task of [PRESSED, TYPED]) {
+    await seedTask(task);
+    await store.pull("origin", config.stateRepo.branch);
+    await store.writeQuestion(task, 4, "Which migration path?", [OPTION, "Write a new one"]);
+    await store.writeState({
+      ...seed,
+      id: task,
+      status: "awaiting-human",
+      sessions: 4,
+      progress: { lastProgressSession: 1, noProgressStreak: 3 },
+    });
+    await store.commitAndPush(`chore(${task}): awaiting human`, "origin", "main");
+  }
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const pressed = await inbox.submit({ kind: "answer-option", task: PRESSED, option: 0 });
+  const typed = await inbox.submit({ kind: "answer", task: TYPED, text: OPTION });
+  // Read at the commit the answer made rather than at `main`: both tasks go `ready` the
+  // moment they are answered and are then claimed by the failing runner above, which parks
+  // them and journals that — noise that is nothing to do with what is being compared.
+  const answered = {
+    pressed: await waitForCommit(`chore(${PRESSED}): answered question 4`, 30_000),
+    typed: await waitForCommit(`chore(${TYPED}): answered question 4`, 30_000),
+  };
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(pressed, typed, "the two paths must report the same outcome");
+  assert.ok(answered.pressed !== undefined && answered.typed !== undefined, "an answer went unpushed");
+
+  const answerFile = (commit: string, task: TaskId): Promise<string | undefined> =>
+    blobAt(commit, `tasks/${task}/questions/004-answer.md`);
+
+  assert.equal(
+    await answerFile(answered.pressed, PRESSED),
+    `${OPTION}\n`,
+    "the full option text, untruncated",
+  );
+  assert.equal(
+    await answerFile(answered.pressed, PRESSED),
+    await answerFile(answered.typed, TYPED),
+  );
+
+  // The task id and the wall clock are the only things allowed to differ, so both are
+  // erased before the comparison. Everything else — the entry's heading, its session
+  // ordinal, its wording, the answer inside it — has to match exactly.
+  const anonymise = (task: TaskId, text: string): string =>
+    text.split(task).join("<task>").replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<at>");
+  assert.match(await journalAt(answered.pressed, PRESSED), /Answer from the operator/);
+  assert.equal(
+    anonymise(PRESSED, await journalAt(answered.pressed, PRESSED)),
+    anonymise(TYPED, await journalAt(answered.typed, TYPED)),
+  );
+
+  // Same for the state. The streak reset is the field that matters: it is what stops an
+  // answered task parking again before it has run.
+  const pressedState = await stateAt(answered.pressed, PRESSED);
+  assert.equal(pressedState?.progress.noProgressStreak, 0);
+  assert.equal(
+    anonymise(PRESSED, JSON.stringify(pressedState)),
+    anonymise(TYPED, JSON.stringify(await stateAt(answered.typed, TYPED))),
+  );
+
+  await retire(PRESSED);
+  await retire(TYPED);
+});
+
+test("an option index the stored question does not have is refused, and writes nothing", async () => {
+  // A button lives in the channel forever, so a press can arrive against a question that
+  // has been superseded — or against one that never had options at all. Answering it would
+  // write SOMEBODY ELSE'S choice into the answer file, which the next session then obeys.
+  const STALE = asTaskId("SMOKE-OPTIONS-4");
+  await seedTask(STALE);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  await store.writeQuestion(STALE, 4, "Which migration path?", ["the existing one"]);
+  await store.writeState({
+    ...seed,
+    id: STALE,
+    status: "awaiting-human",
+    sessions: 4,
+    progress: { lastProgressSession: 1, noProgressStreak: 3 },
+  });
+  await store.commitAndPush(`chore(${STALE}): awaiting human`, "origin", "main");
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("session not under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "answer-option", task: STALE, option: 1 });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(outcome.kind, "refused");
+  assert.match(
+    outcome.kind === "refused" ? outcome.reason : "",
+    /no longer offer/,
+    "the refusal has to say why, or the human presses it again",
+  );
+
+  const answer = await new Git(origin).tryRun(
+    "show",
+    `main:tasks/${STALE}/questions/004-answer.md`,
+  );
+  assert.notEqual(answer.code, 0, "nothing may be written for an option that does not exist");
+  assert.equal(
+    (await pushedState(STALE))?.status,
+    "awaiting-human",
+    "the task must stay parked on the question it asked",
+  );
+
+  await retire(STALE);
+});
+
+/**
+ * `/done` — a human marking a task done by hand, with both §12 gates bypassed.
+ *
+ * The property every test here defends is the same one: the record must never read as
+ * though the task was verified. A task can be OBSOLETE rather than finished, and the only
+ * honest way to say so is to write `done` and say in the journal that nothing was checked.
+ */
+const forceDoneSupervisor = (options: {
+  readonly inbox: InMemoryChatQueue;
+  readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
+  readonly reviewers?: SupervisorDeps["reviewers"];
+}): Supervisor =>
+  new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: {
+      verify: () => Promise.reject(new Error("forcing a task done must not run gate 1")),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox: options.inbox,
+    ...(options.trackers === undefined ? {} : { trackers: options.trackers }),
+    ...(options.reviewers === undefined ? {} : { reviewers: options.reviewers }),
+  });
+
+/** Run one chat request against a supervisor, and stop. */
+const applyOne = async (
+  supervisor: Supervisor,
+  inbox: InMemoryChatQueue,
+  intent: ChatIntent,
+): Promise<ChatOutcome> => {
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit(intent);
+  controller.abort();
+  await running.catch(() => undefined);
+  return outcome;
+};
+
+test("/done on a parked task writes done, and journals who forced it and why", async () => {
+  const FORCED = asTaskId("SMOKE-FORCE-1");
+  await seedTask(FORCED, { status: "parked", sessions: 2 });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: FORCED,
+    reason: "the feature was dropped from the roadmap",
+    author: "ada",
+  });
+
+  assert.deepEqual(outcome, { kind: "forced-done" }, JSON.stringify(outcome));
+  assert.equal((await pushedState(FORCED))?.status, "done");
+
+  const journal = await pushedJournal(FORCED);
+  assert.match(journal, /ada/, "the journal must name who forced it");
+  assert.match(journal, /the feature was dropped from the roadmap/, "and why");
+  assert.match(journal, /BYPASSED/, "and that nothing was verified");
+});
+
+test("forcing a task done records no gate as passed, anywhere", async () => {
+  // The whole risk of this command: a `done` that reads like a verified `done` is a lie
+  // the record keeps telling. Asserted on the state and the journal, not on the outcome.
+  const UNVERIFIED = asTaskId("SMOKE-FORCE-2");
+  await seedTask(UNVERIFIED, { status: "failed" });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: UNVERIFIED,
+    reason: "superseded by SMOKE-FORCE-1",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  const state = await pushedState(UNVERIFIED);
+  assert.equal(state?.status, "done");
+  assert.equal(state?.review?.last, undefined, "the council never ran, so it recorded nothing");
+
+  // The two words a verified completion is written with, each on its own and anywhere in
+  // the entry, which is far stricter than a phrase match. Word-bounded on purpose: the
+  // honest wording is "BYPASSED" and "not by verification", and an unanchored substring
+  // match on "passed" or "verif" would reject exactly the sentences that make it honest.
+  const journal = await pushedJournal(UNVERIFIED);
+  assert.doesNotMatch(journal, /\bpassed\b/i, "nothing may read as a gate that passed");
+  assert.doesNotMatch(journal, /\bverified\b/i, "nor as a task that was verified");
+  assert.match(journal, /BYPASSED/);
+});
+
+test("/done needs no PR and merges nothing", async () => {
+  // Obsolescence is the primary use case, and an obsolete task has nothing on a branch.
+  // `/merge` refuses both of these, which is why it is not the way to say this.
+  const NO_PR = asTaskId("SMOKE-FORCE-3");
+  await seedTask(NO_PR, { status: "parked" });
+
+  const merges: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("unused")),
+    approve: (repo, pr) => {
+      merges.push(`approve:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    merge: (repo, pr) => {
+      merges.push(`merge:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    forceDoneSupervisor({
+      inbox,
+      reviewers: new Map([
+        [
+          asWorkspaceName("test"),
+          {
+            forTask: () => Promise.resolve(reviewerForge),
+            unreachable: () => Promise.resolve([]),
+            reachable: () => Promise.resolve([]),
+          },
+        ],
+      ]),
+    }),
+    inbox,
+    { kind: "force-done", task: NO_PR, reason: "obsolete", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  assert.equal((await pushedState(NO_PR))?.status, "done");
+  assert.deepEqual(merges, [], "forcing a task done must never merge");
+});
+
+test("/done on a running task refuses and writes nothing at all", async () => {
+  // Racing the lease is the alternative, and it is worse: the session holds it, so the
+  // write would either fail its CAS or land under a session still working the task.
+  const RUNNING = asTaskId("SMOKE-FORCE-4");
+  await seedTask(RUNNING, { status: "running" });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: RUNNING,
+    reason: "obsolete",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "not-forceable", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-forceable" ? outcome.reason : "",
+    /cancel/i,
+    "the refusal has to say what to do instead",
+  );
+  assert.equal((await pushedState(RUNNING))?.status, "running", "the status must not move");
+  assert.equal(await pushedJournal(RUNNING), "", "a refusal writes no history");
+});
+
+test("/done is accepted on failed and on awaiting-human", async () => {
+  for (const status of ["failed", "awaiting-human"] as const) {
+    const task = asTaskId(`SMOKE-FORCE-${status}`);
+    await seedTask(task, { status });
+
+    const inbox = new InMemoryChatQueue();
+    const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+      kind: "force-done",
+      task,
+      reason: "obsolete",
+      author: "ada",
+    });
+
+    assert.equal(outcome.kind, "forced-done", `${status}: ${JSON.stringify(outcome)}`);
+    assert.equal((await pushedState(task))?.status, "done", status);
+  }
+});
+
+test("the tracker is told, with a reason naming it a forced completion", async () => {
+  // Mirrored through the EXISTING `parked` transition: `completed` requires a PR url and
+  // `/done` must work without one. The reason field is what carries the truth — which is
+  // also why the name of this test is not "closed": `parked` releases the item and comments
+  // on it, and closing an issue is reserved for `completed` and the gates it stands for.
+  const MIRRORED = asTaskId("SMOKE-FORCE-5");
+  await seedTask(MIRRORED, { status: "parked" }, ["github.com/acme/widget"], {
+    kind: "github-issues",
+    id: "42",
+    container: "acme/widget",
+  });
+
+  const seen: TrackerTransition[] = [];
+  const tracker: Tracker = {
+    kind: "github-issues",
+    listAgentItems: () => Promise.resolve([]),
+    comment: () => Promise.resolve(),
+    // `/done` closes nothing and files nothing, so a call here is a bug worth failing on
+    // rather than a stub worth satisfying quietly.
+    create: () => Promise.reject(new Error("forcing a task done must not file a tracker item")),
+    transition: (_ref, transition) => {
+      seen.push(transition);
+      return Promise.resolve();
+    },
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    forceDoneSupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
+    inbox,
+    { kind: "force-done", task: MIRRORED, reason: "obsolete", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  assert.equal(seen.length, 1, JSON.stringify(seen));
+  const mirrored = seen[0];
+  assert.equal(mirrored?.kind, "parked");
+  const reason = mirrored?.kind === "parked" ? mirrored.reason : "";
+  assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
+  assert.match(reason, /obsolete/, "the human's reason travels with it");
+  assert.match(reason, /ada/);
 });

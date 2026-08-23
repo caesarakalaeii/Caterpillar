@@ -22,6 +22,20 @@ import type { LogLevel } from "../obs/log.ts";
 export interface CommitIdentity {
   readonly name: string;
   readonly email: string;
+  /**
+   * Addresses this deployment used to commit as, if any. READ ONLY — nothing commits as one.
+   *
+   * The digest's authorship split (§19) decides fleet-versus-human by address, and this
+   * identity is deployment configuration: a deployment that reinstalled its App has commits
+   * under the retired address in the same window as the current one. Without this, that
+   * window reports the retired half as a person's work — a contributor who does not exist,
+   * and a fleet share halved on the one day it changed.
+   *
+   * Optional, unlike `email`, because a deployment that has never changed identity has no
+   * honest value to give: an empty list is the truth, and requiring it would make every
+   * caller that constructs an identity state a fact it does not have.
+   */
+  readonly pastEmails?: readonly string[];
 }
 
 export interface ForgeConfig {
@@ -451,6 +465,24 @@ export interface DigestConfig {
 }
 
 /**
+ * Scheduled work (DESIGN.md §22).
+ *
+ * ONE switch, and everything else about a schedule lives in the state repo. That is the
+ * point of the split: which schedules exist, when they fire, in which zone and with which
+ * acceptance commands is operator-authored, reviewable and revertable in the repo the
+ * supervisor already polls, and adding one must not be a redeploy. What this process gets
+ * to decide is only whether it participates at all.
+ *
+ * `enabled` defaults to FALSE, like the digest's and the web view's, and for the digest's
+ * reason: firing an occurrence writes tasks into the shared state repo, and a runner
+ * someone started on a workstation must not begin doing that because it was upgraded. The
+ * claim protocol (§22) makes a second firing runner harmless, not welcome.
+ */
+export interface ScheduleConfig {
+  readonly enabled: boolean;
+}
+
+/**
  * Supervisor-mediated cluster reads (DESIGN.md §20).
  *
  * Two switches, and they are not the same switch. `enabled` says this runner may perform
@@ -534,6 +566,7 @@ export interface RunnerConfig {
   readonly intake: IntakeConfig;
   readonly web: WebConfig;
   readonly digest: DigestConfig;
+  readonly schedule: ScheduleConfig;
   readonly cluster: ClusterConfig;
   readonly remediation: RemediationConfig;
   /** The ephemeral cross-process plane (DESIGN.md §21). Off by default. */

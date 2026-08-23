@@ -6,7 +6,7 @@
  * repo, so recovery is "fetch and reclaim".
  */
 import { createServer } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { CredentialStore } from "@earendil-works/pi-ai";
 import { AgentSessionRunner, type WorkspaceBindings } from "./agent/runner.ts";
@@ -19,6 +19,8 @@ import { CredentialService } from "./credential/service.ts";
 import { MirrorChangeReader } from "./digest/changes.ts";
 import { DailyDigest } from "./digest/publish.ts";
 import { LlmSummariser } from "./digest/summarise.ts";
+import { schedulePrecheck } from "./schedule/precheck.ts";
+import { ScheduleRunner } from "./schedule/run.ts";
 import { asRunnerId, type WorkspaceName } from "./domain/task.ts";
 import { mergedCatalog } from "./forge/catalog.ts";
 import type { RepoCatalog } from "./forge/reach.ts";
@@ -65,6 +67,7 @@ import { AcceptanceVerifier } from "./supervisor/verifier.ts";
 import type { Tracker } from "./tracker/types.ts";
 import { WorktreeManager } from "./workspace/worktree.ts";
 import { ToolchainResolver } from "./workspace/toolchain.ts";
+import { NixCommandEval, ToolchainDoctor } from "./workspace/toolchain-doctor.ts";
 import { nixStoreDir, UsageMonitor } from "./workspace/usage.ts";
 
 const CONFIG_PATH = process.env["CONFIG_PATH"] ?? "/etc/caterpillar/config.json";
@@ -329,6 +332,17 @@ const main = async (): Promise<void> => {
     ...(credentialStore(config.llm, logger) ?? {}),
   });
 
+  const scheduler = createScheduler({
+    config,
+    store,
+    leases,
+    worktrees,
+    toolchain,
+    notifier: discord.notifier,
+    metrics,
+    logger,
+  });
+
   const digester = createDigest({
     config,
     git,
@@ -372,6 +386,7 @@ const main = async (): Promise<void> => {
     store,
     leases,
     ...(digester === undefined ? {} : { digest: digester }),
+    ...(scheduler === undefined ? {} : { schedule: scheduler }),
     chat,
     runner: new AgentSessionRunner({
       config,
@@ -399,10 +414,17 @@ const main = async (): Promise<void> => {
         settleMs: config.limits.ciSettleSeconds * 1000,
         pollMs: config.limits.ciPollSeconds * 1000,
       },
+      // A gate that renders something writes it here and the supervisor commits it as a
+      // §17 artifact. Beside the task's worktree rather than inside it: a file in the
+      // checkout is a file in `git status`, and the next `git add -A` would put a
+      // screenshot in the pull request.
+      evidence: { store, dir: (task) => join(config.paths.tasks, task, "evidence") },
     }),
     progress: new GitProgressProbe({ worktrees }),
     // The third gate (§12.1) — runs only after the §12 pair has already passed.
-    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain }),
+    // `artifacts: store` is what lets the reviewers see what the gate rendered, not just
+    // what the diff says (§12.1). Read-only, staged beside the checkout.
+    council: new ReviewCouncil({ config, worktrees, llm, logger, toolchain, artifacts: store }),
     maintainer: new PlanMaintainer({ config, worktrees, llm, logger, toolchain }),
     reviewers,
     // The workspaces' forge factories, for the one question the loop asks of them: can this
@@ -445,6 +467,15 @@ const main = async (): Promise<void> => {
       logger,
       metrics: intakeObserver(metrics),
       maxSessionsPerTask: config.limits.maxSessionsPerTask,
+      // The same idea as `forges` above, for the environment rather than the repos: a
+      // `toolchain.packages` list with a typo'd nixpkgs attribute is refused here instead
+      // of parking a claimed task in `nix print-dev-env` a session later (§8.1). On a
+      // runner without nix it evaluates nothing and refuses nothing.
+      toolchainDoctor: new ToolchainDoctor({
+        config: loaded.toolchain,
+        nix: new NixCommandEval(),
+        logger,
+      }),
     }),
     intakeStatus,
     // The fifth intake path (§20). Present whether or not the receiver is listening: the
@@ -554,6 +585,57 @@ const main = async (): Promise<void> => {
 };
 
 /**
+ * Build the scheduled-work runner, if this runner was told to fire schedules (DESIGN.md §22).
+ *
+ * Off by default, like the digest and for the digest's reason: firing an occurrence writes
+ * tasks into the shared state repo, and a runner someone starts on a workstation must not
+ * begin doing that because it was upgraded. The claim protocol makes a second firing runner
+ * harmless, not welcome.
+ *
+ * The precheck runner is always supplied when this is built, and that is deliberate rather
+ * than incidental: a schedule that declares a gate and a runner that cannot run one is a
+ * combination `ScheduleRunner` has to treat as "leave this occurrence alone", which costs an
+ * occurrence and explains nothing. Every runner that fires schedules can run their
+ * prechecks.
+ */
+const createScheduler = (options: {
+  readonly config: RunnerConfig;
+  readonly store: StateStore;
+  readonly leases: LeaseManager;
+  readonly worktrees: WorktreeManager;
+  readonly toolchain: ToolchainResolver;
+  readonly notifier: Notifier;
+  readonly metrics: AgentMetrics;
+  readonly logger: Logger;
+}): ScheduleRunner | undefined => {
+  const { config, logger } = options;
+
+  if (!config.schedule.enabled) {
+    logger.info("schedule.disabled", { reason: "schedule.enabled is false" });
+    return undefined;
+  }
+
+  logger.info("schedule.configured", { runner: config.runnerId });
+
+  return new ScheduleRunner({
+    store: options.store,
+    leases: options.leases,
+    notifier: options.notifier,
+    logger,
+    runner: config.runnerId,
+    branch: config.stateRepo.branch,
+    maxSessionsPerTask: config.limits.maxSessionsPerTask,
+    precheck: schedulePrecheck({
+      worktrees: options.worktrees,
+      toolchain: options.toolchain,
+      logger,
+    }),
+    onSettled: (schedule, outcome) =>
+      options.metrics.schedules.inc({ runner: config.runnerId, schedule, outcome }),
+  });
+};
+
+/**
  * Build the daily digest, if this runner was told to publish one (DESIGN.md §19).
  *
  * Off by default, like the web view and for a related reason: publishing writes to the
@@ -590,6 +672,8 @@ const createDigest = (options: {
     summarise: digest.summarise,
   });
 
+  const mirrors = new MirrorChangeReader(options.worktrees);
+
   return new DailyDigest({
     git: options.git,
     store: options.store,
@@ -600,8 +684,13 @@ const createDigest = (options: {
     runner: config.runnerId,
     branch: config.stateRepo.branch,
     // Read-only, and strictly local: the digest reports on mirrors this runner already
-    // has and never fetches one to do it.
-    changes: new MirrorChangeReader(options.worktrees),
+    // has and never fetches one to do it. One reader serves both questions it is asked —
+    // what a task produced, and who authored the window.
+    changes: mirrors,
+    authorship: mirrors,
+    // Every address that has ever been this fleet, current one first. The retired ones are
+    // how a window straddling a change of identity (§9.7) is not read as a person's work.
+    identity: { emails: [config.identity.email, ...(config.identity.pastEmails ?? [])] },
     ...(digest.summarise
       ? {
           summariser: new LlmSummariser({
@@ -614,6 +703,7 @@ const createDigest = (options: {
       : {}),
     onPublished: (_date, quiet) =>
       options.metrics.digests.inc({ runner: config.runnerId, quiet: String(quiet) }),
+    onAttributed: (report) => options.metrics.recordAttribution(config.runnerId, report),
   });
 };
 
@@ -936,8 +1026,8 @@ const runBridge = (deps: {
     channelId: bot.channelId,
     threads: router,
     logger,
-    onMessage: (content, author, channelId, messageId) =>
-      bridge.handleMessage(content, author, channelId, messageId),
+    onMessage: (content, author, channelId, messageId, replyTo) =>
+      bridge.handleMessage(content, author, channelId, messageId, replyTo),
     onInteraction: (interaction) => bridge.handleInteraction(interaction),
     // Passed WITHOUT a leadership check, unlike everything else the bridge does. Presence
     // is idempotent and identical on every replica — all four render from the same surveyed

@@ -28,11 +28,34 @@
  *     message, because the supervisor logs those verbatim.
  */
 import type { TaskId } from "../domain/task.ts";
-import { button, BUTTON_STYLE, linkButton, row, rows, type ActionRow, type Button } from "./components.ts";
+import {
+  button,
+  BUTTON_STYLE,
+  BUTTONS_PER_ROW,
+  linkButton,
+  row,
+  rows,
+  type ActionRow,
+  type Button,
+} from "./components.ts";
 import { type FetchLike, postJson } from "./http.ts";
 
 export type Notification =
-  | { readonly kind: "question"; readonly task: TaskId; readonly question: string; readonly phase: string }
+  | {
+      readonly kind: "question";
+      readonly task: TaskId;
+      readonly question: string;
+      readonly phase: string;
+      /**
+       * The enumerated choices the agent offered, each of which becomes a button (§7).
+       *
+       * Absent for an open-ended question, which is the ordinary case and renders exactly
+       * as it always has. The prose is unaffected either way: the options are already in
+       * the question text, written by the agent, and repeating them under it would say the
+       * same thing twice on the surface where space is scarcest.
+       */
+      readonly options?: readonly string[];
+    }
   | { readonly kind: "parked"; readonly task: TaskId; readonly reason: string }
   | {
       readonly kind: "done";
@@ -116,6 +139,23 @@ export type Notification =
       readonly task: TaskId;
       readonly alertname: string;
       readonly severity?: string;
+    }
+  /**
+   * A schedule's occurrence became a task (DESIGN.md §22). The intake notification of the
+   * sixth path onto the channel: work nobody typed appeared, so the channel is where anyone
+   * finds out it did.
+   *
+   * A SKIPPED occurrence is deliberately not notified. A precheck that says "nothing to
+   * audit" is the normal case for a schedule worth having, and a message per occurrence per
+   * schedule would make the channel a cron log — which is what the ledger under
+   * `schedules/occurrences/` and the `/intake` page are for.
+   */
+  | {
+      readonly kind: "schedule-task";
+      readonly task: TaskId;
+      readonly schedule: string;
+      /** `YYYY-MM-DDTHHMMZ`, so a reader can tell which morning this is about. */
+      readonly occurrence: string;
     }
   /**
    * A firing alert was declined, and this is the ONE message about it.
@@ -545,23 +585,58 @@ const hardSplit = (line: string, budget: number): readonly string[] => {
 const resumeButton = (task: TaskId): Button | undefined =>
   button({ action: { verb: "res", task }, label: "Resume", style: BUTTON_STYLE.primary });
 
+/**
+ * The other answer to a park, as a button.
+ *
+ * Every notification that offers Resume is asking a human to decide, and the decision has
+ * two answers: the task can be OBSOLETE rather than stuck, in which case resuming it buys
+ * a session nobody wants. Secondary styling and second position, because that is the rarer
+ * answer. Pressing it writes nothing on its own — it opens the modal that asks why.
+ */
+const doneButton = (task: TaskId): Button | undefined =>
+  button({ action: { verb: "done", task }, label: "Mark done", style: BUTTON_STYLE.secondary });
+
 export const componentsFor = (
   notification: Notification,
   options: { readonly inThread?: boolean } = {},
 ): readonly ActionRow[] | undefined => {
   switch (notification.kind) {
-    case "question":
-      return options.inThread === true
-        ? undefined
-        : rows(
-            row(
-              button({
-                action: { verb: "ans", task: notification.task },
-                label: "Answer",
-                style: BUTTON_STYLE.primary,
-              }),
+    case "question": {
+      if (options.inThread === true) return undefined;
+      // Sliced rather than trusted. `ask_human` refuses a sixth option, but these arrive
+      // from a file in the state repo that a human can edit, and `row` THROWS above five —
+      // which would cost the whole notification, on the one path where silence means a
+      // human never learns the task is waiting.
+      const choices = (notification.options ?? []).slice(0, BUTTONS_PER_ROW);
+      // The free-text button keeps its own row, and keeps its label when there is nothing
+      // beside it: a question with no options must render exactly what it rendered before
+      // options existed. With options it becomes "Answer…", because next to two named
+      // choices a bare "Answer" reads as a third one.
+      return rows(
+        choices.length === 0
+          ? undefined
+          : row(
+              ...choices.map((choice, at) =>
+                button({
+                  // The INDEX, not the text: `custom_id` holds 100 characters. The text is
+                  // looked up from the question record when the press arrives.
+                  action: { verb: "opt", task: notification.task, arg: String(at) },
+                  // `button` clamps the label to Discord's 45; the stored option is what
+                  // gets written as the answer, so nothing is lost by cutting it here.
+                  label: choice,
+                  style: BUTTON_STYLE.primary,
+                }),
+              ),
             ),
-          );
+        row(
+          button({
+            action: { verb: "ans", task: notification.task },
+            label: choices.length === 0 ? "Answer" : "Answer…",
+            style: choices.length === 0 ? BUTTON_STYLE.primary : BUTTON_STYLE.secondary,
+          }),
+        ),
+      );
+    }
     case "done":
       return rows(row(linkButton("View PR", notification.prUrl)));
     case "verdict":
@@ -579,6 +654,7 @@ export const componentsFor = (
               })
             : undefined,
           resumeButton(notification.task),
+          doneButton(notification.task),
           notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
         ),
       );
@@ -587,17 +663,20 @@ export const componentsFor = (
     // posted in the thread the prose will be typed in, so the way back belongs in the same
     // place rather than as a command to be retyped underneath it.
     case "plan-stalled":
-      return rows(row(resumeButton(notification.task)));
+      return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // Every other park, for the same reason. `/resume` on something parked is the single most
     // predictable next act in the system, and until now it was the only one with no button.
     case "parked":
     case "failed":
-      return rows(row(resumeButton(notification.task)));
+      return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // An alert notification is a statement, not a prompt. Creating the task has already
     // happened, and a refusal is fixed by committing a policy entry rather than by
     // pressing anything here.
     case "alert-task":
     case "alert-refused":
+    // Nor is a scheduled task: nobody typed it, so there is nothing here anyone is waiting
+    // to answer. It is claimed, sessioned and reviewed like every other task.
+    case "schedule-task":
     case "plan-ready":
     case "plan-revised":
     case "provider-unavailable":
@@ -737,6 +816,13 @@ const frame = (notification: Notification, hint: boolean): string => {
         `🔔 **${notification.alertname}** is firing — created \`${task}\`` +
         `${notification.severity === undefined ? "" : ` (severity ${notification.severity})`}.\n` +
         `It is queued like any other task and ends in a pull request; nothing touches the cluster.`
+      );
+    case "schedule-task":
+      return (
+        `🗓️ Schedule **${notification.schedule}** fired for ${notification.occurrence} — ` +
+        `created \`${task}\`.\n` +
+        `Nobody typed it. It is claimed, sessioned and gated like any other task; if there ` +
+        `turns out to be nothing to do, the session says so instead of opening a pull request.`
       );
     case "provider-unavailable":
       return fit(notification.detail, (text) =>

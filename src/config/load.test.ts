@@ -573,3 +573,18 @@ test("cluster.maxLogLines is capped by the general output ceiling, not its own c
 
   assert.equal(config.cluster.maxLogLines, MAX_OUTPUT_LINES);
 });
+
+test("a config that says nothing about schedules fires none", async () => {
+  // Off by default, like the digest and for the same reason (§22): a schedule creates
+  // tasks in the shared state repo, and a runner someone started on a workstation must
+  // not begin doing that because it was upgraded. The claim protocol makes a second
+  // firing runner harmless, not welcome.
+  const config = await load({});
+
+  assert.equal(config.schedule.enabled, false);
+});
+
+test("schedule.enabled is a boolean, not a truthy string", async () => {
+  assert.equal((await load({ schedule: { enabled: true } })).schedule.enabled, true);
+  await assert.rejects(() => load({ schedule: { enabled: "yes" } }), ConfigError);
+});

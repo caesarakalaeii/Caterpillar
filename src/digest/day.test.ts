@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dueWindows, isTimeZone, localDate, windowFor } from "./day.ts";
+import { dueWindows, isTimeZone, localDate, previousWindow, windowFor } from "./day.ts";
 
 const BERLIN = "Europe/Berlin";
 const AT_SIX = { hour: 18, timeZone: BERLIN } as const;
@@ -81,6 +81,28 @@ test("catch-up reaches back exactly one day", () => {
   const due = dueWindows(new Date("2026-08-16T16:30:00Z"), AT_SIX);
 
   assert.equal(due.length, 2);
+});
+
+test("the previous window ends exactly where this one starts", () => {
+  // The comparison window for a trend. It has to MEET this one: an overlap would count
+  // some commits on both sides of the comparison, and a gap would drop a day of work out
+  // of the baseline the trend is measured against.
+  const today = windowFor("2026-08-16", AT_SIX);
+  // The window carries its own boundary, so this cannot be asked with a different one
+  // than the window was built with — which would be a baseline shifted by hours.
+  const before = previousWindow(today);
+
+  assert.equal(before.date, "2026-08-15");
+  assert.equal(before.end.getTime(), today.start.getTime());
+});
+
+test("the previous window across a DST change is still a whole local day", () => {
+  // Recomputed in the zone rather than by subtracting 24 hours, which is the shortcut that
+  // would make the baseline an hour shorter than the day it is compared with.
+  const before = previousWindow(windowFor("2026-03-30", AT_SIX));
+
+  assert.equal(before.date, "2026-03-29");
+  assert.equal(before.end.getTime() - before.start.getTime(), 23 * 60 * 60 * 1000);
 });
 
 test("a timezone that does not exist is refused rather than silently UTC", () => {

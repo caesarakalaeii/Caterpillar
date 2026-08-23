@@ -280,6 +280,38 @@ test("a steer says the session picks it up without being restarted", () => {
 test("a done task is told to be done, and pointed somewhere that works", () => {
   const reply = describeOutcome(TASK, { kind: "finished" });
   assert.match(reply, /brainstorm/);
+  // `finished` answers a second `/done`, `/resume` or `/merge` on an already-done task, and
+  // that task may itself have been forced done with both gates skipped. So this one reply
+  // cannot assert HOW the task got there: claiming it "passed every gate and merged" would
+  // be the verified-completion lie that `/done` exists to keep out of the record.
+  assert.doesNotMatch(reply, /\bpassed\b/i, "this reply cannot know the gates ran");
+  assert.doesNotMatch(reply, /\bmerged\b/i, "this reply cannot know anything was merged");
+});
+
+test("a forced done says it was not verified, and never says it merged", () => {
+  // The reply is the first thing a human reads back, so it is the first place the record
+  // could start reading as a verified completion. It must not.
+  const reply = describeOutcome(TASK, { kind: "forced-done" });
+  assert.match(reply, /done/i);
+  assert.match(reply, /gate/i, "the reader has to be told nothing was checked");
+  // A DENIAL of the merge is fine and wanted; a claim of one is the lie. So the guard is
+  // on the denial being PRESENT rather than on the word "merged" being absent: banning the
+  // word outright rejected the very sentence that makes the reply truthful, and banning it
+  // only at the start of a line let a mid-sentence "the PR was merged" through.
+  assert.match(reply, /nothing was merged/i, "the reader must be told no merge happened");
+  assert.doesNotMatch(
+    reply,
+    /(?<!nothing was )merged/i,
+    "the only permitted use of the word is the denial",
+  );
+});
+
+test("a refused force says to cancel it first", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "not-forceable",
+    reason: "it is running right now — `/cancel` it first",
+  });
+  assert.match(reply, /cancel/i);
 });
 
 test("a running task's review lines say guidance needs no restart", () => {
