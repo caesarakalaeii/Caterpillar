@@ -47,6 +47,15 @@ test("packageCheckExpression refuses a package name that is not a bare attribute
   }
 });
 
+test("packageCheckExpression reports the names that are ABSENT from the pin", () => {
+  // The polarity of this one `!` is the whole feature. Dropping it inverts the doctor —
+  // every package that resolves is refused and every typo is waved through — and no other
+  // test in this file can see that, because the fake computes `missing` from `wanted`
+  // rather than by interpreting the expression. So it is asserted on the emitted source.
+  const expression = packageCheckExpression("github:NixOS/nixpkgs/nixos-25.05", ["jq"]);
+  assert.match(expression, /missing = builtins\.filter \(name: !\(pkgs \? \$\{name\}\)\) wanted;/);
+});
+
 /* --------------------------------------------------------------- the doctor */
 
 const config = { ...DEFAULT_TOOLCHAIN_CONFIG, timeoutSeconds: 5 };
@@ -57,15 +66,28 @@ const config = { ...DEFAULT_TOOLCHAIN_CONFIG, timeoutSeconds: 5 };
  * Reads the declared names out of the expression's `wanted = [ … ]` binding rather than
  * every quoted string in it: the expression also carries a lowercase translation table,
  * and a fake that scraped all quoted strings reported the whole alphabet as missing.
+ *
+ * It also reads the POLARITY of the `missing` filter out of the expression instead of
+ * assuming it. A fake that hardcoded `!attributes.includes(name)` agrees with itself no
+ * matter what the expression says, so inverting the `!` in the real expression — which
+ * makes the doctor refuse every package that resolves — left every test in this file
+ * green. Interpreting the filter is what makes the fake able to disagree.
  */
 const fakeNix = (attributes: readonly string[]): NixEval => ({
   async evaluate(expression) {
     const declared = /wanted = \[ ([^\]]*) \]/.exec(expression)?.[1] ?? "";
     const wanted = [...declared.matchAll(/"([^"]+)"/g)].map((match) => match[1] ?? "");
     assert.ok(wanted.length > 0, "the fake found no declared packages to check");
+
+    const filter = /missing = builtins\.filter \(name: (!?)\(pkgs \? \$\{name\}\)\) wanted;/.exec(
+      expression,
+    );
+    assert.ok(filter !== null, "the fake could not find the `missing` filter to interpret");
+    const reportsAbsent = filter[1] === "!";
+
     return {
       kind: "answered",
-      missing: wanted.filter((name) => !attributes.includes(name)),
+      missing: wanted.filter((name) => attributes.includes(name) !== reportsAbsent),
       candidates: attributes,
     };
   },
