@@ -72,6 +72,8 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
     maxReviewRounds: 3,
     maxSessionSeconds: 3600,
     commandTimeoutSeconds: 900,
+    commandOutputMaxLines: 2000,
+    commandOutputMaxBytes: 51200,
     sabotageMaxCommands: 40,
     sabotageMinFreeGb: 5,
     ciSettleSeconds: 1200,

@@ -50,6 +50,7 @@ import type { LlmRuntime } from "../llm/models.ts";
 import { classifyProviderFailure } from "../llm/outage.ts";
 import { errorFields, type Logger } from "../obs/log.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
+import { outputCeiling } from "../agent/budget.ts";
 import { BoundedExecutionEnv } from "../agent/exec.ts";
 import type { ResolvedEnv, ToolchainResolver } from "../workspace/toolchain.ts";
 import { decide, type CouncilVerdict, type ReviewerVerdict } from "./decide.ts";
@@ -445,6 +446,17 @@ export class ReviewCouncil implements Council {
         shellPath: toolchain.shell,
         shellEnv: toolchain.env,
         timeoutSeconds: config.limits.commandTimeoutSeconds,
+        // The output ceiling too, and for the same reason as the timeout: a reviewer runs
+        // the same `npm test` in the same worktree with the same window to spend, and it is
+        // this shell that has already demonstrated it will do so (§6.4).
+        output: outputCeiling({
+          maxLines: config.limits.commandOutputMaxLines,
+          maxBytes: config.limits.commandOutputMaxBytes,
+        }),
+        // Keyed by the TASK, not by `plan.cwd`: the sabotage reviewer works in a private
+        // copy that is deleted when the round ends, and a spill written inside it would go
+        // with it while the note in the transcript still pointed there.
+        overflowDir: join(config.paths.tasks, spec.id, ".caterpillar", "output"),
         logger,
         task: spec.id,
       };

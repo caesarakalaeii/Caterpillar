@@ -31,6 +31,7 @@
  */
 import { readFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
+import { MAX_OUTPUT_LINES } from "../agent/budget.ts";
 import { assertNamespaceAllowed } from "./guard.ts";
 import { isPodPattern, validateKind, validateName, validatePodPattern } from "./names.ts";
 import { assertKindDescribable, redactObject, renderObject } from "./redact.ts";
@@ -50,7 +51,16 @@ export const DEFAULT_LOKI_URL = "http://loki.monitoring.svc.cluster.local:3100";
 
 /** Ceilings the tool layer also advertises, kept here so the client cannot be talked past them. */
 export const MAX_SINCE_MINUTES = 24 * 60;
-export const MAX_LOG_LINES = 2000;
+/**
+ * Lines one `cluster_logs` call may return.
+ *
+ * `MAX_OUTPUT_LINES`, not a 2000 of its own: this was the codebase's only output bound for
+ * a while, and §6.4 makes it one configured case of the general rule instead of a special
+ * one. Two independent constants for the same quantity is how they come to disagree, and
+ * the disagreement would be invisible — a remediation session getting a different ceiling
+ * from Loki than from its own shell, with nothing to say why.
+ */
+export const MAX_LOG_LINES = MAX_OUTPUT_LINES;
 export const MAX_EVENTS = 200;
 
 export interface LogsRequest {

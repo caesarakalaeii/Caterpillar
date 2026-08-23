@@ -115,6 +115,27 @@ export interface LimitsConfig {
    */
   readonly commandTimeoutSeconds: number;
   /**
+   * Ceiling AND default on the LINES one command may return (DESIGN.md §6.4).
+   *
+   * `commandTimeoutSeconds` above bounds how long a command runs; this bounds how much it
+   * hands back, and the two failures look nothing alike. A 40,000-line `grep` succeeds in a
+   * second and spends a large share of the context window that the handoff threshold (§6.1)
+   * exists to protect, after which the task hands off early with a journal that can only
+   * say it ran out of room.
+   *
+   * Defaults to `MAX_OUTPUT_LINES` (2,000), which is also the cap: lower it for a small
+   * context window, and a config asking for more is clamped. Same argument as the timeout —
+   * the agent can edit config in its own worktree, so a bound it could raise is not one.
+   */
+  readonly commandOutputMaxLines: number;
+  /**
+   * Ceiling AND default on the BYTES one command may return (DESIGN.md §6.4).
+   *
+   * The line ceiling above misses the most expensive case: one `cat` of a minified lockfile
+   * is three lines and half a megabyte. Whichever of the two bites first wins.
+   */
+  readonly commandOutputMaxBytes: number;
+  /**
    * Shell commands the sabotage reviewer may run in total (DESIGN.md §12.1).
    *
    * `commandTimeoutSeconds` above bounds one command; nothing bounds how MANY. This

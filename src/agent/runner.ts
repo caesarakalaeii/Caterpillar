@@ -40,6 +40,7 @@ import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import type { Logger } from "../obs/log.ts";
 import type { LiveSession } from "../obs/live.ts";
+import { outputCeiling } from "./budget.ts";
 import { BoundedExecutionEnv } from "./exec.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
@@ -196,6 +197,7 @@ export class AgentSessionRunner {
       // gate's all come from here. Resolved once per session rather than per command:
       // wrapping each command would put quoting between the model and its own shell.
       const toolchain = await this.options.toolchain.resolve(spec, worktree);
+      const limits = this.options.config.limits;
       const execContext: ExecContext = {
         // Bounded, not bare. pi's bash tool leaves the timeout to the model and defaults
         // to none, so this is where a command that never returns stops being able to hold
@@ -205,7 +207,17 @@ export class AgentSessionRunner {
           cwd: worktree,
           shellPath: toolchain.shell,
           shellEnv: toolchain.env,
-          timeoutSeconds: this.options.config.limits.commandTimeoutSeconds,
+          timeoutSeconds: limits.commandTimeoutSeconds,
+          // And bounded in what it RETURNS, which is the other half of §6.4: a wide `grep`
+          // cannot hold the lease, but it can spend the window the handoff threshold below
+          // exists to protect.
+          output: outputCeiling({
+            maxLines: limits.commandOutputMaxLines,
+            maxBytes: limits.commandOutputMaxBytes,
+          }),
+          // Beside the checkout, not inside it: the scratch directory the toolchain cache
+          // already uses, so a spilled log is never committable and is reaped with the task.
+          overflowDir: join(this.options.config.paths.tasks, spec.id, ".caterpillar", "output"),
           logger: this.options.logger,
           task: spec.id,
         }),

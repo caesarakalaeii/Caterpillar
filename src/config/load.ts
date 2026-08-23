@@ -19,6 +19,7 @@ import { DEFAULT_TOOLCHAIN_CONFIG as DEFAULTS } from "../workspace/toolchain.ts"
 import { DEFAULT_REAP_CONFIG as REAP_DEFAULTS } from "../workspace/worktree.ts";
 import { DEFAULT_USAGE_CONFIG as USAGE_DEFAULTS, defaultWorkRoot } from "../workspace/usage.ts";
 import { DEFAULT_KUBE_API_URL, DEFAULT_LOKI_URL, MAX_LOG_LINES } from "../cluster/client.ts";
+import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "../agent/budget.ts";
 import type {
   ClusterConfig,
   CommitIdentity,
@@ -63,6 +64,8 @@ interface RawConfig {
     readonly maxReviewRounds?: unknown;
     readonly maxSessionSeconds?: unknown;
     readonly commandTimeoutSeconds?: unknown;
+    readonly commandOutputMaxLines?: unknown;
+    readonly commandOutputMaxBytes?: unknown;
     readonly sabotageMaxCommands?: unknown;
     readonly sabotageMinFreeGb?: unknown;
     readonly ciSettleSeconds?: unknown;
@@ -114,6 +117,29 @@ const num = (value: unknown, field: string, fallback?: number): number => {
     throw new ConfigError(`${field} must be a finite number`);
   }
   return value;
+};
+
+/**
+ * One half of the output ceiling: defaulted, refused if nonsense, clamped if generous.
+ *
+ * The three treatments are deliberately different, and each is the one that fits:
+ *   - **absent → the built-in ceiling**, because the common config says nothing;
+ *   - **above it → clamped**, because an operator who wrote a larger number wanted more
+ *     output, not a runner that will not start — and because the agent can edit config in
+ *     its own worktree, so raising it must be impossible rather than merely discouraged;
+ *   - **zero, negative or fractional → refused, by name**, because none of them is a
+ *     budget. Half a line is a typo, and a ceiling of 0 is a shell whose every command
+ *     returns nothing but an elision note.
+ */
+const outputBound = (value: unknown, field: string, ceiling: number): number => {
+  const asked = num(value, field, ceiling);
+  if (!Number.isInteger(asked) || asked < 1) {
+    throw new ConfigError(
+      `${field} (${asked}) must be a whole number of at least 1 — a shell whose output ` +
+        `ceiling is zero returns an elision note and nothing else`,
+    );
+  }
+  return Math.min(asked, ceiling);
 };
 
 /**
@@ -392,22 +418,17 @@ const webConfig = (web: Record<string, unknown>): WebConfig => ({
  * see and fix — whereas throwing at startup would take the whole supervisor down over a
  * feature nothing may even be using yet.
  */
-const clusterConfig = (cluster: Record<string, unknown>): ClusterConfig => {
-  const maxLogLines = num(cluster["maxLogLines"], "cluster.maxLogLines", MAX_LOG_LINES);
-  if (!Number.isInteger(maxLogLines) || maxLogLines < 1) {
-    throw new ConfigError("cluster.maxLogLines must be a positive integer");
-  }
-
-  return {
-    enabled: bool(cluster["enabled"], "cluster.enabled", false),
-    namespaces: strings(cluster["namespaces"], "cluster.namespaces"),
-    lokiUrl: str(cluster["lokiUrl"], "cluster.lokiUrl", DEFAULT_LOKI_URL),
-    kubeApiUrl: str(cluster["kubeApiUrl"], "cluster.kubeApiUrl", DEFAULT_KUBE_API_URL),
-    // Clamped rather than refused: the client caps it too, and an operator who wrote a
-    // larger number wanted more logs, not a runner that will not start.
-    maxLogLines: Math.min(maxLogLines, MAX_LOG_LINES),
-  };
-};
+const clusterConfig = (cluster: Record<string, unknown>): ClusterConfig => ({
+  enabled: bool(cluster["enabled"], "cluster.enabled", false),
+  namespaces: strings(cluster["namespaces"], "cluster.namespaces"),
+  lokiUrl: str(cluster["lokiUrl"], "cluster.lokiUrl", DEFAULT_LOKI_URL),
+  kubeApiUrl: str(cluster["kubeApiUrl"], "cluster.kubeApiUrl", DEFAULT_KUBE_API_URL),
+  // Through the same helper as `limits.commandOutput*`, and capped by `MAX_LOG_LINES`,
+  // which is now `MAX_OUTPUT_LINES` itself (§6.4). This used to be the codebase's only
+  // output bound and had its own copy of every rule; it is one configured case of the
+  // general one now.
+  maxLogLines: outputBound(cluster["maxLogLines"], "cluster.maxLogLines", MAX_LOG_LINES),
+});
 
 /**
  * Validate the `remediation` block (DESIGN.md §20).
@@ -539,6 +560,20 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     );
   }
 
+  // Hoisted for the same reason as the sabotage budgets: validated before use, and refused
+  // rather than corrected. A ceiling of 0 is a shell whose every command returns nothing but
+  // an elision note, which is a typo and never an intent.
+  const commandOutputMaxLines = outputBound(
+    raw.limits?.commandOutputMaxLines,
+    "limits.commandOutputMaxLines",
+    MAX_OUTPUT_LINES,
+  );
+  const commandOutputMaxBytes = outputBound(
+    raw.limits?.commandOutputMaxBytes,
+    "limits.commandOutputMaxBytes",
+    MAX_OUTPUT_BYTES,
+  );
+
   // Not 0, and not negative: `awaitChecks` sleeps `min(pollMs, remaining)` between polls,
   // so a non-positive interval polls the forge continuously for the whole settle budget.
   // `ciSettleSeconds` needs no companion check — 0 there simply skips the wait.
@@ -642,6 +677,8 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
         "limits.commandTimeoutSeconds",
         15 * 60,
       ),
+      commandOutputMaxLines,
+      commandOutputMaxBytes,
       sabotageMaxCommands,
       sabotageMinFreeGb,
       // 20 minutes. Comfortably longer than this repo's own CI (~5 minutes) plus time

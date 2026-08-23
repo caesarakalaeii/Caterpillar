@@ -250,10 +250,19 @@ const buildRunner = (
 
   const config = {
     handoff: { thresholdFraction: 0.7 },
-    // Two ceilings, both far out of reach here. `maxSessionSeconds` bounds the session
-    // itself (§6.4) and these tests finish in milliseconds; `commandTimeoutSeconds`
-    // bounds the agent's shell, and its own behaviour is covered in `exec.test.ts`.
-    limits: { maxSessionSeconds: 3600, commandTimeoutSeconds: 900 },
+    // Four ceilings, all far out of reach here. `maxSessionSeconds` bounds the session
+    // itself (§6.4) and these tests finish in milliseconds; `commandTimeoutSeconds` and the
+    // two `commandOutput*` bound the agent's shell, and their own behaviour is covered in
+    // `exec.test.ts` and `budget.test.ts`.
+    limits: {
+      maxSessionSeconds: 3600,
+      commandTimeoutSeconds: 900,
+      commandOutputMaxLines: 2_000,
+      commandOutputMaxBytes: 51_200,
+    },
+    // Where a bounded command spills what the window would not take. Under `tasks` so the
+    // fixture's own cleanup removes it.
+    paths: { tasks },
     // The runner reads the workspace profile to build the credential scope: the host a
     // task's repos must live on, and the state repo none of them may be (§9.1, §9.3).
     workspaces: new Map([

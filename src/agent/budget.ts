@@ -92,6 +92,18 @@ export interface BoundedOutput {
 }
 
 /**
+ * Whether `boundOutput` would drop anything, without paying to find out.
+ *
+ * Exported so a caller can skip the expensive part — `exec.ts` spills the whole output to
+ * disk before rendering the note that names the file, and doing that for every `git status`
+ * would fill the work volume. `boundOutput` asks the same question through this function,
+ * so the two cannot come to different answers.
+ */
+export const willElide = (text: string, ceiling: OutputCeiling): boolean =>
+  text.length > 0 &&
+  (countLines(text) > ceiling.maxLines || Buffer.byteLength(text, "utf8") > ceiling.maxBytes);
+
+/**
  * Bound one tool's output, keeping both ends and declaring the gap.
  *
  * The line budget is split 1:3 head to tail. The tail is where a failing command puts its
@@ -105,10 +117,7 @@ export const boundOutput = (
 ): BoundedOutput => {
   const totalLines = countLines(text);
 
-  if (text.length === 0) {
-    return { text, elided: false, droppedLines: 0, totalLines: 0 };
-  }
-  if (totalLines <= ceiling.maxLines && Buffer.byteLength(text, "utf8") <= ceiling.maxBytes) {
+  if (!willElide(text, ceiling)) {
     return { text, elided: false, droppedLines: 0, totalLines };
   }
 
