@@ -36,6 +36,10 @@ class RecordingTracker implements Tracker {
     return [];
   }
   async comment(): Promise<void> {}
+  // Mirroring a transition never files anything, so a call here is a bug worth failing on.
+  async create(): Promise<TrackerRef> {
+    throw new Error("mirroring a transition must not file a tracker item");
+  }
   async transition(_ref: TrackerRef, transition: TrackerTransition): Promise<void> {
     if (this.failure !== undefined) throw this.failure;
     this.transitions.push(transition);

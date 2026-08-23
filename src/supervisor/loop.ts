@@ -3308,11 +3308,21 @@ export class Supervisor {
         // Outside the unit, both of them, exactly as every other outcome in this class does
         // it: the tracker and Discord are views of what git already says, and holding the
         // state checkout across a network round trip stalls every other slot's writes.
+        // The session index, as every other post-session verdict uses (§4.4). A verdict
+        // reached twice for one task is not reachable from here anyway: `settle` drops the
+        // `verify` block before returning, so a replay after a pod kill gets `undefined`
+        // and never mirrors. What the token buys is the case a `/resume` opens — a second
+        // fix, re-verified to the same sentence — where the index has advanced.
+        const occurrence = String(state.sessions);
         if (cleared) {
-          await this.mirror(spec, { kind: "completed", prUrl: state.pr?.url ?? "(merged)" });
+          await this.mirror(
+            spec,
+            { kind: "completed", prUrl: state.pr?.url ?? "(merged)" },
+            occurrence,
+          );
           await this.reapTask(spec, "done");
         } else {
-          await this.mirror(spec, { kind: "parked", reason: line });
+          await this.mirror(spec, { kind: "parked", reason: line }, occurrence);
         }
         await this.notifyTask(state, {
           kind: "alert-reverified",
@@ -4404,12 +4414,20 @@ export class Supervisor {
         return undefined;
       });
       if (spec !== undefined) {
-        await this.mirror(spec, {
-          kind: "parked",
-          reason:
-            `Forced done by ${request.author} without verification — the acceptance gates ` +
-            `were bypassed. Reason: ${request.reason}`,
-        });
+        // The session index, as the other post-session transitions use. Forcing a task done
+        // is terminal — a second `/done` reads `done` and answers `finished` — so the only
+        // replay this can see is a pod killed between the push above and this comment,
+        // which comes back at the same index and collapses (§4.4).
+        await this.mirror(
+          spec,
+          {
+            kind: "parked",
+            reason:
+              `Forced done by ${request.author} without verification — the acceptance gates ` +
+              `were bypassed. Reason: ${request.reason}`,
+          },
+          String(state.sessions),
+        );
       }
 
       return { kind: "forced-done" };

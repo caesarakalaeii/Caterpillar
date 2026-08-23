@@ -592,7 +592,12 @@ Which token is right depends on the transition, so each call site chooses:
   separates two questions with identical text.
 - `completed` and `parked` use the **session index**. Both follow a completed session, so the
   index does advance between two genuine occurrences, and a pod killed between the tracker
-  comment and the state write comes back at the same index and collapses.
+  comment and the state write comes back at the same index and collapses. The two mirrors
+  that do *not* follow a session take the same token for the same reason: an alert
+  re-verification verdict (§20) cannot recur without a `/resume` and a further session in
+  between, and forcing a task done from chat (`/done`, §12) is terminal — a second reads
+  `done` and answers `finished` — so for both, the only replay reachable is a pod killed
+  between the push and the comment, at the same index.
 
 **`publish_artifact` checks its record last, not first.** Every other skipping verb reads the
 record before acting. This one acts and reads the record only if the attempt was *refused*,

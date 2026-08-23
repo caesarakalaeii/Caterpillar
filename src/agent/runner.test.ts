@@ -760,7 +760,8 @@ test("a task with no pull request asks the forge nothing", async () => {
  * A tracker that counts the comments it was asked for (DESIGN.md §9.5).
  *
  * Only `comment` is reachable from a session — `task_note` is the one tracker capability
- * the agent has — so the rest answers emptily.
+ * the agent has — so the rest answers emptily, except `create`, which is supervisor-driven
+ * and so a bug worth failing on rather than a stub worth satisfying quietly.
  */
 class CountingTracker implements Tracker {
   readonly kind = "github-issues";
@@ -771,6 +772,9 @@ class CountingTracker implements Tracker {
   }
   async comment(_ref: TrackerRef, text: string): Promise<void> {
     this.comments.push(text);
+  }
+  async create(): Promise<TrackerRef> {
+    throw new Error("a session must not file a tracker item");
   }
   async transition(): Promise<void> {}
 }

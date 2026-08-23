@@ -521,6 +521,9 @@ class CountingTracker implements Tracker {
   async comment(_ref: TrackerRef, text: string): Promise<void> {
     this.comments.push(text);
   }
+  async create(): Promise<TrackerRef> {
+    throw new Error("a tool must not file a tracker item");
+  }
   async transition(): Promise<void> {}
 }
 
