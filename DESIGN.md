@@ -875,6 +875,15 @@ need does not exist, which is the honest limitation: an operator who lowers
 `limits.commandOutputMaxLines` for a small window does not thereby lower what one `read`
 costs.
 
+There is a third shell, and it gets neither ceiling: `PlanMaintainer` (`src/plan/maintain.ts`)
+builds a bare `NodeExecutionEnv`, so its `bash` tool has no output bound and — this part
+predates the output ceiling — no `limits.commandTimeoutSeconds` either. Invariant 12's
+"no command returns without one either" is therefore true of the agent's shell and the
+council's, which is where a wide `grep` actually happens, and not of the plan maintainer's.
+It is left alone here because wrapping it is a change to the maintainer's behaviour rather
+than to the budget, and it belongs in the change that also gives it the timeout: one
+`BoundedExecutionEnv` for both ceilings, not a second knob for one of them.
+
 An interrupted session is `reason: "interrupted"` and **nothing is recorded** — no
 session count, no journal entry, no usage. Same reasoning as an outage (§6.3) and
 deliberately distinct from it: no provider misbehaved, so no cooldown starts. Charging a

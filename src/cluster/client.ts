@@ -337,6 +337,13 @@ export class ClusterClient implements ClusterReader {
     this.lokiUrl = (options.lokiUrl ?? DEFAULT_LOKI_URL).replace(/\/+$/, "");
     // Through `outputCeiling` rather than a `Math.min` of its own: the default-and-clamp
     // rule is one rule (§6.4), and this used to be the only place that had it.
+    //
+    // One behaviour change to know about: the two layers treat nonsense differently. A
+    // programmatic `maxLogLines: 0` used to yield 0 and now yields the 2,000 default, so
+    // out-of-range input RAISES the effective bound here instead of lowering it. Nothing
+    // reaches this through config — `load.ts`'s `outputBound` refuses anything below 1 by
+    // name — and no caller passes a non-positive value, so it is left as the shared rule's
+    // answer rather than special-cased back.
     this.maxLogLines = outputCeiling({
       ...(options.maxLogLines === undefined ? {} : { maxLines: options.maxLogLines }),
     }).maxLines;

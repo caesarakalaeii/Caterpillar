@@ -10,7 +10,7 @@
  * inspected the return value would pass while the window still filled up.
  */
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -232,6 +232,39 @@ test("a command inside the ceiling writes no overflow file and no note", async (
 
   assert.equal(seen, "hello\n");
   await assert.rejects(() => readdir(overflowDir), /ENOENT/);
+});
+
+test("a spill that cannot be written loses the overflow, not the command", async () => {
+  // The failure path of the one piece of IO in this class. A full or read-only work volume
+  // must cost the session its overflow file and nothing else: the bounded view is still
+  // correct and still useful, and losing a `grep` outright would be the worse outcome.
+  //
+  // `overflowDir` is put UNDER a regular file, so `mkdir -p` cannot succeed (ENOTDIR).
+  const { logger, lines } = recorder();
+  const cwd = await mkdtemp(join(tmpdir(), "caterpillar-exec-"));
+  roots.push(cwd);
+  const blocker = join(cwd, "not-a-directory");
+  await writeFile(blocker, "");
+  const subject = new BoundedExecutionEnv({
+    cwd,
+    timeoutSeconds: 60,
+    logger,
+    task: "TASK-1",
+    output: outputCeiling({ maxLines: 30 }),
+    overflowDir: join(blocker, "output"),
+  });
+
+  const seen = await streamed(subject, "seq 1 4000");
+
+  assert.ok(seen.split("\n").length <= 40, `the model saw ${seen.split("\n").length} lines`);
+  assert.match(seen, /of 4,000 lines shown/, "the bound and its note must survive the failure");
+  // And it must say so rather than naming a file that was never written: a note pointing at
+  // a path that does not exist sends the session to read something that is not there.
+  assert.match(seen, /not written anywhere and is gone/);
+  assert.ok(
+    lines.some((line) => line.event === "exec.output-spill-failed"),
+    "the operator must see that the volume refused the write",
+  );
 });
 
 test("the returned stdout is bounded too, for the callers that read it", async () => {

@@ -55,6 +55,13 @@
  *   - Progress updates arrive when the command ends rather than while it runs. Nothing here
  *     consumes them — the live view (§18) renders settled messages — and the alternative is
  *     streaming unbounded output into the window, which is the bug.
+ *   - **`exec` no longer separates the two channels.** Both streams are bounded as one view,
+ *     because a stack trace on stderr spends the same window as a log on stdout; that view
+ *     is returned as `stdout` and delivered through `onStdout`, and `stderr` comes back
+ *     empty rather than carrying a second copy of the same bytes. So the return type is
+ *     wider than what this class actually returns. No caller in the tree distinguishes the
+ *     two today — pi's bash tool is the only consumer — but one that starts to will get
+ *     everything on one channel, not nothing on the other.
  */
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
