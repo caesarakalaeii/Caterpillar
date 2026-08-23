@@ -5035,7 +5035,10 @@ test("a merge that fails halfway names what DID land", async () => {
 
   assert.equal(outcome.kind, "not-mergeable");
   const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
-  assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
+  // Case-insensitive on the verb only: the sentence now opens with what the council did
+  // (`mergeNote`) so "merged" is mid-sentence, and the assertion is about the repo and
+  // number being named rather than about a capital letter.
+  assert.match(reason, /merged acme\/widget#11/i, "the half that landed has to be named");
   assert.match(reason, /half-landed/);
 });
 
