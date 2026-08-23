@@ -391,6 +391,8 @@ state-repo/
       sessions/
         001.jsonl.gz           # pi transcript, gzipped
       artifacts/
+      effects/                 # ONE FILE per landed control-plane effect — see §4.4
+        done-3f2a1c….json
 ```
 
 `spec.md` is written once and never edited — not by the agent and not by a human. The
@@ -519,6 +521,61 @@ logged at `error` — the runner recovers, so nothing else would raise it, and t
 disagreeing about a task is never routine. The remote wins because it has to: it is what
 every other runner already agrees on. A `state.salvaged` line today means something the
 fleet has not seen before, not the journal.
+
+### 4.4 Every control verb is idempotent, not just `open_pr`
+
+`open_pr` has always been idempotent: asked for a branch that already carries an open pull
+request it **adopts that PR** rather than failing, so a handoff, a lost state write, or a
+human who opened it by hand does not strand the task. That was the right behaviour and it was
+solved exactly once.
+
+Every *other* supervisor-mediated verb — `done`, `handoff`, `ask_human`, `task_note`,
+`submit_plan`, `publish_artifact` — and every tracker lifecycle mirror (§9.5) can be
+interrupted between *the outside world changed* and *the state repo recorded it*. A pod killed
+in that window is an **ordinary event** in a system whose whole premise is surviving pod
+restarts, so the recovery belongs in the design rather than in each verb's good intentions.
+
+**A request id, derived and not allocated.** `effectRequestId(task, verb, args)` is a sha256
+over the task id, the verb and a canonical encoding of the arguments. Derived, because a
+replayed session makes the same call with the same arguments and must compute the same id —
+an allocated id would be lost along with the state write that was going to carry it.
+Canonical, because the arguments arrive as a parsed tool call and nothing guarantees two model
+turns spell an object's keys in the same order; `JSON.stringify` preserves insertion order, so
+an id built on it would be a check that never matches, which looks exactly like one that works.
+
+**One file per effect.** `tasks/<id>/effects/<request-id>.json`, written the way the journal
+writes its shards and for the same reason (§4.1): two runners recording the same task write
+different paths, so their histories commute and both commits rebase. A single per-task ledger
+file would put back the one conflict class §4.3 exists to describe.
+
+**The record is a fast path, never an authority.** If the record says a pull request was
+opened and the forge says otherwise, **the forge wins** — so `open_pr` records its effect and
+skips nothing, because `Forge.openPr` already adopts an existing PR and asking is both cheap
+and the only way to be right. Which verbs skip on a replay is therefore decided per verb:
+
+| Verb | On a replay |
+|---|---|
+| `open_pr` | asks the forge anyway; the forge is the authority |
+| `task_note`, `publish_artifact` | skipped — a duplicate tracker comment is permanent, and a replayed publish would hit §17's cap or a file the agent has since deleted |
+| `done`, `handoff`, `ask_human`, `submit_plan` | recorded, and they still signal: the sink is in memory and the record is not, so a resumed session that already claimed done must still stop |
+| `tracker.*` (§9.5) | skipped — a retried mirror already may not fail a task, and now may not double one either |
+
+Every read and write of the record swallows its own errors. A ledger failure means the state
+repo could not be reached, which says nothing about whether the effect landed, and failing a
+verb that has already happened is worse than performing it twice. For the same reason a mirror
+that *threw* is not recorded: the retry that would fix it has to stay eligible.
+
+**Only the supervisor writes it.** The record is in the state repo, which task-scoped tokens
+cannot reach (§9.3), so the agent's tools receive a two-callback `EffectLedger` bound to their
+own task — they can neither read another task's record nor write their own.
+
+**Bounded.** A task keeps `EFFECTS_KEPT` (64) records and `recordEffect` prunes the oldest
+past that on every write — in the write, because that is the only moment the directory grows,
+and a cap enforced from housekeeping is one that depends on a loop having run. Age is the right
+axis: the window a record closes is between one side effect and the state write after it, so a
+record old enough to evict belongs to a session that ended long ago, and 64 is well above one
+long session's verb count. Unreadable records are prune candidates rather than survivors, or
+they would hold the cap open forever.
 
 ---
 
@@ -2846,6 +2903,14 @@ done          → only after §12 gates pass: comment with PR link, unlabel agen
 parked        → comment with the reason, remove agent-wip
 ```
 
+Every one of those transitions is mirrored **at most once**, keyed on the transition and its
+arguments in the task's effect record (§4.4). A mirror happens after the authoritative git
+write, so a pod killed in between comes back and replays it — and a duplicate comment on a
+tracker item is permanent, reading to the human it is for as an agent that has lost track of
+what it has said. A mirror may not *fail* a task, and it may not *double* one. A mirror that
+threw is deliberately not recorded, so the next attempt still happens; two parks for two
+different reasons are two effects, because the key is the arguments and not the kind.
+
 `needs-human` is cleared on claim and on done (**amended** after the first
 intake-sourced task finished `done`, closed, and still wearing it). A claim is the only
 exit from `awaiting-human`, so reaching one means the question was answered; the label
@@ -4243,6 +4308,18 @@ calls, no git calls, no clock, so every decision above is testable without a net
 
 The control-plane verbs being *tools* rather than parsed prose is load-bearing: every
 state transition is typed and auditable.
+
+**Every one of them is idempotent, and by the same mechanism.** Each verb takes an
+`EffectLedger` — two callbacks the supervisor binds to that task's effect record (§4.4) — and
+consults it before acting. `open_pr` was the only verb that survived being called twice; now
+`task_note` posted twice with the same text comments once, a replayed `publish_artifact` hands
+back what the first call stored, and `done`, `handoff`, `ask_human` and `submit_plan` still
+signal on a replay because their signal is in memory and the record is not. §4.4 has the table
+of what skips and what does not, and why the answer differs per verb.
+
+The ledger is *optional* on `ToolContext`, and a context without one behaves exactly as it did
+before. The CLI verifiers build one with no state repo behind it, and an idempotency record
+that became a precondition would be an outage rather than a safety net.
 
 The three `cluster_*` reads bind **only for `kind: remediation`** (§20), and only on a
 runner where an operator has set `cluster.enabled`. An `implement` or `brainstorm` task
