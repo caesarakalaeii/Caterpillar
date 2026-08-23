@@ -177,7 +177,7 @@ receivers:
   - name: caterpillar-remediation
     webhook_configs:
       - url: http://caterpillar.caterpillar.svc.cluster.local:8081/alerts
-        send_resolved: false          # resolved alerts are skipped anyway; do not send them
+        send_resolved: true           # REQUIRED — see below; this is Alertmanager's default
         http_config:
           authorization:
             type: Bearer
@@ -194,6 +194,19 @@ route:
 `continue: true` matters: without it the alert stops at this receiver and your humans stop
 hearing about it. Remediation is an *additional* consumer of the alert, never a replacement
 for the one that wakes somebody up.
+
+`send_resolved: true` matters for a newer reason, and this line USED to read `false`. A
+resolved delivery never creates a task and never did — but it is now the only positive
+evidence the supervisor has that an alert stopped, which is what the post-merge
+re-verification rests on (DESIGN.md §20). With it off, every remediation fix that merges is
+reported as **"could not be re-verified"** and its task is parked rather than closed. That
+is the deliberate behaviour — silence is not read as success — but it means a fleet with
+`send_resolved: false` parks every remediation task it finishes. It is Alertmanager's
+default, so the fix is usually to delete the line.
+
+To check that resolutions are arriving at all, watch the delivery counter:
+`caterpillar_alerts_received_total{outcome="resolved"}`. Flat while alerts are firing and
+clearing means the route is wrong, the token is stale, or `send_resolved` is off.
 
 ### 6. Run the preflight
 
@@ -372,6 +385,13 @@ Field by field:
 - **`maxOpenTasks`** — default 1. An alert that keeps firing while a fix is in review must
   not open a second task saying the same thing. A `parked` task counts as *closed*: it is
   waiting on a human, and a fresh firing is exactly the nudge that should open a new task.
+- **`settleSeconds`** — default 600, refused above 21600 (six hours). How long a merged fix
+  for this alert is given to take effect before the supervisor decides whether it worked
+  (DESIGN.md §20). The task stays open for that long and no session runs on it. Set it to
+  how long the alert takes to clear once the underlying cause is gone: a crash loop stops
+  within a scrape, an alert on a disk a nightly job cleans up does not. Too short reports a
+  working fix as still firing; too long holds a finished task open. It is refused rather
+  than clamped above the ceiling, so a typo is a message rather than a surprise.
 
 Which alerts are worth listing: the ones about the fleet's own code, where a repo's tests
 could demonstrate a fix. §11's provider-cooldown alert is the instructive one to leave
@@ -462,6 +482,43 @@ git -C <state-repo> rm alerts/refusals/a1b2c3d4e5f60718.json
 git -C <state-repo> commit -m "ops: clear refusal now that CaterpillarNoProgress has a policy"
 git -C <state-repo> push
 ```
+
+### Every remediation task parks with "could not be re-verified"
+
+Almost always `send_resolved: false` on the Alertmanager webhook receiver — see step 5.
+
+A merged remediation fix is held for `settleSeconds` and then re-checked against what
+Alertmanager has delivered for its fingerprint (DESIGN.md §20). A **resolved** delivery is
+the only positive evidence that the alert stopped, and silence is deliberately not read as
+success: a quiet Alertmanager is also a dead one. With resolutions turned off there is never
+any evidence, so the honest verdict is always "could not be re-verified" and the task parks.
+
+Check `caterpillar_alerts_received_total{outcome="resolved"}`. Flat while alerts fire and
+clear means the resolutions are not arriving — `send_resolved`, a stale token, or a route
+that no longer matches.
+
+The other possibility is a `settleSeconds` shorter than the alert takes to clear. The
+symptom is different: **"alert still firing"** rather than "could not be re-verified",
+because the evidence arrived and said the wrong thing. The verdict for a held task is in its
+journal, and the window it was held for is on its record:
+
+```bash
+git -C <state-repo> show main:alerts/refusals/a1b2c3d4e5f60718.json
+```
+
+A `verify` block still present means the task is settling right now. A failed verdict deletes
+the whole record, which frees that alertname's `maxOpenTasks` slot so its OTHER firings can
+open tasks. A re-fire of the same fingerprint still finds the parked task — that is the one
+holding the diagnosis and the fix that did not work, so `/resume` it rather than expecting a
+second task to appear.
+
+### A remediation task closed with "the alert was NOT re-verified"
+
+The repo's base branch has a merge queue, so the council enqueued the pull request instead of
+merging it. A queued change is not on the default branch yet and can still be rejected by the
+queue, so there is no merge instant to measure a settle window from and no re-verification is
+attempted (DESIGN.md §20). The task closes, and the journal says so rather than reporting a
+clear nobody established. Watch the alert yourself, or check the queue.
 
 You do not have to: the next firing after the entry exists is handled on its merits and the
 record is cleared by the success path anyway. Delete it when you want the notification back

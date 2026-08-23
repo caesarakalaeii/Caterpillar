@@ -32,7 +32,14 @@ import {
   type AlertPolicy,
   type AlertPolicyEntry,
 } from "./policy.ts";
-import { fencedBlock, type AlertObserver, type AlertOutcome, type FiringAlert } from "./receiver.ts";
+import {
+  fencedBlock,
+  type AlertObserver,
+  type AlertOutcome,
+  type AlertResolution,
+  type FiringAlert,
+} from "./receiver.ts";
+import { isAlertFingerprint } from "./policy.ts";
 
 /**
  * The in-memory handover between the HTTP server and the loop.
@@ -49,7 +56,8 @@ import { fencedBlock, type AlertObserver, type AlertOutcome, type FiringAlert } 
  */
 export class AlertQueue {
   private readonly limit: number;
-  private queue: FiringAlert[] = [];
+  private alerts: FiringAlert[] = [];
+  private resolutions: AlertResolution[] = [];
 
   constructor(limit = 100) {
     this.limit = limit;
@@ -57,8 +65,21 @@ export class AlertQueue {
 
   /** False when the queue is full and the alert was dropped. */
   submit(alert: FiringAlert): boolean {
-    if (this.queue.length >= this.limit) return false;
-    this.queue.push(alert);
+    if (this.size >= this.limit) return false;
+    this.alerts.push(alert);
+    return true;
+  }
+
+  /**
+   * False when the queue is full and the resolution was dropped.
+   *
+   * ONE bound over both lists, not two. Both are memory this process holds on behalf of a
+   * sender it does not control, so two separate limits would be two ways to exhaust it —
+   * and the cap exists to bound the process, not to be fair between kinds of delivery.
+   */
+  resolve(resolution: AlertResolution): boolean {
+    if (this.size >= this.limit) return false;
+    this.resolutions.push(resolution);
     return true;
   }
 
@@ -68,15 +89,23 @@ export class AlertQueue {
    * Swapped rather than emptied in place, like `ChatInbox.drain`, so an alert arriving
    * mid-drain waits for the next tick instead of being handled by a pass that has moved on.
    */
-  drain(): readonly FiringAlert[] {
-    const taken = this.queue;
-    this.queue = [];
-    return taken;
+  drain(): AlertDelivery {
+    const alerts = this.alerts;
+    const resolutions = this.resolutions;
+    this.alerts = [];
+    this.resolutions = [];
+    return { alerts, resolutions };
   }
 
   get size(): number {
-    return this.queue.length;
+    return this.alerts.length + this.resolutions.length;
   }
+}
+
+/** One drain's worth of deliveries: what is firing, and what has stopped. */
+export interface AlertDelivery {
+  readonly alerts: readonly FiringAlert[];
+  readonly resolutions: readonly AlertResolution[];
 }
 
 /**
@@ -115,7 +144,25 @@ export interface AlertPass {
   readonly created: number;
   readonly duplicate: number;
   readonly refused: number;
+  /** Resolutions that landed on a pending re-verification as evidence (§20). */
+  readonly resolved: number;
 }
+
+/**
+ * What handling one firing alert did.
+ *
+ * `wrote` is separate from the outcome because the two came apart: a `duplicate` writes
+ * nothing most of the time, and stamps the firing evidence when the fingerprint's fix is
+ * inside its settle window (§20). The caller commits once per pass, so it needs to know
+ * whether there is anything to commit rather than inferring it from the outcome.
+ */
+interface HandledAlert {
+  readonly outcome: AlertOutcome;
+  readonly wrote: boolean;
+}
+
+/** The commit message for a pass that only recorded resolutions. */
+const RESOLVED_COMMIT = "chore(alerts): record alert resolution(s)";
 
 export class AlertProcessor {
   private readonly deps: AlertProcessorDeps;
@@ -135,9 +182,23 @@ export class AlertProcessor {
     alerts: readonly FiringAlert[],
     remote: string,
     branch: string,
+    resolutions: readonly AlertResolution[] = [],
   ): Promise<AlertPass> {
     const { store, logger } = this.deps;
-    if (alerts.length === 0) return { seen: 0, created: 0, duplicate: 0, refused: 0 };
+    if (alerts.length === 0 && resolutions.length === 0) {
+      return { seen: 0, created: 0, duplicate: 0, refused: 0, resolved: 0 };
+    }
+
+    // FIRST, and outside the policy read, because a resolution needs no policy: it is an
+    // observation about an alert that already produced a task, and a policy document that
+    // stopped parsing after that task was created must not be able to lose the evidence
+    // that its fix worked.
+    const resolved = await this.recordResolutions(resolutions);
+
+    if (alerts.length === 0) {
+      if (resolved > 0) await store.commitAndPush(RESOLVED_COMMIT, remote, branch);
+      return { seen: 0, created: 0, duplicate: 0, refused: 0, resolved };
+    }
 
     let policy: AlertPolicy;
     try {
@@ -152,13 +213,14 @@ export class AlertProcessor {
         alerts: alerts.length,
         ...errorFields(error),
       });
-      return { seen: alerts.length, created: 0, duplicate: 0, refused: 0 };
+      if (resolved > 0) await store.commitAndPush(RESOLVED_COMMIT, remote, branch);
+      return { seen: alerts.length, created: 0, duplicate: 0, refused: 0, resolved };
     }
 
     let created = 0;
     let duplicate = 0;
     let refused = 0;
-    let changed = false;
+    let changed = resolved > 0;
 
     // Tasks this PASS has created, per alertname. `countOpenAlertTasks` reads `state.json`
     // files and cannot see a task created a moment ago in the same batch — so two distinct
@@ -169,9 +231,9 @@ export class AlertProcessor {
     const createdHere = new Map<string, number>();
 
     for (const alert of alerts) {
-      let outcome: AlertOutcome;
+      let handled: HandledAlert;
       try {
-        outcome = await this.handle(alert, lookupPolicy(policy, alert.alertname), createdHere);
+        handled = await this.handle(alert, lookupPolicy(policy, alert.alertname), createdHere);
       } catch (error) {
         // One alert that cannot be filed must not cost the rest of the batch, and must
         // never cost the poll: the loop has tasks to run either way.
@@ -183,6 +245,7 @@ export class AlertProcessor {
         continue;
       }
 
+      const { outcome } = handled;
       this.deps.metrics?.observe(alert.alertname, outcome);
       if (outcome === "created") {
         created += 1;
@@ -190,8 +253,10 @@ export class AlertProcessor {
       }
       if (outcome === "duplicate") duplicate += 1;
       if (outcome === "refused-no-policy" || outcome === "refused-max-open") refused += 1;
-      // A duplicate writes nothing at all — that is the whole point of it.
-      if (outcome !== "duplicate") changed = true;
+      // `wrote` rather than a test on the outcome, because a duplicate is the one outcome
+      // that writes nothing MOST of the time: it stamps the firing evidence when the
+      // fingerprint is inside a settle window, and that stamp has to be pushed.
+      if (handled.wrote) changed = true;
     }
 
     if (changed) {
@@ -204,14 +269,76 @@ export class AlertProcessor {
       );
     }
 
-    return { seen: alerts.length, created, duplicate, refused };
+    return { seen: alerts.length, created, duplicate, refused, resolved };
+  }
+
+  /**
+   * Stamp `verify.resolvedAt` for every resolution that answers a pending re-verification.
+   *
+   * A resolution for a fingerprint with no `verify` block is recorded NOWHERE, and that is
+   * the whole shape of this function. Most alerts fire and clear without ever producing a
+   * task; writing a record for each would fill `alerts/refusals/` with files nothing reads
+   * and push a commit for every alert the cluster has ever raised.
+   *
+   * Returns how many landed, so the caller knows whether it has anything to commit.
+   */
+  private async recordResolutions(resolutions: readonly AlertResolution[]): Promise<number> {
+    const { store, logger } = this.deps;
+    let recorded = 0;
+
+    for (const resolution of resolutions) {
+      // Checked here as well as in the receiver, exactly as `handle` re-checks a firing
+      // alert's: this is what stops a future second caller writing a path of its choosing.
+      if (!isAlertFingerprint(resolution.fingerprint)) {
+        logger.warn("alert.bad-fingerprint", { alertname: resolution.alertname });
+        continue;
+      }
+
+      try {
+        const record = await store.readAlertRefusal(resolution.fingerprint);
+        if (record?.verify === undefined) continue;
+
+        // Alertmanager's own `endsAt` where it has one, because the alert stopped when the
+        // monitoring says it stopped and a delivery can be minutes late. A timestamp that
+        // will not parse falls back to now rather than being refused: the delivery still
+        // says the alert stopped, and dropping it would report a cleared alert as one that
+        // could not be re-verified.
+        const endsAt = resolution.endsAt;
+        const resolvedAt =
+          endsAt !== undefined && !Number.isNaN(Date.parse(endsAt))
+            ? endsAt
+            : new Date().toISOString();
+
+        await store.writeAlertRefusal(resolution.fingerprint, {
+          ...record,
+          verify: { ...record.verify, resolvedAt },
+        });
+        logger.info("alert.resolution-recorded", {
+          alertname: resolution.alertname,
+          fingerprint: resolution.fingerprint,
+          resolvedAt,
+        });
+        recorded += 1;
+      } catch (error) {
+        // One resolution that cannot be filed must not cost the rest of the batch, nor the
+        // firing alerts in the same delivery. The re-verification then reports the alert as
+        // unverifiable, which is the honest answer rather than a wrong one.
+        logger.error("alert.resolution-failed", {
+          alertname: resolution.alertname,
+          fingerprint: resolution.fingerprint,
+          ...errorFields(error),
+        });
+      }
+    }
+
+    return recorded;
   }
 
   private async handle(
     alert: FiringAlert,
     entry: AlertPolicyEntry | undefined,
     createdHere: ReadonlyMap<string, number>,
-  ): Promise<AlertOutcome> {
+  ): Promise<HandledAlert> {
     const { store, logger } = this.deps;
 
     const id = alertTaskId(alert.fingerprint);
@@ -219,7 +346,7 @@ export class AlertProcessor {
       // The receiver already validated this. Refusing again here rather than trusting the
       // caller is what keeps a future second caller from writing a path of its choosing.
       logger.warn("alert.bad-fingerprint", { alertname: alert.alertname });
-      return "malformed";
+      return { outcome: "malformed", wrote: false };
     }
 
     // FIRST, before the policy lookup and before any counting. The same alert firing for
@@ -227,7 +354,7 @@ export class AlertProcessor {
     // question this function could ask.
     if (await store.hasTask(id)) {
       logger.debug("alert.exists", { task: id, alertname: alert.alertname });
-      return "duplicate";
+      return { outcome: "duplicate", wrote: await this.stampFiring(alert) };
     }
 
     if (entry === undefined) {
@@ -298,7 +425,39 @@ export class AlertProcessor {
       alertname: alert.alertname,
       ...(alert.severity === undefined ? {} : { severity: alert.severity }),
     });
-    return "created";
+    return { outcome: "created", wrote: true };
+  }
+
+  /**
+   * Stamp `verify.lastFiringAt` when this fingerprint's fix is being re-verified (§20).
+   *
+   * Returns whether anything was written, which is almost always FALSE: the record only
+   * carries a `verify` block between the merge and the verdict. That condition is the whole
+   * design of this function — an unconditional stamp would push a commit to the state repo
+   * every few minutes for every alert with an open task, forever, and the repo's history
+   * would become a stream of timestamps nothing reads.
+   *
+   * The supervisor's clock rather than the alert's `startsAt`: `startsAt` is when the alert
+   * began firing, which for a re-delivery is BEFORE the merge — so using it would read a
+   * fresh delivery of a still-firing alert as evidence from before the fix and report the
+   * fix as unverifiable. What matters here is when we were last told, and that is now.
+   */
+  private async stampFiring(alert: FiringAlert): Promise<boolean> {
+    const { store, logger } = this.deps;
+
+    const record = await store.readAlertRefusal(alert.fingerprint);
+    if (record?.verify === undefined) return false;
+
+    await store.writeAlertRefusal(alert.fingerprint, {
+      ...record,
+      verify: { ...record.verify, lastFiringAt: new Date().toISOString() },
+    });
+    logger.info("alert.still-firing", {
+      alertname: alert.alertname,
+      fingerprint: alert.fingerprint,
+      task: record.task,
+    });
+    return true;
   }
 
   /**
@@ -318,7 +477,7 @@ export class AlertProcessor {
     task: TaskId,
     outcome: Extract<AlertOutcome, "refused-no-policy" | "refused-max-open">,
     detail: string,
-  ): Promise<AlertOutcome> {
+  ): Promise<HandledAlert> {
     const { store, logger } = this.deps;
 
     const previous = await store.readAlertRefusal(alert.fingerprint);
@@ -332,7 +491,7 @@ export class AlertProcessor {
 
     if (already) {
       logger.debug("alert.still-refused", { alertname: alert.alertname, reason: outcome });
-      return outcome;
+      return { outcome, wrote: true };
     }
 
     logger.warn("alert.refused", {
@@ -347,7 +506,7 @@ export class AlertProcessor {
       fingerprint: alert.fingerprint,
       detail,
     });
-    return outcome;
+    return { outcome, wrote: true };
   }
 
   /** A notification that fails is logged and forgotten: the record in git is the truth. */

@@ -5254,7 +5254,10 @@ Alertmanager  →  POST /alerts  →  policy lookup  →  spec.md (kind: remedia
                                        │                        │
                                   no entry?                  normal claim,
                                   refusal record             normal session,
-                                                             §12 gate, PR
+                                                             §12 gate, PR, merge
+                                                                        │
+                                                             re-verify: did the
+                                                             alert actually clear?
 ```
 
 ### It never writes to the cluster
@@ -5325,6 +5328,7 @@ alerts:
       This alert usually means a session wedged on a provider cooldown.
     runbook: https://runbooks.example/…      # optional URL surfaced in the goal
     maxOpenTasks: 1                          # optional, default 1
+    settleSeconds: 600                      # optional, default 600, max 21600
 ```
 
 **In the state repo, not this repo and not a ConfigMap.** Adding an alert must be a commit
@@ -5429,6 +5433,117 @@ check that needs a cluster to test is a check nobody tests.
 `docs/remediation-runbook.md` is the operator's end-to-end guide: the order of operations
 across the two repos, how to test the webhook by hand, how to write a policy entry, and the
 three levers for turning it off in a hurry.
+
+### Did the fix work? The re-verification
+
+Until this existed the path had no closing edge. A remediation task diagnosed a firing
+alert, opened a pull request, the council read it, and it merged — and **whether the alert
+actually cleared was never checked**. A patch that ended the incident and a patch that
+changed nothing produced the same record: `done`, one merged PR, and silence.
+
+The dedup makes that worse rather than better. The task id is `ALERT-<fingerprint>`, which
+correctly makes an alert firing for an hour one task rather than twenty — so a re-fire
+after a merged-but-ineffective fix is deduped against the very task that failed to fix it,
+and may never become work again at all. The loop could close on a patch that did nothing,
+and the only signal was a human noticing the alert was still there.
+
+So a merged remediation fix is **held for a bounded settle window** and then re-checked.
+
+```
+PR merges  →  verify block written on alerts/refusals/<fp>.json
+              task → ready, and the claim filter skips it
+                      │
+              housekeeping pass, once the window has run out
+                      │
+        ┌─────────────┼──────────────────┐
+     cleared      still firing     cannot be checked
+     → done       → parked         → parked
+                  + record reset   + record reset
+```
+
+**The evidence is what Alertmanager delivered, not a question anyone asks it.** A firing
+alert is re-delivered on `repeat_interval` for as long as it fires, and a webhook receiver
+with `send_resolved` — its default — gets one delivery when it stops. The receiver used to
+DROP the resolved ones; it now records them, so `alerts/refusals/<fingerprint>.json` is the
+ledger of what the monitoring has said about that fingerprint and the decision is a pure
+function over it (`remediation/verify.ts`). Adding an Alertmanager API client instead would
+have meant a URL, a credential and a failure mode to answer a question the existing stream
+already answers. Nothing here reads the cluster, and invariant 13 is untouched: the session
+gets no new capability, and the observation is one the supervisor performs.
+
+**Silence is never a clear.** It is the one inference this refuses to make, and the reason
+is that "nothing delivered since the merge" is also what a stopped Alertmanager, an edited
+route, a rotated webhook token and a receiver nobody enabled look like. Every one of those
+is indistinguishable from a fix that worked. So a window that runs out with no delivery
+either way is **`unverifiable`** — recorded, notified, and never counted as a success.
+Absence of evidence is not evidence.
+
+**The window is bounded configuration**, per alertname, in the same policy entry as
+everything else an operator says in advance: `settleSeconds`, defaulting to ten minutes and
+refused above six hours. Per-alert because the right number is a property of the alert — a
+crash loop stops within a scrape of the fix landing, and an alert on a disk a nightly job
+cleans up does not. A fleet-wide window would have to be the slowest of them, holding every
+fast task open for hours. It is refused rather than clamped above the ceiling: an operator
+who wrote a day meant it, and being quietly given six hours reads as the file being ignored.
+The window a task is held for is the one read back off the RECORD, not the policy as it
+stands at the verdict — the entry can change while a fix is in review, and the number the
+journal already quoted is the one the task is entitled to.
+
+**A failed re-verification resets the fingerprint's record.** Deleting
+`alerts/refusals/<fingerprint>.json` frees the alertname's `maxOpenTasks` slot —
+`countOpenAlertTasks` joins that directory to `tasks/`, so a record naming a task that
+failed to fix its incident would otherwise go on holding the slot and refusing every other
+firing of the same alertname. It also drops the stale `verify` block, so nothing settles the
+same verdict twice.
+
+What it does NOT do is let the same fingerprint fire into a new task. That dedup is
+`hasTask(ALERT-<fingerprint>)` and a task directory outlives its task, so a re-fire finds
+the parked task — which is the honest answer: that task holds the diagnosis, the merged fix
+that did not work, and the verdict, and a second task for one incident would start from
+nothing. The way it becomes work again is the park's notification and `/resume`, which is
+why the park carries the evidence and why the failure is notified rather than logged.
+
+A CLEARED verdict deletes only the `verify` block and keeps the record, because removing it
+while the task is still being written as done would free the alertname's slot, and a firing
+in that window would open a second task for an incident that had just been fixed.
+
+**A failure parks, and parks with the evidence.** Not `failed`: the change merged and
+passed every gate, so `failed` would be a lie about the change. What is true is that the
+incident is not over and a human has to decide what next — so the verdict goes in the
+journal along with the reset, and the next session starts from "the previous fix did not
+work" rather than from scratch. And it is said out loud either way, in Discord and in the
+digest (§19): `ALERT-6155db — fix merged, alert cleared after 4m` or `fix merged, alert
+still firing`. A silent success and a silent failure must not look the same; that they did
+is the defect this closes.
+
+Two mechanisms are worth naming because a reader would reach for something else:
+
+- **The hold is `ready` plus a filter in the claim path, not a seventh `TaskStatus`.** A new
+  status would touch the web view, the slash commands, the digest ordering, the snapshot
+  ranking, the worktree live set and `isTerminal`, none of which has anything to say about
+  an alert. `ready` is also honest for a settling task: nothing is wrong with it and the
+  work is not finished. The filter is where the one distinguishing fact lives, and it is
+  free for every other task — the question is answered from the task id alone unless it
+  starts with `ALERT-`.
+- **The verdict, the journal, the transition and the push are one unit.** A commit made
+  inside a unit stages only the paths that unit wrote (`stageCommitPush`), so recording the
+  verdict outside it left the deleted record uncommitted until some later unrelated bare
+  commit happened to stage it. The reset has to land with the park that motivates it, or git
+  carries a park whose reason had no effect.
+
+The re-check runs on the **housekeeping** pass, after the alert drain so evidence that
+arrived in the same pass is read by the verdict it decides. It claims the task's lease
+before acting, because two replicas must not settle one verdict, and it re-reaches the
+verdict under that lease rather than trusting the one computed without it.
+
+**A fix that was only enqueued is not re-verified, and the journal says so.** On a
+queue-protected base the council enqueues rather than merges (§12.3), and a queued pull
+request is not on the default branch — the queue runs the change's own checks against a
+speculative base and can still reject it. There is therefore no merge instant to time a
+window from: one started now would run out while the fix was still on its way and park a
+change that works. So the hold is skipped and the skip is written into the journal, naming
+the queue. That is the same rule as `unverifiable`, applied one step earlier: what is not
+known is said rather than guessed at, in either direction.
 
 ### What is deliberately absent
 

@@ -134,10 +134,25 @@ const task = (change: TaskChange): readonly string[] => {
     "",
     facts.join(" · "),
     "",
+    ...reverified(change),
     ...change.changes.flatMap(repo),
     ...unavailable(change),
   ];
 };
+
+/**
+ * Whether the merged fix actually cleared the alert (DESIGN.md §20).
+ *
+ * Its own line rather than another entry in the fact list, because it is the one fact on a
+ * remediation task that decides how to read all the others: `done` with an alert still
+ * firing and `done` with it cleared are different days' work, and a reader scanning the
+ * facts should not have to find this among the session counts.
+ *
+ * Nothing at all when there was no re-verification, which is every task from every other
+ * intake path.
+ */
+const reverified = (change: TaskChange): readonly string[] =>
+  change.reverified === undefined ? [] : [`Re-verified: **${change.reverified}**`, ""];
 
 const repo = (change: RepoChange): readonly string[] => [
   `\`${change.repo}\` · ${plural(change.commits.length, "commit")} · ` +

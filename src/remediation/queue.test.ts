@@ -19,7 +19,7 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import type { AlertRefusal } from "../state/store.ts";
 import { parsePolicy, PolicyParseError, type AlertPolicy } from "./policy.ts";
 import { AlertProcessor, AlertQueue, renderAlertSpec, type AlertStore } from "./queue.ts";
-import type { FiringAlert } from "./receiver.ts";
+import type { AlertResolution, FiringAlert } from "./receiver.ts";
 
 const POLICY = parsePolicy(`
 version: 1
@@ -272,7 +272,7 @@ test("the happy path writes a spec carrying the policy's acceptance commands ver
 
   const pass = await processor(store, notifier).process([alert()], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 1, created: 1, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 1, created: 1, duplicate: 0, refused: 0, resolved: 0 });
 
   const spec = store.specs[0];
   assert.ok(spec !== undefined);
@@ -415,7 +415,7 @@ test("a policy that does not parse refuses nothing and records nothing", async (
     maxSessionsPerTask: 20,
   }).process([alert()], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 1, created: 0, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 1, created: 0, duplicate: 0, refused: 0, resolved: 0 });
   assert.equal(store.refusals.size, 0);
   assert.equal(store.specs.length, 0);
   assert.equal(store.commits.length, 0);
@@ -428,7 +428,7 @@ test("an empty drain reads no policy and pushes nothing", async () => {
 
   const pass = await processor(store, notifier).process([], "origin", "main");
 
-  assert.deepEqual(pass, { seen: 0, created: 0, duplicate: 0, refused: 0 });
+  assert.deepEqual(pass, { seen: 0, created: 0, duplicate: 0, refused: 0, resolved: 0 });
   assert.equal(store.commits.length, 0);
 });
 
@@ -443,8 +443,138 @@ test("the queue is bounded and drops rather than growing", () => {
   assert.equal(queue.submit(alert()), false);
   assert.equal(queue.size, 3);
 
-  assert.equal(queue.drain().length, 3);
+  assert.equal(queue.drain().alerts.length, 3);
   assert.equal(queue.size, 0);
   // Swapped rather than emptied in place, so room is available immediately after a drain.
   assert.equal(queue.submit(alert()), true);
+});
+
+test("resolutions share the queue's bound and are drained alongside firings", () => {
+  const queue = new AlertQueue(2);
+
+  assert.equal(queue.submit(alert()), true);
+  assert.equal(queue.resolve(resolution()), true);
+  // One bound over both, because both are memory this process holds on behalf of a sender
+  // it does not control. Two separate limits would be two ways to exhaust it.
+  assert.equal(queue.resolve(resolution()), false);
+  assert.equal(queue.size, 2);
+
+  const drained = queue.drain();
+  assert.equal(drained.alerts.length, 1);
+  assert.equal(drained.resolutions.length, 1);
+  assert.equal(queue.size, 0);
+});
+
+/* ---- post-merge re-verification evidence (§20) ---------------------------------- */
+
+/** A record for a task whose fix has merged and is being re-verified. */
+const awaitingVerification = (over: Partial<AlertRefusal> = {}): AlertRefusal => ({
+  fingerprint: "a1b2c3d4",
+  alertname: "CaterpillarNoProgress",
+  reason: "created",
+  task: "ALERT-a1b2c3d4" as TaskId,
+  verify: { mergedAt: "2026-08-17T18:00:00.000Z", settleSeconds: 600 },
+  ...over,
+});
+
+const resolution = (over: Partial<AlertResolution> = {}): AlertResolution => ({
+  alertname: "CaterpillarNoProgress",
+  fingerprint: "a1b2c3d4",
+  endsAt: "2026-08-17T18:04:00.000Z",
+  ...over,
+});
+
+test("a resolution while a fix is being re-verified is the evidence it cleared", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  store.refusals.set("a1b2c3d4", awaitingVerification());
+
+  const pass = await processor(store, notifier).process(
+    [],
+    "origin",
+    "main",
+    [resolution()],
+  );
+
+  assert.equal(pass.resolved, 1);
+  // Alertmanager's own `endsAt`, not the supervisor's clock: the alert stopped when the
+  // monitoring says it stopped, and a delivery can be minutes late.
+  assert.equal(store.refusals.get("a1b2c3d4")?.verify?.resolvedAt, "2026-08-17T18:04:00.000Z");
+  // Recorded and PUSHED, like every other alert decision: another runner performs the
+  // re-verification, and evidence held on one runner's disk is evidence nobody else has.
+  assert.equal(store.commits.length, 1);
+});
+
+test("a firing delivery while a fix is being re-verified is the evidence it did not", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  store.refusals.set("a1b2c3d4", awaitingVerification());
+  // The task still exists, so this delivery is a duplicate for intake purposes.
+  store.specs.push(renderAlertSpec("ALERT-a1b2c3d4" as TaskId, alert(), POLICY.entries[0]!));
+
+  const pass = await processor(store, notifier).process([alert()], "origin", "main");
+
+  assert.equal(pass.duplicate, 1);
+  assert.ok(store.refusals.get("a1b2c3d4")?.verify?.lastFiringAt !== undefined);
+  assert.equal(store.refusals.get("a1b2c3d4")?.verify?.resolvedAt, undefined);
+});
+
+test("a duplicate with no re-verification pending still writes nothing at all", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  const p = processor(store, notifier);
+
+  await p.process([alert()], "origin", "main");
+  const commitsAfterFirst = store.commits.length;
+  const recordAfterFirst = store.refusals.get("a1b2c3d4");
+
+  await p.process([alert()], "origin", "main");
+
+  // The stamping is confined to the settle window on purpose. Stamping every duplicate
+  // would commit and push to the state repo every few minutes, forever, for every alert
+  // with an open task — a history of nothing but timestamps.
+  assert.equal(store.commits.length, commitsAfterFirst);
+  assert.deepEqual(store.refusals.get("a1b2c3d4"), recordAfterFirst);
+});
+
+test("a resolution for an alert nobody is re-verifying is recorded nowhere", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+
+  const pass = await processor(store, notifier).process([], "origin", "main", [resolution()]);
+
+  // Nothing needs it, and writing one would create a record for every alert that has ever
+  // fired and cleared — an unbounded directory of files nothing reads.
+  assert.equal(pass.resolved, 0);
+  assert.equal(store.refusals.size, 0);
+  assert.equal(store.commits.length, 0);
+});
+
+test("a resolution for a fingerprint that is not one is refused even here", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  store.refusals.set("a1b2c3d4", awaitingVerification());
+
+  const pass = await processor(store, notifier).process([], "origin", "main", [
+    resolution({ fingerprint: "../../etc/passwd" }),
+  ]);
+
+  assert.equal(pass.resolved, 0);
+  assert.equal(store.commits.length, 0);
+});
+
+test("a resolution with no usable endsAt is stamped with when it was seen", async () => {
+  const store = new FakeStore();
+  const notifier = new FakeNotifier();
+  store.refusals.set("a1b2c3d4", awaitingVerification());
+
+  await processor(store, notifier).process([], "origin", "main", [
+    resolution({ endsAt: "whenever" }),
+  ]);
+
+  // A delivery whose timestamp will not parse is still a delivery: Alertmanager said the
+  // alert stopped, and the only thing lost is by how much the receipt lagged it. Falling
+  // back to nothing would turn a cleared alert into an unverifiable one.
+  const stamped = store.refusals.get("a1b2c3d4")?.verify?.resolvedAt;
+  assert.ok(stamped !== undefined && !Number.isNaN(Date.parse(stamped)));
 });

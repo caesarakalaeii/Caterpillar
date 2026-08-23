@@ -104,6 +104,16 @@ export interface TaskChange {
   readonly noProgressStreak: number;
   /** Journal appended inside the window, bounded. The agent's own account of the day. */
   readonly journal?: string;
+  /**
+   * What the post-merge re-verification concluded, when one concluded inside the window
+   * (DESIGN.md §20) — `fix merged, alert cleared after 4m`, or `fix merged, alert still
+   * firing`.
+   *
+   * Absent on every task nobody re-verified, which is almost all of them. Absent rather
+   * than empty for the reason `changesUnavailable` is absent rather than zero: a blank
+   * verdict beside every task would read as an answer that went missing.
+   */
+  readonly reverified?: string;
   /** Code this task produced, when this runner holds the mirror to prove it. */
   readonly changes: readonly RepoChange[];
   /** Set when the diff could not be read — names the repos, never pretends they were empty. */
@@ -251,6 +261,7 @@ export const collectDay = async (options: CollectOptions): Promise<DayDigest> =>
     if (paths === undefined) return;
 
     const before = from === undefined ? undefined : await readState(git, from, id);
+    const journal = await journalOf(git, from, to, id);
     changed.push({
       id,
       title,
@@ -267,7 +278,8 @@ export const collectDay = async (options: CollectOptions): Promise<DayDigest> =>
       answersGiven: count(paths, /\/questions\/\d+-answer\.md$/),
       verdicts: count(paths, /\/reviews\/\d+-verdict\.md$/),
       noProgressStreak: after.progress.noProgressStreak,
-      ...(await journalOf(git, from, to, id)),
+      ...journal,
+      ...reverificationOf(journal.journal),
       ...(await changesOf(options.changes, id, facts.repos)),
     });
 
@@ -453,6 +465,36 @@ const journalOf = async (
         ? trimmed
         : `… (earlier entries omitted)\n${points.slice(-JOURNAL_LIMIT).join("")}`,
   };
+};
+
+/**
+ * The `**Re-verified:** …` line the supervisor wrote, pulled back out of the journal (§20).
+ *
+ * Read from the JOURNAL rather than from `alerts/refusals/`, and that is not a shortcut. The
+ * record is deleted by a failed verdict and stripped of its `verify` block by a successful
+ * one — by design, to free the alertname's slot — which means by the time a digest runs
+ * there is nothing left on it to read. The journal is the durable record of what was
+ * concluded, and the digest is already collecting it.
+ *
+ * The LAST match wins. A task can be re-verified, parked, resumed, re-merged and
+ * re-verified again inside one window, and the verdict that stands is the one at the end;
+ * printing an earlier "still firing" beside a later "cleared" would read as a contradiction.
+ *
+ * Undefined when there is no such line, which is every task from every other intake path.
+ * Absent rather than empty, for `changesUnavailable`'s reason: a blank verdict beside every
+ * task would read as an answer that went missing.
+ */
+const REVERIFIED = /\*\*Re-verified:\*\*\s*(.+?)\.?\s*$/gm;
+
+const reverificationOf = (journal: string | undefined): { reverified?: string } => {
+  if (journal === undefined) return {};
+
+  let last: string | undefined;
+  // `matchAll` clones the regex, so the module-level `lastIndex` is never advanced and two
+  // calls cannot interfere. `exec` in a loop here would need the reset.
+  for (const match of journal.matchAll(REVERIFIED)) last = match[1]?.trim();
+
+  return last === undefined || last === "" ? {} : { reverified: last };
 };
 
 /**

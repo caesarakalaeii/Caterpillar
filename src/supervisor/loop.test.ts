@@ -21,21 +21,24 @@ import {
   type RepoRef,
   type RunnerId,
   type SessionOutcome,
+  type TaskKind,
   type TaskId,
   type TaskState,
   type TrackerRef,
   type WorkspaceName,
 } from "../domain/task.ts";
+import type { MergeQueueSupport } from "../forge/mergeability.ts";
 import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
 import { type Notifier, NullNotifier } from "../notify/discord.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
+import { AlertProcessor, AlertQueue } from "../remediation/queue.ts";
 import type { FiringAlert } from "../remediation/receiver.ts";
 import type { Council } from "../review/council.ts";
 import { decide } from "../review/decide.ts";
 import { Git } from "../state/git.ts";
 import { type Lease, LeaseLostError, LeaseManager, leaseRef } from "../state/lease.ts";
-import { StateStore } from "../state/store.ts";
+import { StateStore, type AlertRefusal } from "../state/store.ts";
 import { removeTempTree } from "../testing/tempdir.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts";
@@ -120,6 +123,8 @@ const seedTask = async (
   repos: readonly string[] = ["github.com/acme/widget"],
   /** The tracker item the task came from, for tests about what is mirrored back to it. */
   tracker?: TrackerRef,
+  /** Omitted for `implement`, which is what `readSpec` reads an absent `kind` as. */
+  kind?: TaskKind,
 ): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
@@ -128,6 +133,7 @@ const seedTask = async (
     [
       "---",
       "workspace: test",
+      ...(kind === undefined ? [] : [`kind: ${kind}`]),
       "repos:",
       ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
@@ -153,6 +159,80 @@ const seedTask = async (
   await stateGit.run("add", "-A");
   await stateGit.run("commit", "-m", `seed ${id}`);
   await stateGit.run("push", "origin", "HEAD:main");
+};
+
+
+/**
+ * Seed `alerts/refusals/<fingerprint>.json`, as the alert path writes it when it creates a
+ * remediation task (§20). The record is what a post-merge re-verification reads.
+ *
+ * Called BEFORE the supervisor under test starts, which is why it can share `statePath`
+ * with `seedTask`: committing into that checkout while a loop is polling it interleaves two
+ * writers in one git directory, the hazard `StateStore`'s mutex exists to prevent. Evidence
+ * that has to arrive mid-run goes through the alert queue instead — see
+ * `reverifyingSupervisor`.
+ */
+const seedAlertRecord = async (
+  fingerprint: string,
+  alertname: string,
+  task: TaskId,
+): Promise<void> => {
+  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
+  await mkdir(join(statePath, "alerts", "refusals"), { recursive: true });
+  await writeFile(
+    join(statePath, "alerts", "refusals", `${fingerprint}.json`),
+    `${JSON.stringify({ fingerprint, alertname, reason: "created", task } satisfies AlertRefusal, null, 2)}\n`,
+  );
+  await stateGit.run("add", "-A");
+  await stateGit.run("commit", "-m", `seed alert ${fingerprint}`);
+  await stateGit.run("push", "origin", "HEAD:main");
+};
+
+/**
+ * Seed the operator's `alerts/policy.yaml` with one entry, carrying a settle window.
+ *
+ * The policy is the only place a settle window comes from (`Supervisor.settleWindowFor`), so
+ * a test that wants a window that runs out has to say so here rather than back-dating a
+ * record — otherwise it proves the verdict logic and nothing about the configuration.
+ */
+const seedAlertPolicy = async (alertname: string, settleSeconds: number): Promise<void> => {
+  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
+  await mkdir(join(statePath, "alerts"), { recursive: true });
+  await writeFile(
+    join(statePath, "alerts", "policy.yaml"),
+    [
+      "version: 1",
+      "alerts:",
+      `  - alertname: ${alertname}`,
+      "    workspace: test",
+      "    repos:",
+      "      - github.com/acme/widget",
+      "    acceptance:",
+      '      - "true"',
+      `    settleSeconds: ${settleSeconds}`,
+      "",
+    ].join("\n"),
+  );
+  await stateGit.run("add", "-A");
+  await stateGit.run("commit", "-m", `seed alert policy for ${alertname}`);
+  await stateGit.run("push", "origin", "HEAD:main");
+};
+
+/** One firing delivery, with the two fields `AlertProcessor` keys on and nothing else. */
+const firingAlert = (alertname: string, fingerprint: string): FiringAlert => ({
+  alertname,
+  fingerprint,
+  labels: [],
+  annotations: [],
+});
+
+/** The record as the remote has it, or undefined once a failed verdict deleted it. */
+const readAlertRecord = async (fingerprint: string): Promise<AlertRefusal | undefined> => {
+  const shown = await new Git(origin).tryRun(
+    "show",
+    `main:alerts/refusals/${fingerprint}.json`,
+  );
+  return shown.code === 0 ? (JSON.parse(shown.stdout) as AlertRefusal) : undefined;
 };
 
 await seedTask(TASK);
@@ -2838,7 +2918,7 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
     toolchain: TEST_TOOLCHAIN,
     alerts: {
       queue: {
-        drain: () => alerts.splice(0, alerts.length),
+        drain: () => ({ alerts: alerts.splice(0, alerts.length), resolutions: [] }),
       },
       ingester: (() => {
         let first = true;
@@ -2852,7 +2932,13 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
               first = false;
               return Promise.reject(new Error("push rejected"));
             }
-            return Promise.resolve({ seen: queued.length, created: 0, duplicate: 0, refused: 0 });
+            return Promise.resolve({
+              seen: queued.length,
+              created: 0,
+              duplicate: 0,
+              refused: 0,
+              resolved: 0,
+            });
           },
         };
       })(),
@@ -6096,4 +6182,305 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
+});
+
+/**
+ * A supervisor wired for §20's closing edge, with a real `AlertProcessor` behind a real
+ * `AlertQueue`.
+ *
+ * The queue is the seam these tests drive, and it is the production one: submitting a
+ * firing alert or a resolution is exactly what the webhook receiver does, so the evidence a
+ * verdict is reached from arrives the way Alertmanager delivers it. The earlier version of
+ * these tests pushed the evidence straight to the state remote from a second checkout, and
+ * that made them flaky for a reason worth writing down: the supervisor only sees a remote
+ * write after `store.pull`, and `pull` DECLINES for as long as a session holds the tree
+ * dirty (`StateStore.pull`). With `pollSeconds: 1` and a session that returns instantly,
+ * whether any given pass pulled was a coin flip, so the wait for a verdict passed or timed
+ * out depending on load. Going through the queue removes the remote round trip entirely:
+ * `drainAlerts` writes into the supervisor's OWN checkout and `settleReverifications` runs
+ * immediately after it in the same pass.
+ */
+const reverifyingSupervisor = (
+  queue: AlertQueue,
+  prUrl: string,
+  /** `required` for the one test about a fix that was enqueued rather than merged. */
+  mergeQueue: MergeQueueSupport = "absent",
+): { readonly supervisor: Supervisor; readonly store: StateStore } => {
+  const store = new StateStore(statePath, stateGit);
+
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("the reviewer never checks anything out")),
+    openPr: () => Promise.reject(new Error("the reviewer never opens PRs")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.resolve([]),
+    approve: () => Promise.resolve(),
+    merge: () => Promise.resolve(),
+    mergeQueue: () => Promise.resolve(mergeQueue),
+    enqueue: () => Promise.resolve(),
+    revoke: () => Promise.resolve(),
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store,
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed", prUrl }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () =>
+        Promise.resolve({
+          usage: EMPTY_USAGE,
+          verdict: decide([
+            {
+              lens: "correctness",
+              title: "Correctness",
+              decision: "pass",
+              blocking: false,
+              summary: "Reads correctly.",
+              findings: [],
+            },
+          ]),
+        }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    alerts: {
+      queue,
+      ingester: new AlertProcessor({
+        store,
+        notifier: new NullNotifier(),
+        logger: SILENT_LOGGER,
+        maxSessionsPerTask: config.limits.maxSessionsPerTask,
+      }),
+    },
+  });
+
+  return { supervisor, store };
+};
+
+test("a merged remediation fix is held for a verdict, and parked when the alert keeps firing", async () => {
+  // The closing edge of §20, end to end. Before this the merge went straight to `done`, so
+  // a patch that changed nothing and a patch that fixed the incident produced the same
+  // record — and because task ids on this path are `ALERT-<fingerprint>`, the re-fire was
+  // deduped against the very task that had failed to fix it. Nothing ever said so.
+  //
+  // Driven through a running supervisor rather than by calling the private methods, because
+  // the property is the SEQUENCE: merge, hold, verdict, park. Each step is one a later
+  // refactor can drop without any unit test noticing.
+  const FINGERPRINT = "6155db6f";
+  const ALERTNAME = "CaterpillarNoProgress";
+  const HELD = asTaskId(`ALERT-${FINGERPRINT}`);
+
+  // A one-second window, so "the window ran out" is a fact rather than a wait. The number
+  // comes from the operator's policy through `settleWindowFor`, which is the path the
+  // journal quotes — a test that back-dated the record instead would prove nothing about
+  // where the window comes from.
+  await seedAlertPolicy(ALERTNAME, 1);
+  await seedTask(
+    HELD,
+    { pr: { number: 20, url: "https://example.invalid/pr/20" } },
+    ["github.com/acme/widget"],
+    /* no tracker: nothing filed this, an alert did */ undefined,
+    "remediation",
+  );
+  // The record the queue writes when it creates a remediation task. Seeded BEFORE the
+  // supervisor starts, so nothing is racing a running loop for the state repo.
+  await seedAlertRecord(FINGERPRINT, ALERTNAME, HELD);
+
+  const queue = new AlertQueue();
+  const { supervisor } = reverifyingSupervisor(queue, "https://example.invalid/pr/20");
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  // Every wait happens before a single assertion, and the teardown is in `finally`. An
+  // assertion that throws with the loop still running leaks a supervisor polling every
+  // second: the file's tests then all pass and the RUNNER never exits, which CI reports
+  // twenty minutes later as a timeout instead of as this test failing.
+  let heldAt: string | undefined;
+  let settling: TaskState | undefined;
+  let parkedAt: string | undefined;
+  try {
+    // The hold, as the artifact it leaves behind. `done` is what this used to push here.
+    heldAt = await waitForCommit(`chore(${HELD}): re-verifying`, 60_000);
+    settling = heldAt === undefined ? undefined : await stateAt(heldAt, HELD);
+
+    // The alert firing again after the fix merged, delivered the way Alertmanager delivers
+    // it. `handle` sees the task already exists, so this writes no new task — it stamps
+    // `lastFiringAt` on the record, which is the evidence the verdict is reached from.
+    if (heldAt !== undefined) queue.submit(firingAlert(ALERTNAME, FINGERPRINT));
+
+    parkedAt = await waitForCommit(`chore(${HELD}): parked`, 60_000);
+  } finally {
+    controller.abort();
+    await running.catch(() => undefined);
+  }
+
+  assert.ok(heldAt !== undefined, "the merge never started a re-verification");
+  assert.notEqual(settling?.status, "done", "a merged fix must not be done before it is checked");
+  assert.ok(parkedAt !== undefined, "a fix that did not work never reached a verdict");
+
+  const parked = await stateAt(parkedAt, HELD);
+  assert.equal(parked?.status, "parked", "a fix that did not clear the alert is not done");
+
+  // The evidence, in the journal, because the next session starts from "the previous fix
+  // did not work" rather than from scratch — which is the whole reason this is not a `done`
+  // with a warning in a log line.
+  assert.match(await journalAt(parkedAt, HELD), /alert still firing/i);
+
+  // And the dedup record is GONE, which frees the alertname's `maxOpenTasks` slot: without
+  // it, a record naming the task that failed to fix its incident goes on refusing every
+  // other firing of that alertname (`countOpenAlertTasks`).
+  assert.equal(await readAlertRecord(FINGERPRINT), undefined);
+});
+
+test("a merged remediation fix whose alert cleared reaches done, and says how long it took", async () => {
+  const FINGERPRINT = "6155dbaa";
+  const ALERTNAME = "CaterpillarBudget";
+  const CLEARED = asTaskId(`ALERT-${FINGERPRINT}`);
+
+  await seedAlertPolicy(ALERTNAME, 1);
+  await seedTask(
+    CLEARED,
+    { pr: { number: 21, url: "https://example.invalid/pr/21" } },
+    ["github.com/acme/widget"],
+    /* no tracker: nothing filed this, an alert did */ undefined,
+    "remediation",
+  );
+  await seedAlertRecord(FINGERPRINT, ALERTNAME, CLEARED);
+
+  const queue = new AlertQueue();
+  const { supervisor } = reverifyingSupervisor(queue, "https://example.invalid/pr/21");
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let heldAt: string | undefined;
+  let heldRecord: AlertRefusal | undefined;
+  let doneAt: string | undefined;
+  try {
+    heldAt = await waitForCommit(`chore(${CLEARED}): re-verifying`, 60_000);
+
+    // Read off the REMOTE, which is the assertion below as much as it is a value this test
+    // needs: the hold writes the merge instant to `alerts/refusals/`, and a commit made
+    // inside a unit stages only the paths that unit wrote (`StateStore.pending`). A merge
+    // instant written outside the unit is therefore in the working tree and in no commit,
+    // where the next `pull`'s `clean -ffdq alerts` deletes it — and the re-verification is
+    // silently forgotten, which is the one outcome §20 exists to rule out.
+    heldRecord = heldAt === undefined ? undefined : await readAlertRecord(FINGERPRINT);
+
+    // Alertmanager says the alert stopped, four minutes after the merge. `endsAt` is what
+    // the record's `resolvedAt` is taken from, and the elapsed time the digest quotes is
+    // measured from the merge — so the two have to be read off the same record rather than
+    // guessed here.
+    const mergedAt = Date.parse(heldRecord?.verify?.mergedAt ?? "");
+    if (!Number.isNaN(mergedAt)) {
+      queue.resolve({
+        alertname: ALERTNAME,
+        fingerprint: FINGERPRINT,
+        endsAt: new Date(mergedAt + 4 * 60_000).toISOString(),
+      });
+      doneAt = await waitForCommit(`chore(${CLEARED}): done`, 60_000);
+    }
+  } finally {
+    controller.abort();
+    await running.catch(() => undefined);
+  }
+
+  assert.ok(heldAt !== undefined, "the merge never started a re-verification");
+  assert.ok(
+    heldRecord?.verify?.mergedAt !== undefined,
+    "the hold's own commit did not carry the merge instant it wrote",
+  );
+  assert.ok(doneAt !== undefined, "an alert that cleared never let its task finish");
+
+  assert.equal((await stateAt(doneAt, CLEARED))?.status, "done");
+  // A silent success and a silent failure must not look the same, so the clear is said out
+  // loud with the number that makes it checkable.
+  assert.match(await journalAt(doneAt, CLEARED), /alert cleared after 4m/);
+  // The record survives a clear, minus its `verify` block: it is what `countOpenAlertTasks`
+  // joins to `tasks/`, and dropping it here would free the alertname's slot early.
+  const after = await readAlertRecord(FINGERPRINT);
+  assert.equal(after?.alertname, ALERTNAME);
+  assert.equal(after?.verify, undefined);
+});
+
+test("a fix that only reached the merge queue is not re-verified, and says so", async () => {
+  // A queued pull request has not landed: the queue runs its own checks against a
+  // speculative base and can still reject it (`stopsTheSequence`). Holding the task for a
+  // settle window here would time the window from an instant the fix was not yet on the
+  // default branch, and then park a task whose fix was still on its way — reporting a
+  // working change as one that did not clear the alert.
+  //
+  // So the hold is skipped, and the skip is SAID. Absence of evidence is not evidence: a
+  // task that finishes with no re-verification has to record that none was performed, or
+  // this reads exactly like the silence §20 exists to remove.
+  const FINGERPRINT = "6155dbcc";
+  const ALERTNAME = "CaterpillarQueued";
+  const ENQUEUED = asTaskId(`ALERT-${FINGERPRINT}`);
+
+  await seedAlertPolicy(ALERTNAME, 1);
+  await seedTask(
+    ENQUEUED,
+    { pr: { number: 22, url: "https://example.invalid/pr/22" } },
+    ["github.com/acme/widget"],
+    /* no tracker: nothing filed this, an alert did */ undefined,
+    "remediation",
+  );
+  await seedAlertRecord(FINGERPRINT, ALERTNAME, ENQUEUED);
+
+  const queue = new AlertQueue();
+  const { supervisor } = reverifyingSupervisor(queue, "https://example.invalid/pr/22", "required");
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  let doneAt: string | undefined;
+  try {
+    doneAt = await waitForCommit(`chore(${ENQUEUED}): done`, 60_000);
+  } finally {
+    controller.abort();
+    await running.catch(() => undefined);
+  }
+
+  assert.ok(doneAt !== undefined, "a queued fix left the task unfinished");
+  assert.equal((await stateAt(doneAt, ENQUEUED))?.status, "done");
+
+  const journal = await journalAt(doneAt, ENQUEUED);
+  assert.match(journal, /not re-verified/i, "the skipped re-verification must be recorded");
+  assert.match(journal, /queue/i, "and it must say why, or the next reader cannot act on it");
+  assert.doesNotMatch(journal, /alert cleared/i, "a skipped check must never read as a clear");
+
+  // No hold, so no merge instant: the record is untouched and the alertname's slot stays
+  // taken, exactly as it would be for a task that never merged at all.
+  const record = await readAlertRecord(FINGERPRINT);
+  assert.equal(record?.verify, undefined, "a queued fix must not stamp a merge instant");
 });

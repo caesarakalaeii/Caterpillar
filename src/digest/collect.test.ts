@@ -536,3 +536,66 @@ test("a reader that throws costs the attribution section and not the day", async
   assert.equal(digest.attribution, undefined);
   assert.equal(digest.changed.length, 1, "the rest of the day is still reported");
 });
+
+test("a re-verified alert is reported as a fact, not left buried in the journal", async () => {
+  // §20's closing edge, as the digest has to render it: "fix merged, alert cleared after 4m"
+  // or "fix merged, alert still firing". A silent success and a silent failure must not look
+  // the same, and a reader scanning a day's tasks should not have to read prose to tell
+  // which one this was.
+  const subject = await repo();
+  const cleared = asTaskId("ALERT-6155dbaa");
+  const firing = asTaskId("ALERT-6155dbbb");
+
+  await subject.commit(BEFORE, { "README.md": "state repo\n" });
+  await subject.commit(INSIDE, {
+    [`tasks/${cleared}/spec.md`]: SPEC("# Alert `CaterpillarBudget` is firing"),
+    [`tasks/${cleared}/state.json`]: JSON.stringify(state({ id: cleared, status: "done" })),
+    [`tasks/${cleared}/journal/0002-20260816T090000000Z-pod-a.md`]:
+      "## Session 2\n\n**Re-verified:** fix merged, alert cleared after 4m.\n",
+    [`tasks/${firing}/spec.md`]: SPEC("# Alert `CaterpillarNoProgress` is firing"),
+    [`tasks/${firing}/state.json`]: JSON.stringify(state({ id: firing, status: "parked" })),
+    [`tasks/${firing}/journal/0002-20260816T090000000Z-pod-a.md`]:
+      "## Session 2\n\n**Re-verified:** fix merged, alert still firing (last delivered " +
+      "2026-08-16T08:59:00.000Z).\n\nThe change merged and passed every gate.\n",
+  });
+
+  const digest = await collect(subject.root);
+  const byId = new Map(digest.changed.map((change) => [change.id, change]));
+
+  assert.equal(byId.get(cleared)?.reverified, "fix merged, alert cleared after 4m");
+  // The whole sentence, including the timestamp: the reader's next act on a failure is to
+  // go and look at the alert, and "when was it last seen" is the first thing they need.
+  assert.match(
+    byId.get(firing)?.reverified ?? "",
+    /^fix merged, alert still firing \(last delivered 2026-08-16T08:59:00\.000Z\)$/,
+  );
+  // Absent, not empty, on a task nobody re-verified — `exactOptionalPropertyTypes`, and a
+  // reader that treated "" as a verdict would print a blank one.
+  assert.equal("reverified" in (byId.get(asTaskId("TASK-1")) ?? { reverified: undefined }), true);
+});
+
+test("only the last re-verification in the window is reported", async () => {
+  // A task can be re-verified, parked, resumed, re-merged and re-verified again inside one
+  // day. The verdict a digest reports is the one that stands at the window's end; an
+  // earlier "still firing" printed beside a later "cleared" would read as a contradiction.
+  const subject = await repo();
+  const id = asTaskId("ALERT-6155dbcc");
+
+  await subject.commit(BEFORE, { "README.md": "state repo\n" });
+  await subject.commit(INSIDE, {
+    [`tasks/${id}/spec.md`]: SPEC("# Alert `CaterpillarBudget` is firing"),
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "parked" })),
+    [`tasks/${id}/journal/0002-20260816T090000000Z-pod-a.md`]:
+      "## Session 2\n\n**Re-verified:** fix merged, alert still firing.\n",
+  });
+  await subject.commit(LATER, {
+    [`tasks/${id}/state.json`]: JSON.stringify(state({ id, status: "done" })),
+    [`tasks/${id}/journal/0003-20260816T110000000Z-pod-a.md`]:
+      "## Session 3\n\n**Re-verified:** fix merged, alert cleared after 7m.\n",
+  });
+
+  assert.equal(
+    (await collect(subject.root)).changed[0]?.reverified,
+    "fix merged, alert cleared after 7m",
+  );
+});
