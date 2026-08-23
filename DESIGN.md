@@ -2081,8 +2081,16 @@ This is §9.1.1 with a different exit code, so it gets the same answer: ask at t
 each declared name and, **only when one is missing**, a prefix-filtered `attrNames` for the
 near miss — one evaluation, because the candidate list is wanted only when the answer is
 bad. It **evaluates and does not build**: nothing is substituted or compiled. Measured
-against the shipped pin on a warm store, ~0.5s; a cold first fetch of the nixpkgs tree is
-~45s, which is what `toolchain.timeoutSeconds` already bounds.
+against the shipped pin on a warm store, ~0.5s.
+
+**The ceiling is 30s and is a bound on intake, not on nix.** Not
+`toolchain.timeoutSeconds`, which is 900 because it bounds a devShell build that may
+compile from source. Intake runs on the supervisor's own thread of control, once per
+interval, over every labelled item — so an item whose evaluation hangs stalls every item
+behind it, and at 900s one cold nixpkgs fetch would hold up a pass for fifteen minutes. A
+cold fetch was measured at ~45s and therefore exceeds the ceiling: it fails open and is
+checked on a later pass once the store is warm, which is the right trade, because the worst
+case is an unchecked item and that is precisely the behaviour that existed before.
 
 **It fails open, and that is the load-bearing half.** Every answer that is not "nix ran and
 said no" lets the item through: no nix on the runner, an evaluation that timed out, a pin

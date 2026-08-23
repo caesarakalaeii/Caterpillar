@@ -277,11 +277,30 @@ export const toolchainFault = (
   );
 };
 
+/**
+ * Ceiling on the one evaluation, and it is really a bound on INTAKE.
+ *
+ * Deliberately NOT `ToolchainConfig.timeoutSeconds`, which is 900 because it bounds a
+ * devShell build that may compile from source. Intake is a different budget entirely: it
+ * runs on the supervisor's own thread of control, once per interval, over every labelled
+ * item in the backlog — so an item whose evaluation hangs stalls every item behind it. At
+ * 900 seconds one cold nixpkgs fetch would hold up a whole pass for fifteen minutes.
+ *
+ * 30 seconds. A warm evaluation of `legacyPackages.<system>` is about half a second; a cold
+ * one — nothing in the store — was measured at ~45s and therefore exceeds this, which is
+ * the case that fails open and gets checked on a later pass once the store is warm. That
+ * is the right trade: the worst case is an unchecked item, which is exactly the behaviour
+ * that existed before this check.
+ */
+export const DEFAULT_DOCTOR_TIMEOUT_SECONDS = 30;
+
 export interface ToolchainDoctorOptions {
   readonly config: ToolchainConfig;
   readonly nix: NixEval;
   /** Optional: without one the doctor is silent, which is what the pure tests want. */
   readonly logger?: Logger;
+  /** Ceiling on the evaluation. Defaults to `DEFAULT_DOCTOR_TIMEOUT_SECONDS`. */
+  readonly timeoutSeconds?: number;
 }
 
 /**
@@ -294,11 +313,13 @@ export class ToolchainDoctor {
   private readonly config: ToolchainConfig;
   private readonly nix: NixEval;
   private readonly logger: Logger | undefined;
+  private readonly timeoutMs: number;
 
   constructor(options: ToolchainDoctorOptions) {
     this.config = options.config;
     this.nix = options.nix;
     this.logger = options.logger;
+    this.timeoutMs = (options.timeoutSeconds ?? DEFAULT_DOCTOR_TIMEOUT_SECONDS) * 1000;
   }
 
   /**
@@ -328,7 +349,7 @@ export class ToolchainDoctor {
     }
 
     const answer = await this.nix
-      .evaluate(expression, this.config.timeoutSeconds * 1000)
+      .evaluate(expression, this.timeoutMs)
       .catch((error: unknown) => {
         // A throw here is an unavailable nix, not a bad attribute. Treated as such rather
         // than propagated, because propagating would abort the whole intake pass over one
