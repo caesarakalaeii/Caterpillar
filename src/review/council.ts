@@ -454,6 +454,11 @@ export class ReviewCouncil implements Council {
         // The output ceiling too, and for the same reason as the timeout: a reviewer runs
         // the same `npm test` in the same worktree with the same window to spend, and it is
         // this shell that has already demonstrated it will do so (§6.4).
+        //
+        // Through the budget rather than `budget.ts`'s bare `outputCeiling`, so the window
+        // caps the configured number a second time. The rule is the same one the agent's
+        // shell follows, and it is pinned there — runner.test.ts's "bounded by the WINDOW,
+        // not just by config". Keep the two call sites the same shape.
         output: budget.outputCeiling({
           maxLines: config.limits.commandOutputMaxLines,
           maxBytes: config.limits.commandOutputMaxBytes,

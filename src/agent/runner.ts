@@ -216,7 +216,10 @@ export class AgentSessionRunner {
           // And bounded in what it RETURNS, which is the other half of §6.4: a wide `grep`
           // cannot hold the lease, but it can spend the window the handoff threshold exists
           // to protect. Through the budget, so the configured number is capped a second time
-          // by what this model's window can actually afford.
+          // by what this model's window can actually afford — not `budget.ts`'s bare
+          // `outputCeiling`, which enforces the configured number only, and would let one
+          // command cross the handoff threshold by itself on a small window. Pinned by
+          // runner.test.ts's "bounded by the WINDOW, not just by config".
           output: budget.outputCeiling({
             maxLines: limits.commandOutputMaxLines,
             maxBytes: limits.commandOutputMaxBytes,

@@ -385,6 +385,55 @@ test("hands off when the context budget is exceeded", async () => {
   );
 });
 
+test("a tool result reaching the model is bounded by the WINDOW, not just by config", async () => {
+  // The guarantee `ContextBudget.outputCeiling` exists for: no single tool call can cross
+  // the handoff threshold by itself. `budget.ts`'s pure clamp only enforces the configured
+  // number, which is a rounding error in a 1M window and a large share of a 60k one — so
+  // the runner has to pass the window-measured ceiling, and nothing observed that it did.
+  // Asserted on the TRANSCRIPT, the actual bytes sent to the model, because a test against
+  // the ceiling object would pass on either one.
+  //
+  // 60k window, 0.7 threshold -> a 42k-token budget -> a byte ceiling of 16,800, against
+  // the config's 51,200 above. The output has to be the shape that tells those two apart:
+  // 400 lines of 200 characters is 80KB inside the 2,000-line ceiling, so BYTES are what
+  // bites and the window's number is the only thing that can bite first. `seq 1 40000`
+  // would not do — 40,000 short lines hit the line ceiling, which ContextBudget
+  // deliberately leaves alone, so both wirings return an identical view.
+  const { runner, faux } = buildRunner(60_000);
+  const wideCommand = `for i in $(seq 1 400); do printf '%200d\\n' "$i"; done`;
+
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: wideCommand }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage(fauxToolCall("done", { summary: "counted" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  await runner.run(spec, state());
+
+  const transcript = gunzipSync(
+    await readFile(join(stateRepo, "tasks", TASK, "sessions", "001.jsonl.gz")),
+  ).toString("utf8");
+
+  assert.match(transcript, /output bounded/, "the bound must have been applied at all");
+
+  // Between the two ceilings, so it fails whichever way the wiring is wrong: the pure
+  // clamp alone lets 51,200 bytes through, and no bound at all lets 80KB through.
+  const windowCeilingBytes = 16_800;
+  const configuredCeilingBytes = 51_200;
+  const wide = transcript.match(/ {100,}\d+/g) ?? [];
+  const seenBytes = wide.reduce((total, line) => total + line.length, 0);
+
+  assert.ok(seenBytes > 0, "the command's output should be in the transcript at all");
+  assert.ok(
+    seenBytes <= windowCeilingBytes,
+    `the model was handed ${seenBytes} bytes of one command's output. A 60k window affords ` +
+      `${windowCeilingBytes}; the configured ceiling of ${configuredCeilingBytes} is what ` +
+      `reaches BoundedExecutionEnv when the window-measured ceiling is bypassed`,
+  );
+});
+
 test("checks out sibling repos under the workspace and excludes them locally", async () => {
   // The Codeberg workflow: one workspace repo with the rest cloned inside it. A task
   // spanning the ecosystem must see siblings where its own docs say they are.
