@@ -428,7 +428,7 @@ test("Forgejo has no merge queue, and says so without a request", async () => {
   // Forgejo has no queue concept at all, so this is a definite answer, and answering
   // `unknown` would suggest something might be there that a later release could find.
   const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));
-  assert.equal(await forge.mergeQueue(REPO, "main"), "absent");
+  assert.equal(await forge.mergeQueue(REPO, 7), "absent");
 });
 
 test("enqueuing on Forgejo is a programming error, not a silent no-op", async () => {

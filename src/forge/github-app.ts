@@ -19,6 +19,7 @@
  */
 import { createSign } from "node:crypto";
 import { repoSlug, type RepoRef, type TaskSpec } from "../domain/task.ts";
+import type { MergeQueueSupport } from "./mergeability.ts";
 import { nearestName, nearestSlug, type UnreachableRepo } from "./reach.ts";
 import {
   assertInScope,
@@ -267,6 +268,19 @@ interface ReviewThreadsResponse {
   };
 }
 
+/** `mergeQueue` is null on a base branch that has none — that is the `absent` answer. */
+interface MergeQueueResponse {
+  readonly errors?: readonly { readonly message?: string }[];
+  readonly data?: {
+    readonly repository?: {
+      readonly pullRequest?: {
+        readonly id?: string;
+        readonly mergeQueue?: { readonly id?: string } | null;
+      } | null;
+    } | null;
+  };
+}
+
 const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$threads:Int!,$comments:Int!,$reviews:Int!,$cursor:String){
   repository(owner:$owner,name:$name){
     pullRequest(number:$number){
@@ -284,6 +298,33 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$t
         }
       }
     }
+  }
+}`;
+
+/**
+ * Is there a merge queue on this pull request's base branch?
+ *
+ * `pullRequest.mergeQueue` and not `branchProtectionRule.requiresMergeQueue`: a queue can
+ * be required by a REPOSITORY RULESET as well as by a classic protection rule, and the
+ * ruleset is invisible to the protection-rule field. Asking for the queue itself covers
+ * both, because the queue is what either configuration produces — and asking through the
+ * pull request means the caller never has to know the base branch's name.
+ *
+ * `id` is fetched in the same query so the enqueue mutation, which takes a node id rather
+ * than a number, does not need a second round trip.
+ */
+const MERGE_QUEUE_QUERY = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      id
+      mergeQueue{ id }
+    }
+  }
+}`;
+
+const ENQUEUE_MUTATION = `mutation($pullRequestId:ID!){
+  enqueuePullRequest(input:{pullRequestId:$pullRequestId}){
+    mergeQueueEntry{ position }
   }
 }`;
 
@@ -589,6 +630,72 @@ class GitHubAppForge implements Forge {
         ...(options.title === undefined ? {} : { commit_title: options.title }),
       }),
     });
+  }
+
+  /**
+   * Whether this pull request's base branch requires a merge queue (DESIGN.md §12).
+   *
+   * Never throws — a question nobody can answer must not be what stops a change that
+   * passed every gate, so anything going wrong is `unknown` and the caller merges the way
+   * it always did. Three things reach that branch and none of them is a defect in the
+   * change being merged: the reviewer App's token not being granted whatever GitHub
+   * decides this field needs, a 5xx, and a pull request the query cannot resolve.
+   *
+   * The scope guard is the exception, and it is deliberately outside the catch: a repo the
+   * task never declared is a programming error on our side (§9.1), not a forge that could
+   * not answer.
+   */
+  async mergeQueue(repo: RepoRef, pr: number): Promise<MergeQueueSupport> {
+    assertInScope(repo, this.allowed);
+
+    try {
+      const found = await this.pullRequestQueue(repo, pr);
+      // A pull request the query could not resolve is not a base branch without a queue.
+      if (found === undefined) return "unknown";
+      return found.mergeQueue == null ? "absent" : "required";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /**
+   * Add a pull request to its base branch's merge queue.
+   *
+   * Two requests, because `enqueuePullRequest` takes a node id and everything else in this
+   * file works in numbers. Throws on either — unlike the detection above, a failure here
+   * means nothing is queued, and reporting it as queued would leave a human watching a
+   * queue the change is not in.
+   */
+  async enqueue(repo: RepoRef, pr: number): Promise<void> {
+    assertInScope(repo, this.allowed);
+
+    const pullRequestId = (await this.pullRequestQueue(repo, pr))?.id;
+    if (pullRequestId === undefined) {
+      throw new GitHubApiError(
+        200,
+        "/graphql",
+        `pull request ${repo.owner}/${repo.name}#${pr} has no node id, so it cannot be enqueued`,
+      );
+    }
+
+    await this.graphql<{ readonly errors?: readonly { readonly message?: string }[] }>(
+      repo,
+      ENQUEUE_MUTATION,
+      { pullRequestId },
+    );
+  }
+
+  /** The node id and merge queue of one pull request, in one request. */
+  private async pullRequestQueue(
+    repo: RepoRef,
+    pr: number,
+  ): Promise<{ readonly id?: string; readonly mergeQueue?: { readonly id?: string } | null } | undefined> {
+    const body = await this.graphql<MergeQueueResponse>(repo, MERGE_QUEUE_QUERY, {
+      owner: repo.owner,
+      name: repo.name,
+      number: pr,
+    });
+    return body.data?.repository?.pullRequest ?? undefined;
   }
 
   async revoke(): Promise<void> {
