@@ -2067,6 +2067,57 @@ the toolchain of the session that triggered it.
   through to the inherited environment would hand the agent a shell missing the exact tool
   the task is about, and it would spend a session and a few dollars discovering that.
 
+#### A declared toolchain is checked before the task exists
+
+Parking on nix's own error is the right answer once a task exists, and it is an expensive
+way to learn about a typo. `toolchain.packages` is free text: §14.1 checks that the block
+is *shaped* right — `mode` is one of two words, `packages` is a non-empty list of strings —
+and nothing checked that the names in it resolve. So `lua51` (the attribute is **`lua5_1`**)
+passed intake, became a task, was claimed, and failed inside the session in
+`nix print-dev-env`. A session spent on a missing underscore.
+
+This is §9.1.1 with a different exit code, so it gets the same answer: ask at the door.
+`workspace/toolchain-doctor.ts` evaluates `pkgs ? <attr>` against the configured pin for
+each declared name and, **only when one is missing**, a prefix-filtered `attrNames` for the
+near miss — one evaluation, because the candidate list is wanted only when the answer is
+bad. It **evaluates and does not build**: nothing is substituted or compiled. Measured
+against the shipped pin on a warm store, ~0.5s; a cold first fetch of the nixpkgs tree is
+~45s, which is what `toolchain.timeoutSeconds` already bounds.
+
+**It fails open, and that is the load-bearing half.** Every answer that is not "nix ran and
+said no" lets the item through: no nix on the runner, an evaluation that timed out, a pin
+that could not be fetched, output that would not parse. A nix evaluation that times out is
+not evidence that an attribute is wrong, exactly as a 500 from GitHub is not evidence that
+an App was uninstalled (§9.1.1). Getting this backwards would be worse than having no check
+at all: on a runner without nix *every* declared toolchain is unevaluable, so a strict
+check would refuse every item that had bothered to declare one — and suppress each refusal
+durably (§14.2).
+
+A missing attribute is reported by an evaluation that **succeeds**, which is what makes the
+distinction clean: a non-zero exit from `nix eval` always means the question could not be
+answered, never that the answer was no.
+
+Two details worth keeping:
+
+- **The near miss is ranked by a squashed comparison first**, then by bounded edit distance —
+  the same idea as §9.1.1, tuned for attributes rather than slugs. `_`, `-` and `.` are
+  separators nixpkgs uses inconsistently (`nodejs_22`, `lua5_1`, `gcc-unwrapped`) and nobody
+  remembers which, so squashing is what finds `lua5_1` for `lua51`. Prefix matches are
+  deliberately *not* ranked, which is where it parts company with `rankRepos`:
+  `lua51Packages` contains the whole query and is a set of lua modules rather than the
+  interpreter the author meant.
+- **A name that is not a bare attribute is refused rather than escaped.** The name is
+  interpolated into a nix expression this process then evaluates. `.` is excluded with the
+  rest: `pkgs ? ${a.b}` asks about a *nested* attribute, so a dotted name does not mean what
+  it looks like it means. No top-level attribute in the shipped pin contains one.
+
+`mode: inherit` declares no packages and is a no-op, not a refusal — as is `mode: nix` with
+no `packages`, where the repo's own nix expression decides and the repo is not checked out
+at intake.
+
+Provenance: `orca vm recipe doctor`, which validates a per-workspace environment recipe
+without provisioning it.
+
 ---
 
 ## 9. Credentials & security
@@ -3879,6 +3930,21 @@ distributed clock to be wrong about in exchange for one saved request per five m
 A claim that *errors* is not a claim someone else won, and is treated as a win: a
 state-repo blip must not stop intake fleet-wide and silently. A duplicated pass is
 idempotent (`hasTask`); a skipped one is work nobody sees.
+
+**What gets refused.** Four questions are asked of an item, each one the first moment the
+answer is cheap, and all four refuse through the one path above — recorded, suppressed,
+commented once, visible on `/intake` (§14.5):
+
+- the body does not parse into a spec, or names no `acceptance` (§14.1);
+- its author does not have write access, so the body is not run as shell (§9.1);
+- it names a repo the workspace's credential cannot reach (§9.1.1);
+- its `toolchain.packages` names an attribute that does not exist in the pinned nixpkgs
+  (§8.1).
+
+The last two are *usability* checks and not security boundaries — `assertWorkspaceScope` is
+that — and both fail open: a forge that cannot be asked and a nix that cannot evaluate are
+the absence of evidence, and a refusal needs evidence. A repo or an attribute that is
+genuinely wrong is refused on the next pass instead.
 
 Ordering inside a single ingest is load-bearing: `state.json` is written first and
 `spec.md` last, because `spec.md` is the existence marker. A crash between the two leaves
