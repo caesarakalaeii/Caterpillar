@@ -434,10 +434,18 @@ test("an indented `#` at the start of a body is not promoted to column zero", ()
       `${indent}# Attribution\n\nCredit Acme Corp.`,
       `an indent of ${JSON.stringify(indent)} was stripped off the leading heading`,
     );
-    for (const block of [authorRepoStandards, lensRepoStandards]) {
-      assert.ok(
-        !/^#{1,2} /m.test(block(parseRepoStandards("acme/web", `## tests: Rule\n\n${indent}# Attribution\n\nX.\n`)).split("### acme/web")[1] ?? ""),
-        `${block.name} emitted a heading at the fleet's own level from an indented body`,
+    // And through both rendered blocks, which is where a promoted heading would do its
+    // damage: everything after the section's own `###` must contain no `#` or `##`.
+    const parsed = parseRepoStandards("acme/web", `## tests: Rule\n\n${indent}# X\n\nY.\n`);
+    for (const [name, block] of [
+      ["authorRepoStandards", authorRepoStandards(parsed)],
+      ["lensRepoStandards", lensRepoStandards(parsed, "tests")],
+    ] as const) {
+      const afterSectionHeading = block.split("### acme/web")[1] ?? "";
+      assert.doesNotMatch(
+        afterSectionHeading,
+        /^#{1,2} /m,
+        `${name} emitted a heading at the fleet's own level from an indented body`,
       );
     }
   }
