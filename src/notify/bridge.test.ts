@@ -901,3 +901,21 @@ test("a task-scoped message the bot posts is remembered, so a reply to it is pla
   // The stubbed API hands back id `999` for every message it accepts.
   assert.equal(messages.taskFor("999"), TASK, "the outcome the bot just posted must be placeable");
 });
+
+test("a fetched message whose bold prefix is not a task falls back rather than misrouting", async () => {
+  // Not every bold opener is a task id. The brainstorm opening message starts `**Brainstorm**`
+  // and `Brainstorm` passes `isTaskId` — it is a legal directory name — so parsing alone
+  // would file the answer against a task that does not exist, and the human would be told
+  // "No task **Brainstorm** in the state repo" instead of being answered.
+  const { bridge, inbox, calls } = harness({
+    threads: sharedThread(),
+    fetchedMessage: { content: "**Brainstorm** — acme/widget\n\nmake the overlay themeable" },
+  });
+
+  const handled = bridge.handleMessage("use option B", "operator", THREAD, "human-msg", "question-msg");
+  const task = await queuedTask(inbox, { kind: "applied", index: 1 });
+  await handled;
+
+  assert.equal(task, TASK, "an id no task answers to must not win over the rank rule");
+  assert.match(String(posted(calls)[0]?.body["content"]), /I filed this against/);
+});
