@@ -23,6 +23,8 @@ import {
   type SessionOutcome,
   type TaskId,
   type TaskState,
+  type TrackerRef,
+  type WorkspaceName,
 } from "../domain/task.ts";
 import type { Forge } from "../forge/types.ts";
 import { AgentMetrics } from "../metrics/registry.ts";
@@ -42,7 +44,8 @@ import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { InMemoryThreadBindings } from "../redis/threads.ts";
-import { type ChatOutcome, type ChatRequest } from "./inbox.ts";
+import { type ChatIntent, type ChatOutcome, type ChatRequest } from "./inbox.ts";
+import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { FleetActivity } from "../notify/activity.ts";
 import { TaskSnapshot } from "./snapshot.ts";
 import {
@@ -115,6 +118,8 @@ const seedTask = async (
   over: Partial<TaskState> = {},
   /** Repo slugs for the spec, primary first. One repo unless a test needs §9.4.1's plural. */
   repos: readonly string[] = ["github.com/acme/widget"],
+  /** The tracker item the task came from, for tests about what is mirrored back to it. */
+  tracker?: TrackerRef,
 ): Promise<void> => {
   await stateGit.tryRun("pull", "--ff-only", "origin", "main");
   await mkdir(join(statePath, "tasks", id), { recursive: true });
@@ -127,6 +132,14 @@ const seedTask = async (
       ...repos.map((repo) => `  - ${repo}`),
       "acceptance:",
       '  - "true"',
+      ...(tracker === undefined
+        ? []
+        : [
+            "tracker:",
+            `  kind: ${tracker.kind}`,
+            `  id: "${tracker.id}"`,
+            ...(tracker.container === undefined ? [] : [`  container: ${tracker.container}`]),
+          ]),
       "---",
       "",
       "Prove the pipeline runs.",
@@ -5260,4 +5273,229 @@ test("a rejected claim still pushes the evidence its gate published", async () =
   );
 
   await retire(EVIDENCE);
+});
+
+/**
+ * `/done` — a human marking a task done by hand, with both §12 gates bypassed.
+ *
+ * The property every test here defends is the same one: the record must never read as
+ * though the task was verified. A task can be OBSOLETE rather than finished, and the only
+ * honest way to say so is to write `done` and say in the journal that nothing was checked.
+ */
+const forceDoneSupervisor = (options: {
+  readonly inbox: InMemoryChatQueue;
+  readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
+  readonly reviewers?: SupervisorDeps["reviewers"];
+}): Supervisor =>
+  new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: {
+      verify: () => Promise.reject(new Error("forcing a task done must not run gate 1")),
+    },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox: options.inbox,
+    ...(options.trackers === undefined ? {} : { trackers: options.trackers }),
+    ...(options.reviewers === undefined ? {} : { reviewers: options.reviewers }),
+  });
+
+/** Run one chat request against a supervisor, and stop. */
+const applyOne = async (
+  supervisor: Supervisor,
+  inbox: InMemoryChatQueue,
+  intent: ChatIntent,
+): Promise<ChatOutcome> => {
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit(intent);
+  controller.abort();
+  await running.catch(() => undefined);
+  return outcome;
+};
+
+test("/done on a parked task writes done, and journals who forced it and why", async () => {
+  const FORCED = asTaskId("SMOKE-FORCE-1");
+  await seedTask(FORCED, { status: "parked", sessions: 2 });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: FORCED,
+    reason: "the feature was dropped from the roadmap",
+    author: "ada",
+  });
+
+  assert.deepEqual(outcome, { kind: "forced-done" }, JSON.stringify(outcome));
+  assert.equal((await pushedState(FORCED))?.status, "done");
+
+  const journal = await pushedJournal(FORCED);
+  assert.match(journal, /ada/, "the journal must name who forced it");
+  assert.match(journal, /the feature was dropped from the roadmap/, "and why");
+  assert.match(journal, /BYPASSED/, "and that nothing was verified");
+});
+
+test("forcing a task done records no gate as passed, anywhere", async () => {
+  // The whole risk of this command: a `done` that reads like a verified `done` is a lie
+  // the record keeps telling. Asserted on the state and the journal, not on the outcome.
+  const UNVERIFIED = asTaskId("SMOKE-FORCE-2");
+  await seedTask(UNVERIFIED, { status: "failed" });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: UNVERIFIED,
+    reason: "superseded by SMOKE-FORCE-1",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  const state = await pushedState(UNVERIFIED);
+  assert.equal(state?.status, "done");
+  assert.equal(state?.review?.last, undefined, "the council never ran, so it recorded nothing");
+
+  const journal = await pushedJournal(UNVERIFIED);
+  assert.doesNotMatch(journal, /gates? passed/i, "nothing may read as a gate that passed");
+  assert.doesNotMatch(journal, /acceptance .*passed/i);
+});
+
+test("/done needs no PR and merges nothing", async () => {
+  // Obsolescence is the primary use case, and an obsolete task has nothing on a branch.
+  // `/merge` refuses both of these, which is why it is not the way to say this.
+  const NO_PR = asTaskId("SMOKE-FORCE-3");
+  await seedTask(NO_PR, { status: "parked" });
+
+  const merges: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("unused")),
+    approve: (repo, pr) => {
+      merges.push(`approve:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    merge: (repo, pr) => {
+      merges.push(`merge:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    forceDoneSupervisor({
+      inbox,
+      reviewers: new Map([
+        [
+          asWorkspaceName("test"),
+          {
+            forTask: () => Promise.resolve(reviewerForge),
+            unreachable: () => Promise.resolve([]),
+            reachable: () => Promise.resolve([]),
+          },
+        ],
+      ]),
+    }),
+    inbox,
+    { kind: "force-done", task: NO_PR, reason: "obsolete", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  assert.equal((await pushedState(NO_PR))?.status, "done");
+  assert.deepEqual(merges, [], "forcing a task done must never merge");
+});
+
+test("/done on a running task refuses and writes nothing at all", async () => {
+  // Racing the lease is the alternative, and it is worse: the session holds it, so the
+  // write would either fail its CAS or land under a session still working the task.
+  const RUNNING = asTaskId("SMOKE-FORCE-4");
+  await seedTask(RUNNING, { status: "running" });
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    kind: "force-done",
+    task: RUNNING,
+    reason: "obsolete",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "not-forceable", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-forceable" ? outcome.reason : "",
+    /cancel/i,
+    "the refusal has to say what to do instead",
+  );
+  assert.equal((await pushedState(RUNNING))?.status, "running", "the status must not move");
+  assert.equal(await pushedJournal(RUNNING), "", "a refusal writes no history");
+});
+
+test("/done is accepted on failed and on awaiting-human", async () => {
+  for (const status of ["failed", "awaiting-human"] as const) {
+    const task = asTaskId(`SMOKE-FORCE-${status}`);
+    await seedTask(task, { status });
+
+    const inbox = new InMemoryChatQueue();
+    const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+      kind: "force-done",
+      task,
+      reason: "obsolete",
+      author: "ada",
+    });
+
+    assert.equal(outcome.kind, "forced-done", `${status}: ${JSON.stringify(outcome)}`);
+    assert.equal((await pushedState(task))?.status, "done", status);
+  }
+});
+
+test("the tracker item is closed, with a reason naming it a forced completion", async () => {
+  // Mirrored through the EXISTING `parked` transition: `completed` requires a PR url and
+  // `/done` must work without one. The reason field is what carries the truth.
+  const MIRRORED = asTaskId("SMOKE-FORCE-5");
+  await seedTask(MIRRORED, { status: "parked" }, ["github.com/acme/widget"], {
+    kind: "github-issues",
+    id: "42",
+    container: "acme/widget",
+  });
+
+  const seen: TrackerTransition[] = [];
+  const tracker: Tracker = {
+    kind: "github-issues",
+    listAgentItems: () => Promise.resolve([]),
+    comment: () => Promise.resolve(),
+    transition: (_ref, transition) => {
+      seen.push(transition);
+      return Promise.resolve();
+    },
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    forceDoneSupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
+    inbox,
+    { kind: "force-done", task: MIRRORED, reason: "obsolete", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "forced-done", JSON.stringify(outcome));
+  assert.equal(seen.length, 1, JSON.stringify(seen));
+  const mirrored = seen[0];
+  assert.equal(mirrored?.kind, "parked");
+  const reason = mirrored?.kind === "parked" ? mirrored.reason : "";
+  assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
+  assert.match(reason, /obsolete/, "the human's reason travels with it");
+  assert.match(reason, /ada/);
 });
