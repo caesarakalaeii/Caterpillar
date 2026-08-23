@@ -72,7 +72,11 @@ const clampPositiveInteger = (asked: number | undefined, ceiling: number): numbe
 
 export interface BoundOutputOptions {
   /**
-   * Where the whole output was written, if it was, relative to the agent's cwd.
+   * Where the whole output was written, if it was. Absolute, and outside the worktree.
+   *
+   * Absolute because the spill lives beside the checkout rather than in it, so that it is
+   * never committable and dies with the task — and because the sabotage reviewer's cwd is a
+   * private copy that is deleted mid-round, so a relative path would name nothing.
    *
    * Named in the elision so a session that needs the middle can read it in slices. Absent
    * when nothing was spilled — in which case the note says only what is missing, which is
@@ -170,6 +174,12 @@ const HEAD_SHARE = 0.25;
  *
  * Generous by a few hundred bytes rather than tight, and floored at one byte so a ceiling
  * smaller than the note still returns something.
+ *
+ * That floor is the one case where the returned view exceeds `maxBytes`: the note cannot be
+ * compressed, so a ceiling of a few hundred bytes or less gets the note plus one byte. The
+ * "the note counts against the ceiling too" guarantee therefore holds above roughly 400
+ * bytes and not below — unreachable through config, since the smallest ceiling
+ * `ContextBudget.outputCeiling` will construct is around 12KB.
  */
 const forContent = (maxBytes: number, overflowPath: string | undefined): number => {
   const allowance = 320 + Buffer.byteLength(overflowPath ?? "", "utf8");

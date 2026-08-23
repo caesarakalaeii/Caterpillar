@@ -815,6 +815,14 @@ how a model comes to believe a file ends where it does not.
 `journal.ts` declares its own. Silent truncation is worse than a short answer, because the
 model acts on it.
 
+The note is charged against both halves of the ceiling — a line of the line budget and a few
+hundred bytes of the byte budget — because it is text the model reads, so `maxLines` of
+content plus a note is over the ceiling it declares. The line matters more than it sounds:
+pi bounds its own capture at exactly 2,000 lines, tail-only, so at the shipped default a
+view one line over gets cut a second time and the line that goes is the first head line.
+That is the compiler's first error — the only reason the head is kept. Do not spend that
+line on content; the "pi's truncation is a no-op" claim below depends on it.
+
 **The overflow is written, not discarded.** `<tasks>/<task>/.caterpillar/output/<uuid>.log`,
 named in the note, so a session that needs the middle can read it in slices. That directory
 is the scratch directory the toolchain cache already uses: beside the checkout, so a spill
