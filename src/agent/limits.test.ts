@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-agent-core";
+import { MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES } from "./budget.ts";
 import { ContextBudget, HandoffThresholdError } from "./limits.ts";
 
 test("handoff threshold must sit below the compaction point", () => {
@@ -68,4 +69,56 @@ test("handoff fires once the estimate crosses the threshold", () => {
   assert.ok(budget.tokensUsed([heavy]) >= 141_000);
   assert.equal(budget.shouldHandoff([heavy]), true);
   assert.equal(budget.wouldCompact([heavy]), false);
+});
+
+/**
+ * The output ceiling measured in the SAME accounting as the handoff threshold
+ * (DESIGN.md §6.1 and §6.4).
+ *
+ * A fixed line count says nothing about what it costs. 2,000 lines is a rounding error in
+ * a 1M window and a third of a 32k one, and the session still has to do its work in
+ * whatever is left — the same argument `journalBudgetChars` makes about journal history,
+ * and the reason it is made here rather than in `budget.ts`: this is the class that knows
+ * how big the window is and what a token is worth in it.
+ */
+test("the output ceiling is a share of the window, not a fixed number of lines", () => {
+  const small = new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 });
+  const large = new ContextBudget({ contextWindow: 1_000_000, thresholdFraction: 0.7 });
+
+  assert.ok(
+    large.outputCeiling().maxBytes > small.outputCeiling().maxBytes,
+    "a bigger window must allow a bigger single tool result",
+  );
+});
+
+test("one command can never spend the whole handoff budget", () => {
+  // The failure this exists to prevent: one `grep` that on its own crosses the threshold,
+  // so the session hands off having done nothing and cannot say why.
+  const budget = new ContextBudget({ contextWindow: 200_000, thresholdFraction: 0.7 });
+  const ceiling = budget.outputCeiling();
+
+  assert.ok(
+    ceiling.maxBytes < budget.thresholdTokens,
+    `one tool result may take ${ceiling.maxBytes} bytes of a ${budget.thresholdTokens}-token budget`,
+  );
+});
+
+test("a configured ceiling is honoured when it is lower than the window's share", () => {
+  // The operator's number wins downwards. Upwards it does not: a window cannot afford
+  // more than its share whatever the config says.
+  const budget = new ContextBudget({ contextWindow: 1_000_000, thresholdFraction: 0.7 });
+
+  const tight = budget.outputCeiling({ maxLines: 50, maxBytes: 4_000 });
+  assert.equal(tight.maxLines, 50);
+  assert.equal(tight.maxBytes, 4_000);
+});
+
+test("the window's share caps a generous configured ceiling on a small window", () => {
+  const budget = new ContextBudget({ contextWindow: 60_000, thresholdFraction: 0.5 });
+
+  const ceiling = budget.outputCeiling({ maxLines: MAX_OUTPUT_LINES, maxBytes: MAX_OUTPUT_BYTES });
+  assert.ok(
+    ceiling.maxBytes < MAX_OUTPUT_BYTES,
+    `a 60k window allowed ${ceiling.maxBytes} bytes per command`,
+  );
 });
