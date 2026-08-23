@@ -1,12 +1,17 @@
 /**
- * Independent completion verification. See DESIGN.md §12.
+ * Independent verification, performed by the SUPERVISOR and never by the agent.
  *
- * Runs in the SUPERVISOR, never in the agent. Both gates must pass:
- *   1. every acceptance command in spec.md exits 0
- *   2. a PR is open, CI is green, and the branch still merges into its base
+ * Two gates live here, asking different questions about the same work:
  *
- * The agent cannot influence this: it does not choose the commands, does not run
- * them, and does not report the result. `done` only triggers this check.
+ *   `AcceptanceVerifier` is §12 — IS THIS CHANGE ANY GOOD. Every acceptance command in
+ *   `spec.md` exits 0, and a pull request is open with CI green and a branch that still
+ *   merges into its base. The agent cannot influence it: it does not choose the commands,
+ *   does not run them, and does not report the result. `done` only triggers the check.
+ *
+ *   `AlertReverifier` is §20 — DID IT WORK. For a remediation task whose fix has merged, it
+ *   asks whether the alert the task was created for actually stopped. The agent cannot
+ *   influence that either, and in its case not even the supervisor can: the answer is what
+ *   Alertmanager delivered, read back out of the state repo.
  *
  * Gate 1 also COLLECTS. A command's exit code cannot say what a change renders, so a gate
  * that writes a screenshot, a trace or a report into `CATERPILLAR_EVIDENCE_DIR` has it
@@ -27,6 +32,14 @@ import {
 } from "../domain/task.ts";
 import { conflictGuidance } from "../forge/mergeability.ts";
 import type { CheckStatus, Forge, ForgeFactory } from "../forge/types.ts";
+import { ALERT_TASK_PREFIX, isAlertTaskId } from "../remediation/policy.ts";
+import {
+  reverifyAlert,
+  settleWindowSeconds,
+  type ReverifyVerdict,
+} from "../remediation/verify.ts";
+import { errorFields, type Logger } from "../obs/log.ts";
+import type { AlertRefusal } from "../state/store.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
 import { TASK_SHELL_ARGS, type ToolchainResolver } from "../workspace/toolchain.ts";
 import type { WorkspaceBindings } from "../agent/runner.ts";
@@ -543,3 +556,255 @@ const installsDependencies = (command: string): boolean =>
   /\bcargo\s+(fetch|build)\b/.test(command) ||
   /\bnix\s+(build|develop|shell)\b/.test(command) ||
   /\bmake\s+(deps|install|setup|bootstrap)\b/.test(command);
+
+/**
+ * The part of `StateStore` the re-verification uses.
+ *
+ * Structural, and written out for the same reason `AlertStore` in `remediation/queue.ts`
+ * is: the list IS the claim that this reads alert records, writes one, and deletes one —
+ * and nothing else. In particular it cannot read or write a task's `state.json`, which is
+ * what keeps the loop the only thing that decides a task's status.
+ */
+export interface ReverifyStore {
+  listAlertRefusals(): Promise<readonly AlertRefusal[]>;
+  readAlertRefusal(fingerprint: string): Promise<AlertRefusal | undefined>;
+  writeAlertRefusal(fingerprint: string, record: AlertRefusal): Promise<void>;
+  clearAlertRefusal(fingerprint: string): Promise<void>;
+}
+
+export interface AlertReverifierOptions {
+  readonly store: ReverifyStore;
+  readonly logger: Logger;
+  /** Injected, so a settle window is testable without spending it. */
+  readonly now?: () => number;
+}
+
+/** A task whose settle window has run out, and what the evidence says about it. */
+export interface DueReverification {
+  readonly task: TaskId;
+  readonly alertname: string;
+  readonly verdict: ReverifyVerdict;
+}
+
+/**
+ * Post-merge re-verification of a remediation task (DESIGN.md §20).
+ *
+ * The closing edge of the alert path. Before this, a remediation pull request merged, the
+ * task went to `done`, and nothing ever asked whether the alert stopped — so a patch that
+ * changed nothing and a patch that fixed the incident produced the same record, and the
+ * only signal was a human noticing the alert was still there weeks later.
+ *
+ * READ-ONLY with respect to the world, which is invariant 13 restated: nothing here
+ * restarts, scales or silences anything, and it does not even ask the cluster a question.
+ * The evidence is what Alertmanager already delivered to the receiver, stamped onto the
+ * fingerprint's record by `remediation/queue.ts`. This reads it back.
+ *
+ * ## Why the record and not the task's state
+ *
+ * The hold is keyed by FINGERPRINT because the evidence is: deliveries reach a receiver
+ * that knows a fingerprint and nothing about tasks. Keeping it on `alerts/refusals/` also
+ * makes the window survive a deploy — Keel rolls the pod on every push to main, and a
+ * window held in memory would be lost mid-settle, sending the task to `done` with nothing
+ * having checked. Which is the exact silence this closes.
+ *
+ * ## What a failure does to the record
+ *
+ * A still-firing or unverifiable verdict DELETES the record. That is the load-bearing
+ * write, not a tidy-up: task ids on this path are `ALERT-<fingerprint>`, so the next firing
+ * of the same alert is deduped against the task that already exists. Leaving the record
+ * behind would let an ineffective fix permanently suppress its own alert, which is a worse
+ * outcome than never having re-verified at all.
+ *
+ * A CLEARED verdict deletes only the `verify` block. The record itself is what
+ * `countOpenAlertTasks` joins to `tasks/`, and removing it while the task is still being
+ * written as done would free the alertname's slot — so a firing in that window would open a
+ * second task for an incident that had just been fixed.
+ */
+export class AlertReverifier {
+  private readonly store: ReverifyStore;
+  private readonly logger: Logger;
+  private readonly now: () => number;
+
+  constructor(options: AlertReverifierOptions) {
+    this.store = options.store;
+    this.logger = options.logger;
+    this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Start the settle window for a task whose fix has just merged.
+   *
+   * False when there is nothing to re-verify: the task did not come from an alert, or its
+   * record is gone. Both are ordinary — every other intake path produces the first, and an
+   * operator who deleted a record produces the second — and both mean the caller should
+   * finish the task as it always did rather than hold it open for evidence that will never
+   * be filed.
+   */
+  async begin(task: TaskId, settleSeconds: number | undefined): Promise<boolean> {
+    const fingerprint = fingerprintOf(task);
+    if (fingerprint === undefined) return false;
+
+    const record = await this.read(fingerprint);
+    if (record === undefined) return false;
+
+    const window = settleWindowSeconds(settleSeconds);
+    // The supervisor's clock at the moment of the merge, rather than the forge's merge
+    // timestamp: the two are within seconds of each other, and this one is the clock every
+    // later comparison is made against, so taking both from the same source is what stops a
+    // skewed forge reading as an alert that cleared before the fix landed.
+    const mergedAt = new Date(this.now()).toISOString();
+
+    try {
+      await this.store.writeAlertRefusal(fingerprint, {
+        ...record,
+        verify: { mergedAt, settleSeconds: window },
+      });
+    } catch (error) {
+      // Reported false rather than thrown: the merge has already happened, and a task that
+      // cannot be held open should be finished rather than left in limbo. The journal entry
+      // the caller writes says the re-verification could not be started.
+      this.logger.warn("reverify.begin-failed", { task, ...errorFields(error) });
+      return false;
+    }
+
+    this.logger.info("reverify.begun", {
+      task,
+      alertname: record.alertname,
+      mergedAt,
+      settleSeconds: window,
+    });
+    return true;
+  }
+
+  /**
+   * Is this task being held for a verdict?
+   *
+   * The claim filter's question, so it has to be cheap and it has to fail OPEN: a task whose
+   * record cannot be read is reported as not pending, because holding it on the strength of
+   * an unreadable record would wedge it on every poll with nothing able to release it.
+   */
+  async pending(task: TaskId): Promise<boolean> {
+    const fingerprint = fingerprintOf(task);
+    if (fingerprint === undefined) return false;
+    return (await this.read(fingerprint))?.verify !== undefined;
+  }
+
+  /**
+   * Every held task whose window has run out, with the verdict for each.
+   *
+   * Pure with respect to the store: it reads and decides, and `settle` is what writes. The
+   * split is what lets the caller journal and notify before the record changes underneath
+   * it, and it keeps this callable from a housekeeping pass that has not claimed anything.
+   *
+   * Never throws. This runs on the housekeeping loop, which has to survive a filesystem
+   * answering errors — that is exactly when it is most worth having.
+   */
+  async due(): Promise<readonly DueReverification[]> {
+    let records: readonly AlertRefusal[];
+    try {
+      records = await this.store.listAlertRefusals();
+    } catch (error) {
+      this.logger.warn("reverify.list-failed", errorFields(error));
+      return [];
+    }
+
+    const out: DueReverification[] = [];
+    for (const record of records) {
+      const verdict = this.judge(record);
+      if (verdict === undefined || verdict.kind === "waiting") continue;
+      // `record.task` is defined whenever `judge` returned a verdict — it checks.
+      out.push({ task: record.task as TaskId, alertname: record.alertname, verdict });
+    }
+    return out;
+  }
+
+  /**
+   * Reach a verdict on one task and record that it has been reached.
+   *
+   * Undefined when there is nothing to say: no record, no `verify` block, or a window that
+   * has not run out. The caller does nothing in that case, which is what holds the task.
+   */
+  async settle(task: TaskId): Promise<ReverifyVerdict | undefined> {
+    const fingerprint = fingerprintOf(task);
+    if (fingerprint === undefined) return undefined;
+
+    const record = await this.read(fingerprint);
+    if (record === undefined) return undefined;
+
+    const verdict = this.judge(record);
+    if (verdict === undefined || verdict.kind === "waiting") return undefined;
+
+    try {
+      if (verdict.kind === "cleared") {
+        // The `verify` block only. See the class comment for why the record itself stays.
+        const { verify: _settled, ...rest } = record;
+        await this.store.writeAlertRefusal(fingerprint, rest);
+      } else {
+        // The reset. A fix that did not work, or one nothing could check, must not go on
+        // suppressing its own alert through `ALERT-<fingerprint>` dedup.
+        await this.store.clearAlertRefusal(fingerprint);
+      }
+    } catch (error) {
+      // Undefined rather than the verdict, so the caller holds the task instead of acting
+      // on a decision that was not durably recorded. The next pass reaches the same verdict
+      // from the same evidence: the window has already run out and nothing shortens it.
+      this.logger.warn("reverify.settle-failed", { task, ...errorFields(error) });
+      return undefined;
+    }
+
+    this.logger.info("reverify.settled", {
+      task,
+      alertname: record.alertname,
+      verdict: verdict.kind,
+    });
+    return verdict;
+  }
+
+  /**
+   * One record → a verdict, or undefined for a record this must not act on.
+   *
+   * The task-id cross-check is here rather than at the call sites because both of them need
+   * it. `alerts/refusals/<fingerprint>.json` naming task `ALERT-<fingerprint>` is an
+   * invariant of the write path, but the file is JSON in a git repo a human can edit, and a
+   * mismatch acted on would let one alert's record settle another alert's task.
+   */
+  private judge(record: AlertRefusal): ReverifyVerdict | undefined {
+    const verify = record.verify;
+    if (verify === undefined || record.task === undefined) return undefined;
+    if (fingerprintOf(record.task) !== record.fingerprint) {
+      this.logger.warn("reverify.record-mismatch", {
+        fingerprint: record.fingerprint,
+        task: record.task,
+      });
+      return undefined;
+    }
+
+    return reverifyAlert({
+      mergedAt: verify.mergedAt,
+      // The window as it stood when the fix merged, not as the policy stands now: the entry
+      // can change while a fix is in review, and the number the journal already quoted is
+      // the one the task is entitled to.
+      settleSeconds: verify.settleSeconds,
+      evidence: {
+        kind: "observed",
+        ...(verify.lastFiringAt === undefined ? {} : { lastFiringAt: verify.lastFiringAt }),
+        ...(verify.resolvedAt === undefined ? {} : { resolvedAt: verify.resolvedAt }),
+      },
+      now: this.now(),
+    });
+  }
+
+  /** A record, or nothing — including when the store could not answer. */
+  private async read(fingerprint: string): Promise<AlertRefusal | undefined> {
+    try {
+      return await this.store.readAlertRefusal(fingerprint);
+    } catch (error) {
+      this.logger.warn("reverify.read-failed", { fingerprint, ...errorFields(error) });
+      return undefined;
+    }
+  }
+}
+
+/** `ALERT-a1b2c3d4` → `a1b2c3d4`, and undefined for a task from any other intake path. */
+const fingerprintOf = (task: string): string | undefined =>
+  isAlertTaskId(task) ? task.slice(ALERT_TASK_PREFIX.length) : undefined;
