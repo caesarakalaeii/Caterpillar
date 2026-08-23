@@ -134,6 +134,15 @@ export class BoundedExecutionEnv extends NodeExecutionEnv {
 
     // Withheld from the caller until the command ends, then handed over bounded. See the
     // header: these callbacks, not the returned `stdout`, are what pi's bash tool reads.
+    //
+    // The whole output is held in memory, which is a second copy of what `NodeExecutionEnv`
+    // is already accumulating for its return value — so a command that produces a gigabyte
+    // costs twice what it did, having already been unbounded. Not fixed here because
+    // trimming a rolling buffer while streaming the rest to disk is what pi's own capture
+    // does and it is the reason its truncation is tail-only: the head is gone by the time
+    // the command ends. Keeping the head is the point (a compiler's first error), and
+    // `limits.commandTimeoutSeconds` bounds how long a runaway command has to produce
+    // output at all.
     let captured = "";
     const started = Date.now();
     const result = await super.exec(command, {
@@ -175,11 +184,13 @@ export class BoundedExecutionEnv extends NodeExecutionEnv {
     if (view.length > 0) options?.onStdout?.(view);
 
     if (!result.ok) return result;
-    // The return value carries the same bounded view. The acceptance gate and the plan
-    // maintainer read `stdout` rather than the callbacks, and a ceiling that depends on
-    // which caller you are is not a ceiling. `stderr` is emptied rather than bounded
-    // separately: `view` already holds both, and a second copy would charge the same
-    // output to the window twice.
+    // The return value carries the same bounded view, so the ceiling does not depend on
+    // which half of `ExecutionEnv`'s contract a caller uses. Every caller today reads the
+    // callbacks — pi's four tools are the only ones — but the two channels carry the same
+    // output, and leaving one of them unbounded would make the next caller the exception.
+    //
+    // `stderr` is emptied rather than bounded separately: `view` already holds both streams
+    // interleaved, and a second copy would charge the same output to the window twice.
     return { ok: true, value: { ...result.value, stdout: view, stderr: "" } };
   }
 

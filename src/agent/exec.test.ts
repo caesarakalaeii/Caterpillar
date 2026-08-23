@@ -235,9 +235,9 @@ test("a command inside the ceiling writes no overflow file and no note", async (
 });
 
 test("the returned stdout is bounded too, for the callers that read it", async () => {
-  // `exec` returns the whole output as well as streaming it, and the acceptance gate and
-  // the plan maintainer read the return value. Bounding one channel and not the other
-  // would leave the ceiling depending on which caller you are.
+  // `exec` returns the whole output as well as streaming it, and both are part of
+  // `ExecutionEnv`'s contract. Bounding one channel and not the other would make the
+  // ceiling depend on which half a caller happens to read.
   const { subject } = await env(60, SILENT_LOGGER, outputCeiling({ maxLines: 40 }));
 
   const result = await subject.exec("seq 1 8000");

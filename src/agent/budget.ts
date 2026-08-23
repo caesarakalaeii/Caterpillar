@@ -122,17 +122,18 @@ export const boundOutput = (
   }
 
   const lines = text.split("\n");
-  const kept = keepBothEnds(lines, ceiling);
+  const kept = keepBothEnds(lines, ceiling, options.overflowPath);
 
   // No whole line fits — one line is longer than the entire byte budget. The "never a
   // partial line" guarantee has to give way here, and it gives way loudly: a cut line that
   // looks complete is how a model comes to believe a file ends where it does not.
   if (kept.head.length === 0 && kept.tail.length === 0) {
-    const shown = sliceBytes(text, ceiling.maxBytes);
+    const shown = sliceBytes(text, forContent(ceiling.maxBytes, options.overflowPath));
     return {
       text: `${shown}\n${byteElision(shown, text, options.overflowPath)}`,
       elided: true,
-      droppedLines: 0,
+      // Every line, including the one that was cut: the model has a fragment, not a line.
+      droppedLines: totalLines,
       totalLines,
     };
   }
@@ -160,6 +161,22 @@ const countLines = (text: string): number => {
 const HEAD_SHARE = 0.25;
 
 /**
+ * Bytes left for CONTENT once the elision note is paid for.
+ *
+ * The note is what the model reads too, so a "50KiB ceiling" that returns 50KiB of output
+ * plus a sentence is over its ceiling. Charging it needs an allowance rather than the exact
+ * length, because the note states how many lines were kept and that is not known until the
+ * budget has been spent — so the exact cost depends on the answer it is an input to.
+ *
+ * Generous by a few hundred bytes rather than tight, and floored at one byte so a ceiling
+ * smaller than the note still returns something.
+ */
+const forContent = (maxBytes: number, overflowPath: string | undefined): number => {
+  const allowance = 320 + Buffer.byteLength(overflowPath ?? "", "utf8");
+  return Math.max(1, maxBytes - allowance);
+};
+
+/**
  * Take lines from both ends until either budget runs out.
  *
  * Tail first, and the tail gets what the head does not use: on a failing command the last
@@ -168,19 +185,19 @@ const HEAD_SHARE = 0.25;
 const keepBothEnds = (
   lines: readonly string[],
   ceiling: OutputCeiling,
+  overflowPath: string | undefined,
 ): { readonly head: string[]; readonly tail: string[] } => {
   const headLimit = Math.max(1, Math.floor(ceiling.maxLines * HEAD_SHARE));
   const tailLimit = ceiling.maxLines - headLimit;
+  const maxBytes = forContent(ceiling.maxBytes, overflowPath);
 
   const tail: string[] = [];
   const head: string[] = [];
-  // Charged against the byte budget even though it is not part of the output, because the
-  // note is what the model reads and paying for it is the honest accounting.
   let bytes = 0;
 
   const fits = (line: string): boolean => {
     const cost = Buffer.byteLength(line, "utf8") + 1;
-    if (bytes + cost > ceiling.maxBytes) return false;
+    if (bytes + cost > maxBytes) return false;
     bytes += cost;
     return true;
   };

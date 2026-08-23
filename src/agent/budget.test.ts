@@ -66,8 +66,10 @@ test("a byte ceiling bites even when the line count is small", () => {
   const fat = `${"x".repeat(50_000)}\n${"y".repeat(50_000)}\n${"z".repeat(50_000)}`;
   const bounded = boundOutput(fat, outputCeiling({ maxLines: 1_000, maxBytes: 4_000 }));
 
+  // The note counts against the ceiling too — it is text the model reads — so the whole
+  // returned view fits, not just the content inside it.
   assert.ok(
-    Buffer.byteLength(bounded.text, "utf8") <= 4_000 + 400,
+    Buffer.byteLength(bounded.text, "utf8") <= 4_000,
     `bounded output was ${Buffer.byteLength(bounded.text, "utf8")} bytes`,
   );
   assert.equal(bounded.elided, true);
@@ -79,8 +81,12 @@ test("a line longer than the whole byte ceiling is cut, and says so", () => {
   // how a model comes to believe a file ends where it does not.
   const bounded = boundOutput("x".repeat(20_000), outputCeiling({ maxBytes: 1_000 }));
 
-  assert.ok(Buffer.byteLength(bounded.text, "utf8") <= 1_400);
+  assert.ok(
+    Buffer.byteLength(bounded.text, "utf8") <= 1_000,
+    `bounded output was ${Buffer.byteLength(bounded.text, "utf8")} bytes`,
+  );
   assert.match(bounded.text, /bytes shown/);
+  assert.equal(bounded.droppedLines, 1, "the one line is a fragment now, not a line");
 });
 
 test("the overflow file is named in the output when there is one", () => {

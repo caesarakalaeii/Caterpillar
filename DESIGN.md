@@ -827,8 +827,8 @@ been got wrong. pi's bash tool reads `env.exec`'s `onStdout`/`onStderr` callback
 ignores the `stdout` it returns, so bounding the return value alone leaves the model's own
 view unbounded while every test passes. `BoundedExecutionEnv` therefore withholds the
 caller's callbacks for the duration of the command and hands over one bounded chunk just
-before `exec` resolves — and bounds the return value too, because the acceptance gate and
-the plan maintainer read that instead. Two consequences, both accepted: pi's own truncation
+before `exec` resolves — and bounds the return value too, so the ceiling does not depend on
+which half of `ExecutionEnv`'s contract a caller reads. Two consequences, both accepted: pi's own truncation
 becomes a no-op (a constant 2,000 no config could lower, tail-only, spilled to a `tmpdir`
 file outside the worktree), and progress updates arrive when a command ends rather than
 while it runs, which nothing in this codebase consumes.
