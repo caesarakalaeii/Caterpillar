@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { Git, type GitResult } from "../state/git.ts";
-import { asTaskId, type RepoRef } from "../domain/task.ts";
+import { asTaskId, type RepoRef, type TaskId } from "../domain/task.ts";
 import { assertInside, WorktreeManager } from "./worktree.ts";
 
 const REPO: RepoRef = { host: "github.com", owner: "acme", name: "widget" };
@@ -1081,6 +1081,74 @@ test("two concurrent checkouts against one mirror do not corrupt it", async () =
     assert.equal((await git.run("config", "remote.origin.push")).trim(), "HEAD");
     assert.match(await git.run("config", "credential.helper"), new RegExp(task));
   }
+});
+
+/**
+ * Push a commit onto the remote's `agent/<task>` branch, as a session on another runner
+ * would have. Answers with the oid the remote branch now points at.
+ *
+ * Goes through the seed clone `seedMirror` left behind rather than through the mirror,
+ * because the mirror is the thing under test: the point is that the remote moved without
+ * this runner's mirror hearing about it.
+ */
+const pushAgentBranch = async (
+  root: string,
+  repo: RepoRef,
+  task: TaskId,
+  content: string,
+): Promise<string> => {
+  const seed = join(root, `${repo.name}-seed`);
+  const git = new Git(seed, HERMETIC);
+  const branch = `agent/${task}`;
+
+  const existing = await git.tryRun("rev-parse", "--verify", "--quiet", branch);
+  await git.run(...(existing.code === 0 ? ["checkout", branch] : ["checkout", "-b", branch]));
+  await writeFile(join(seed, "pushed"), content);
+  await git.run("add", "-A");
+  await git.run("commit", "-m", `work from another runner: ${content.trim()}`);
+  await git.run("push", "origin", `HEAD:refs/heads/${branch}`);
+  return (await git.run("rev-parse", "HEAD")).trim();
+};
+
+test("a session starts on the remote tip of its own branch, never behind it", async () => {
+  // GH-96: eighteen commits went missing between sessions of one task, and session 7
+  // re-implemented the whole thing from scratch because its worktree started on `main`.
+  //
+  // The mechanism is `MIRROR_REFSPECS`. `^refs/heads/agent/*` stops the mirror refresh
+  // writing a branch a worktree holds, and it does that by never fetching agent refs at
+  // all — so a mirror that has no local `refs/heads/agent/<task>` will never learn one
+  // from the remote. `addWorktreeLocked` then finds no branch, creates one from the
+  // mirror's default branch, and the session begins on the base with no way to tell that
+  // apart from a task nobody has ever touched.
+  //
+  // Reachable whenever the local ref is missing or stale where the remote's is not: a
+  // runner that never worked this task, a reaped worktree, a mirror re-cloned after a
+  // failed fetch, or the branch reset GH-95 reported. In every one of those the remote
+  // has the work and the invariant is the same — the worktree is at the remote tip, or
+  // the session does not start.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("GH-96");
+  const pushed = await pushAgentBranch(root, REPO, task, "eighteen commits\n");
+
+  const worktree = await manager(root).ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    pushed,
+    "a fresh worktree must start at the remote tip of agent/<task>, not at the base",
+  );
+  assert.equal(
+    (await new Git(worktree, HERMETIC).run("rev-parse", "--abbrev-ref", "HEAD")).trim(),
+    `agent/${task}`,
+  );
+  // And the file the earlier session wrote is actually in the tree, so the agent can see
+  // its own previous work rather than merely being on a ref that mentions it.
+  assert.ok(
+    existsSync(join(worktree, "pushed")),
+    "the previous session's committed files must be checked out",
+  );
 });
 
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
