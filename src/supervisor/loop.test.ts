@@ -950,6 +950,10 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
       calls.push(`merge:${pr}`);
       return Promise.resolve();
     },
+    // No merge queue on these repos, which is what every one of these tests assumed
+    // before the question could be asked at all.
+    mergeQueue: () => Promise.resolve("absent" as const),
+    enqueue: () => Promise.reject(new Error("no queue to enqueue into")),
     revoke: () => Promise.resolve(),
   };
 
@@ -4893,6 +4897,10 @@ test("a two-repo task merges both PRs, in the order its repos were named", async
       merges.push(`merge:${repo.name}#${pr}`);
       return Promise.resolve();
     },
+    // No merge queue on these repos, which is what every one of these tests assumed
+    // before the question could be asked at all.
+    mergeQueue: () => Promise.resolve("absent" as const),
+    enqueue: () => Promise.reject(new Error("no queue to enqueue into")),
     revoke: () => Promise.resolve(),
   };
 
@@ -4979,6 +4987,10 @@ test("a merge that fails halfway names what DID land", async () => {
       repo.name === "widget"
         ? Promise.resolve()
         : Promise.reject(new Error("required status check is pending")),
+    // No merge queue on these repos, which is what every one of these tests assumed
+    // before the question could be asked at all.
+    mergeQueue: () => Promise.resolve("absent" as const),
+    enqueue: () => Promise.reject(new Error("no queue to enqueue into")),
     revoke: () => Promise.resolve(),
   };
 
@@ -5025,6 +5037,183 @@ test("a merge that fails halfway names what DID land", async () => {
   const reason = outcome.kind === "not-mergeable" ? outcome.reason : "";
   assert.match(reason, /Merged acme\/widget#11/, "the half that landed has to be named");
   assert.match(reason, /half-landed/);
+});
+
+test("a base branch with a merge queue is enqueued, and the reply says queued not merged", async () => {
+  // Merging directly into a queue-protected base either fails or BYPASSES the queue, and
+  // bypassing is worse: it defeats the gate the repo's owners chose. And "in queue" is its
+  // own state — reported as merged, a human stops watching a change the queue can still
+  // reject; reported as a failure, it is the CI-`pending` mistake of §11.1 again.
+  const QUEUED = asTaskId("SMOKE-QUEUE-1");
+  await seedTask(QUEUED, {
+    status: "parked",
+    pr: { number: 11, url: "https://example.invalid/widget/11" },
+  });
+
+  const calls: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
+    approve: (_repo, pr) => {
+      calls.push(`approve:${pr}`);
+      return Promise.resolve();
+    },
+    merge: (_repo, pr) => {
+      calls.push(`merge:${pr}`);
+      return Promise.resolve();
+    },
+    mergeQueue: () => Promise.resolve("required" as const),
+    enqueue: (_repo, pr) => {
+      calls.push(`enqueue:${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: QUEUED });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(calls, ["approve:11", "enqueue:11"], "the queue is used INSTEAD of the merge");
+  assert.equal(outcome.kind, "merged", JSON.stringify(outcome));
+  const note = outcome.kind === "merged" ? (outcome.note ?? "") : "";
+  assert.match(note, /queue/i, "the reply must not call a queued pull request merged");
+});
+
+test("a queued pull request stops the sequence, so the sibling repo is left alone", async () => {
+  // §9.4.1 merges in declared order and stops at the first failure. A queue is not a
+  // failure, but it is not a landed change either — the sibling would go onto a default
+  // branch whose counterpart is still waiting its turn and can still be rejected.
+  const PARTIAL = asTaskId("SMOKE-QUEUE-2");
+  await seedTask(
+    PARTIAL,
+    {
+      status: "parked",
+      prs: [
+        {
+          number: 11,
+          url: "https://example.invalid/widget/11",
+          repo: { host: "github.com", owner: "acme", name: "widget" },
+        },
+        {
+          number: 22,
+          url: "https://example.invalid/ext/22",
+          repo: { host: "github.com", owner: "acme", name: "widget-extension" },
+        },
+      ],
+    },
+    ["github.com/acme/widget", "github.com/acme/widget-extension"],
+  );
+
+  const calls: string[] = [];
+  const reviewerForge: Forge = {
+    kind: "fake-reviewer",
+    credential: () => Promise.reject(new Error("unused")),
+    openPr: () => Promise.reject(new Error("unused")),
+    checks: () => Promise.reject(new Error("unused")),
+    listReviewComments: () => Promise.reject(new Error("the reviewer never reads comments")),
+    approve: (repo, pr) => {
+      calls.push(`approve:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    merge: (repo, pr) => {
+      calls.push(`merge:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    // Only the FIRST repo queues. If the rule were not honoured the second would merge
+    // directly and land ahead of its counterpart.
+    mergeQueue: (repo) => Promise.resolve(repo.name === "widget" ? ("required" as const) : ("absent" as const)),
+    enqueue: (repo, pr) => {
+      calls.push(`enqueue:${repo.name}#${pr}`);
+      return Promise.resolve();
+    },
+    revoke: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("no session under test")) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    reviewers: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () => Promise.resolve(reviewerForge),
+          unreachable: () => Promise.resolve([]),
+          reachable: () => Promise.resolve([]),
+        },
+      ],
+    ]),
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    inbox,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const outcome = await inbox.submit({ kind: "merge", task: PARTIAL });
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(
+    calls,
+    ["approve:widget#11", "enqueue:widget#11"],
+    "the sibling must not be touched while the first is still in the queue",
+  );
+  const note = outcome.kind === "merged" ? (outcome.note ?? "") : "";
+  assert.match(note, /widget-extension/, "and the reply has to say what was left open");
 });
 
 test("CI that has not finished releases the task instead of spending a session on it", async () => {
