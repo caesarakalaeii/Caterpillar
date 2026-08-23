@@ -1194,6 +1194,40 @@ test("a worktree reset behind its remote branch is not handed to a session as-is
   );
 });
 
+test("a worktree holding commits the remote has not seen keeps them", async () => {
+  // The regression `catchUpWorktree` could most easily introduce. A session commits and has
+  // not pushed yet — the state this very task's own branch was found in — and the reuse path
+  // now consults the remote. Anything that RESET the worktree to the remote tip would delete
+  // work that exists nowhere else, which is strictly worse than the bug being fixed: a stale
+  // start costs a duplicate implementation, a reset costs the implementation itself.
+  //
+  // So a fast-forward and only a fast-forward. `merge --ff-only` against an ancestor is a
+  // no-op, which is the whole reason it is the verb there.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("AHEAD-1");
+  const subject = manager(root);
+  const pushed = await pushAgentBranch(root, REPO, task, "work from another runner\n");
+
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  await writeFile(join(worktree, "local-only"), "not pushed anywhere\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "committed here, never pushed");
+  const local = (await git.run("rev-parse", "HEAD")).trim();
+  assert.notEqual(local, pushed, "fixture is wrong: the worktree must be ahead");
+
+  const reused = await subject.ensureWorktree(REPO, task);
+
+  assert.equal(
+    (await new Git(reused, HERMETIC).run("rev-parse", "HEAD")).trim(),
+    local,
+    "a worktree ahead of the remote must be left exactly where it is",
+  );
+  assert.ok(existsSync(join(reused, "local-only")), "and the file only it carries with it");
+});
+
 test("commitsSince reads the branch's commits oldest-first, with what each touched", async () => {
   // Feeds `review/tdd.ts`, whose whole subject is the ORDER — so oldest-first is the
   // contract, not a detail. `git log` defaults to newest-first, which would invert every
