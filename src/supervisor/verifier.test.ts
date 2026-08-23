@@ -10,9 +10,15 @@
  * two repos passed on the strength of the primary while the sibling's CI was red — or absent
  * entirely. The work is one change and half of it being green is not it passing.
  *
- * And the evidence a gate leaves behind, at the bottom. `acceptance: ["npx playwright test"]`
+ * And the evidence a gate leaves behind. `acceptance: ["npx playwright test"]`
  * is the honest end-to-end test for a change that renders something, and it was impossible
  * while a gate could only return an exit code.
+ *
+ * The last block of the file covers a different gate entirely: §20's post-merge
+ * re-verification, which asks whether the alert a remediation task was created for actually
+ * stopped. It shares this file with §12's gates because it is the same kind of thing — a
+ * check the SUPERVISOR performs and the agent cannot influence — and it has its own header
+ * comment where it starts.
  */
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -33,7 +39,13 @@ import { SILENT_LOGGER } from "../obs/log.ts";
 import { ARTIFACT_BYTES, ARTIFACT_COUNT } from "../state/store.ts";
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import type { WorktreeManager } from "../workspace/worktree.ts";
-import { AcceptanceVerifier, type EvidenceStore } from "./verifier.ts";
+import type { AlertRefusal } from "../state/store.ts";
+import {
+  AcceptanceVerifier,
+  AlertReverifier,
+  type EvidenceStore,
+  type ReverifyStore,
+} from "./verifier.ts";
 
 /**
  * Who the resolved environment commits as. Any address will do here — what the
@@ -828,4 +840,264 @@ test("a mergeability question git could not answer does not fail the gate", asyn
   );
 
   assert.equal(result.passed, true, result.detail);
+});
+
+/* ---- post-merge re-verification of a remediation task (§20) ---------------------- */
+
+/**
+ * The second gate this file now covers, and it is a different one.
+ *
+ * §12 asks "is this change any good"; §20 asks "did it work" — whether the alert the task
+ * was created for actually stopped once the fix merged. `remediation/verify.ts` decides
+ * from the evidence; `AlertReverifier` is what the fleet then does about it, and the two
+ * properties worth asserting here are the ones that make the loop close honestly:
+ *
+ *   a failed re-verification RESETS the fingerprint's record, so a subsequent firing can
+ *   become work again — without that, `ALERT-<fingerprint>` dedup means an ineffective fix
+ *   permanently suppresses its own alert, which is worse than never having checked;
+ *
+ *   a re-verification that could not be performed reports exactly that and clears nothing.
+ *
+ * The store is a fake: what these tests assert is the sequence of record writes and
+ * deletions, and a real `StateStore` would put a git invocation between every one of them.
+ */
+const ALERT_TASK = asTaskId("ALERT-a1b2c3d4");
+const FINGERPRINT = "a1b2c3d4";
+const MERGED_AT = "2026-08-23T12:00:00.000Z";
+
+/** `MERGED_AT` plus some minutes, as an ISO string. */
+const at = (minutes: number): string =>
+  new Date(Date.parse(MERGED_AT) + minutes * 60_000).toISOString();
+
+class FakeAlertStore implements ReverifyStore {
+  readonly records = new Map<string, AlertRefusal>();
+  readonly cleared: string[] = [];
+
+  constructor(record?: AlertRefusal) {
+    if (record !== undefined) this.records.set(record.fingerprint, record);
+  }
+
+  listAlertRefusals(): Promise<readonly AlertRefusal[]> {
+    return Promise.resolve([...this.records.values()]);
+  }
+
+  readAlertRefusal(fingerprint: string): Promise<AlertRefusal | undefined> {
+    return Promise.resolve(this.records.get(fingerprint));
+  }
+
+  writeAlertRefusal(fingerprint: string, record: AlertRefusal): Promise<void> {
+    this.records.set(fingerprint, record);
+    return Promise.resolve();
+  }
+
+  clearAlertRefusal(fingerprint: string): Promise<void> {
+    this.cleared.push(fingerprint);
+    this.records.delete(fingerprint);
+    return Promise.resolve();
+  }
+}
+
+const alertRecord = (over: Partial<AlertRefusal> = {}): AlertRefusal => ({
+  fingerprint: FINGERPRINT,
+  alertname: "CaterpillarNoProgress",
+  reason: "created",
+  task: ALERT_TASK,
+  ...over,
+});
+
+const reverifier = (
+  store: ReverifyStore,
+  now: () => number = () => Date.parse(at(20)),
+): AlertReverifier => new AlertReverifier({ store, logger: SILENT_LOGGER, now });
+
+test("beginning a re-verification stamps the merge instant and the window", async () => {
+  const store = new FakeAlertStore(alertRecord());
+
+  const began = await reverifier(store).begin(ALERT_TASK, 900);
+
+  assert.equal(began, true);
+  const verify = store.records.get(FINGERPRINT)?.verify;
+  assert.equal(verify?.settleSeconds, 900);
+  // The supervisor's clock at the moment of the merge, so every later comparison has one
+  // fixed instant to be relative to.
+  assert.equal(verify?.mergedAt, at(20));
+  // Nothing else about the record moves: `alertname` and `task` are what
+  // `countOpenAlertTasks` joins on, and losing either would free the alert's slot early.
+  assert.equal(store.records.get(FINGERPRINT)?.alertname, "CaterpillarNoProgress");
+  assert.equal(store.records.get(FINGERPRINT)?.task, ALERT_TASK);
+});
+
+test("a task with no alert record cannot be re-verified and says so", async () => {
+  // A remediation task whose record an operator deleted, or one from before this existed.
+  // It must not be held open forever waiting for evidence that will never be filed.
+  const store = new FakeAlertStore();
+
+  assert.equal(await reverifier(store).begin(ALERT_TASK, 900), false);
+  assert.equal(await reverifier(store).pending(ALERT_TASK), false);
+});
+
+test("a task id that is not an alert's is not re-verified at all", async () => {
+  // Every other intake path produces tasks with no alert behind them. Asking about them
+  // must be free and must never touch the store.
+  const store = new FakeAlertStore(alertRecord());
+
+  assert.equal(await reverifier(store).begin(asTaskId("GH-acme-widget-12"), 900), false);
+  assert.equal(await reverifier(store).pending(asTaskId("GH-acme-widget-12")), false);
+});
+
+test("a re-verification is pending from the merge until a verdict is reached", async () => {
+  const store = new FakeAlertStore(alertRecord());
+  const clock = { now: Date.parse(at(0)) };
+  const subject = new AlertReverifier({ store, logger: SILENT_LOGGER, now: () => clock.now });
+
+  assert.equal(await subject.pending(ALERT_TASK), false);
+  await subject.begin(ALERT_TASK, 600);
+  // Held: nothing has been delivered and the window has not run out. This is what stops a
+  // session being started on a task whose fix has merged and is settling.
+  assert.equal(await subject.pending(ALERT_TASK), true);
+
+  clock.now = Date.parse(at(11));
+  const verdict = await subject.settle(ALERT_TASK);
+  assert.equal(verdict?.kind, "unverifiable");
+  // Decided, so no longer pending: `settle` is what ends the hold, either way.
+  assert.equal(await subject.pending(ALERT_TASK), false);
+});
+
+test("an alert that cleared settles as cleared and leaves the record in place", async () => {
+  const store = new FakeAlertStore(
+    alertRecord({ verify: { mergedAt: MERGED_AT, settleSeconds: 600, resolvedAt: at(4) } }),
+  );
+
+  const verdict = await reverifier(store).settle(ALERT_TASK);
+
+  assert.equal(verdict?.kind, "cleared");
+  // NOT deleted. The record is what `countOpenAlertTasks` joins to `tasks/`, and removing
+  // it on the success path would free the alertname's slot while the task is still being
+  // recorded as done — so a firing in that window would open a second task for an incident
+  // that was just fixed.
+  assert.deepEqual(store.cleared, []);
+  // The `verify` block goes, though: the question has been answered, and a record still
+  // carrying one would hold the task open again after a restart.
+  assert.equal(store.records.get(FINGERPRINT)?.verify, undefined);
+});
+
+test("an alert still firing resets the record so a re-fire becomes work again", async () => {
+  const store = new FakeAlertStore(
+    alertRecord({ verify: { mergedAt: MERGED_AT, settleSeconds: 600, lastFiringAt: at(9) } }),
+  );
+
+  const verdict = await reverifier(store).settle(ALERT_TASK);
+
+  assert.equal(verdict?.kind, "still-firing");
+  // THE POINT OF THE WHOLE FEATURE. The task id is `ALERT-<fingerprint>`, so without this
+  // the next firing of the same alert is deduped against a task that already exists and
+  // never becomes work — the fix that did not work would permanently suppress its own
+  // alert, which is a worse outcome than never having checked.
+  assert.deepEqual(store.cleared, [FINGERPRINT]);
+});
+
+test("an alert that could not be re-verified resets the record too", async () => {
+  const store = new FakeAlertStore(
+    alertRecord({ verify: { mergedAt: MERGED_AT, settleSeconds: 600 } }),
+  );
+
+  const verdict = await reverifier(store).settle(ALERT_TASK);
+
+  assert.equal(verdict?.kind, "unverifiable");
+  // Reset for the same reason as a failure, and deliberately not treated like a clear:
+  // nothing established that this alert stopped, so the next firing must be allowed to
+  // open work. Treating "could not check" as "cleared" is what would make the silent
+  // success this feature removes reappear one layer up.
+  assert.deepEqual(store.cleared, [FINGERPRINT]);
+});
+
+test("settling a task with no pending re-verification answers nothing", async () => {
+  const store = new FakeAlertStore(alertRecord());
+
+  assert.equal(await reverifier(store).settle(ALERT_TASK), undefined);
+  assert.deepEqual(store.cleared, []);
+});
+
+test("every task now due a verdict is listed, and one still waiting is not", async () => {
+  const store = new FakeAlertStore();
+  store.records.set("aaaa", {
+    fingerprint: "aaaa",
+    alertname: "A",
+    reason: "created",
+    task: asTaskId("ALERT-aaaa"),
+    verify: { mergedAt: MERGED_AT, settleSeconds: 600, lastFiringAt: at(9) },
+  });
+  store.records.set("bbbb", {
+    fingerprint: "bbbb",
+    alertname: "B",
+    reason: "created",
+    task: asTaskId("ALERT-bbbb"),
+    // Merged much later: still inside its window at the clock below.
+    verify: { mergedAt: at(19), settleSeconds: 600 },
+  });
+  // No `verify` at all: an ordinary open remediation task, not a settling one.
+  store.records.set("cccc", {
+    fingerprint: "cccc",
+    alertname: "C",
+    reason: "created",
+    task: asTaskId("ALERT-cccc"),
+  });
+
+  const due = await reverifier(store).due();
+
+  assert.deepEqual(
+    due.map((entry) => entry.task),
+    [asTaskId("ALERT-aaaa")],
+  );
+  assert.equal(due[0]?.verdict.kind, "still-firing");
+});
+
+test("a store that cannot be read reports nothing due rather than throwing", async () => {
+  // This runs on the housekeeping pass, which must survive a filesystem that is answering
+  // errors — that is exactly when it is most worth having.
+  const broken: ReverifyStore = {
+    listAlertRefusals: () => Promise.reject(new Error("EIO")),
+    readAlertRefusal: () => Promise.reject(new Error("EIO")),
+    writeAlertRefusal: () => Promise.reject(new Error("EIO")),
+    clearAlertRefusal: () => Promise.reject(new Error("EIO")),
+  };
+  const subject = reverifier(broken);
+
+  assert.deepEqual(await subject.due(), []);
+  // And a task whose record cannot be read is NOT reported as pending: holding it open on
+  // the strength of an unreadable record would wedge it on every poll.
+  assert.equal(await subject.pending(ALERT_TASK), false);
+  assert.equal(await subject.begin(ALERT_TASK, 600), false);
+});
+
+test("a record whose task id does not match its own file is not acted on", async () => {
+  // The fingerprint is the file name and `ALERT-<fingerprint>` is the task id, so the two
+  // agreeing is an invariant of the write path — but the record is JSON in a git repo a
+  // human can edit, and acting on a mismatch would let one record settle another's task.
+  const store = new FakeAlertStore(
+    alertRecord({
+      task: asTaskId("ALERT-deadbeef"),
+      verify: { mergedAt: MERGED_AT, settleSeconds: 600, lastFiringAt: at(9) },
+    }),
+  );
+
+  assert.deepEqual(await reverifier(store).due(), []);
+  assert.equal(await reverifier(store).settle(ALERT_TASK), undefined);
+  assert.deepEqual(store.cleared, []);
+});
+
+test("the window comes from the record, not from whatever the caller believes now", async () => {
+  // The policy entry can change while a fix is in review. The window a task is held for is
+  // the one that was in force when its fix merged, because that is the number the journal
+  // entry and the digest line already quoted.
+  const store = new FakeAlertStore(
+    alertRecord({ verify: { mergedAt: MERGED_AT, settleSeconds: 7200 } }),
+  );
+
+  assert.equal(
+    await reverifier(store, () => Date.parse(at(30))).settle(ALERT_TASK),
+    undefined,
+    "still inside a two-hour window",
+  );
+  assert.equal((await reverifier(store, () => Date.parse(at(130))).settle(ALERT_TASK))?.kind, "unverifiable");
 });
