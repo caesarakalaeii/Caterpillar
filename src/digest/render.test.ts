@@ -314,3 +314,47 @@ test("a digest with no attribution at all has no authorship section", () => {
 
   assert.doesNotMatch(text, /## Authorship/);
 });
+
+test("a re-verified alert says whether the fix worked, in the task's own block", () => {
+  // §20 asks for exactly this line, and the reason it is here rather than only in Discord
+  // is that Discord is a moment and the digest is the record: "did the alert clear" is a
+  // question asked the next morning at least as often as it is asked at 03:00.
+  const document = render(
+    digest({
+      quiet: false,
+      changed: [
+        change({
+          id: asTaskId("ALERT-6155dbaa"),
+          title: "Alert `CaterpillarBudget` is firing",
+          from: "running",
+          to: "done",
+          reverified: "fix merged, alert cleared after 4m",
+        }),
+        change({
+          id: asTaskId("ALERT-6155dbbb"),
+          title: "Alert `CaterpillarNoProgress` is firing",
+          from: "running",
+          to: "parked",
+          reverified: "fix merged, alert still firing",
+        }),
+      ],
+    }),
+  );
+
+  assert.match(document, /fix merged, alert cleared after 4m/);
+  assert.match(document, /fix merged, alert still firing/);
+});
+
+test("a task nobody re-verified prints no verdict at all", () => {
+  // The rule the whole document follows: a fact that could not be measured is declared,
+  // never printed as a neutral-looking default. Most tasks come from no alert, and a blank
+  // verdict beside every one of them would be noise that reads as a missing answer.
+  const document = render(
+    digest({
+      quiet: false,
+      changed: [change({ id: asTaskId("TASK-9"), from: "running", to: "done" })],
+    }),
+  );
+
+  assert.doesNotMatch(document, /re-verif/i);
+});
