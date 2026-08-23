@@ -520,7 +520,7 @@ export class WorktreeManager {
   }
 
   /**
-   * Does this worktree's `HEAD` still merge into `base`? (DESIGN.md §12.)
+   * Does this worktree's `HEAD` still merge into `base`? (DESIGN.md §12.3)
    *
    *   - `undefined` — it merges cleanly.
    *   - a `ConflictSummary` — it does not, with the files and their hunk counts.

@@ -698,7 +698,7 @@ test("a forge that cannot be reached does not fail the session", async () => {
 });
 
 /**
- * A branch that no longer merges is said so at session start (DESIGN.md §12).
+ * A branch that no longer merges is said so at session start (DESIGN.md §12.3).
  *
  * The failure this exists for: a task that ran for several sessions ends with a branch
  * `main` has moved past, and the first thing that notices is the merge — after every gate

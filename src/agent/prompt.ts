@@ -32,7 +32,7 @@ export interface PromptParts {
   readonly artifacts?: string;
   /** Unresolved review comments on the task's pull requests (DESIGN.md §7.3). */
   readonly reviewGuidance?: string;
-  /** The branch no longer merges into its base, and which files (DESIGN.md §12). */
+  /** The branch no longer merges into its base, and which files (DESIGN.md §12.3). */
   readonly conflicts?: string;
 }
 

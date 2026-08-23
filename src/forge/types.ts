@@ -156,7 +156,7 @@ export interface Forge {
   merge(repo: RepoRef, pr: number, options?: MergeOptions): Promise<void>;
 
   /**
-   * Does the base branch of this pull request require a merge queue? (DESIGN.md §12.)
+   * Does the base branch of this pull request require a merge queue? (DESIGN.md §12.3)
    *
    * Asked about the PULL REQUEST rather than about a branch name, because the caller does
    * not reliably know the base: `state.json` records a number and a url, and older state

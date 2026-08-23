@@ -193,7 +193,7 @@ export class AcceptanceVerifier {
   }
 
   /**
-   * Gate 2's third question: does this branch still merge into its base?
+   * Gate 2's third question: does this branch still merge into its base? (§12.3.)
    *
    * Returns a REJECTION or `undefined`, so the caller keeps the CI detail when there is
    * nothing to say. Both gates passing and the merge then failing is a terminal-looking

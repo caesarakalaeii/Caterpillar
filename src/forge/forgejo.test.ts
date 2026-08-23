@@ -424,7 +424,7 @@ test("review comments are refused for a repo outside the task's scope", async ()
 });
 
 test("Forgejo has no merge queue, and says so without a request", async () => {
-  // The seam degrades rather than fails (DESIGN.md §12). `absent` and not `unknown`:
+  // The seam degrades rather than fails (DESIGN.md §12.3). `absent` and not `unknown`:
   // Forgejo has no queue concept at all, so this is a definite answer, and answering
   // `unknown` would suggest something might be there that a later release could find.
   const forge = await factory([["Acme", "tok"]]).forTask(spec([REPO]));

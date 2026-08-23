@@ -1152,7 +1152,7 @@ test("commitsSince answers with nothing rather than throwing on a bad base", asy
 });
 
 /**
- * Conflicts against the base branch (DESIGN.md §12).
+ * Conflicts against the base branch (DESIGN.md §12.3).
  *
  * A task that ran for several sessions can end on a branch that no longer merges. Read at
  * the merge, that is a terminal-looking failure after every gate has passed; read at

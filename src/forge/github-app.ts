@@ -673,7 +673,7 @@ class GitHubAppForge implements Forge {
   }
 
   /**
-   * Whether this pull request's base branch requires a merge queue (DESIGN.md §12).
+   * Whether this pull request's base branch requires a merge queue (DESIGN.md §12.3).
    *
    * Never throws — a question nobody can answer must not be what stops a change that
    * passed every gate, so anything going wrong is `unknown` and the caller merges the way
