@@ -203,8 +203,16 @@ test("a tracker of the wrong kind is not written to at all", async () => {
   assert.deepEqual(ledger.recorded, []);
 });
 
-test("no tracker configured is a no-op", async () => {
-  await mirror(undefined, PARKED, new FakeLedger());
+test("no tracker configured attempts nothing", async () => {
+  // A runner with no tracker for the workspace. Asserted on the LEDGER rather than on the
+  // absence of a throw: the record is the only observable here, and a mirror that recorded
+  // an effect it never performed would suppress the mirror a configured tracker would do.
+  const ledger = new FakeLedger();
+
+  await mirror(undefined, PARKED, ledger);
+
+  assert.deepEqual(ledger.recorded, []);
+  assert.equal(ledger.landedVerbs.size, 0);
 });
 
 test("a ledger that cannot be reached still mirrors", async () => {

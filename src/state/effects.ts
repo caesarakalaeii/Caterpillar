@@ -110,6 +110,17 @@ export const effectRequestId = (task: TaskId, verb: EffectVerb, args: unknown): 
 };
 
 /**
+ * Codepoint order, and deliberately not `localeCompare`.
+ *
+ * Both users of this need an order that is the same on every machine: the request id is a
+ * hash of key-sorted JSON, so a locale that ordered two keys differently would give the
+ * same arguments two different ids — an idempotency check that never matches. `localeCompare`
+ * is ICU-sensitive and treats `-` and `\n` as variable-weight, which is exactly what the
+ * sort keys here contain.
+ */
+const byCodepoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
  * JSON with object keys in a fixed order, so two spellings of the same arguments hash
  * alike.
  *
@@ -128,7 +139,7 @@ const canonicalJson = (value: unknown): string => {
 
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, field]) => field !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .sort(([a], [b]) => byCodepoint(a, b))
     .map(([key, field]) => `${JSON.stringify(key)}:${canonicalJson(field)}`);
   return `{${entries.join(",")}}`;
 };
@@ -168,12 +179,13 @@ export const effectFileName = (requestId: string): string => {
  * whenever a session records several verbs in quick succession. Which of two equally old
  * records is evicted does not matter — neither is a plausible replay target — but a rule
  * that cannot say what it deletes cannot be tested, so the order is total rather than
- * whatever `Array.prototype.sort` happens to do with the ties.
+ * whatever `Array.prototype.sort` happens to do with the ties. Compared by codepoint for
+ * `byCodepoint`'s reason: "total" has to mean total on every machine.
  */
 export const prunableEffects = (records: readonly EffectAge[]): readonly string[] => {
   if (records.length <= EFFECTS_KEPT) return [];
 
-  const byAge = [...records].sort((a, b) => sortKey(a).localeCompare(sortKey(b)));
+  const byAge = [...records].sort((a, b) => byCodepoint(sortKey(a), sortKey(b)));
   return byAge.slice(0, records.length - EFFECTS_KEPT).map((record) => record.requestId);
 };
 
