@@ -27,11 +27,12 @@
  *   - the URL's last path segment IS the credential. It must not reach an error
  *     message, because the supervisor logs those verbatim.
  */
-import type { TaskId } from "../domain/task.ts";
+import type { ReportSource, TaskId } from "../domain/task.ts";
 import {
   button,
   BUTTON_STYLE,
   BUTTONS_PER_ROW,
+  encodeReport,
   linkButton,
   row,
   rows,
@@ -627,6 +628,32 @@ const doneButton = (task: TaskId): Button | undefined =>
 const amendButton = (task: TaskId): Button | undefined =>
   button({ action: { verb: "amd", task }, label: "Amend criteria", style: BUTTON_STYLE.secondary });
 
+/**
+ * The agent's own text, offered as a tracker item (DESIGN.md §7).
+ *
+ * On the three notifications that carry prose the AGENT wrote — a question, a park reason, a
+ * verdict — because those are the ones that turn out to be reports. The text is not in the
+ * button: the `custom_id` carries the task and a two-character code saying what to file and
+ * which text to file it from, and the loop reads the text out of the state repo.
+ *
+ * Its OWN row, always. Every notification that gets these already carries buttons, `row`
+ * throws above five, and a throw here costs the whole message on paths where silence means
+ * nobody learns the task is waiting.
+ */
+const reportRow = (task: TaskId, source: ReportSource): ActionRow | undefined =>
+  row(
+    button({
+      action: { verb: "file", task, arg: encodeReport({ report: "bug", source }) },
+      label: "Report a bug",
+      style: BUTTON_STYLE.secondary,
+    }),
+    button({
+      action: { verb: "file", task, arg: encodeReport({ report: "feature", source }) },
+      label: "Request a feature",
+      style: BUTTON_STYLE.secondary,
+    }),
+  );
+
 export const componentsFor = (
   notification: Notification,
   options: { readonly inThread?: boolean } = {},
@@ -666,6 +693,7 @@ export const componentsFor = (
             style: choices.length === 0 ? BUTTON_STYLE.primary : BUTTON_STYLE.secondary,
           }),
         ),
+        reportRow(notification.task, "question"),
       );
     }
     case "done":
@@ -676,6 +704,7 @@ export const componentsFor = (
           notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
           amendButton(notification.task),
         ),
+        reportRow(notification.task, "verdict"),
       );
     // The amend button gets a ROW OF ITS OWN here, and only here. This row already holds four
     // buttons when a merge is possible and a PR exists, and `row` THROWS above five — which
@@ -717,6 +746,7 @@ export const componentsFor = (
           doneButton(notification.task),
           amendButton(notification.task),
         ),
+        reportRow(notification.task, "parked"),
       );
     case "failed":
       return rows(row(resumeButton(notification.task), doneButton(notification.task)));

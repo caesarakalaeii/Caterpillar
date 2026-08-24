@@ -352,6 +352,38 @@ export const recordedReason = (text: string): string => {
 };
 
 /**
+ * What a report filed from an agent's own text is asking for.
+ *
+ * The two answers a human has when they read a question, a park reason or a verdict and
+ * recognise it as something worth tracking: the behaviour is wrong, or the behaviour is
+ * missing. They differ only in the label the item carries — see `Tracker.create`.
+ */
+export type ReportKind = "bug" | "feature";
+
+/**
+ * Which of the agent's texts a report was filed from.
+ *
+ * Named after the notification the button sat under, because that is what a human chose:
+ * the three are three different files in the state repo, and a task that parked after a
+ * verdict has both. Inferring which one was meant would file the wrong text silently.
+ */
+export type ReportSource = "question" | "parked" | "verdict";
+
+/**
+ * An item this task has already had filed from it (DESIGN.md §7).
+ *
+ * Written so a second press of the same button reports the existing item instead of filing
+ * another. It has to live in git rather than in the process that served the first press: a
+ * button on a Discord message stays visible forever, and the runner that serves the second
+ * press is often not the one that served the first.
+ */
+export interface FiledReport {
+  readonly report: ReportKind;
+  readonly source: ReportSource;
+  readonly ref: TrackerRef;
+}
+
+/**
  * A task's place in a plan (DESIGN.md §14.3).
  *
  * `blockedBy` is the authority; `wave` is DERIVED from it by longest-path layering and
@@ -396,6 +428,13 @@ export interface TaskState {
   readonly plan?: PlanMembership;
   /** The Discord thread this task talks in, when it has one. */
   readonly chat?: { readonly threadId: string };
+  /**
+   * Tracker items filed from this task's own text (§7). Absent until one has been.
+   *
+   * The idempotency record for the report buttons, keyed by the pair that identifies a
+   * press: what was filed, and which text it was filed from.
+   */
+  readonly reports?: readonly FiledReport[];
   readonly createdAt: string;
   readonly updatedAt: string;
 }

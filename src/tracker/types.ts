@@ -45,6 +45,25 @@ export interface TrackerItem {
  */
 export const DEFAULT_CANDIDATE_LABEL = "agent-candidate";
 
+/**
+ * The web address of a tracker item, when its ref is enough to build one.
+ *
+ * GitHub only, and deliberately: `container` there IS `owner/repo` and the issue path is
+ * fixed. Vikunja's web URL depends on the instance's frontend address, which a `TrackerRef`
+ * does not carry — inventing one would produce a link that 404s, which is worse for a reader
+ * than the plain id every caller falls back to.
+ *
+ * Here rather than in the web view, where it started, because a filed report is reported
+ * back to Discord as a link and a second copy of this would be a second guess about issue
+ * URLs. Both callers only ever have a ref.
+ */
+export const trackerItemUrl = (ref: TrackerRef): string | undefined => {
+  if (ref.kind !== "github-issues" || ref.container === undefined) return undefined;
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(ref.container)) return undefined;
+  if (!/^\d+$/.test(ref.id)) return undefined;
+  return `https://github.com/${ref.container}/issues/${ref.id}`;
+};
+
 /** A new item to file. See `Tracker.create`. */
 export interface TrackerCreateRequest {
   readonly title: string;

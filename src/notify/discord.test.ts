@@ -458,13 +458,25 @@ test("a question with options offers one button per option AND the free-text one
     options: ["Use the existing one", "Write a new one"],
   });
 
-  assert.deepEqual(labelsOf(attached), ["Use the existing one", "Write a new one", "Answer…"]);
+  assert.deepEqual(labelsOf(attached), [
+    "Use the existing one",
+    "Write a new one",
+    "Answer…",
+    "Report a bug",
+    "Request a feature",
+  ]);
   // The option's INDEX, never its text: a `custom_id` holds 100 characters and the task id
   // has already spent most of them.
-  assert.deepEqual(idsOf(attached), [`c1:opt:${TASK}:0`, `c1:opt:${TASK}:1`, `c1:ans:${TASK}`]);
+  assert.deepEqual(idsOf(attached), [
+    `c1:opt:${TASK}:0`,
+    `c1:opt:${TASK}:1`,
+    `c1:ans:${TASK}`,
+    `c1:file:${TASK}:bq`,
+    `c1:file:${TASK}:fq`,
+  ]);
 });
 
-test("a question without options renders exactly the one button it always did", () => {
+test("a question without options keeps the plain Answer button and its label", () => {
   const attached = componentsFor({
     kind: "question",
     task: TASK,
@@ -472,8 +484,12 @@ test("a question without options renders exactly the one button it always did", 
     question: "What is the retention policy?",
   });
 
-  assert.deepEqual(labelsOf(attached), ["Answer"]);
-  assert.deepEqual(idsOf(attached), [`c1:ans:${TASK}`]);
+  assert.deepEqual(labelsOf(attached), ["Answer", "Report a bug", "Request a feature"]);
+  assert.deepEqual(idsOf(attached), [
+    `c1:ans:${TASK}`,
+    `c1:file:${TASK}:bq`,
+    `c1:file:${TASK}:fq`,
+  ]);
 });
 
 test("an over-long option is cut in the LABEL only", () => {
@@ -506,7 +522,16 @@ test("more options than fit a row costs the extras, never the notification", () 
     options: ["a", "b", "c", "d", "e", "f"],
   });
 
-  assert.deepEqual(labelsOf(attached), ["a", "b", "c", "d", "e", "Answer…"]);
+  assert.deepEqual(labelsOf(attached), [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "Answer…",
+    "Report a bug",
+    "Request a feature",
+  ]);
 });
 
 test("a question in its own thread offers no buttons even when it has options", () => {

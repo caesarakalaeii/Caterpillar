@@ -7,6 +7,7 @@
  */
 import type { TaskId, TaskStatus } from "../domain/task.ts";
 import type { ChatOutcome } from "../supervisor/inbox.ts";
+import { trackerItemUrl } from "../tracker/types.ts";
 import type { TaskSummary } from "../supervisor/snapshot.ts";
 import { CONTENT_LIMIT, take } from "./discord.ts";
 
@@ -61,6 +62,10 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
       return amendedReply(task, outcome);
     case "not-amendable":
       return `Could not amend **${task}**: ${outcome.reason}`;
+    case "filed":
+      return filedReply(task, outcome);
+    case "not-filed":
+      return `Could not file a report from **${task}**: ${outcome.reason}`;
     case "unknown-task":
       return `No task **${task}** in the state repo. Check the id from its notification.`;
     case "guided":
@@ -154,6 +159,30 @@ const amendedReply = (
         `amendment wins, so a second one corrects the first.`,
     ].join("\n"),
     CONTENT_LIMIT,
+  );
+};
+
+/**
+ * Where the filed item is, and what it is.
+ *
+ * The address is the whole reply. The button exists to stop somebody copying text between
+ * two windows, and a reply that says "filed" and leaves them to go looking puts half of
+ * that work back. Falls back to the ref when no web address can be built from it — see
+ * `trackerItemUrl` for why guessing one is worse.
+ *
+ * `note` is rendered when there is one, and the only one there is says the item already
+ * existed: a second press of a button that has been sitting in the channel for a week must
+ * not read as a second report.
+ */
+const filedReply = (task: TaskId, outcome: ChatOutcome & { readonly kind: "filed" }): string => {
+  const where = trackerItemUrl(outcome.ref) ?? `${outcome.ref.kind} item ${outcome.ref.id}`;
+  const what = outcome.report === "bug" ? "bug report" : "feature request";
+  const note = outcome.note === undefined ? "" : ` — ${outcome.note}`;
+
+  return (
+    `Filed a ${what} from **${task}**${note}: ${where}\n` +
+    `It carries the \`agent-candidate\` label, so nothing picks it up as work until ` +
+    `somebody relabels it.`
   );
 };
 

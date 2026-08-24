@@ -28,6 +28,7 @@ import type { IntakeStatusView } from "../intake/status.ts";
 import type { LiveSession } from "../obs/live.ts";
 import { PolicyParseError, type AlertPolicyEntry } from "../remediation/policy.ts";
 import { isScheduleTaskId, scheduleOf, type Schedule } from "../schedule/definition.ts";
+import { trackerItemUrl } from "../tracker/types.ts";
 import type {
   AcceptanceAmendment,
   AlertRefusal,
@@ -598,7 +599,7 @@ export const taskOrigin = (
   const tracker = spec.tracker;
   if (tracker === undefined) return { kind: "spec", label: "a hand-committed spec" };
 
-  const url = goalUrl(spec.goal, "Tracker item") ?? trackerUrl(tracker);
+  const url = goalUrl(spec.goal, "Tracker item") ?? trackerItemUrl(tracker);
   return {
     kind: "tracker",
     label: `${tracker.kind} ${tracker.container === undefined ? "" : `${tracker.container} `}#${tracker.id}`.trim(),
@@ -619,21 +620,6 @@ export const taskOrigin = (
 const goalUrl = (goal: string, label: string): string | undefined => {
   const pattern = new RegExp(`^-?\\s*${label}:\\s*(https?://\\S+)\\s*$`, "m");
   return pattern.exec(goal)?.[1];
-};
-
-/**
- * The web address of a tracker item, when its ref is enough to build one.
- *
- * GitHub only, and deliberately: `container` there IS `owner/repo` and the issue path is
- * fixed. Vikunja's web URL depends on the instance's frontend address, which a `TrackerRef`
- * does not carry — inventing one would produce a link that 404s, which is worse than the
- * plain text this falls back to.
- */
-const trackerUrl = (ref: TrackerRef): string | undefined => {
-  if (ref.kind !== "github-issues" || ref.container === undefined) return undefined;
-  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(ref.container)) return undefined;
-  if (!/^\d+$/.test(ref.id)) return undefined;
-  return `https://github.com/${ref.container}/issues/${ref.id}`;
 };
 
 /** The first heading or first non-blank line of a goal, as a one-line name. */

@@ -60,6 +60,16 @@ export interface TrackerConfig {
    */
   readonly wipLabel?: string;
   readonly needsHumanLabel?: string;
+  /**
+   * Where a report filed from an agent's own text goes — a GitHub `owner/name`, a Vikunja
+   * project id (DESIGN.md §7).
+   *
+   * Absent is the default and the common case: the report goes to the TASK'S OWN repo, which
+   * is where somebody looking for it would look. This exists for the deployment that keeps
+   * its reports in one place rather than scattered across every repo a task touched — and
+   * for Vikunja, where the task's repo is not a container the tracker knows about at all.
+   */
+  readonly candidateContainer?: string;
 }
 
 /**

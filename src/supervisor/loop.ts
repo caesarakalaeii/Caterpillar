@@ -22,14 +22,18 @@ import {
   capabilitiesSatisfy,
   claimOrder,
   EMPTY_USAGE,
+  goalHeadline,
   isClaimable,
   isTerminal,
   recordedReason,
   repoSlug,
   taskPullRequests,
+  type FiledReport,
   type ProposedPlan,
   type RepoRef,
   type ProviderOutage,
+  type ReportKind,
+  type ReportSource,
   type ReviewRecord,
   type SessionOutcome,
   type TaskId,
@@ -38,6 +42,7 @@ import {
   type TaskSpec,
   type TaskState,
   type TaskStatus,
+  type TrackerRef,
   type UsageTotals,
   type WorkspaceName,
 } from "../domain/task.ts";
@@ -86,7 +91,11 @@ import { unreachableSummary, type RepoReach } from "../forge/reach.ts";
 import type { Forge, ForgeFactory, WorkspaceScope } from "../forge/types.ts";
 import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
-import type { Tracker, TrackerTransition } from "../tracker/types.ts";
+import {
+  DEFAULT_CANDIDATE_LABEL,
+  type Tracker,
+  type TrackerTransition,
+} from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
 import { AlertReverifier } from "./verifier.ts";
 import { isNewerComment } from "../agent/review-guidance.ts";
@@ -519,6 +528,100 @@ const reverificationSkipped = (spec: TaskSpec, merge: MergeReport): string | und
  * and merged — the one terminal status where coming back is not a recovery.
  */
 const RESUMABLE: readonly TaskStatus[] = ["parked", "failed"];
+
+/**
+ * How a park reason is marked in the journal, and therefore how it is read back.
+ *
+ * The journal is the only place a park reason is durably recorded — `state.json` keeps the
+ * status and not the sentence — so filing a report from one means finding this marker. A
+ * constant rather than the literal in two places: the writer and the reader disagreeing
+ * would silently file the wrong text, or nothing at all.
+ */
+const PARK_MARKER = "**Parked:**";
+
+/** The label a feature request carries on top of `DEFAULT_CANDIDATE_LABEL`. */
+const REPORT_LABELS: Record<ReportKind, string> = { bug: "bug", feature: "enhancement" };
+
+/** How much of an agent's text a filed report quotes. Generous; a tracker item is not a chat message. */
+const REPORT_BODY_LIMIT = 30_000;
+
+/** Trackers cap a title; GitHub's limit is 256. Well inside it, and readable in a list. */
+const REPORT_TITLE_LIMIT = 120;
+
+/**
+ * The one-line name of a filed report.
+ *
+ * The agent's first line, prefixed with what is being asked for. A title is what somebody
+ * scanning the tracker reads, and "Report from TASK-1" says nothing they can triage on.
+ */
+const reportTitle = (report: ReportKind, text: string): string => {
+  const headline = goalHeadline(text) ?? "report from an agent's response";
+  const prefix = report === "bug" ? "[bug]" : "[feature]";
+  const room = REPORT_TITLE_LIMIT - prefix.length - 1;
+  const points = [...headline];
+  return `${prefix} ${points.length <= room ? headline : `${points.slice(0, room - 1).join("")}…`}`;
+};
+
+/**
+ * The body of a filed report: the agent's words, then where they came from.
+ *
+ * The agent's text FIRST and verbatim, because it is the report — a reader who has to scroll
+ * past provenance to find the substance is a reader who closes the tab. The provenance is
+ * below it and names the task, so a report that turns out to need context can be traced back
+ * to the session that produced it; without that a candidate is unactionable, and the state
+ * repo is the only place the rest of the story lives.
+ */
+const reportBody = (input: {
+  readonly task: TaskId;
+  readonly spec: TaskSpec;
+  readonly source: ReportSource;
+  readonly text: string;
+  readonly author: string;
+}): string => {
+  const said = {
+    question: "asked",
+    parked: "parked, saying",
+    verdict: "was sent back by the review council, which said",
+  }[input.source];
+
+  const quoted = [...input.text].length > REPORT_BODY_LIMIT
+    ? `${[...input.text].slice(0, REPORT_BODY_LIMIT).join("")}\n\n… (truncated; the whole text is in \`tasks/${input.task}/\` in the state repo)`
+    : input.text;
+
+  return [
+    quoted,
+    "",
+    "---",
+    "",
+    `Filed by ${input.author} from \`${input.task}\`, which ${said} the above.`,
+    `Repos: ${input.spec.repos.map((repo) => `\`${repoSlug(repo)}\``).join(", ") || "none declared"}.`,
+    "",
+    `The full history is in \`tasks/${input.task}/\` in the state repo. This item carries ` +
+      `\`${DEFAULT_CANDIDATE_LABEL}\` and is a REPORT, not a task: relabel it for ingest to ` +
+      `make it one.`,
+  ].join("\n");
+};
+
+/**
+ * The most recent park reason in a journal, or nothing.
+ *
+ * The journal is where a park reason durably lives — `state.json` keeps the status and not
+ * the sentence — and entries are appended, so the last marked one is the current reason. The
+ * whole entry body is taken rather than one line: a park reason can be a paragraph, and
+ * `park` writes it as one block under the marker.
+ */
+const lastParkReason = (journal: string | undefined): string | undefined => {
+  if (journal === undefined) return undefined;
+
+  const at = journal.lastIndexOf(PARK_MARKER);
+  if (at < 0) return undefined;
+
+  // To the end of the entry: the next `## Session` heading, or the end of the journal.
+  const rest = journal.slice(at + PARK_MARKER.length);
+  const end = rest.search(/^## Session /m);
+  const reason = (end < 0 ? rest : rest.slice(0, end)).trim();
+  return reason === "" ? undefined : reason;
+};
 
 /**
  * One task's session, as everything outside `workTask` needs to see it (DESIGN.md §6.4).
@@ -3575,7 +3678,7 @@ export class Supervisor {
     // stay outside it: both are views of what git already says, and holding the state
     // checkout across a Discord round trip would stall every other slot's writes.
     await this.unit(async () => {
-      await store.appendJournal(spec.id, state.sessions, `**Parked:** ${reason}`);
+      await store.appendJournal(spec.id, state.sessions, `${PARK_MARKER} ${reason}`);
       await this.transition(lease, state, "parked");
       await this.push(lease, `chore(${spec.id}): parked`);
     });
@@ -3725,6 +3828,8 @@ export class Supervisor {
         return this.applyForceDone(request);
       case "amend":
         return this.applyAmend(request);
+      case "file-report":
+        return this.applyFileReport(request);
       case "brainstorm":
         return this.applyBrainstorm(request);
     }
@@ -4143,7 +4248,11 @@ export class Supervisor {
     try {
       const handle = heldLease(lease);
       await this.unit(async () => {
-        await store.appendJournal(request.task, state.sessions, "**Parked:** cancelled from chat.");
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          `${PARK_MARKER} cancelled from chat.`,
+        );
         await this.transition(handle, state, "parked");
         await this.push(handle, `chore(${request.task}): parked from chat`);
       });
@@ -4549,6 +4658,234 @@ export class Supervisor {
     } finally {
       await leases.release(lease).catch(() => undefined);
     }
+  }
+
+  /**
+   * File a tracker item from the agent's own text — a Report button (DESIGN.md §7).
+   *
+   * A question, a park reason or a verdict is often already a good bug report or feature
+   * request, and until this existed the only way to capture one was to copy it out of
+   * Discord by hand. So the supervisor does the copying: it reads the text out of the state
+   * repo, files it under `DEFAULT_CANDIDATE_LABEL`, and reports back where it went.
+   *
+   * The label is what keeps this from being the same act as tasking. `agent-candidate` is
+   * deliberately not the label `listAgentItems` picks up — see `tracker/types.ts`: a report
+   * that arrived labelled for ingest would be minted into a running task on the next intake
+   * pass, and that task could file another report.
+   *
+   * **Filing is not idempotent, so this method has to be.** A button on a Discord message
+   * stays visible forever and a second press is ordinary, not exceptional. The created ref is
+   * therefore written onto the task in the state repo, keyed by the pair a press identifies,
+   * and a repeat press reports the existing item. In git rather than in memory, because the
+   * runner serving the second press is often not the one that served the first.
+   *
+   * The one window that remains is between the create and the push: an item filed and not
+   * recorded is filed again by the next press. That order is forced — there is no ref to
+   * record until the tracker has answered — and the failure is reported rather than
+   * swallowed, so the human knows to look before pressing again.
+   *
+   * No status transition and no journal entry beyond the record itself. Filing a report says
+   * nothing about the task: a parked task stays parked, and a task nobody resumed must not
+   * become claimable because somebody filed a bug from its park reason.
+   */
+  private async applyFileReport(
+    request: ChatRequest & { readonly kind: "file-report" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+
+    const spec = await store.readSpec(request.task).catch(() => undefined);
+    if (spec === undefined) return { kind: "not-filed", reason: "the task has no readable spec" };
+
+    // BEFORE the tracker is even looked up: a second press must cost nothing and must not
+    // depend on a tracker being reachable to answer correctly.
+    const already = (state.reports ?? []).find(
+      (filed) => filed.report === request.report && filed.source === request.source,
+    );
+    if (already !== undefined) {
+      return {
+        kind: "filed",
+        report: already.report,
+        ref: already.ref,
+        note: "already filed from this task",
+      };
+    }
+
+    const tracker = this.deps.trackers?.get(spec.workspace);
+    if (tracker === undefined) {
+      return {
+        kind: "not-filed",
+        reason:
+          `workspace \`${spec.workspace}\` has no tracker configured, so there is nowhere to ` +
+          `file it. The text is still in this channel.`,
+      };
+    }
+
+    const text = await this.reportText(request.task, request.source);
+    if (text === undefined) {
+      return {
+        kind: "not-filed",
+        reason:
+          `the task has no ${request.source === "parked" ? "park reason" : request.source} in ` +
+          `the state repo to file — the button may be from an older message than the task's ` +
+          `current history.`,
+      };
+    }
+
+    const container = this.reportContainer(spec, tracker.kind);
+    if (container === undefined) {
+      return {
+        kind: "not-filed",
+        reason:
+          `nowhere to file it: workspace \`${spec.workspace}\` sets no ` +
+          `\`tracker.candidateContainer\`, and the task's own repos are not somewhere a ` +
+          `\`${tracker.kind}\` tracker can file.`,
+      };
+    }
+
+    // The lease FIRST, for `applyMerge`'s reason: the write below is a push, and every push
+    // verifies lease ownership (§5.1). Refusing an unclaimable task is also the safe
+    // direction — nothing has been filed, and the human is told why.
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) {
+      return {
+        kind: "not-filed",
+        reason:
+          "another runner holds this task right now, so the filed item could not be recorded " +
+          "against it — and an unrecorded item is one a second press would file twice. Try " +
+          "again in a moment.",
+      };
+    }
+
+    try {
+      const omitted: string[] = [];
+      const labels = [DEFAULT_CANDIDATE_LABEL, REPORT_LABELS[request.report]];
+
+      let ref: TrackerRef;
+      try {
+        ref = await tracker.create({
+          title: reportTitle(request.report, text),
+          body: reportBody({
+            task: request.task,
+            spec,
+            source: request.source,
+            text,
+            author: request.author,
+          }),
+          container,
+          labels,
+          onLabelsOmitted: (dropped) => omitted.push(...dropped),
+        });
+      } catch (error) {
+        // Reported, never swallowed: the text the human wanted captured exists only in
+        // Discord, so silence here loses it. Nothing is recorded either — a remembered ref
+        // for an item that does not exist would make every later press report a phantom.
+        logger.warn("report.create-failed", {
+          task: request.task,
+          tracker: tracker.kind,
+          container,
+          ...errorFields(error),
+        });
+        return {
+          kind: "not-filed",
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+
+      if (omitted.length > 0) {
+        // A dropped label is recoverable by hand and losing the report is not, so neither
+        // adapter refuses over one — which makes this log the only place the omission lands.
+        logger.warn("report.labels-omitted", {
+          task: request.task,
+          container,
+          labels: omitted.join(","),
+        });
+      }
+
+      const filed: FiledReport = { report: request.report, source: request.source, ref };
+      const handle = heldLease(lease);
+      try {
+        // One unit — see `unit`. The record IS the idempotency, so a sibling slot's commit
+        // sweeping it up while this one commits nothing is how the next press files a
+        // duplicate.
+        await this.unit(async () => {
+          await store.writeState({ ...state, reports: [...(state.reports ?? []), filed] });
+          await this.push(handle, `chore(${request.task}): filed a ${request.report} report`);
+        });
+      } catch (error) {
+        // The item exists; failing to remember it is worth a log and a warning to the human,
+        // not a retry and certainly not a claim that nothing was filed.
+        logger.warn("report.unrecorded", { task: request.task, ...errorFields(error) });
+        return {
+          kind: "filed",
+          report: request.report,
+          ref,
+          note:
+            "but it could not be recorded against the task, so pressing the button again " +
+            "would file a second one",
+        };
+      }
+
+      logger.info("report.filed", {
+        task: request.task,
+        report: request.report,
+        source: request.source,
+        tracker: tracker.kind,
+        container,
+        item: ref.id,
+        author: request.author,
+      });
+      return { kind: "filed", report: request.report, ref };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * The agent's own text for one report source, or nothing when the task has none.
+   *
+   * Three sources, three files, and the button says which — it is not inferred. A task that
+   * parked after a verdict has both texts, so a precedence rule would file the wrong one
+   * without anybody being able to tell from the reply.
+   */
+  private async reportText(
+    task: TaskId,
+    source: ReportSource,
+  ): Promise<string | undefined> {
+    const { store } = this.deps;
+
+    switch (source) {
+      case "question": {
+        // Every question, not just the pending one: a park notification and its question can
+        // both be on screen, and a question already answered is still the agent's own text.
+        const asked = await store.listQuestions(task);
+        return asked.at(-1)?.question;
+      }
+      case "verdict":
+        return (await store.latestVerdict(task))?.trim();
+      case "parked":
+        return lastParkReason(await store.readJournal(task));
+    }
+  }
+
+  /**
+   * Where a report goes: the workspace's own choice, else the task's primary repo.
+   *
+   * The default is where the work is, because that is where somebody looking for the report
+   * would look. It only exists for GitHub issues, where a container IS an `owner/name` slug;
+   * a Vikunja container is a project id, and a repo slug passed as one is not a wrong
+   * destination but a nonexistent one. So Vikunja needs `candidateContainer`, and saying so
+   * up front beats a create that fails on the id.
+   */
+  private reportContainer(spec: TaskSpec, tracker: string): string | undefined {
+    const configured = this.deps.config.workspaces.get(spec.workspace)?.tracker?.candidateContainer;
+    if (configured !== undefined) return configured;
+    if (tracker !== "github-issues") return undefined;
+
+    const primary = spec.repos[0];
+    return primary === undefined ? undefined : repoSlug(primary);
   }
 
   /**

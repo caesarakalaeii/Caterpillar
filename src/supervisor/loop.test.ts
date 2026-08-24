@@ -6648,6 +6648,41 @@ test("a report filed from a question quotes the question, not the park reason", 
   await retire(ASKED);
 });
 
+test("a tracker whose containers are not repos will not have a repo slug guessed at", async () => {
+  // A Vikunja container is a project id. A repo slug passed as one is not a wrong destination,
+  // it is a nonexistent one — so this is refused before the create rather than by it, and the
+  // refusal names the setting that fixes it.
+  const PROJECTLESS = asTaskId("SMOKE-REPORT-10");
+  await seedParkedWithReason(PROJECTLESS, "the loader rejects a valid list");
+
+  const created: TrackerCreateRequest[] = [];
+  const vikunja: Tracker = {
+    kind: "vikunja",
+    listAgentItems: () => Promise.resolve([]),
+    comment: () => Promise.resolve(),
+    create: (request) => {
+      created.push(request);
+      return Promise.resolve({ kind: "vikunja" as const, id: "1" });
+    },
+    transition: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(vikunja) }),
+    inbox,
+    { kind: "file-report", task: PROJECTLESS, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "not-filed", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-filed" ? outcome.reason : "",
+    /candidateContainer/,
+    "the refusal has to name the setting that fixes it",
+  );
+  assert.deepEqual(created, [], "nothing may be filed against a guessed project id");
+});
+
 test("a workspace with no tracker cannot file, and says which workspace", async () => {
   const NOWHERE = asTaskId("SMOKE-REPORT-9");
   await seedParkedWithReason(NOWHERE, "the loader rejects a valid list");
