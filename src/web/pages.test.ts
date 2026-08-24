@@ -481,3 +481,17 @@ test("an amendment that changed nothing but the record is still listed", () => {
   assert.doesNotMatch(rendered, /as filed/i, "there is only one list to show");
   assert.match(rendered, /removed by mistake/, "but the reason still has to be on the page");
 });
+
+test("a task detail from a runner that predates amendments still renders", () => {
+  // The aggregating viewer (§18) proxies a REMOTE runner's `/api/tasks/<id>` and renders it
+  // with this template. A replica still on an image that predates amendments sends no
+  // `amendments` key at all, so the field is optional and the page must treat its absence
+  // as "none" rather than throw — otherwise the viewer answers every task page with a 500
+  // for as long as a rollout takes. Same reason `workspace` is optional on `RunnerExport`.
+  const { amendments: _dropped, ...previousVintage } = amendedDetail({});
+
+  const rendered = render(taskPage(previousVintage));
+
+  assert.match(rendered, /npm test -- src\/widget/, "the gate is still shown");
+  assert.doesNotMatch(rendered, /Amendments/i);
+});
