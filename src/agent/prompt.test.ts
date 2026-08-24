@@ -227,8 +227,11 @@ test("a task with no amendment gets byte-for-byte the prompt it got before", () 
       "A command may write a file into `$CATERPILLAR_EVIDENCE_DIR` — a screenshot, a trace, " +
       "a report. The supervisor commits whatever is there as an artifact of this task, " +
       "whether the command passed or failed, and shows it to the review council. It does " +
-      "not change the verdict: the exit code is still the whole gate. Keep it under 1 MiB — " +
-      "over the cap it is refused with its size in the failure text rather than truncated, " +
+      "not change the verdict: the exit code is still the whole gate. Keep it under " +
+      // Derived, not transcribed, for the reason the evidence-line test above gives: a cap
+      // spelled out here and changed in store.ts would make this guard assert the old prompt.
+      `${ARTIFACT_BYTES / 1024 ** 2} MiB — over the cap it is refused with its size in ` +
+      "the failure text rather than truncated, " +
       "because half an image is not a smaller image.\n" +
       "\n" +
       "This is the first session. Start by orienting yourself in the repo, then begin.\n",
