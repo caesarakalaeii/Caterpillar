@@ -13,6 +13,7 @@
  * that drifts, and the round trip it produces rejects a change over a rule its author was
  * never given (DESIGN.md §12.2).
  */
+import { acceptanceChange, type AmendedAcceptance } from "../domain/acceptance.ts";
 import type { TaskKind, TaskSpec, TaskState } from "../domain/task.ts";
 // The cap itself, not a transcription of it: a prompt that names a number the store no
 // longer enforces sends every agent hunting for a limit that does not exist.
@@ -34,6 +35,14 @@ export interface PromptParts {
   readonly reviewGuidance?: string;
   /** The branch no longer merges into its base, and which files (DESIGN.md §12.3). */
   readonly conflicts?: string;
+  /**
+   * The gate as filed and every amendment to it (DESIGN.md §12.3).
+   *
+   * `spec.acceptance` above is already the EFFECTIVE list, so the session sees the right
+   * commands without this. What it cannot see is that they were ever different, which is
+   * the half that costs a session — see `amendmentNotice`.
+   */
+  readonly amendments?: AmendedAcceptance;
 }
 
 export const SYSTEM_PROMPT = `You are a long-running autonomous coding agent.
@@ -219,6 +228,48 @@ export const systemPromptFor = (
 const section = (title: string, body: string | undefined): string =>
   body === undefined || body.trim().length === 0 ? "" : `\n## ${title}\n\n${body.trim()}\n`;
 
+const bullets = (label: string, entries: readonly string[], none: string): readonly string[] =>
+  entries.length === 0 ? [none] : [label, ...entries.map((entry) => `- \`${entry}\``)];
+
+/**
+ * What an amendment did to this task's gate, or nothing when there has not been one
+ * (DESIGN.md §12.3).
+ *
+ * Rendered WHENEVER an amendment exists, and deliberately not conditioned on how recently
+ * it was filed. The motivating incident runs both ways. Two tasks were re-claimed into the
+ * same unsatisfiable criterion twice each because nothing told the session the ground had
+ * NOT moved; and a gate that moves with nobody saying so costs a session re-deriving a
+ * failure that no longer exists. A stale-but-visible note costs a paragraph.
+ *
+ * Only the NEWEST amendment is described, because only it is the gate: the highest number
+ * wins entirely, so the diff of a superseded one would name criteria that are not in
+ * force. How many there have been is still said, since "amended twice" tells a session
+ * that this gate has been argued with and got it wrong once already.
+ */
+const amendmentNotice = (amendments: AmendedAcceptance | undefined): string | undefined => {
+  const newest = amendments?.history.at(-1);
+  if (amendments === undefined || newest === undefined) return undefined;
+
+  const { removed, added } = acceptanceChange(amendments.filed, newest.acceptance);
+
+  return [
+    `The acceptance criteria above are NOT the ones \`spec.md\` filed. They were amended ` +
+      `by ${newest.author} at ${newest.at} (${amendments.history.length} ` +
+      `amendment${amendments.history.length === 1 ? "" : "s"} so far), and the list above is ` +
+      `the gate the supervisor will run.`,
+    "",
+    `Reason given: ${newest.why}`,
+    "",
+    ...bullets("No longer required:", removed, "No criterion was removed."),
+    "",
+    ...bullets("Required now and not before:", added, "No criterion was added."),
+    "",
+    "`spec.md` is unchanged on purpose — it is the record of what the task was asked to do. " +
+      "If a criterion above is still unsatisfiable, say so and why rather than working " +
+      "around it: amending it again is a human's decision, not yours.",
+  ].join("\n");
+};
+
 /** Build the opening user message for a session. */
 export const buildPrompt = (parts: PromptParts): string => {
   const { spec, state } = parts;
@@ -261,6 +312,10 @@ export const buildPrompt = (parts: PromptParts): string => {
   ].join("\n");
 
   const body = [
+    // FIRST, and immediately after the criteria it is about. A session that reads the list
+    // without this has no way to know one of those commands is not the one it was given
+    // last time, or that the impossible one it already failed on is gone.
+    section("The acceptance criteria were amended", amendmentNotice(parts.amendments)),
     section("Recovery note", parts.recoveryNote),
     section("Artifacts from upstream tasks", parts.artifacts),
     section("Answer from the operator", parts.answer),
