@@ -885,7 +885,7 @@ test("an amended task's session is told what changed and why", async () => {
   assert.match(transcript, /were amended/, "the section has to reach the model");
   assert.match(transcript, /predates this branch/, "carrying the reason verbatim");
   assert.match(transcript, /npm run lint/, "the criterion that went away is named");
-  assert.match(transcript, /npm test -- src\\\/widget/, "and so is the one that replaced it");
+  assert.match(transcript, /npm test -- src\/widget/, "and so is the one that replaced it");
 });
 
 test("an unamended task's session hears nothing about amendments", async () => {
