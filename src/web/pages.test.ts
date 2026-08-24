@@ -394,3 +394,89 @@ test("the artifacts section says these are downloads and where they came from", 
 test("a task with no artifacts gets no artifacts section", () => {
   assert.doesNotMatch(render(taskPage(detailWith([]))), /Artifacts/);
 });
+
+/**
+ * The gate as filed beside the gate in force (DESIGN.md §12.3).
+ *
+ * `readSpec` returns the effective list, so the page has always shown the amended commands
+ * with nothing to say they are amended. An operator asking who changed this gate and why
+ * had to go and read the state repo.
+ */
+const SPEC: TaskDetail["spec"] = {
+  id: asTaskId("TASK-9"),
+  workspace: asWorkspaceName("primary"),
+  kind: "implement",
+  goal: "Make the header not overlap the nav.",
+  repos: [{ host: "github.com", owner: "acme", name: "widget" }],
+  requires: [],
+  acceptance: ["npm test -- src/widget"],
+};
+
+const amendedDetail = (over: Partial<TaskDetail>): TaskDetail => ({
+  ...detailWith([]),
+  spec: SPEC,
+  ...over,
+});
+
+test("an amended task's page shows the gate as filed beside the gate in force", () => {
+  const rendered = render(
+    taskPage(
+      amendedDetail({
+        filedAcceptance: ["npm test", "npm run lint"],
+        amendments: [
+          {
+            index: 1,
+            acceptance: ["npm test -- src/widget"],
+            why: "the repo-wide lint predates this branch",
+            author: "operator",
+            at: "2026-08-19T09:14:02.113Z",
+          },
+        ],
+      }),
+    ),
+  );
+
+  assert.match(rendered, /as filed/i);
+  assert.match(rendered, /in force/i);
+  assert.match(rendered, /npm run lint/, "the criterion that went away is still shown");
+  assert.match(rendered, /npm test -- src\/widget/, "and so is the one in force");
+  assert.match(rendered, /the repo-wide lint predates this branch/, "with the reason");
+  assert.match(rendered, /operator/);
+  assert.match(rendered, /2026-08-19T09:14:02\.113Z/);
+});
+
+test("an unamended task's page labels neither 'as filed' nor 'in force'", () => {
+  // The common case. Two labelled panels on every task page would be noise, and one of
+  // them would be a copy of the other.
+  const rendered = render(taskPage(amendedDetail({})));
+
+  assert.match(rendered, /npm test -- src\/widget/, "the gate is still shown");
+  assert.doesNotMatch(rendered, /as filed/i);
+  assert.doesNotMatch(rendered, /in force/i);
+  assert.doesNotMatch(rendered, /Amendments/i);
+});
+
+test("an amendment that changed nothing but the record is still listed", () => {
+  // Possible, and worth showing: a re-amendment that restores the filed list leaves the
+  // two identical. The labels are then wrong — there is one list — but the WHY is the whole
+  // reason to look, so the amendment record stays.
+  const rendered = render(
+    taskPage(
+      amendedDetail({
+        filedAcceptance: ["npm test -- src/widget"],
+        amendments: [
+          {
+            index: 2,
+            acceptance: ["npm test -- src/widget"],
+            why: "restoring the criterion amendment 1 removed by mistake",
+            author: "operator",
+            at: "2026-08-20T09:00:00.000Z",
+          },
+        ],
+      }),
+    ),
+  );
+
+  assert.doesNotMatch(rendered, /as filed/i, "there is only one list to show");
+  assert.match(rendered, /removed by mistake/, "but the reason still has to be on the page");
+});

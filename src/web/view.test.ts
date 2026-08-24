@@ -661,3 +661,43 @@ test("intakeView carries the schedules, their errors and the last occurrences", 
   assert.equal(view.occurrences[0]?.outcome, "skipped");
   assert.equal(view.scheduling, false, "this runner is not firing them");
 });
+
+/**
+ * An amended gate on the task page (DESIGN.md §12.3).
+ *
+ * `readSpec` returns the effective list, so the page already shows the right commands and
+ * says nothing about the document that was filed. An operator asking "who changed this
+ * gate, and why" has no answer on the page and has to go read the state repo.
+ */
+test("task detail carries both the filed gate and the amendments that replaced it", async () => {
+  const subject = await store();
+  const id = asTaskId("TASK-AMENDED");
+  await subject.writeSpec(spec("TASK-AMENDED", "# Amended\n\nThe goal."));
+  await subject.writeState(state("TASK-AMENDED"));
+  await subject.writeAmendment(id, {
+    acceptance: ["npm test -- src/widget"],
+    why: "the repo-wide lint predates this branch",
+    author: "operator",
+  });
+
+  const detail = await taskDetail(subject, id, new LiveSession());
+
+  assert.deepEqual(detail?.spec?.acceptance, ["npm test -- src/widget"], "in force");
+  assert.deepEqual(detail?.filedAcceptance, ["npm test"], "as filed");
+  assert.equal(detail?.amendments.length, 1);
+  assert.equal(detail?.amendments[0]?.why, "the repo-wide lint predates this branch");
+  assert.equal(detail?.amendments[0]?.author, "operator");
+});
+
+test("task detail reports no amendments and no filed gate for a task nobody amended", async () => {
+  // `filedAcceptance` is absent rather than a copy of the effective list, so the page has
+  // nothing to compare and renders as it always did.
+  const subject = await store();
+  await subject.writeSpec(spec("TASK-PLAIN", "# Plain\n\nThe goal."));
+  await subject.writeState(state("TASK-PLAIN"));
+
+  const detail = await taskDetail(subject, asTaskId("TASK-PLAIN"), new LiveSession());
+
+  assert.deepEqual(detail?.amendments, []);
+  assert.equal(detail?.filedAcceptance, undefined);
+});
