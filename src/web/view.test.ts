@@ -684,7 +684,7 @@ test("task detail carries both the filed gate and the amendments that replaced i
 
   assert.deepEqual(detail?.spec?.acceptance, ["npm test -- src/widget"], "in force");
   assert.deepEqual(detail?.filedAcceptance, ["npm test"], "as filed");
-  assert.equal(detail?.amendments.length, 1);
+  assert.equal(detail?.amendments?.length, 1);
   assert.equal(detail?.amendments[0]?.why, "the repo-wide lint predates this branch");
   assert.equal(detail?.amendments[0]?.author, "operator");
 });

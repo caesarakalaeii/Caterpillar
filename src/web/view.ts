@@ -305,8 +305,14 @@ export interface TaskDetail {
   /**
    * Every amendment to the acceptance criteria, oldest first (§12.3). Empty for almost
    * every task, and the page renders as it always has in that case.
+   *
+   * OPTIONAL for the reason `RunnerExport.workspace` is: the aggregating viewer (§18)
+   * renders a REMOTE runner's task detail with this same template, and a replica still on
+   * an image that predates amendments sends no such key. Required here would make the
+   * viewer answer every task page with an error for as long as a rollout takes. Absent and
+   * empty mean the same thing to the page.
    */
-  readonly amendments: readonly AcceptanceAmendment[];
+  readonly amendments?: readonly AcceptanceAmendment[];
   /**
    * `spec.md`'s own acceptance list, present only when the task has been amended.
    *

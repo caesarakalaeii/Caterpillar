@@ -9,6 +9,7 @@
  * what keeps "the UI cannot write" checkable by reading one file (`view.ts`) rather than
  * by auditing every template.
  */
+import type { AcceptanceAmendment } from "../domain/acceptance.ts";
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, safeUrl, type Html } from "./html.ts";
 import type { TranscriptEntry } from "./transcript.ts";
@@ -697,7 +698,7 @@ const acceptancePanels = (
  * appears. Newest first, because the last one is the gate in force — the highest number
  * wins entirely (§12.3) and the earlier ones are history.
  */
-const amendmentSection = (amendments: TaskDetail["amendments"]): Html =>
+const amendmentSection = (amendments: readonly AcceptanceAmendment[]): Html =>
   amendments.length === 0
     ? raw("")
     : html`<section>
@@ -817,7 +818,7 @@ export const taskPage = (detail: TaskDetail): Html => {
           </section>`
     }
 
-    ${amendmentSection(detail.amendments)}
+    ${amendmentSection(detail.amendments ?? [])}
 
     ${
       detail.live === undefined
