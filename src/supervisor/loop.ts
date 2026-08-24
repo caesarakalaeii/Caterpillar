@@ -41,6 +41,7 @@ import {
   type UsageTotals,
   type WorkspaceName,
 } from "../domain/task.ts";
+import type { AmendedAcceptance } from "../domain/acceptance.ts";
 import {
   brainstormId,
   brainstormSpec,
@@ -172,10 +173,16 @@ export interface Verifier {
   /**
    * Independently checks the §12 gates: acceptance commands exit 0, PR open, CI green.
    * Runs in the supervisor, never in the agent.
+   *
+   * `amendments` is the gate as filed plus the records that replaced it, so the report can
+   * say which criteria a human amended in (§12.3). Optional because `spec.acceptance` is
+   * already the effective list either way: a task with no amendment — almost all of them —
+   * is verified and reported exactly as before.
    */
   verify(
     spec: TaskSpec,
     state: TaskState,
+    amendments?: AmendedAcceptance,
   ): Promise<{
     readonly passed: boolean;
     readonly detail: string;
@@ -2360,7 +2367,12 @@ export class Supervisor {
       }
 
       case "done-claimed": {
-        const result = await this.deps.verifier.verify(spec, state);
+        // The records, not a derivation from `spec`: `readSpec` already applied the newest
+        // amendment, so the spec alone cannot say a criterion was amended. Never fails the
+        // claim — an unreadable amendment costs the provenance block in the report, and the
+        // gate itself is what decides the verdict.
+        const amendments = await this.amendedGate(spec);
+        const result = await this.deps.verifier.verify(spec, state, amendments);
         logger.info("verification.result", {
           task: spec.id,
           session: state.sessions,
@@ -4607,6 +4619,31 @@ export class Supervisor {
         kind: notification.kind,
         ...errorFields(error),
       });
+    }
+  }
+
+  /**
+   * The task's gate as filed plus every amendment to it, for the verifier's report (§12.3).
+   *
+   * Returns `undefined` for a task that has never been amended — almost all of them — so the
+   * report is unchanged, and for one whose records cannot be read. An unreadable amendment
+   * is logged rather than raised: the verdict comes from the commands the verifier runs,
+   * and losing a completion claim over a decoration on its report would be the wrong trade.
+   */
+  private async amendedGate(spec: TaskSpec): Promise<AmendedAcceptance | undefined> {
+    const { store, logger } = this.deps;
+
+    try {
+      const history = await store.listAmendments(spec.id);
+      if (history.length === 0) return undefined;
+      const filed = await store.readBaseSpec(spec.id);
+      return { filed: filed.acceptance, history };
+    } catch (error) {
+      logger.warn("verification.amendments-unreadable", {
+        task: spec.id,
+        ...errorFields(error),
+      });
+      return undefined;
     }
   }
 

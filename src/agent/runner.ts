@@ -27,6 +27,7 @@ import type { ClusterReader } from "../cluster/client.ts";
 import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
+import type { AmendedAcceptance } from "../domain/acceptance.ts";
 import { repoSlug, taskPullRequests } from "../domain/task.ts";
 import type {
   RepoRef,
@@ -297,6 +298,7 @@ export class AgentSessionRunner {
         ...(await this.promptContext(spec, recoveryNote)),
         ...(await this.stagedSection(spec, state)),
         ...(await this.conflictSection(spec, repo, worktree)),
+        ...(await this.amendmentSection(spec)),
         ...(review.section === undefined ? {} : { reviewGuidance: review.section }),
       });
 
@@ -618,6 +620,40 @@ export class AgentSessionRunner {
 
     const section = conflictGuidance(base, summary);
     return section === undefined ? {} : { conflicts: section };
+  }
+
+  /**
+   * The gate as filed and every amendment to it, for the prompt (DESIGN.md §12.3).
+   *
+   * Read here rather than derived from `spec`, because `spec` cannot tell the difference:
+   * `readSpec` returns the EFFECTIVE list and says nothing about whether it was amended.
+   * `readBaseSpec` supplies the list as filed and `listAmendments` the records that
+   * replaced it, which together are what `prompt.ts` needs to name what changed.
+   *
+   * Never fails the session. A task with no `amendments/` directory — the overwhelming
+   * majority — gets an empty history and renders exactly as it did before, and a spec that
+   * will not parse or an amendment that will not is worth a missing paragraph rather than a
+   * session: the effective list is already in the prompt either way. It IS logged, because
+   * an unreadable amendment is the one case where the note the section exists to give is
+   * silently absent.
+   */
+  private async amendmentSection(
+    spec: TaskSpec,
+  ): Promise<{ readonly amendments?: AmendedAcceptance }> {
+    const { store, logger } = this.options;
+
+    try {
+      const history = await store.listAmendments(spec.id);
+      if (history.length === 0) return {};
+      const filed = await store.readBaseSpec(spec.id);
+      return { amendments: { filed: filed.acceptance, history } };
+    } catch (error) {
+      logger.warn("prompt.amendments-unreadable", {
+        task: spec.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {};
+    }
   }
 
   /** Journal, handoff and any operator answer that unparked this task. */

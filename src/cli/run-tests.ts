@@ -24,10 +24,24 @@ import { spawn } from "node:child_process";
 import { EXPECTED_TEST_COUNT, judgeRun } from "../testing/run-report.ts";
 
 /**
- * The hang backstop. A test that stops making progress fails by name in three minutes
- * rather than holding CI open indefinitely, which is what this was raised for.
+ * The hang backstop. A test that stops making progress fails by name rather than holding
+ * CI open indefinitely, which is what this was raised for.
+ *
+ * `--test-timeout` bounds each FILE as well as each test, so this has to clear the slowest
+ * legitimate file with room for a loaded machine, not just the slowest test. It does not
+ * bound the whole run; DEFAULT_RUN_DEADLINE_MS does that.
+ *
+ * It was 180s, which was comfortable when the slowest file took a few seconds and is not
+ * now: src/supervisor/loop.test.ts drives a real supervisor over a real git remote across
+ * ~94 tests and takes about 140s on an idle machine. Under CI contention that ran past
+ * 180s and the runner CANCELLED the file — `npm test` then exits 1 reporting `# fail 0`
+ * and `# cancelled 1`, with no assertion to name, on whichever matrix leg was slower.
+ * Reproduced locally by running the suite against twelve busy cores.
+ *
+ * Ten minutes keeps the backstop meaningful — a genuinely hung file still fails well
+ * inside the run deadline — while leaving the slow-but-honest file a 4x margin.
  */
-const DEFAULT_TEST_TIMEOUT_MS = 180_000;
+const DEFAULT_TEST_TIMEOUT_MS = 600_000;
 
 /**
  * The per-test timeout, overridable so this file's own tests can exercise the hang path

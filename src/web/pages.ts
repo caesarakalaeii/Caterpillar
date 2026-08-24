@@ -9,6 +9,7 @@
  * what keeps "the UI cannot write" checkable by reading one file (`view.ts`) rather than
  * by auditing every template.
  */
+import type { AcceptanceAmendment } from "../domain/acceptance.ts";
 import type { LogRecord } from "../obs/ring.ts";
 import { html, join, raw, safeUrl, type Html } from "./html.ts";
 import type { TranscriptEntry } from "./transcript.ts";
@@ -646,6 +647,78 @@ const policyPanel = (view: IntakeView): Html => {
 
 /* --------------------------------------------------------------------- task */
 
+const acceptanceList = (acceptance: readonly string[]): Html =>
+  acceptance.length === 0
+    ? html`<p class="empty">none declared</p>`
+    : html`<pre class="raw">${acceptance.join("\n")}</pre>`;
+
+/**
+ * The gate, as one panel or as two (DESIGN.md §12.3).
+ *
+ * One panel unless the two lists actually DIFFER. `filedAcceptance` is absent for a task
+ * nobody amended, and an amendment can also leave the list unchanged — a re-amendment that
+ * restores what an earlier one removed — in which case there is a single list and labelling
+ * it twice would say something untrue about it. The amendment record itself is still shown
+ * below, because the reason is the whole point of looking.
+ */
+const acceptancePanels = (
+  inForce: readonly string[],
+  filed: readonly string[] | undefined,
+): Html => {
+  const amended =
+    filed !== undefined &&
+    (filed.length !== inForce.length || filed.some((entry) => !inForce.includes(entry)));
+
+  if (!amended) {
+    return html`<div class="panel">
+      <h3>acceptance — run by the supervisor, never by the agent</h3>
+      ${acceptanceList(inForce)}
+    </div>`;
+  }
+
+  return html`<div class="panel">
+      <h3>acceptance in force — what the supervisor runs</h3>
+      ${acceptanceList(inForce)}
+    </div>
+    <div class="panel">
+      <h3>acceptance as filed — what <code>spec.md</code> asked for</h3>
+      ${acceptanceList(filed ?? [])}
+      <p class="crumb">
+        <code>spec.md</code> is immutable, so an amendment overlays it rather than
+        rewriting it. This is the record of what the task was originally asked to do.
+      </p>
+    </div>`;
+};
+
+/**
+ * Every amendment to the gate, or nothing at all.
+ *
+ * Nothing for a task with no amendments, which is almost all of them: an empty section on
+ * every task page would be noise, and a reader would learn to skip the place the answer
+ * appears. Newest first, because the last one is the gate in force — the highest number
+ * wins entirely (§12.3) and the earlier ones are history.
+ */
+const amendmentSection = (amendments: readonly AcceptanceAmendment[]): Html =>
+  amendments.length === 0
+    ? raw("")
+    : html`<section>
+        <h2>Amendments to the acceptance criteria</h2>
+        <p class="sub">
+          The newest one is the gate; they are never merged and never applied in sequence.
+          <code>spec.md</code> is untouched by all of them.
+        </p>
+        ${[...amendments].reverse().map(
+          (amendment) => html`<div class="panel">
+            <h3>
+              amendment ${amendment.index} · ${amendment.author} · ${timeTag(amendment.at)}
+            </h3>
+            <div class="prose">${amendment.why}</div>
+            <h3 class="second">the list it put in force</h3>
+            ${acceptanceList(amendment.acceptance)}
+          </div>`,
+        )}
+      </section>`;
+
 export const taskPage = (detail: TaskDetail): Html => {
   const state = detail.state;
   const pr = safeUrl(state.pr?.url);
@@ -737,20 +810,15 @@ export const taskPage = (detail: TaskDetail): Html => {
             <div class="panel">
               <div class="prose">${detail.spec.goal}</div>
             </div>
-            <div class="panel">
-              <h3>acceptance — run by the supervisor, never by the agent</h3>
-              ${
-                detail.spec.acceptance.length === 0
-                  ? html`<p class="empty">none declared</p>`
-                  : html`<pre class="raw">${detail.spec.acceptance.join("\n")}</pre>`
-              }
-            </div>
+            ${acceptancePanels(detail.spec.acceptance, detail.filedAcceptance)}
             <div class="panel">
               <h3>repos</h3>
               <pre class="raw">${detail.spec.repos.map((r) => `${r.host}/${r.owner}/${r.name}`).join("\n")}</pre>
             </div>
           </section>`
     }
+
+    ${amendmentSection(detail.amendments ?? [])}
 
     ${
       detail.live === undefined

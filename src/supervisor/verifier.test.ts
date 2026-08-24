@@ -319,6 +319,108 @@ test("a repo with no CI still passes, and says so once per repo", async () => {
   assert.match(result.detail, /acceptance criteria alone/);
 });
 
+/* ────────────────── an amended criterion says so in the report (§12.3) ────────────────── */
+
+/**
+ * The gate the verifier ran is `readSpec`'s EFFECTIVE list, so an amended criterion is
+ * graded silently: the report names the command and nothing says the command is not the
+ * one `spec.md` filed. "How did this pass?" six months later is then answerable only by
+ * diffing the state repo, which is exactly what the amendment record exists to avoid.
+ *
+ * The amendment is THREADED IN rather than re-derived here: the verifier is handed the list
+ * as filed alongside the records, so nothing in this file has to guess which entry moved.
+ */
+const AMENDED = {
+  filed: ["true", "npm run lint"],
+  history: [
+    {
+      index: 1,
+      acceptance: ["true", "npm test -- src/widget"],
+      why: "the repo-wide lint predates this branch and fails on files it does not touch",
+      author: "operator",
+      at: "2026-08-19T09:14:02.113Z",
+    },
+  ],
+} as const;
+
+test("a passing report says which criterion came from an amendment", async () => {
+  const worktree = await scratch();
+  const { bindings } = ciForge({});
+  const result = await ciVerifier(worktree, bindings).verify(
+    { ...specWith(["true"]), acceptance: ["true"] },
+    { ...state, prs: [{ number: 1, url: "https://example.invalid/r/1", repo: PRIMARY }] },
+    { filed: ["npm run lint"], history: [{ ...AMENDED.history[0], acceptance: ["true"] }] },
+  );
+
+  assert.equal(result.passed, true, result.detail);
+  assert.match(result.detail, /amended/i, "a green report must not hide that the gate moved");
+  assert.match(result.detail, /`true`/, "naming the criterion the amendment introduced");
+  assert.match(result.detail, /npm run lint/, "and the one it replaced");
+  assert.ok(result.detail.includes(AMENDED.history[0].why), "with the reason verbatim");
+  assert.match(result.detail, /operator/);
+});
+
+test("a rejection on an amended criterion says the criterion was amended", async () => {
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(
+    { ...specWith(["true"]), acceptance: ["true", "exit 4"] },
+    state,
+    { filed: ["true"], history: [{ ...AMENDED.history[0], acceptance: ["true", "exit 4"] }] },
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /exited 4/);
+  assert.match(result.detail, /amended/i);
+  assert.match(result.detail, /exit 4/, "the failing criterion is the amended one");
+  assert.ok(result.detail.includes(AMENDED.history[0].why));
+});
+
+test("a criterion that survived the amendment is not reported as amended", async () => {
+  // The distinction the report has to get right: an amendment replaces the whole list, so
+  // most entries in it are the ones `spec.md` filed. Calling every command in an amended
+  // task's gate "amended" would make the label mean nothing.
+  const worktree = await scratch();
+  const verifier = verifierFor(worktree, { PATH: process.env["PATH"] ?? "/usr/bin:/bin" });
+
+  const result = await verifier.verify(
+    { ...specWith(["true"]), acceptance: ["exit 5", "true"] },
+    state,
+    { filed: ["exit 5"], history: [{ ...AMENDED.history[0], acceptance: ["exit 5", "true"] }] },
+  );
+
+  assert.equal(result.passed, false);
+  assert.match(result.detail, /exited 5/);
+  assert.doesNotMatch(
+    result.detail,
+    /`exit 5` (is|was) .*amend/,
+    "a criterion as filed must not be labelled amended",
+  );
+});
+
+test("a task with no amendments gets exactly the report it got before", async () => {
+  const worktree = await scratch();
+  const { bindings } = ciForge({});
+  const spec = { ...specWith(["true"]), acceptance: ["true"] };
+  const withPr = {
+    ...state,
+    prs: [{ number: 1, url: "https://example.invalid/r/1", repo: PRIMARY }],
+  };
+
+  const plain = await ciVerifier(worktree, bindings).verify(spec, withPr);
+  const empty = await ciVerifier(worktree, bindings).verify(spec, withPr, {
+    filed: spec.acceptance,
+    history: [],
+  });
+
+  assert.equal(plain.passed, true, plain.detail);
+  assert.doesNotMatch(plain.detail, /amend/i);
+  // An empty history is what `listAmendments` returns for almost every task, so passing it
+  // must be indistinguishable from passing nothing.
+  assert.equal(empty.detail, plain.detail);
+});
+
 /* ─────────────────── the branch is gone because the work landed ─────────────────── */
 
 /**

@@ -6652,3 +6652,86 @@ test("a fix that only reached the merge queue is not re-verified, and says so", 
   const record = await readAlertRecord(FINGERPRINT);
   assert.equal(record?.verify, undefined, "a queued fix must not stamp a merge instant");
 });
+
+/**
+ * The gate the verifier reports on is the AMENDED one, and it has to be told so (§12.3).
+ *
+ * `readSpec` returns the effective list, so the verifier already runs the right commands.
+ * What it cannot see is which of them a human amended in, and a report that cannot say
+ * leaves "how did this pass?" answerable only by diffing the state repo. The records are
+ * threaded through rather than re-derived inside the verifier, so this pins the thread.
+ */
+test("the verifier is handed the task's amendments alongside the effective gate", async () => {
+  const AMENDED_TASK = asTaskId("SMOKE-AMEND");
+  await seedTask(AMENDED_TASK);
+  await stateGit.tryRun("pull", "--ff-only", "origin", "main");
+  await mkdir(join(statePath, "tasks", AMENDED_TASK, "amendments"), { recursive: true });
+  await writeFile(
+    join(statePath, "tasks", AMENDED_TASK, "amendments", "001.yaml"),
+    [
+      "acceptance:",
+      "  - npm test -- src/widget",
+      "why: the repo-wide lint predates this branch",
+      "author: operator",
+      "at: 2026-08-19T09:14:02.113Z",
+      "",
+    ].join("\n"),
+  );
+  await stateGit.run("add", "-A");
+  await stateGit.run("commit", "-m", `seed amendment for ${AMENDED_TASK}`);
+  await stateGit.run("push", "origin", "HEAD:main");
+
+  let seen: { readonly filed: readonly string[]; readonly whys: readonly string[] } | undefined;
+  const verifier: Verifier = {
+    verify: (spec, _state, amendments) => {
+      seen = {
+        filed: amendments?.filed ?? [],
+        whys: (amendments?.history ?? []).map((entry) => entry.why),
+      };
+      // Rejected, so the task parks rather than convening a council this test does not
+      // care about — the argument is what is under test.
+      return Promise.resolve({ passed: false, detail: `ran ${spec.acceptance.join(", ")}` });
+    },
+  };
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier,
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && seen === undefined) await sleep(100);
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.deepEqual(seen?.filed, ["true"], "the list as FILED, which is not what was run");
+  assert.deepEqual(seen?.whys, ["the repo-wide lint predates this branch"]);
+});

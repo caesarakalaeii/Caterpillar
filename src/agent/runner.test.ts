@@ -833,3 +833,75 @@ test("a branch that merges cleanly gets no conflict section", async () => {
   const transcript = await promptOf(TASK, 9);
   assert.doesNotMatch(transcript, /no longer merges/);
 });
+
+/**
+ * An amended gate is announced at session start (DESIGN.md §12.3).
+ *
+ * The same shape of failure as the conflict section above, in both directions. Two tasks
+ * were re-claimed into the same unsatisfiable criterion twice each because nothing told
+ * the session the ground had NOT moved; and a gate amended with nobody saying so costs a
+ * session re-deriving a failure that no longer exists.
+ *
+ * On the TRANSCRIPT, like the conflict tests, because `prompt.test.ts` can only show that
+ * the renderer works when it is handed the records — not that the runner reads them.
+ */
+test("an amended task's session is told what changed and why", async () => {
+  const AMENDED = asTaskId("TASK-6");
+  await mkdir(join(stateRepo, "tasks", AMENDED), { recursive: true });
+  await writeFile(
+    join(stateRepo, "tasks", AMENDED, "spec.md"),
+    [
+      "---",
+      "workspace: test",
+      "repos:",
+      "  - github.com/acme/widget",
+      "acceptance:",
+      "  - npm run lint",
+      "---",
+      "",
+      "Edit README.md.",
+      "",
+    ].join("\n"),
+  );
+  await store.writeAmendment(AMENDED, {
+    acceptance: ["npm test -- src/widget"],
+    why: "the repo-wide lint predates this branch and fails on files it does not touch",
+    author: "operator",
+  });
+  const amendedSpec = await store.readSpec(AMENDED);
+
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "ran the amended gate" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(amendedSpec, { ...state({ sessions: 9 }), id: AMENDED });
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(AMENDED, 10);
+  assert.match(transcript, /were amended/, "the section has to reach the model");
+  assert.match(transcript, /predates this branch/, "carrying the reason verbatim");
+  assert.match(transcript, /npm run lint/, "the criterion that went away is named");
+  assert.match(transcript, /npm test -- src\/widget/, "and so is the one that replaced it");
+});
+
+test("an unamended task's session hears nothing about amendments", async () => {
+  // The common case, which must stay silent for the conflict section's reason: a note on
+  // every prompt is noise the model learns to skip past.
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "no amendment here" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(spec, state({ sessions: 10 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(TASK, 11);
+  assert.doesNotMatch(transcript, /were amended/);
+});

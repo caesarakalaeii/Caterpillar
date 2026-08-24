@@ -73,3 +73,41 @@ test("a tree still being written into by another process is removed, not refused
     writer.kill("SIGKILL");
   }
 });
+
+test("a writer that outlasts a few milliseconds of backoff is still waited out", async () => {
+  // The budget, not the mechanism. The retry above is satisfied by a writer that finishes
+  // in a few milliseconds, so it passes with a backoff far too short for the case this was
+  // written for: a `git fetch` child on a loaded CI runner, holding `.git/objects` open for
+  // as long as the machine makes it take.
+  //
+  // Under-budgeting fails the way the original flake did — teardown throws ENOTEMPTY and
+  // takes the whole file down in a hook, on whichever matrix leg happened to be slower.
+  // That is unreproducible on a fast developer machine by construction, so the budget is
+  // pinned here instead, with a writer that keeps the tree busy for a whole second.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-tempdir-"));
+  const busy = join(root, "busy");
+  await mkdir(busy, { recursive: true });
+
+  const writer = spawn(
+    process.execPath,
+    [
+      "-e",
+      `const {writeFileSync}=require("fs");const {join}=require("path");` +
+        `const dir=${JSON.stringify(busy)};const until=Date.now()+1000;let n=0;` +
+        `while(Date.now()<until){try{writeFileSync(join(dir,"f"+n++),"x")}catch{break}}`,
+    ],
+    { stdio: "ignore" },
+  );
+
+  try {
+    for (let waited = 0; waited < 3000 && readdirSync(busy).length === 0; waited += 10) {
+      await sleep(10);
+    }
+    assert.ok(readdirSync(busy).length > 0, "the writer must be writing before the removal");
+
+    await removeTempTree(root);
+    assert.equal(existsSync(root), false);
+  } finally {
+    writer.kill("SIGKILL");
+  }
+});

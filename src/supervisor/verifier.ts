@@ -22,6 +22,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { isArtifactName } from "../state/store.ts";
+import { acceptanceChange, type AmendedAcceptance } from "../domain/acceptance.ts";
 import {
   repoSlug,
   taskPullRequests,
@@ -175,6 +176,48 @@ const realSleep = (ms: number): Promise<void> =>
     timer.unref?.();
   });
 
+/**
+ * Which of the criteria just graded came from an amendment, as a suffix for the verdict
+ * (DESIGN.md §12.3).
+ *
+ * Said on BOTH verdicts, and the passing one is the case this is really for. A rejection is
+ * read immediately by the next session, which has the prompt's own amendment section; a
+ * PASS is read six months later by somebody asking how a criterion nobody would have
+ * written got past the gate. Without this, the only answer is a diff of the state repo.
+ *
+ * Only what the amendment CHANGED is named. An amendment replaces the whole list, so most
+ * entries in the gate are the ones intake filed, and labelling all of them amended would
+ * make the label mean nothing.
+ *
+ * Empty string when there is no amendment, so the overwhelmingly common report is
+ * byte-identical to what it was before this existed.
+ */
+const amendmentProvenance = (
+  spec: TaskSpec,
+  amendments: AmendedAcceptance | undefined,
+): string => {
+  const newest = amendments?.history.at(-1);
+  if (amendments === undefined || newest === undefined) return "";
+
+  const { removed, added } = acceptanceChange(amendments.filed, spec.acceptance);
+  const list = (entries: readonly string[]): string =>
+    entries.map((entry) => `- \`${entry}\``).join("\n");
+
+  return (
+    `\n\nThis gate is AMENDED (\`amendments/${String(newest.index).padStart(3, "0")}.yaml\`, ` +
+    `by ${newest.author} at ${newest.at}). \`spec.md\` filed a different list, and these ` +
+    `criteria are the amended ones — what the supervisor ran above is the amendment, not ` +
+    `the document as filed.\n\nReason given: ${newest.why}\n\n` +
+    (added.length === 0
+      ? "The amendment added no criterion."
+      : `Graded but not filed:\n${list(added)}`) +
+    "\n\n" +
+    (removed.length === 0
+      ? "It removed none either."
+      : `Filed but no longer graded:\n${list(removed)}`)
+  );
+};
+
 export class AcceptanceVerifier {
   private readonly options: AcceptanceVerifierOptions;
 
@@ -182,27 +225,49 @@ export class AcceptanceVerifier {
     this.options = options;
   }
 
-  async verify(spec: TaskSpec, state: TaskState): Promise<VerificationResult> {
+  /**
+   * Run both gates and report one verdict.
+   *
+   * `amendments` is the task's gate as filed plus the records that replaced it (§12.3),
+   * THREADED IN rather than re-derived: `spec.acceptance` is already the effective list, so
+   * nothing this class can see distinguishes a criterion a human amended in from one
+   * intake filed. Comparing strings here to guess would put the guess in the audit trail.
+   * Omitted, or carrying an empty history, means the report reads exactly as it always has.
+   */
+  async verify(
+    spec: TaskSpec,
+    state: TaskState,
+    amendments?: AmendedAcceptance,
+  ): Promise<VerificationResult> {
     const repo = spec.repos[0];
+    // Appended to whichever detail is returned, on EVERY path, for the reason gate 1's
+    // evidence note is carried separately: gate 2 replaces gate 1's detail on the passing
+    // path, so a note written into gate 1's would be the one nobody reads.
+    const provenance = amendmentProvenance(spec, amendments);
+    const reporting = (result: VerificationResult): VerificationResult => ({
+      ...result,
+      detail: `${result.detail}${provenance}`,
+    });
+
     if (repo === undefined) {
-      return { passed: false, detail: "task declares no repos" };
+      return reporting({ passed: false, detail: "task declares no repos" });
     }
 
     const acceptance = await this.runAcceptance(spec, repo);
-    if (!acceptance.passed) return acceptance;
+    if (!acceptance.passed) return reporting(acceptance);
 
     // Gate 2's detail is what a passing claim reports, and gate 1's is thrown away — so
     // the evidence note has to be carried across, or a green UI gate would publish a
     // screenshot and mention it nowhere.
     const ci = await this.checkCi(spec, state);
     const reported = { ...ci, detail: `${ci.detail}${acceptance.evidence}` };
-    if (!reported.passed) return reported;
+    if (!reported.passed) return reporting(reported);
 
     // LAST, because it is the cheapest of the three and the only one that can be true of a
     // change nothing is wrong with. A conflict is the base branch having moved, not a
     // defect — so it is worth reporting only once the change itself has passed.
     const conflicts = await this.checkMergeable(spec, repo);
-    return conflicts ?? reported;
+    return reporting(conflicts ?? reported);
   }
 
   /**

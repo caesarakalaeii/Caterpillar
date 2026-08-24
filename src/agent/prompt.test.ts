@@ -150,3 +150,123 @@ test("a brainstorm gets no evidence line, because it declares no acceptance crit
 
   assert.doesNotMatch(prompt, /CATERPILLAR_EVIDENCE_DIR/);
 });
+
+/**
+ * The amendment section (DESIGN.md §12.3).
+ *
+ * Two tasks were re-claimed into the same unsatisfiable criterion twice each because
+ * nothing in the prompt said the ground had NOT moved. The inverse costs the same session:
+ * the gate is amended, the prompt shows the new list with no explanation, and the next
+ * session re-derives a failure that no longer exists.
+ */
+const AMENDED = {
+  filed: ["npm test", "npm run lint"],
+  history: [
+    {
+      index: 1,
+      acceptance: ["npm test", "npm test -- src/widget"],
+      why: "the repo-wide lint predates this branch and fails on files it does not touch",
+      author: "operator",
+      at: "2026-08-19T09:14:02.113Z",
+    },
+  ],
+} as const;
+
+test("a session on an amended task is told what changed and why, verbatim", () => {
+  const spec = { ...SPEC, acceptance: AMENDED.history[0].acceptance };
+
+  const prompt = buildPrompt({ spec, state: STATE, amendments: AMENDED });
+
+  assert.ok(prompt.includes(AMENDED.history[0].why), "the reason must survive word for word");
+  assert.match(prompt, /npm run lint/, "the criterion that went away is named");
+  assert.match(prompt, /npm test -- src\/widget/, "so is the one that replaced it");
+  assert.match(prompt, /operator/);
+  assert.match(prompt, /2026-08-19T09:14:02\.113Z/);
+});
+
+test("an amendment is announced however many sessions ago it was filed", () => {
+  // Deliberately not conditioned on recency. A stale-but-visible note costs a paragraph;
+  // a missing one costs a session.
+  const spec = { ...SPEC, acceptance: AMENDED.history[0].acceptance };
+
+  const prompt = buildPrompt({
+    spec,
+    state: { ...STATE, sessions: 11 },
+    amendments: AMENDED,
+    journal: "session 1 through 11 happened",
+  });
+
+  assert.ok(prompt.includes(AMENDED.history[0].why));
+});
+
+test("a task with no amendment gets byte-for-byte the prompt it got before", () => {
+  // The regression guard on the common path. Written out in full rather than as an
+  // absence-of-the-word-amend check, because a section rendered empty, a stray blank line
+  // or a moved heading are all invisible to that and all change every prompt in the fleet.
+  const prompt = buildPrompt({ spec: SPEC, state: STATE });
+
+  assert.equal(
+    prompt,
+    "# Task TASK-1\n" +
+      "\n" +
+      "Workspace: acme\n" +
+      "Session: 1\n" +
+      "Phase: implementing\n" +
+      "Repos in scope: acme/widget\n" +
+      "\n" +
+      "## Goal\n" +
+      "\n" +
+      "Make the header not overlap the nav.\n" +
+      "\n" +
+      "## Acceptance criteria\n" +
+      "\n" +
+      "These are run by the supervisor, not by you. All must exit 0 before the task is done:\n" +
+      "\n" +
+      "- `npm test`\n" +
+      "\n" +
+      "A command may write a file into `$CATERPILLAR_EVIDENCE_DIR` — a screenshot, a trace, " +
+      "a report. The supervisor commits whatever is there as an artifact of this task, " +
+      "whether the command passed or failed, and shows it to the review council. It does " +
+      "not change the verdict: the exit code is still the whole gate. Keep it under " +
+      // Derived, not transcribed, for the reason the evidence-line test above gives: a cap
+      // spelled out here and changed in store.ts would make this guard assert the old prompt.
+      `${ARTIFACT_BYTES / 1024 ** 2} MiB — over the cap it is refused with its size in ` +
+      "the failure text rather than truncated, " +
+      "because half an image is not a smaller image.\n" +
+      "\n" +
+      "This is the first session. Start by orienting yourself in the repo, then begin.\n",
+  );
+});
+
+test("an empty amendment history is the unamended prompt, not an empty section", () => {
+  // `listAmendments` returns `[]` for the overwhelming majority of tasks, and the runner
+  // passes what it read rather than deciding whether to pass anything.
+  assert.equal(
+    buildPrompt({ spec: SPEC, state: STATE, amendments: { filed: SPEC.acceptance, history: [] } }),
+    buildPrompt({ spec: SPEC, state: STATE }),
+  );
+});
+
+test("only the newest amendment is described, because only it is the gate", () => {
+  // The highest number wins entirely (§12.3). Describing the diff of a superseded
+  // amendment would name criteria that are not in force.
+  const superseded = {
+    index: 1,
+    acceptance: ["npm test", "npm run typecheck"],
+    why: "the first attempt, itself wrong",
+    author: "operator",
+    at: "2026-08-19T09:00:00.000Z",
+  };
+  const spec = { ...SPEC, acceptance: AMENDED.history[0].acceptance };
+
+  const prompt = buildPrompt({
+    spec,
+    state: STATE,
+    amendments: { filed: AMENDED.filed, history: [superseded, { ...AMENDED.history[0], index: 2 }] },
+  });
+
+  assert.ok(prompt.includes(AMENDED.history[0].why));
+  assert.doesNotMatch(prompt, /npm run typecheck/);
+  // But the count is said, so a reader knows the gate has been argued with twice.
+  assert.match(prompt, /2 amendments/);
+});
