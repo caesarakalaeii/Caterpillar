@@ -6,7 +6,7 @@
  * the losing step was a CAS against a ref that had already been deleted.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -5943,13 +5943,15 @@ test("an option index the stored question does not have is refused, and writes n
 });
 
 /**
- * `/done` — a human marking a task done by hand, with both §12 gates bypassed.
+ * A supervisor that serves the chat inbox and runs nothing else.
  *
- * The property every test here defends is the same one: the record must never read as
- * though the task was verified. A task can be OBSOLETE rather than finished, and the only
- * honest way to say so is to write `done` and say in the journal that nothing was checked.
+ * For the two commands a human aims at a task's RECORD rather than at its work: `/done`,
+ * which writes `done` with both §12 gates bypassed, and `/amend`, which replaces the gate
+ * itself (§12.3). Neither runs a session and neither may run a verification, so both stubs
+ * REJECT instead of resolving — a gate that ran under either of these would be a result
+ * nobody asked for, and a stub that answered quietly would hide it.
  */
-const forceDoneSupervisor = (options: {
+const chatOnlySupervisor = (options: {
   readonly inbox: InMemoryChatQueue;
   readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
   readonly reviewers?: SupervisorDeps["reviewers"];
@@ -5965,7 +5967,7 @@ const forceDoneSupervisor = (options: {
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
     verifier: {
-      verify: () => Promise.reject(new Error("forcing a task done must not run gate 1")),
+      verify: () => Promise.reject(new Error("no acceptance gate under test")),
     },
     progress: {
       probe: () =>
@@ -5999,7 +6001,7 @@ test("/done on a parked task writes done, and journals who forced it and why", a
   await seedTask(FORCED, { status: "parked", sessions: 2 });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: FORCED,
     reason: "the feature was dropped from the roadmap",
@@ -6022,7 +6024,7 @@ test("forcing a task done records no gate as passed, anywhere", async () => {
   await seedTask(UNVERIFIED, { status: "failed" });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: UNVERIFIED,
     reason: "superseded by SMOKE-FORCE-1",
@@ -6077,7 +6079,7 @@ test("/done needs no PR and merges nothing", async () => {
 
   const inbox = new InMemoryChatQueue();
   const outcome = await applyOne(
-    forceDoneSupervisor({
+    chatOnlySupervisor({
       inbox,
       reviewers: new Map([
         [
@@ -6106,7 +6108,7 @@ test("/done on a running task refuses and writes nothing at all", async () => {
   await seedTask(RUNNING, { status: "running" });
 
   const inbox = new InMemoryChatQueue();
-  const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
     kind: "force-done",
     task: RUNNING,
     reason: "obsolete",
@@ -6129,7 +6131,7 @@ test("/done is accepted on failed and on awaiting-human", async () => {
     await seedTask(task, { status });
 
     const inbox = new InMemoryChatQueue();
-    const outcome = await applyOne(forceDoneSupervisor({ inbox }), inbox, {
+    const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
       kind: "force-done",
       task,
       reason: "obsolete",
@@ -6169,7 +6171,7 @@ test("the tracker is told, with a reason naming it a forced completion", async (
 
   const inbox = new InMemoryChatQueue();
   const outcome = await applyOne(
-    forceDoneSupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
+    chatOnlySupervisor({ inbox, trackers: new Map([[asWorkspaceName("test"), tracker]]) }),
     inbox,
     { kind: "force-done", task: MIRRORED, reason: "obsolete", author: "ada" },
   );
@@ -6182,6 +6184,172 @@ test("the tracker is told, with a reason naming it a forced completion", async (
   assert.match(reason, /forced/i, "the tracker must not read this as an ordinary park");
   assert.match(reason, /obsolete/, "the human's reason travels with it");
   assert.match(reason, /ada/);
+});
+
+test("an amendment on a parked task is appended, journalled and reported back", async () => {
+  // The gate a human amends is the gate the verifier then runs, so the assertion that
+  // matters is the FILE. An outcome saying "amended" over a directory nobody wrote is the
+  // hand-edited spec.md this mechanism replaces, with extra steps.
+  const AMENDED = asTaskId("SMOKE-AMEND-1");
+  await seedTask(AMENDED, { status: "parked" });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: AMENDED,
+    acceptance: ["npm run check", "npm test"],
+    why: "the glob can never match the literal directory it mandates",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "amended", JSON.stringify(outcome));
+  assert.equal(outcome.kind === "amended" ? outcome.index : undefined, 1);
+  // Both halves of the change, so the human sees what they just did rather than being told
+  // that it worked.
+  assert.deepEqual(outcome.kind === "amended" ? outcome.removed : undefined, ["true"]);
+  assert.deepEqual(outcome.kind === "amended" ? outcome.added : undefined, [
+    "npm run check",
+    "npm test",
+  ]);
+
+  await store.pull("origin", config.stateRepo.branch);
+  const amendments = await store.listAmendments(AMENDED);
+  assert.equal(amendments.length, 1, JSON.stringify(amendments));
+  assert.deepEqual(amendments[0]?.acceptance, ["npm run check", "npm test"]);
+  assert.equal(amendments[0]?.author, "ada", "the record has to say who decided");
+  // The effective gate, which is what the verifier reads next.
+  assert.deepEqual((await store.readSpec(AMENDED)).acceptance, ["npm run check", "npm test"]);
+  // And the filed document is untouched: it is the record of what the task was asked to do.
+  assert.deepEqual((await store.readBaseSpec(AMENDED)).acceptance, ["true"]);
+
+  const journal = await pushedJournal(AMENDED);
+  assert.match(journal, /the glob can never match the literal directory it mandates/);
+  assert.match(journal, /npm run check/, "the journal names what was added");
+  assert.match(journal, /`true`/, "and what was removed");
+  assert.match(journal, /ada/);
+});
+
+test("a second amendment appends 002 and leaves 001 exactly as it was", async () => {
+  // An amendment can be as broken as the criterion it replaced — a criterion written as an
+  // escaped regex for a matcher that is not a regex — so re-amending is the correction path
+  // and there is deliberately no way to edit the last one. That only works if the earlier
+  // record survives byte for byte: the directory listing IS the audit trail.
+  const TWICE = asTaskId("SMOKE-AMEND-2");
+  await seedTask(TWICE, { status: "parked" });
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+
+  const first = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: TWICE,
+    acceptance: ["npx vitest run src\\/widget\\/.*"],
+    why: "the repo-wide gate fails on files this branch never touches",
+    author: "ada",
+  });
+  assert.equal(first.kind, "amended", JSON.stringify(first));
+  await store.pull("origin", config.stateRepo.branch);
+  const asWritten = await readFile(
+    join(statePath, "tasks", TWICE, "amendments", "001.yaml"),
+    "utf8",
+  );
+
+  const second = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: TWICE,
+    acceptance: ["npx vitest run src/widget"],
+    why: "vitest 4 matches a filter with includes(), not as a regex",
+    author: "ada",
+  });
+
+  assert.equal(second.kind, "amended", JSON.stringify(second));
+  assert.equal(second.kind === "amended" ? second.index : undefined, 2);
+
+  await store.pull("origin", config.stateRepo.branch);
+  const amendments = await store.listAmendments(TWICE);
+  assert.deepEqual(
+    amendments.map((amendment) => amendment.index),
+    [1, 2],
+  );
+  assert.equal(
+    await readFile(join(statePath, "tasks", TWICE, "amendments", "001.yaml"), "utf8"),
+    asWritten,
+    "an earlier amendment is never rewritten",
+  );
+  // The highest number wins entirely — not a merge across the two.
+  assert.deepEqual((await store.readSpec(TWICE)).acceptance, ["npx vitest run src/widget"]);
+});
+
+test("amending a running task writes nothing at all", async (t) => {
+  // Refused rather than queued for later. A criterion that changes under a session already
+  // grading itself against the old list is worse than a refusal a human can act on now.
+  const BUSY = asTaskId("SMOKE-AMEND-3");
+  await seedTask(BUSY, { status: "running" });
+
+  // `running` is claimable by design (§6.2), and the tests below this one start real
+  // supervisor loops against this same state repo at `concurrency: 1`. Left as it is, this
+  // fixture is reclaimed by the next loop to start, which spends that single slot on a
+  // whole session for it — starving the test that opened the loop of the slot it is waiting
+  // on. Parked once the assertions are done, which is beyond claiming.
+  t.after(() => seedTask(BUSY, { status: "parked" }));
+
+  const store = new StateStore(statePath, stateGit);
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: BUSY,
+    acceptance: ["npm test"],
+    why: "the gate is impossible",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "not-amendable", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-amendable" ? outcome.reason : "",
+    /cancel/i,
+    "a refusal a human cannot act on is a refusal that wastes the trip",
+  );
+
+  // NOT merely "the outcome said refused". Both halves of the write are asserted absent,
+  // because a refusal that journalled anyway leaves the task carrying a decision nobody
+  // made — and the next session would read it.
+  await store.pull("origin", config.stateRepo.branch);
+  assert.deepEqual(await store.listAmendments(BUSY), []);
+  assert.equal(await pushedJournal(BUSY), "", "nothing may be journalled either");
+  assert.deepEqual((await store.readSpec(BUSY)).acceptance, ["true"]);
+});
+
+test("the refused amendment leaves no task for a later supervisor to pick up", async () => {
+  // Every test in this file shares one state repo, and the tests further down start REAL
+  // supervisor loops against it at `concurrency: 1`. `running` is claimable by design (§6.2
+  // — it is what a crashed pod's task looks like), so a fixture left in that status is
+  // reclaimed by whichever loop starts next: it runs a whole session, a council pass and a
+  // verification, holding the single slot the test that started the loop is waiting for.
+  //
+  // That is invisible until the machine is slow, and then it is a 60-second `waitForCommit`
+  // that times out in a test which never mentions this task. So the refusal test above puts
+  // its task beyond claiming when it is done with it, and this pins that it did.
+  const BUSY = asTaskId("SMOKE-AMEND-3");
+  const state = await pushedState(BUSY);
+  assert.ok(state !== undefined, "the refusal test should have seeded this task");
+  assert.ok(
+    isTerminal(state.status),
+    `SMOKE-AMEND-3 was left ${state.status}, which a later loop will claim and work`,
+  );
+});
+
+test("amending a task that is not in the state repo says so", async () => {
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "amend",
+    task: asTaskId("SMOKE-AMEND-NONE"),
+    acceptance: ["npm test"],
+    why: "nothing to amend",
+    author: "ada",
+  });
+
+  assert.deepEqual(outcome, { kind: "unknown-task" });
 });
 
 /**

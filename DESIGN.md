@@ -4155,6 +4155,41 @@ Five decisions, each of which is the interesting part:
   document a lie. An amendment also cannot empty the list, for the reason gate 1 exists
   at all: a task with nothing the supervisor can run could never be closed.
 
+**The surface is `/amend`, and it is PRE-FILLED.** The command and the `Amend criteria`
+button both open one modal with two boxes: the acceptance list, arriving with the task's
+current *effective* criteria one per line, and a required `why`. The pre-fill is the whole
+feature rather than a nicety — each of the three hand-edits above was one bad line among
+three or four working commands, and nobody retypes four working commands to fix the fifth.
+A task that has already been amended shows the *amended* list, because otherwise a human
+correcting their own amendment silently reinstates the criterion they removed.
+
+The criteria are read from the same in-memory snapshot `/tasks` is served from (§7.1), and
+for the same reason: an interaction has three seconds, and with Redis configured the process
+opening the modal is the standalone bot, which holds no state repo at all. When the snapshot
+cannot supply them the modal is **refused** rather than opened empty — an empty box is
+submitted as a whole replacement list, so it would delete every criterion the task has and
+nothing on screen would say so. Criteria too long for Discord's 4000-character input are
+refused for the same reason instead of being clipped.
+
+The button rides on the three notifications a human is reading at the moment they discover
+the gate is wrong: **`verdict`**, **`review-stalled`** and **`parked`**. Not on `failed`,
+which is an environment that would not build and which no acceptance list fixes.
+
+**It is refused on `running`, and deliberately not queued to apply afterwards.** A criterion
+that moves under a session already grading itself against the old list produces a done-claim
+against a gate that no longer exists, and the verifier then disagrees with the session for a
+reason nothing in the journal explains. `/cancel` stops a session at a turn boundary, so the
+refusal names a next step rather than being a dead end — the same trade `/done` makes.
+
+**The flow is built to be REPEATED.** An amendment can be as broken as the criterion it
+replaced: one real second attempt wrote a criterion as an escaped regex for Vitest, where
+Vitest 4's `filterFiles` matches with `testFile.includes(filter)` lowercased and not as a
+regex at all. So the reply names what was removed and what was added and says to run
+`/amend` again, and the journal entry says the same in the record the next session reads.
+There is no route that edits the last amendment: append-only with the highest number winning
+is already the correction path, and a second mechanism for it would be a second way for two
+writers to disagree about what the gate is.
+
 ### 12.3 A merge queue is enqueued, and a conflict is said out loud early
 
 Two holes on the merge path, both of which turned an ordinary situation into a

@@ -614,6 +614,19 @@ const resumeButton = (task: TaskId): Button | undefined =>
 const doneButton = (task: TaskId): Button | undefined =>
   button({ action: { verb: "done", task }, label: "Mark done", style: BUTTON_STYLE.secondary });
 
+/**
+ * The third answer to a rejection: the CRITERION is wrong, not the work (DESIGN.md §12.3).
+ *
+ * On the three notifications a human reads at the moment they discover that — a verdict
+ * naming an impossible criterion, a review that stalled on the same one, and a park — because
+ * that is where they are standing, and until amendments existed the only lever was to
+ * hand-edit an immutable file in the state repo.
+ *
+ * Pressing it writes nothing. It opens the modal, pre-filled with the criteria as they stand.
+ */
+const amendButton = (task: TaskId): Button | undefined =>
+  button({ action: { verb: "amd", task }, label: "Amend criteria", style: BUTTON_STYLE.secondary });
+
 export const componentsFor = (
   notification: Notification,
   options: { readonly inThread?: boolean } = {},
@@ -658,9 +671,17 @@ export const componentsFor = (
     case "done":
       return rows(row(linkButton("View PR", notification.prUrl)));
     case "verdict":
-      return notification.prUrl === undefined
-        ? undefined
-        : rows(row(linkButton("View PR", notification.prUrl)));
+      return rows(
+        row(
+          notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
+          amendButton(notification.task),
+        ),
+      );
+    // The amend button gets a ROW OF ITS OWN here, and only here. This row already holds four
+    // buttons when a merge is possible and a PR exists, and `row` THROWS above five — which
+    // would cost the whole notification on the one path where silence means nobody learns the
+    // review is stuck. A second row cannot be pushed over the limit by a fifth button
+    // somebody adds to the first.
     case "review-stalled":
       return rows(
         row(
@@ -675,6 +696,7 @@ export const componentsFor = (
           doneButton(notification.task),
           notification.prUrl === undefined ? undefined : linkButton("View PR", notification.prUrl),
         ),
+        row(amendButton(notification.task)),
       );
     // A stalled plan has no PR to link and nothing to merge. What it needs is prose and then
     // a restart, and the restart is the one thing a message can carry: the notification is
@@ -684,7 +706,18 @@ export const componentsFor = (
       return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // Every other park, for the same reason. `/resume` on something parked is the single most
     // predictable next act in the system, and until now it was the only one with no button.
+    //
+    // A park also offers to amend and a `failed` does NOT: `failed` is an environment that
+    // would not build, which no acceptance list fixes, and a button offering a move that
+    // cannot help is worse than no button.
     case "parked":
+      return rows(
+        row(
+          resumeButton(notification.task),
+          doneButton(notification.task),
+          amendButton(notification.task),
+        ),
+      );
     case "failed":
       return rows(row(resumeButton(notification.task), doneButton(notification.task)));
     // An alert notification is a statement, not a prompt. Creating the task has already

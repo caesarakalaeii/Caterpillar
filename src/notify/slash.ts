@@ -43,6 +43,10 @@ export const ANSWER_FIELD = "text";
 /** The `/done` modal's single field. Same contract as `ANSWER_FIELD`. */
 export const DONE_REASON_FIELD = "reason";
 
+/** The amend modal's two fields. Same contract as `ANSWER_FIELD`. */
+export const AMEND_CRITERIA_FIELD = "criteria";
+export const AMEND_WHY_FIELD = "why";
+
 const STATUSES: readonly TaskStatus[] = [
   "ready",
   "running",
@@ -175,6 +179,22 @@ export const COMMANDS: readonly Record<string, unknown>[] = [
       },
     ],
   },
+  {
+    name: "amend",
+    description: "Replace a task's acceptance criteria, with a reason",
+    options: [
+      {
+        name: "task",
+        description: "Task id. Optional in a task's own thread.",
+        type: OPTION_STRING,
+        required: false,
+        autocomplete: true,
+      },
+      // No option for the criteria and none for the reason: both are typed into the modal
+      // this command opens, because the criteria box arrives PRE-FILLED with what the task
+      // currently has to satisfy, and a slash option cannot be pre-filled.
+    ],
+  },
 ];
 
 
@@ -189,6 +209,14 @@ export type Intent =
   | { readonly kind: "open-answer-modal"; readonly task: TaskId }
   /** The Mark done button: the reason it requires has to be typed somewhere. */
   | { readonly kind: "open-done-modal"; readonly task: TaskId }
+  /**
+   * `/amend` and the Amend criteria button, which do the same thing (§12.3).
+   *
+   * The modal is pre-filled with the task's current effective criteria, which have to be
+   * read from the state repo — so this intent says only WHICH task, and the caller that can
+   * read is the one that builds the modal.
+   */
+  | { readonly kind: "open-amend-modal"; readonly task: TaskId }
   /**
    * A box being typed into. `field` says WHICH box, because the two are answered from
    * different places: a task id from the in-memory snapshot, a repo from the workspace's
@@ -386,6 +414,10 @@ const fromCommand = (interaction: Interaction, context: InteractionContext): Int
       if (!isTaskId(task)) return malformed(task);
       return forceDone(task, optionValue(interaction, "reason"));
     }
+    case "amend": {
+      const task = taskOption(interaction, "task", context);
+      return isTaskId(task) ? { kind: "open-amend-modal", task } : malformed(task);
+    }
     case "brainstorm": {
       const topic = optionValue(interaction, "topic")?.trim() ?? "";
       const repo = optionValue(interaction, "repo")?.trim() ?? "";
@@ -441,6 +473,8 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "run", command: { kind: "resume", task: action.task } };
     case "done":
       return { kind: "open-done-modal", task: action.task };
+    case "amd":
+      return { kind: "open-amend-modal", task: action.task };
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }
@@ -453,6 +487,13 @@ const fromModal = (interaction: Interaction): Intent => {
 
   if (action.verb === "done") {
     return forceDone(action.task, modalValue(interaction, DONE_REASON_FIELD));
+  }
+  if (action.verb === "amd") {
+    return amend(
+      action.task,
+      modalValue(interaction, AMEND_CRITERIA_FIELD),
+      modalValue(interaction, AMEND_WHY_FIELD),
+    );
   }
   if (action.verb !== "ans") return { kind: "ignored", reason: "unrecognised modal" };
 
@@ -476,6 +517,44 @@ const forceDone = (task: TaskId, rawReason: string | undefined): Intent => {
     );
   }
   return { kind: "run", command: { kind: "force-done", task, reason } };
+};
+
+/**
+ * An amend modal submission, turned into the whole replacement acceptance list.
+ *
+ * One criterion per line, blank lines and surrounding whitespace dropped. That is not
+ * leniency for its own sake: the box is a paragraph input pre-filled from a YAML list, and
+ * a paste into one arrives with trailing newlines and sometimes with the indentation the
+ * list had. An empty entry would reach the store as a criterion that runs nothing.
+ *
+ * Both refusals are stated HERE rather than left to the store, because the store's message
+ * is written for a log and this one is read by somebody who has just pressed Submit.
+ */
+const amend = (
+  task: TaskId,
+  rawCriteria: string | undefined,
+  rawWhy: string | undefined,
+): Intent => {
+  const acceptance = (rawCriteria ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (acceptance.length === 0) {
+    return malformed(
+      `An amendment to \`${task}\` needs at least one acceptance command — a task with ` +
+        `nothing the supervisor can run could never be closed. Nothing was written.`,
+    );
+  }
+
+  const why = rawWhy?.trim() ?? "";
+  if (why.length === 0) {
+    return malformed(
+      `Amending \`${task}\` needs a \`why\`: it replaces the completion gate, and an ` +
+        `amendment nobody explained is a hand-edited spec with extra steps. Nothing was written.`,
+    );
+  }
+
+  return { kind: "run", command: { kind: "amend", task, acceptance, why } };
 };
 
 const isStatus = (value: string): value is TaskStatus =>

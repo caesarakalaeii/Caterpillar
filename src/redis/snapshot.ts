@@ -231,7 +231,7 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
   if (value === null || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
 
-  const { id, status, phase, sessions, costUsd, prUrl, review, updatedAt } = raw;
+  const { id, status, phase, sessions, costUsd, prUrl, review, acceptance, updatedAt } = raw;
   if (
     typeof id !== "string" ||
     typeof status !== "string" ||
@@ -244,6 +244,12 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
   }
 
   const parsedReview = parseReview(review);
+  // All-or-nothing, unlike the review record: half a criteria list would be offered by the
+  // `/amend` modal as the WHOLE gate, and submitted back as a replacement for it.
+  const parsedAcceptance =
+    Array.isArray(acceptance) && acceptance.every((entry) => typeof entry === "string")
+      ? (acceptance as readonly string[])
+      : undefined;
 
   return {
     id: id as TaskId,
@@ -253,6 +259,7 @@ const parseSummary = (value: unknown): TaskSummary | undefined => {
     costUsd,
     ...(typeof prUrl === "string" ? { prUrl } : {}),
     ...(parsedReview === undefined ? {} : { review: parsedReview }),
+    ...(parsedAcceptance === undefined ? {} : { acceptance: parsedAcceptance }),
     updatedAt,
   };
 };

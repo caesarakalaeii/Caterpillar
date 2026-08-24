@@ -314,6 +314,42 @@ test("a refused force says to cancel it first", () => {
   assert.match(reply, /cancel/i);
 });
 
+test("an amendment reply names what it removed and what it added", () => {
+  // An amendment can be as broken as the criterion it replaced, and re-amending is the only
+  // correction path — so the human has to be able to spot the mistake from the reply rather
+  // than by opening the state repo.
+  const reply = describeOutcome(TASK, {
+    kind: "amended",
+    index: 2,
+    removed: ["npm run lint"],
+    added: ["npm run lint -- src/widget"],
+  });
+
+  assert.match(reply, /npm run lint -- src\/widget/);
+  assert.match(reply, /npm run lint/);
+  assert.match(reply, /002/, "the record it wrote has to be nameable");
+  assert.match(reply, /`\/amend`/, "and re-amending has to be the obvious next move");
+});
+
+test("an amendment that only adds a criterion does not claim to have removed one", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "amended",
+    index: 1,
+    removed: [],
+    added: ["npm run check"],
+  });
+  assert.match(reply, /npm run check/);
+  assert.doesNotMatch(reply, /removed/i);
+});
+
+test("a refused amendment says to cancel it first", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "not-amendable",
+    reason: "it is running right now — `/cancel` it first",
+  });
+  assert.match(reply, /cancel/i);
+});
+
 test("a running task's review lines say guidance needs no restart", () => {
   // The wording that was wrong: it told a human to say what to change "before the next
   // session starts", which is advice for a mechanism that did not exist and a session that

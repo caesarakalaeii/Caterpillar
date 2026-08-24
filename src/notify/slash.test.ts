@@ -12,7 +12,15 @@ import { asTaskId } from "../domain/task.ts";
 import { parseCommand } from "./commands.ts";
 import { encodeCustomId } from "./components.ts";
 import { INTERACTION, type Interaction } from "./interactions.ts";
-import { ANSWER_FIELD, COMMANDS, DONE_REASON_FIELD, parseInteraction, repoChoices } from "./slash.ts";
+import {
+  AMEND_CRITERIA_FIELD,
+  AMEND_WHY_FIELD,
+  ANSWER_FIELD,
+  COMMANDS,
+  DONE_REASON_FIELD,
+  parseInteraction,
+  repoChoices,
+} from "./slash.ts";
 
 const TASK = asTaskId("GH-acme-widget-42");
 
@@ -255,6 +263,110 @@ test("a Mark done modal submitted with no reason is refused", () => {
       data: {
         custom_id: customId,
         components: [{ components: [{ custom_id: DONE_REASON_FIELD, value: "   " }] }],
+      },
+    }),
+  );
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+});
+
+test("the Amend criteria button opens a modal rather than writing anything", () => {
+  // The pre-fill has to be read from the state repo, which the parser cannot do — so the
+  // press is an instruction to open a box, and the criteria arrive with the submission.
+  const customId = encodeCustomId({ verb: "amd", task: TASK });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+    { kind: "open-amend-modal", task: TASK },
+  );
+});
+
+test("/amend opens the same modal as the button", () => {
+  assert.deepEqual(
+    parseInteraction(
+      interaction({ data: { name: "amend", options: [{ name: "task", value: TASK }] } }),
+    ),
+    { kind: "open-amend-modal", task: TASK },
+  );
+});
+
+test("an amend modal submission carries one criterion per line and the reason", () => {
+  const customId = encodeCustomId({ verb: "amd", task: TASK });
+  assert.ok(customId !== undefined);
+
+  assert.deepEqual(
+    parseInteraction(
+      interaction({
+        type: INTERACTION.modalSubmit,
+        data: {
+          custom_id: customId,
+          components: [
+            {
+              components: [
+                {
+                  custom_id: AMEND_CRITERIA_FIELD,
+                  // Blank lines and stray indentation are what a paste into a paragraph box
+                  // actually looks like, and neither is a criterion.
+                  value: "  npm run check  \n\nnpm test -- src/widget\n",
+                },
+              ],
+            },
+            { components: [{ custom_id: AMEND_WHY_FIELD, value: "  the glob can never match  " }] },
+          ],
+        },
+      }),
+    ),
+    {
+      kind: "run",
+      command: {
+        kind: "amend",
+        task: TASK,
+        acceptance: ["npm run check", "npm test -- src/widget"],
+        why: "the glob can never match",
+      },
+    },
+  );
+});
+
+test("an amend modal submitted with no reason is refused", () => {
+  // `why` is the whole audit value of the record. An amendment nobody explained is a
+  // hand-edited spec.md with extra steps.
+  const customId = encodeCustomId({ verb: "amd", task: TASK });
+  assert.ok(customId !== undefined);
+
+  const intent = parseInteraction(
+    interaction({
+      type: INTERACTION.modalSubmit,
+      data: {
+        custom_id: customId,
+        components: [
+          { components: [{ custom_id: AMEND_CRITERIA_FIELD, value: "npm test" }] },
+          { components: [{ custom_id: AMEND_WHY_FIELD, value: "   " }] },
+        ],
+      },
+    }),
+  );
+  const command = intent.kind === "run" ? intent.command : undefined;
+  assert.equal(command?.kind, "malformed");
+  assert.match(command?.kind === "malformed" ? command.reason : "", /why/i);
+});
+
+test("an amend modal submitted with no criteria is refused", () => {
+  // An empty list would leave the task with nothing the supervisor can run, so it could
+  // never be closed — the store refuses it too, and refusing here says so to a human.
+  const customId = encodeCustomId({ verb: "amd", task: TASK });
+  assert.ok(customId !== undefined);
+
+  const intent = parseInteraction(
+    interaction({
+      type: INTERACTION.modalSubmit,
+      data: {
+        custom_id: customId,
+        components: [
+          { components: [{ custom_id: AMEND_CRITERIA_FIELD, value: "\n  \n" }] },
+          { components: [{ custom_id: AMEND_WHY_FIELD, value: "the gate is wrong" }] },
+        ],
       },
     }),
   );
@@ -536,6 +648,13 @@ test("/done in a task's own thread needs only the reason", () => {
   );
 });
 
+test("/amend in a task's own thread needs no id", () => {
+  assert.deepEqual(parseInteraction(interaction({ data: { name: "amend" } }), { thread: TASK }), {
+    kind: "open-amend-modal",
+    task: TASK,
+  });
+});
+
 test("an explicit id beats the thread's own task", () => {
   // `/answer` from inside a thread is how a different task is answered without leaving it
   // (§7.1), and the same has to hold for every other command or the option is a lie.
@@ -583,6 +702,7 @@ test("every command that names one task can be told which by its thread", () => 
     ["cancel", "task"],
     ["task", "id"],
     ["done", "task"],
+    ["amend", "task"],
   ]);
   for (const command of COMMANDS) {
     const name = command["name"] as string;

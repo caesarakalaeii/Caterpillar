@@ -1414,10 +1414,22 @@ export class Supervisor {
     const { store, snapshot } = this.deps;
 
     const records: TaskRecord[] = [];
+    /**
+     * The effective acceptance criteria per task, for the `/amend` modal's pre-fill.
+     *
+     * Read here because this is the only pass that already walks every task, and because the
+     * bot cannot read a spec at all when it runs as its own process. An unreadable spec is
+     * skipped rather than fatal, exactly as an unreadable state is: it costs one task its
+     * amend button, and the surface says so rather than offering an empty box.
+     */
+    const criteria = new Map<TaskId, readonly string[]>();
+
     for (const id of await store.listTasks()) {
       const state = await store.readState(id).catch(() => undefined);
       if (state === undefined) continue;
       records.push({ id, state });
+      const spec = await store.readSpec(id).catch(() => undefined);
+      if (spec !== undefined) criteria.set(id, spec.acceptance);
       // A streak this replica published for a task that has since finished ANYWHERE.
       //
       // `transition` drops the series too, and that stays the fast path — but it only
@@ -1441,7 +1453,9 @@ export class Supervisor {
     // Awaited: with Redis configured this is a write over the network, and a floating
     // promise here would let the poll finish before the bot could see the new list.
     // Never throws — `RedisSnapshotStore` degrades — so it cannot fail the survey.
-    await snapshot?.replace(records.map((record) => summarise(record.state)));
+    await snapshot?.replace(
+      records.map((record) => summarise(record.state, criteria.get(record.id))),
+    );
     // `done` tasks drop out and nothing else does. A message in a bound thread is acted on
     // whatever the task's status, so a `parked` or `failed` task stays bound — that is where
     // guidance goes (§7.3), and unbinding it was what made a stalled brainstorm unreachable
@@ -3697,6 +3711,8 @@ export class Supervisor {
         return this.applyMerge(request);
       case "force-done":
         return this.applyForceDone(request);
+      case "amend":
+        return this.applyAmend(request);
       case "brainstorm":
         return this.applyBrainstorm(request);
     }
@@ -4404,6 +4420,120 @@ export class Supervisor {
       }
 
       return { kind: "forced-done" };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Replace a task's acceptance criteria — `/amend` (DESIGN.md §12.3).
+   *
+   * `running` is REFUSED, and deliberately not queued to apply once the session ends. A
+   * criterion that changes under a session already grading itself against the old list is
+   * worse than a refusal a human can act on immediately: the session would claim done
+   * against a gate that no longer exists, and the verifier would then disagree with it for
+   * reasons nothing in the journal explains. `/cancel` already stops a session at a turn
+   * boundary, so the human has a next step rather than a dead end.
+   *
+   * The journal entry names what was removed and what was added, plus the reason verbatim.
+   * That is the only place a future session or a human can see that the gate MOVED —
+   * `spec.md` still says what it always said, which is the whole point of amending rather
+   * than rewriting, and a diff between two YAML files is not something the next session
+   * reads.
+   *
+   * No status transition. Amending is not resuming: a parked task stays parked, because a
+   * human who wanted it to run again would have said so, and a task silently re-queued by an
+   * edit to its gate is a session nobody asked for.
+   */
+  private async applyAmend(
+    request: ChatRequest & { readonly kind: "amend" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    if (state.status === "running") {
+      return {
+        kind: "not-amendable",
+        reason:
+          "it is running right now, and a criterion that moved under a session already " +
+          "grading itself against the old list is worse than this refusal — `/cancel` it " +
+          "first, then amend it once it has parked.",
+      };
+    }
+
+    // The gate as it stands, for the journal and the reply. `readSpec` is the EFFECTIVE
+    // list, so re-amending reports the diff against the previous amendment rather than
+    // against the document as filed — which is what a human correcting their own amendment
+    // is looking at.
+    const before = await store.readSpec(request.task).catch(() => undefined);
+    if (before === undefined) {
+      return { kind: "not-amendable", reason: "the task has no readable spec" };
+    }
+
+    const removed = before.acceptance.filter((entry) => !request.acceptance.includes(entry));
+    const added = request.acceptance.filter((entry) => !before.acceptance.includes(entry));
+
+    // Claimed for the write and released immediately, exactly as `applyResume` and
+    // `applyForceDone` do: every push verifies lease ownership first (§5.1). An
+    // unclaimable task is one another runner is working, which is what `running` looks
+    // like from here when the stored status is stale.
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) {
+      return {
+        kind: "not-amendable",
+        reason:
+          "another runner is working it right now — `/cancel` it first, then amend it once " +
+          "it has parked.",
+      };
+    }
+
+    try {
+      const handle = heldLease(lease);
+      // One unit, for `applyAnswer`'s reason: the amendment file IS the new gate, and a
+      // sibling slot's commit sweeping it up while this one commits nothing is how a write
+      // reports success and is never read back.
+      const written = await this.unit(async () => {
+        const amendment = await store.writeAmendment(request.task, {
+          acceptance: request.acceptance,
+          why: request.why,
+          author: request.author,
+        });
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          [
+            `**Acceptance criteria amended** by ${request.author} — \`amendments/` +
+              `${String(amendment.index).padStart(3, "0")}.yaml\`.`,
+            "",
+            `Reason: ${request.why}`,
+            "",
+            ...(removed.length === 0
+              ? ["No criterion was removed."]
+              : ["Removed:", ...removed.map((entry) => `- \`${entry}\``)]),
+            "",
+            ...(added.length === 0
+              ? ["No criterion was added."]
+              : ["Added:", ...added.map((entry) => `- \`${entry}\``)]),
+            "",
+            "The gate is now exactly this list. `spec.md` is unchanged — it is the record of " +
+              "what the task was asked to do, and the amendment is the record of what it is " +
+              "now asked to satisfy.",
+          ].join("\n"),
+        );
+        await this.push(handle, `chore(${request.task}): amended acceptance criteria`);
+        return amendment;
+      });
+
+      logger.info("task.amended", {
+        task: request.task,
+        index: written.index,
+        author: request.author,
+        removed: removed.length,
+        added: added.length,
+      });
+
+      return { kind: "amended", index: written.index, removed, added };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

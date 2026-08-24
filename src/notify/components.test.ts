@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { asTaskId } from "../domain/task.ts";
 import {
+  amendModal,
   answerModal,
   doneModal,
   BUTTON_STYLE,
@@ -20,6 +21,7 @@ import {
   linkButton,
   row,
   rows,
+  TEXT_INPUT_LIMIT,
   type Verb,
 } from "./components.ts";
 
@@ -119,7 +121,17 @@ test("every verb the type allows also decodes at runtime", () => {
   // The union and the `VERBS` array behind `isVerb` are parallel by hand, so a verb added
   // to one and not the other type-checks and then decodes as "unrecognised button" in
   // front of whoever pressed it.
-  const verbs: readonly Verb[] = ["ans", "park", "merge", "res", "back", "plan-ok", "plan-no", "done"];
+  const verbs: readonly Verb[] = [
+    "ans",
+    "park",
+    "merge",
+    "res",
+    "back",
+    "plan-ok",
+    "plan-no",
+    "done",
+    "amd",
+  ];
   for (const verb of verbs) {
     const encoded = encodeCustomId({ verb, task: TASK });
     assert.ok(encoded !== undefined, verb);
@@ -146,4 +158,38 @@ test("the answer modal carries the task it will answer", () => {
   const field = modal.components[0]?.components[0];
   assert.equal(field?.custom_id, "text");
   assert.equal(field?.type, COMPONENT.textInput);
+});
+
+test("the amend modal pre-fills the criteria it was given, one per line", () => {
+  // The pre-fill IS the feature: the hand-edits it replaces were one bad glob among three
+  // working commands, and nobody retypes three working commands to fix the fourth.
+  const modal = amendModal({
+    task: TASK,
+    acceptance: ["npm run check", "npm test"],
+    criteriaFieldId: "criteria",
+    whyFieldId: "why",
+  });
+  assert.ok(modal !== undefined);
+  assert.deepEqual(decodeCustomId(modal.custom_id), { verb: "amd", task: TASK });
+
+  const criteria = modal.components[0]?.components[0];
+  assert.equal(criteria?.custom_id, "criteria");
+  assert.equal((criteria as { readonly value?: string }).value, "npm run check\nnpm test");
+  assert.equal((criteria as { readonly required?: boolean }).required, true);
+
+  const why = modal.components[1]?.components[0];
+  assert.equal(why?.custom_id, "why");
+  assert.equal((why as { readonly required?: boolean }).required, true);
+});
+
+test("criteria too long to pre-fill are refused rather than silently truncated", () => {
+  // A truncated pre-fill is submitted as a WHOLE replacement list, so the criteria the box
+  // could not hold would be deleted by a human who never saw them.
+  const modal = amendModal({
+    task: TASK,
+    acceptance: ["x".repeat(TEXT_INPUT_LIMIT), "npm test"],
+    criteriaFieldId: "criteria",
+    whyFieldId: "why",
+  });
+  assert.equal(modal, undefined);
 });

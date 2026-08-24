@@ -50,6 +50,20 @@ export type Command =
    */
   | { readonly kind: "force-done"; readonly task: TaskId; readonly reason: string }
   /**
+   * Replace a task's acceptance criteria — `/amend` (DESIGN.md §12.3).
+   *
+   * `acceptance` is the WHOLE replacement list, not a patch, because that is what the
+   * amendment record holds and what the modal submits. `why` is required for the same
+   * reason the store requires it: an amendment nobody explained is a hand-edited `spec.md`
+   * with extra steps.
+   */
+  | {
+      readonly kind: "amend";
+      readonly task: TaskId;
+      readonly acceptance: readonly string[];
+      readonly why: string;
+    }
+  /**
    * Open a refinement conversation (DESIGN.md §14.3).
    *
    * Carries no task id: it CREATES one, in a thread that does not exist until the bridge

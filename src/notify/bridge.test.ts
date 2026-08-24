@@ -11,8 +11,11 @@
  * the same payload directly.
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import { asTaskId, type TaskState } from "../domain/task.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { asTaskId, asWorkspaceName, type TaskState } from "../domain/task.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
@@ -24,7 +27,20 @@ import { encodeCustomId } from "./components.ts";
 import { INTERACTION, RESPONSE, type Interaction } from "./interactions.ts";
 import { MAX_REMEMBERED_MESSAGES, MessageIndex } from "./messages.ts";
 import { ThreadIndex } from "./threads.ts";
-import { ANSWER_FIELD, DONE_REASON_FIELD } from "./slash.ts";
+import {
+  AMEND_CRITERIA_FIELD,
+  AMEND_WHY_FIELD,
+  ANSWER_FIELD,
+  DONE_REASON_FIELD,
+} from "./slash.ts";
+import { Git } from "../state/git.ts";
+import { StateStore } from "../state/store.ts";
+
+/** Temp checkouts made by the one test that needs a real store. Removed on the way out. */
+const roots: string[] = [];
+after(async () => {
+  await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
+});
 
 const TASK = asTaskId("GH-acme-widget-42");
 const CHANNEL = "1537550186388258866";
@@ -74,6 +90,13 @@ const harness = (
      * case that has to fall through to rank rather than throw.
      */
     readonly fetchedMessage?: { readonly content: string };
+    /**
+     * The acceptance criteria the snapshot carries for `TASK`, for the amend modal.
+     *
+     * The snapshot is where they have to come from: with Redis configured the process
+     * opening the modal is the standalone bot, which holds no state repo at all.
+     */
+    readonly acceptance?: readonly string[];
   } = {},
 ): {
   readonly bridge: DiscordBridge;
@@ -105,7 +128,7 @@ const harness = (
 
   const snapshot = new InMemorySnapshotStore();
   void snapshot.replace([
-    summarise(state()),
+    summarise(state(), over.acceptance),
     summarise(state({ id: asTaskId("GH-acme-widget-7"), status: "ready" })),
     summarise(state({ id: PARKED_TASK, status: "parked", chat: { threadId: PARKED_THREAD } })),
   ]);
@@ -256,6 +279,115 @@ test("the Mark done button asks for a reason before anything is written", async 
 
   assert.equal(inbox.size, 0, "the click itself must force nothing");
   assert.equal(callback(calls).body["type"], RESPONSE.modal);
+});
+
+test("the amend modal is pre-filled with the task's CURRENT criteria, not the filed ones", async () => {
+  // The pre-fill is the whole feature, and "current" is the load-bearing word: a task that
+  // has already been amended must show the amended list, or a human correcting their own
+  // amendment would silently reinstate the criterion they removed. `readSpec` is what makes
+  // that true, so this seeds a real store with a real amendment and goes through it.
+  const root = await mkdtemp(join(tmpdir(), "caterpillar-bridge-amend-"));
+  roots.push(root);
+  const store = new StateStore(root, new Git(root));
+  await store.writeSpec({
+    id: TASK,
+    workspace: asWorkspaceName("test"),
+    kind: "implement",
+    goal: "Fix the widget.",
+    repos: [{ host: "github.com", owner: "acme", name: "widget" }],
+    requires: [],
+    acceptance: ["npm run lint", "npm test"],
+  });
+  await store.writeAmendment(TASK, {
+    acceptance: ["npm run lint -- src/widget", "npm test"],
+    why: "the repo-wide lint predates this branch",
+    author: "operator",
+  });
+  const effective = await store.readSpec(TASK);
+
+  const { bridge, inbox, calls } = harness({ acceptance: effective.acceptance });
+
+  await bridge.handleInteraction(
+    interaction({ data: { name: "amend", options: [{ name: "task", value: TASK }] } }),
+  );
+
+  assert.equal(inbox.size, 0, "opening the box must write nothing");
+  assert.equal(callback(calls).body["type"], RESPONSE.modal);
+  const modal = callback(calls).body["data"] as {
+    readonly components: readonly {
+      readonly components: readonly { readonly custom_id: string; readonly value?: string }[];
+    }[];
+  };
+  assert.equal(
+    modal.components[0]?.components[0]?.value,
+    "npm run lint -- src/widget\nnpm test",
+    "the amended list, one per line",
+  );
+  assert.equal(modal.components[1]?.components[0]?.custom_id, AMEND_WHY_FIELD);
+});
+
+test("amending a task the snapshot does not know refuses instead of offering an empty box", async () => {
+  // An empty pre-fill would be submitted as a whole replacement list, so it deletes every
+  // criterion the task has. Nothing about the modal would say so.
+  const { bridge, inbox, calls } = harness();
+
+  await bridge.handleInteraction(
+    interaction({ data: { name: "amend", options: [{ name: "task", value: "GH-acme-widget-999" }] } }),
+  );
+
+  assert.equal(inbox.size, 0);
+  assert.equal(callback(calls).body["type"], RESPONSE.message);
+  const data = callback(calls).body["data"] as { readonly content: string };
+  assert.match(data.content, /GH-acme-widget-999/);
+});
+
+test("an amend submission queues the whole replacement list and whoever submitted it", async () => {
+  const customId = encodeCustomId({ verb: "amd", task: TASK });
+  assert.ok(customId !== undefined);
+  const { bridge, inbox, calls } = harness();
+
+  const handled = bridge.handleInteraction(
+    interaction({
+      type: INTERACTION.modalSubmit,
+      data: {
+        custom_id: customId,
+        components: [
+          {
+            components: [
+              { custom_id: AMEND_CRITERIA_FIELD, value: "npm run check\nnpm test -- src/widget" },
+            ],
+          },
+          { components: [{ custom_id: AMEND_WHY_FIELD, value: "the glob can never match" }] },
+        ],
+      },
+    }),
+  );
+
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+  const queued = await inbox.drain();
+  assert.deepEqual(
+    queued.map((request) => ({ ...request, settle: undefined })),
+    [
+      {
+        kind: "amend",
+        task: TASK,
+        acceptance: ["npm run check", "npm test -- src/widget"],
+        why: "the glob can never match",
+        // The bridge is the only place that knows who submitted it, and the amendment record
+        // is unauditable without it.
+        author: "operator",
+        settle: undefined,
+      },
+    ],
+  );
+  for (const request of queued) {
+    request.settle({ kind: "amended", index: 1, removed: ["npm run lint"], added: ["npm run check"] });
+  }
+  await handled;
+
+  assert.equal(posted(calls).length, 1);
+  const said = posted(calls)[0]?.body["content"];
+  assert.match(String(said), /npm run check/, "the human has to see what they just changed");
 });
 
 test("the Mark done modal forces the task done, naming whoever submitted it", async () => {
