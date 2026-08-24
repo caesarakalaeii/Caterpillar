@@ -93,6 +93,7 @@ import type { Council } from "../review/council.ts";
 import { explainVerdict, renderVerdict, summariseVerdict } from "../review/decide.ts";
 import {
   DEFAULT_CANDIDATE_LABEL,
+  trackerItemUrl,
   type Tracker,
   type TrackerTransition,
 } from "../tracker/types.ts";
@@ -570,6 +571,9 @@ const reportTitle = (report: ReportKind, text: string): string => {
  * below it and names the task, so a report that turns out to need context can be traced back
  * to the session that produced it; without that a candidate is unactionable, and the state
  * repo is the only place the rest of the story lives.
+ *
+ * When the task itself came from a tracker item, that item's URL goes in too — it is the one
+ * back-reference that leads somewhere for a triager who cannot clone the state repo.
  */
 const reportBody = (input: {
   readonly task: TaskId;
@@ -588,6 +592,8 @@ const reportBody = (input: {
     ? `${[...input.text].slice(0, REPORT_BODY_LIMIT).join("")}\n\n… (truncated; the whole text is in \`tasks/${input.task}/\` in the state repo)`
     : input.text;
 
+  const origin = input.spec.tracker === undefined ? undefined : trackerItemUrl(input.spec.tracker);
+
   return [
     quoted,
     "",
@@ -595,6 +601,7 @@ const reportBody = (input: {
     "",
     `Filed by ${input.author} from \`${input.task}\`, which ${said} the above.`,
     `Repos: ${input.spec.repos.map((repo) => `\`${repoSlug(repo)}\``).join(", ") || "none declared"}.`,
+    ...(origin === undefined ? [] : [`That task came from ${origin}.`]),
     "",
     `The full history is in \`tasks/${input.task}/\` in the state repo. This item carries ` +
       `\`${DEFAULT_CANDIDATE_LABEL}\` and is a REPORT, not a task: relabel it for ingest to ` +

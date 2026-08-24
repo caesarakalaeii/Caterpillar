@@ -2102,6 +2102,10 @@ So the three notifications carrying agent prose — **`question`**, **`parked`**
 files a tracker item carrying the agent's own text and a reference back to the task, and the
 reply is the item's URL.
 
+The reference is the task id, the state repo path, and — when the task itself came from a
+tracker item — that item's URL. A triager may not be able to clone the state repo, so the URL
+is the one back-reference in the item that leads anywhere.
+
 **A filed item is a REPORT, not a task.** It carries `agent-candidate` and never the
 workspace's ingest label (§14). If filing applied the ingest label, the next intake pass
 would mint the report into a running task, which could park with a reason somebody files

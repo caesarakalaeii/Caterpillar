@@ -6395,9 +6395,14 @@ const recordingTracker = (
 };
 
 /** A parked task whose park reason is in the journal, which is where a report reads it from. */
-const seedParkedWithReason = async (task: TaskId, reason: string): Promise<void> => {
+const seedParkedWithReason = async (
+  task: TaskId,
+  reason: string,
+  /** The tracker item the task came from, for the test about linking back to it. */
+  tracker?: TrackerRef,
+): Promise<void> => {
   const store = new StateStore(statePath, stateGit);
-  await seedTask(task, { status: "parked", sessions: 2 });
+  await seedTask(task, { status: "parked", sessions: 2 }, ["github.com/acme/widget"], tracker);
   await store.pull("origin", config.stateRepo.branch);
   await store.appendJournal(task, 2, `**Parked:** ${reason}`);
   await store.commitAndPush(`chore(${task}): parked`, "origin", "main");
@@ -6428,6 +6433,28 @@ test("filing a bug report carries the agent's own words and a link back to the t
   assert.match(filed.body, /the manifest loader rejects a valid `repos:` list/);
   assert.match(filed.body, new RegExp(REPORTED), "the item must name the task it came from");
   assert.match(filed.title, /bug/i, "the title has to say what kind of report this is");
+});
+
+test("a report from a task that came from a tracker item links back to that item", async () => {
+  // A task id names the state repo, which a triager may not be able to clone. Where the task
+  // itself came from is a URL, and it is the one link in the item that leads anywhere.
+  const LINKED = asTaskId("SMOKE-REPORT-11");
+  await seedParkedWithReason(LINKED, "the loader rejects a valid list", {
+    kind: "github-issues",
+    id: "42",
+    container: "acme/widget",
+  });
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: LINKED, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  assert.match(created[0]?.body ?? "", /https:\/\/github\.com\/acme\/widget\/issues\/42/);
 });
 
 test("a filed report is a candidate, never a task", async () => {
