@@ -29,6 +29,7 @@ import type { LiveSession } from "../obs/live.ts";
 import { PolicyParseError, type AlertPolicyEntry } from "../remediation/policy.ts";
 import { isScheduleTaskId, scheduleOf, type Schedule } from "../schedule/definition.ts";
 import type {
+  AcceptanceAmendment,
   AlertRefusal,
   IntakeRejectionRecord,
   ScheduleListing,
@@ -301,6 +302,18 @@ export interface TaskDetail {
   readonly live?: LiveDetail;
   /** Which of the four intake paths produced this task, and a link back to it (§14). */
   readonly origin?: TaskOrigin;
+  /**
+   * Every amendment to the acceptance criteria, oldest first (§12.3). Empty for almost
+   * every task, and the page renders as it always has in that case.
+   */
+  readonly amendments: readonly AcceptanceAmendment[];
+  /**
+   * `spec.md`'s own acceptance list, present only when the task has been amended.
+   *
+   * Absent rather than a copy of `spec.acceptance` for an unamended task, so the page has
+   * nothing to compare and cannot render two labelled panels holding the same list.
+   */
+  readonly filedAcceptance?: readonly string[];
 }
 
 /**
@@ -493,11 +506,26 @@ export const taskDetail = async (
     spec?.kind === "remediation" ? (await alertsByTask(store)).get(id) : undefined;
   const origin = taskOrigin(spec, alert);
 
+  // Both halves of §12.3, and only when there is something to compare. `spec` above is the
+  // EFFECTIVE list, so without the filed one the page can show the amended gate and not
+  // that it was amended. Defensive like the spec read: a malformed amendment costs this
+  // section rather than the whole page, which is the one an operator most needs to see.
+  const amendments = await store.listAmendments(id).catch(() => []);
+  const filedAcceptance =
+    amendments.length === 0
+      ? undefined
+      : await store
+          .readBaseSpec(id)
+          .then((base) => base.acceptance)
+          .catch(() => undefined);
+
   return {
     id,
     title: headline(spec?.goal) ?? id,
     state,
     ...(origin === undefined ? {} : { origin }),
+    amendments,
+    ...(filedAcceptance === undefined ? {} : { filedAcceptance }),
     questions: await store.listQuestions(id),
     verdicts: await store.listVerdicts(id),
     artifacts: await store.listArtifacts(id),

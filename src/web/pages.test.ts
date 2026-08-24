@@ -372,6 +372,7 @@ const detailWith = (artifacts: readonly string[]): TaskDetail => ({
   verdicts: [],
   artifacts,
   sessions: [1],
+  amendments: [],
 });
 
 test("an artifact link downloads rather than navigating to agent-authored bytes", () => {
