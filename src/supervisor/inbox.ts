@@ -17,7 +17,7 @@
  * one are answered from the snapshot (`snapshot.ts`) inside Discord's 3-second
  * acknowledgement budget; this queue is only for things that must be written.
  */
-import type { TaskId } from "../domain/task.ts";
+import type { ReportKind, ReportSource, TaskId, TrackerRef } from "../domain/task.ts";
 
 export type ChatOutcome =
   | { readonly kind: "applied"; readonly index: number }
@@ -127,6 +127,27 @@ export type ChatOutcome =
     }
   /** Amending was refused — a `running` task, which has to be cancelled first. */
   | { readonly kind: "not-amendable"; readonly reason: string }
+  /**
+   * A tracker item was filed from the agent's own text — a Report button (DESIGN.md §7).
+   *
+   * `ref` rather than a URL, because a ref is what the tracker returns and only some of them
+   * have a derivable web address: Vikunja's depends on the instance's frontend, which a ref
+   * does not carry. The reply renders a link when there is one and names the item when there
+   * is not — a guessed URL that 404s is worse than an id.
+   *
+   * `note` is what actually happened when it was not simply "filed": a SECOND press of the
+   * same button reports the item the first press filed, and a reply that did not say so
+   * would read as a second item. Not a separate outcome kind, because every caller does the
+   * same thing with both — the pair is `merged`'s, for the same reason.
+   */
+  | {
+      readonly kind: "filed";
+      readonly report: ReportKind;
+      readonly ref: TrackerRef;
+      readonly note?: string;
+    }
+  /** Filing was refused, or the tracker rejected it. The text is still only in Discord. */
+  | { readonly kind: "not-filed"; readonly reason: string }
   | { readonly kind: "failed"; readonly error: string };
 
 /** What the bridge asks the loop to do. Everything here writes the state repo. */
@@ -184,6 +205,23 @@ export type ChatIntent =
       readonly topic: string;
       readonly repos: readonly string[];
       readonly threadId: string;
+      readonly author: string;
+    }
+  /**
+   * File a tracker item from the agent's own text — a Report button (DESIGN.md §7).
+   *
+   * The text is deliberately NOT here. It is read from the state repo by the loop, which is
+   * the side that owns it — and a long question is SPLIT across several Discord messages, so
+   * the message the button sits on holds only the last part of it.
+   *
+   * `author` travels for `force-done`'s reason: the filed item says who asked for it, and
+   * nothing downstream can reconstruct it because the loop never sees Discord.
+   */
+  | {
+      readonly kind: "file-report";
+      readonly task: TaskId;
+      readonly report: ReportKind;
+      readonly source: ReportSource;
       readonly author: string;
     }
   /**

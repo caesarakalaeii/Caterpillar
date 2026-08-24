@@ -458,13 +458,25 @@ test("a question with options offers one button per option AND the free-text one
     options: ["Use the existing one", "Write a new one"],
   });
 
-  assert.deepEqual(labelsOf(attached), ["Use the existing one", "Write a new one", "Answer…"]);
+  assert.deepEqual(labelsOf(attached), [
+    "Use the existing one",
+    "Write a new one",
+    "Answer…",
+    "Report a bug",
+    "Request a feature",
+  ]);
   // The option's INDEX, never its text: a `custom_id` holds 100 characters and the task id
   // has already spent most of them.
-  assert.deepEqual(idsOf(attached), [`c1:opt:${TASK}:0`, `c1:opt:${TASK}:1`, `c1:ans:${TASK}`]);
+  assert.deepEqual(idsOf(attached), [
+    `c1:opt:${TASK}:0`,
+    `c1:opt:${TASK}:1`,
+    `c1:ans:${TASK}`,
+    `c1:file:${TASK}:bq`,
+    `c1:file:${TASK}:fq`,
+  ]);
 });
 
-test("a question without options renders exactly the one button it always did", () => {
+test("a question without options keeps the plain Answer button and its label", () => {
   const attached = componentsFor({
     kind: "question",
     task: TASK,
@@ -472,8 +484,12 @@ test("a question without options renders exactly the one button it always did", 
     question: "What is the retention policy?",
   });
 
-  assert.deepEqual(labelsOf(attached), ["Answer"]);
-  assert.deepEqual(idsOf(attached), [`c1:ans:${TASK}`]);
+  assert.deepEqual(labelsOf(attached), ["Answer", "Report a bug", "Request a feature"]);
+  assert.deepEqual(idsOf(attached), [
+    `c1:ans:${TASK}`,
+    `c1:file:${TASK}:bq`,
+    `c1:file:${TASK}:fq`,
+  ]);
 });
 
 test("an over-long option is cut in the LABEL only", () => {
@@ -506,7 +522,16 @@ test("more options than fit a row costs the extras, never the notification", () 
     options: ["a", "b", "c", "d", "e", "f"],
   });
 
-  assert.deepEqual(labelsOf(attached), ["a", "b", "c", "d", "e", "Answer…"]);
+  assert.deepEqual(labelsOf(attached), [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "Answer…",
+    "Report a bug",
+    "Request a feature",
+  ]);
 });
 
 test("a question in its own thread offers no buttons even when it has options", () => {
@@ -635,6 +660,80 @@ test("a stalled review keeps every button it had when the amend one is added", (
   ]);
   for (const row of attached ?? []) {
     assert.ok(row.components.length <= 5, "a row over five buttons is a 400 for the message");
+  }
+});
+
+test("every notification carrying the agent's own words offers to file it as a report", () => {
+  // The use case: a question, a park reason or a verdict is often already a good bug report
+  // or feature request, and the only way to capture it was to copy the text out by hand.
+  const carriers: readonly Notification[] = [
+    { kind: "question", task: TASK, phase: "implementing", question: "Which migration path?" },
+    { kind: "parked", task: TASK, reason: "the loader rejects a valid manifest" },
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+    },
+  ];
+
+  // The source travels in the arg, because the loop reads the text out of the state repo
+  // and a question, a park and a verdict are three different files there.
+  const source = { question: "q", parked: "p", verdict: "v" } as const;
+
+  for (const carrier of carriers) {
+    const attached = componentsFor(carrier);
+    assert.ok(labelsOf(attached).includes("Report a bug"), carrier.kind);
+    assert.ok(labelsOf(attached).includes("Request a feature"), carrier.kind);
+
+    const code = source[carrier.kind as "question" | "parked" | "verdict"];
+    assert.ok(idsOf(attached).includes(`c1:file:${TASK}:b${code}`), carrier.kind);
+    assert.ok(idsOf(attached).includes(`c1:file:${TASK}:f${code}`), carrier.kind);
+  }
+});
+
+test("the report buttons never push a row over Discord's five", () => {
+  // `row` THROWS above five, which costs the whole message — and these buttons go onto the
+  // busiest notifications in the system, two of which already carry three and four.
+  const carriers: readonly Notification[] = [
+    {
+      kind: "question",
+      task: TASK,
+      phase: "implementing",
+      question: "Which one?",
+      options: ["a", "b", "c", "d", "e"],
+    },
+    { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+      prUrl: "https://example.invalid/pr/1",
+    },
+  ];
+
+  for (const carrier of carriers) {
+    const attached = componentsFor(carrier);
+    assert.ok((attached ?? []).length <= 5, `${carrier.kind}: over five rows is a 400`);
+    for (const row of attached ?? []) {
+      assert.ok(row.components.length <= 5, `${carrier.kind}: over five buttons is a 400`);
+    }
+  }
+});
+
+test("a notification that is not the agent's own words offers no report button", () => {
+  // There is nothing to file: `done` is a URL, `failed` is the runner's own error, and a
+  // report whose body is the supervisor talking about itself is noise in the tracker.
+  for (const notification of [
+    { kind: "done", task: TASK, prUrl: "https://example.invalid/pr/1" },
+    { kind: "failed", task: TASK, error: "the dev environment could not be prepared" },
+  ] as const satisfies readonly Notification[]) {
+    assert.deepEqual(
+      labelsOf(componentsFor(notification)).filter((label) => label.includes("Report")),
+      [],
+      notification.kind,
+    );
   }
 });
 

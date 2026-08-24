@@ -2089,6 +2089,60 @@ rather than hours, and a verdict a human leaned on is not a verdict.
 **No steering without a thread.** A task nobody is watching has nobody to steer it, and
 `/answer <id> <text>` from the channel reaches the same code path for the case that needs it.
 
+### 7.4 An agent's own words, filed as a report
+
+A question, a park reason or a verdict is frequently already a good bug report or feature
+request. "the manifest loader rejects a valid `repos:` list" is not a park reason wanting an
+answer, it is a defect somebody should track. Until this existed the only way to capture one
+was to select the text in Discord, open the tracker, and paste — which nobody does at 23:40,
+so the observation was lost and the same park reason arrived again a week later.
+
+So the three notifications carrying agent prose — **`question`**, **`parked`** and
+**`verdict`** — each get two buttons: `Report a bug` and `Request a feature`. Pressing one
+files a tracker item carrying the agent's own text and a reference back to the task, and the
+reply is the item's URL.
+
+The reference is the task id, the state repo path, and — when the task itself came from a
+tracker item — that item's URL. A triager may not be able to clone the state repo, so the URL
+is the one back-reference in the item that leads anywhere.
+
+**A filed item is a REPORT, not a task.** It carries `agent-candidate` and never the
+workspace's ingest label (§14). If filing applied the ingest label, the next intake pass
+would mint the report into a running task, which could park with a reason somebody files
+another report from — a loop that amplifies itself and that nobody authorised. Promoting a
+candidate is a human relabelling it. The bug/feature distinction is a second label on top,
+because that is the only thing separating the two: both are the same act.
+
+**The text is not in the button.** A `custom_id` holds 100 characters and the task id has
+spent most of them, so the press carries the task and a two-character code: what to file, and
+which of the agent's texts to file. The supervisor reads the text out of the state repo —
+which it must, because a long question is SPLIT across several messages (§7.1) and the message
+the button sits on holds only the last part of it.
+
+**The source travels rather than being inferred.** A task that parked after a verdict has both
+texts, so a precedence rule would pick one of them and file the wrong one with nothing in the
+reply saying which. Three sources, three files, and the button says which.
+
+**Pressing twice must not file twice, and this is not hypothetical.** A button on a Discord
+message stays visible forever, so a second press is ordinary. The created ref is written onto
+the task in the state repo, keyed by the pair a press identifies, and a repeat press reports
+the existing item instead of creating a second one. In git rather than in memory, because the
+runner serving the second press is often not the one that served the first.
+
+One window remains, and it is the create-then-record order, which is forced: there is no ref
+to record until the tracker has answered. An item filed and not recorded would be filed again
+by the next press, so a failure to record is **reported** — the reply names the item and says
+that pressing again would duplicate it.
+
+**The default target is the task's own repo**, because that is where somebody looking for the
+report would look. `workspaces.<name>.tracker.candidateContainer` overrides it, for the
+deployment that keeps its reports in one place and for Vikunja, whose containers are project
+ids rather than repo slugs.
+
+**Nothing about the task changes.** No transition, no forgiven counters: a parked task stays
+parked, and a task nobody resumed must not become claimable because somebody filed a bug from
+its park reason.
+
 ---
 
 ## 8. Machine handoff

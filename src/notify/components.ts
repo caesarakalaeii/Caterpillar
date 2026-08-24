@@ -20,7 +20,7 @@
  *   - five buttons per row and five rows per message are hard limits; over either is a
  *     400 and the message never appears.
  */
-import { isTaskId, type TaskId } from "../domain/task.ts";
+import { isTaskId, type ReportKind, type ReportSource, type TaskId } from "../domain/task.ts";
 
 /** Discord component type discriminators. */
 export const COMPONENT = {
@@ -107,6 +107,10 @@ export interface Modal {
  * `amd` is `/amend`: replace a task's acceptance criteria (§12.3). Abbreviated for the same
  * reason the rest are — the criteria themselves never travel in a `custom_id`, they are
  * pre-filled into the modal the press opens.
+ *
+ * `file` files a tracker item from the agent's own text. Its `arg` is a two-character report
+ * code (`encodeReport`), never the text: the text is read out of the state repo by the loop,
+ * which is the only side that can read it.
  */
 export type Verb =
   | "ans"
@@ -118,7 +122,8 @@ export type Verb =
   | "plan-ok"
   | "plan-no"
   | "done"
-  | "amd";
+  | "amd"
+  | "file";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -179,9 +184,53 @@ const VERBS: readonly string[] = [
   "plan-no",
   "done",
   "amd",
+  "file",
 ];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);
+
+/**
+ * The two facts a `file` button carries, in the two characters it has left.
+ *
+ * A `custom_id` holds 100 and the task id has spent most of them, so the report kind and
+ * the source get one character each. Neither is inferable from the other end: the loop
+ * cannot tell a bug from a feature request, and a task that parked after a verdict has both
+ * texts — choosing by precedence would file the wrong one silently.
+ */
+const REPORT_CODE: Record<ReportKind, string> = { bug: "b", feature: "f" };
+const SOURCE_CODE: Record<ReportSource, string> = { question: "q", parked: "p", verdict: "v" };
+
+export interface ReportRequest {
+  readonly report: ReportKind;
+  readonly source: ReportSource;
+}
+
+export const encodeReport = (request: ReportRequest): string =>
+  `${REPORT_CODE[request.report]}${SOURCE_CODE[request.source]}`;
+
+/**
+ * Read a report code back, or nothing at all.
+ *
+ * Undefined rather than a default for anything unrecognised. This arrives from whatever
+ * Discord was told to send — a button from an older deploy, or a crafted interaction — and a
+ * default would file a report of a kind nobody chose out of a text nobody chose, leaving it
+ * in the tracker for somebody to work out afterwards.
+ */
+export const decodeReport = (arg: string): ReportRequest | undefined => {
+  const [reportCode, sourceCode, ...rest] = [...arg];
+  if (rest.length > 0) return undefined;
+
+  const report = keyOf(REPORT_CODE, reportCode);
+  const source = keyOf(SOURCE_CODE, sourceCode);
+  if (report === undefined || source === undefined) return undefined;
+  return { report, source };
+};
+
+/** The key whose code is `code`. Undefined for anything the map does not hold. */
+const keyOf = <K extends string>(codes: Record<K, string>, code: string | undefined): K | undefined =>
+  code === undefined
+    ? undefined
+    : (Object.keys(codes) as K[]).find((key) => codes[key] === code);
 
 const clamp = (text: string, limit: number): string =>
   [...text].length <= limit ? text : [...text].slice(0, limit).join("");

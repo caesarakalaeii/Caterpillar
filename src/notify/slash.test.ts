@@ -270,6 +270,41 @@ test("a Mark done modal submitted with no reason is refused", () => {
   assert.equal(command?.kind, "malformed");
 });
 
+test("a Report button becomes a file-report command carrying what and from where", () => {
+  for (const { arg, report, source } of [
+    { arg: "bq", report: "bug", source: "question" },
+    { arg: "fp", report: "feature", source: "parked" },
+    { arg: "bv", report: "bug", source: "verdict" },
+  ] as const) {
+    const customId = encodeCustomId({ verb: "file", task: TASK, arg });
+    assert.ok(customId !== undefined, arg);
+
+    assert.deepEqual(
+      parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+      { kind: "run", command: { kind: "file-report", task: TASK, report, source } },
+      arg,
+    );
+  }
+});
+
+test("a Report button with an unreadable arg is ignored rather than guessed at", () => {
+  // It arrives from whatever Discord was told to send. Defaulting would file a report of a
+  // kind nobody chose, out of a text nobody chose, and leave it in the tracker.
+  for (const arg of [undefined, "", "bug", "zz"]) {
+    const customId = encodeCustomId({
+      verb: "file",
+      task: TASK,
+      ...(arg === undefined ? {} : { arg }),
+    });
+    assert.ok(customId !== undefined, JSON.stringify(arg));
+
+    const intent = parseInteraction(
+      interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+    );
+    assert.equal(intent.kind, "ignored", JSON.stringify(arg));
+  }
+});
+
 test("the Amend criteria button opens a modal rather than writing anything", () => {
   // The pre-fill has to be read from the state repo, which the parser cannot do — so the
   // press is an instruction to open a box, and the criteria arrive with the submission.

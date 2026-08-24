@@ -598,6 +598,8 @@ export class DiscordBridge {
           return `Marking ${command.task} done`;
         case "amend":
           return `Amending ${command.task}`;
+        case "file-report":
+          return `Filing a ${command.report === "bug" ? "bug report" : "feature request"} from ${command.task}`;
       }
     })();
     await this.answer(interaction, this.acknowledge(interaction, queued(what, who)));
@@ -689,6 +691,19 @@ export class DiscordBridge {
             task: command.task,
             acceptance: command.acceptance,
             why: command.why,
+            author,
+          }),
+        );
+      // And again for the same reason: the filed item says who asked for it, and the loop
+      // never sees Discord. The TEXT is not carried — see `ChatIntent`'s `file-report`.
+      case "file-report":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({
+            kind: "file-report",
+            task: command.task,
+            report: command.report,
+            source: command.source,
             author,
           }),
         );

@@ -19,7 +19,14 @@
  * design has nowhere to put them. `/brainstorm` is the answer to that, and it produces
  * acceptance criteria by refining them with a human first.
  */
-import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task.ts";
+import {
+  asTaskId,
+  isTaskId,
+  type ReportKind,
+  type ReportSource,
+  type TaskId,
+  type TaskStatus,
+} from "../domain/task.ts";
 
 export type Command =
   | { readonly kind: "answer"; readonly task: TaskId; readonly text: string }
@@ -62,6 +69,19 @@ export type Command =
       readonly task: TaskId;
       readonly acceptance: readonly string[];
       readonly why: string;
+    }
+  /**
+   * File a tracker item from the agent's own text — a Report button (DESIGN.md §7).
+   *
+   * Carries no prose, and cannot: a `custom_id` holds 100 characters and the task id has
+   * spent most of them. `source` says which of the agent's texts to file, because the three
+   * are three different files in the state repo and only the supervisor can read them.
+   */
+  | {
+      readonly kind: "file-report";
+      readonly task: TaskId;
+      readonly report: ReportKind;
+      readonly source: ReportSource;
     }
   /**
    * Open a refinement conversation (DESIGN.md §14.3).

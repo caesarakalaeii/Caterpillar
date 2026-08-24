@@ -424,6 +424,37 @@ test("the Mark done modal forces the task done, naming whoever submitted it", as
   assert.equal(posted(calls).length, 1);
 });
 
+test("a Report button queues the report, naming whoever pressed it", async () => {
+  // The author is not on the intent the parser produces, for `force-done`'s reason: the
+  // bridge is the only place that knows who pressed, and the filed item says who asked.
+  const customId = encodeCustomId({ verb: "file", task: TASK, arg: "bp" });
+  assert.ok(customId !== undefined);
+  const { bridge, inbox, calls } = harness();
+
+  const handled = bridge.handleInteraction(
+    interaction({ type: INTERACTION.component, data: { custom_id: customId } }),
+  );
+
+  for (let attempt = 0; attempt < 50 && inbox.size === 0; attempt++) await flush();
+  const queued = await inbox.drain();
+  assert.deepEqual(queued.map((request) => ({ ...request, settle: undefined })), [
+    {
+      kind: "file-report",
+      task: TASK,
+      report: "bug",
+      source: "parked",
+      author: "operator",
+      settle: undefined,
+    },
+  ]);
+  for (const request of queued) {
+    request.settle({ kind: "filed", report: "bug", ref: { kind: "github-issues", id: "7" } });
+  }
+  await handled;
+
+  assert.equal(posted(calls).length, 1);
+});
+
 test("a submitted modal answers the task the button came from", async () => {
   const customId = encodeCustomId({ verb: "ans", task: TASK });
   assert.ok(customId !== undefined);

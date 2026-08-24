@@ -17,7 +17,7 @@ import { asTaskId, isTaskId, type TaskId, type TaskStatus } from "../domain/task
 import { rankRepos } from "../forge/reach.ts";
 import { parseRepo } from "../plan/brainstorm.ts";
 import type { Command } from "./commands.ts";
-import { decodeCustomId } from "./components.ts";
+import { decodeCustomId, decodeReport } from "./components.ts";
 import {
   INTERACTION,
   focusedOption,
@@ -475,6 +475,19 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "open-done-modal", task: action.task };
     case "amd":
       return { kind: "open-amend-modal", task: action.task };
+    case "file": {
+      // Ignored rather than defaulted when the code will not read, exactly as `opt`'s index
+      // is: a default would file a report of a kind nobody chose, out of a text nobody
+      // chose, and leave it in the tracker for somebody else to work out.
+      const request = action.arg === undefined ? undefined : decodeReport(action.arg);
+      if (request === undefined) {
+        return { kind: "ignored", reason: "report button without a usable report code" };
+      }
+      return {
+        kind: "run",
+        command: { kind: "file-report", task: action.task, ...request },
+      };
+    }
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }

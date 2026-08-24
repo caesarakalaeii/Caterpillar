@@ -48,7 +48,12 @@ import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { InMemoryThreadBindings } from "../redis/threads.ts";
 import { type ChatIntent, type ChatOutcome, type ChatRequest } from "./inbox.ts";
-import type { Tracker, TrackerTransition } from "../tracker/types.ts";
+import {
+  DEFAULT_CANDIDATE_LABEL,
+  type Tracker,
+  type TrackerCreateRequest,
+  type TrackerTransition,
+} from "../tracker/types.ts";
 import { FleetActivity } from "../notify/activity.ts";
 import { TaskSnapshot } from "./snapshot.ts";
 import {
@@ -5955,9 +5960,11 @@ const chatOnlySupervisor = (options: {
   readonly inbox: InMemoryChatQueue;
   readonly trackers?: ReadonlyMap<WorkspaceName, Tracker>;
   readonly reviewers?: SupervisorDeps["reviewers"];
+  /** For the one request that reads workspace configuration: where a report is filed. */
+  readonly config?: RunnerConfig;
 }): Supervisor =>
   new Supervisor({
-    config,
+    config: options.config ?? config,
     store: new StateStore(statePath, stateGit),
     leases: new LeaseManager({
       git: stateGit,
@@ -6350,6 +6357,374 @@ test("amending a task that is not in the state repo says so", async () => {
   });
 
   assert.deepEqual(outcome, { kind: "unknown-task" });
+});
+
+/**
+ * A tracker that records every `create` it is asked for and files nothing.
+ *
+ * The call COUNT is the assertion the idempotency tests turn on: an outcome that reports the
+ * right ref while having filed a second item looks correct from the outside and leaves a
+ * duplicate in the tracker that nobody pressed a button for.
+ */
+const recordingTracker = (
+  options: { readonly fail?: string } = {},
+): {
+  readonly tracker: Tracker;
+  readonly created: TrackerCreateRequest[];
+} => {
+  const created: TrackerCreateRequest[] = [];
+  return {
+    created,
+    tracker: {
+      kind: "github-issues",
+      listAgentItems: () => Promise.resolve([]),
+      comment: () => Promise.resolve(),
+      create: (request) => {
+        created.push(request);
+        return options.fail === undefined
+          ? Promise.resolve({
+              kind: "github-issues" as const,
+              id: String(100 + created.length),
+              container: request.container,
+            })
+          : Promise.reject(new Error(options.fail));
+      },
+      transition: () => Promise.resolve(),
+    },
+  };
+};
+
+/** A parked task whose park reason is in the journal, which is where a report reads it from. */
+const seedParkedWithReason = async (
+  task: TaskId,
+  reason: string,
+  /** The tracker item the task came from, for the test about linking back to it. */
+  tracker?: TrackerRef,
+): Promise<void> => {
+  const store = new StateStore(statePath, stateGit);
+  await seedTask(task, { status: "parked", sessions: 2 }, ["github.com/acme/widget"], tracker);
+  await store.pull("origin", config.stateRepo.branch);
+  await store.appendJournal(task, 2, `**Parked:** ${reason}`);
+  await store.commitAndPush(`chore(${task}): parked`, "origin", "main");
+};
+
+const FLEET_TRACKERS = (tracker: Tracker): ReadonlyMap<WorkspaceName, Tracker> =>
+  new Map([[asWorkspaceName("test"), tracker]]);
+
+test("filing a bug report carries the agent's own words and a link back to the task", async () => {
+  // The whole use case: the park reason IS the bug report, and copying it out by hand was
+  // the only way to capture it. So the text has to arrive verbatim, and the item has to say
+  // which task said it — a report nobody can trace back is a report nobody can act on.
+  const REPORTED = asTaskId("SMOKE-REPORT-1");
+  await seedParkedWithReason(REPORTED, "the manifest loader rejects a valid `repos:` list");
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: REPORTED, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  assert.equal(created.length, 1, JSON.stringify(created));
+  const filed = created[0];
+  assert.ok(filed !== undefined);
+  assert.match(filed.body, /the manifest loader rejects a valid `repos:` list/);
+  assert.match(filed.body, new RegExp(REPORTED), "the item must name the task it came from");
+  assert.match(filed.title, /bug/i, "the title has to say what kind of report this is");
+});
+
+test("a report from a task that came from a tracker item links back to that item", async () => {
+  // A task id names the state repo, which a triager may not be able to clone. Where the task
+  // itself came from is a URL, and it is the one link in the item that leads anywhere.
+  const LINKED = asTaskId("SMOKE-REPORT-11");
+  await seedParkedWithReason(LINKED, "the loader rejects a valid list", {
+    kind: "github-issues",
+    id: "42",
+    container: "acme/widget",
+  });
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: LINKED, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  assert.match(created[0]?.body ?? "", /https:\/\/github\.com\/acme\/widget\/issues\/42/);
+});
+
+test("a filed report is a candidate, never a task", async () => {
+  // `agent-candidate` and NOT the ingest label: a report that arrived carrying the label
+  // `listAgentItems` picks up would be minted into a running task on the next intake pass,
+  // which could file another report. Nobody authorised any of that.
+  const CANDIDATE = asTaskId("SMOKE-REPORT-2");
+  await seedParkedWithReason(CANDIDATE, "the loader rejects a valid list");
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: CANDIDATE, report: "feature", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  const labels = created[0]?.labels ?? [];
+  assert.ok(labels.includes(DEFAULT_CANDIDATE_LABEL), JSON.stringify(labels));
+  assert.ok(!labels.includes("agent"), "filing must not be the same act as tasking");
+  assert.ok(
+    labels.some((label) => /feature|enhancement/i.test(label)),
+    `a feature request has to be distinguishable from a bug: ${JSON.stringify(labels)}`,
+  );
+});
+
+test("pressing the same report button twice files exactly one item", async () => {
+  // A button on a Discord message stays visible forever, so a second press is not a
+  // hypothetical. The count is asserted on the tracker, because an outcome that reports the
+  // first ref while filing a second item is the failure that looks correct from outside.
+  const ONCE = asTaskId("SMOKE-REPORT-3");
+  await seedParkedWithReason(ONCE, "the loader rejects a valid list");
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const supervisor = chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) });
+  const intent: ChatIntent = {
+    kind: "file-report",
+    task: ONCE,
+    report: "bug",
+    source: "parked",
+    author: "ada",
+  };
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const first = await inbox.submit(intent);
+  const second = await inbox.submit(intent);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(created.length, 1, `filed ${created.length} times: ${JSON.stringify(created)}`);
+  assert.equal(first.kind, "filed", JSON.stringify(first));
+  assert.equal(second.kind, "filed", JSON.stringify(second));
+  assert.deepEqual(
+    second.kind === "filed" ? second.ref : undefined,
+    first.kind === "filed" ? first.ref : undefined,
+    "the second press has to report the item the first one filed",
+  );
+  assert.match(
+    second.kind === "filed" ? (second.note ?? "") : "",
+    /already/i,
+    "and has to say it was already filed rather than implying a second one",
+  );
+});
+
+test("the filed ref is written to the state repo and survives a reload", async () => {
+  // What makes the second press idempotent across a restart: the record is in git, not in
+  // the process that served the first press.
+  const REMEMBERED = asTaskId("SMOKE-REPORT-4");
+  await seedParkedWithReason(REMEMBERED, "the loader rejects a valid list");
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: REMEMBERED, report: "bug", source: "parked", author: "ada" },
+  );
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+
+  const pushed = await pushedState(REMEMBERED);
+  assert.deepEqual(
+    pushed?.reports,
+    [
+      {
+        report: "bug",
+        source: "parked",
+        ref: { kind: "github-issues", id: "101", container: "acme/widget" },
+      },
+    ],
+    JSON.stringify(pushed?.reports),
+  );
+
+  // A SECOND supervisor, with its own tracker, reading the record back out of git.
+  const reloaded = recordingTracker();
+  const secondInbox = new InMemoryChatQueue();
+  const again = await applyOne(
+    chatOnlySupervisor({ inbox: secondInbox, trackers: FLEET_TRACKERS(reloaded.tracker) }),
+    secondInbox,
+    { kind: "file-report", task: REMEMBERED, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.deepEqual(reloaded.created, [], "a reloaded runner must not file it a second time");
+  assert.deepEqual(
+    again.kind === "filed" ? again.ref : undefined,
+    { kind: "github-issues", id: "101", container: "acme/widget" },
+  );
+  assert.equal(created.length, 1);
+});
+
+test("a report is filed against the task's own repo unless the workspace names another", async () => {
+  // The default is where the work is, because that is where somebody would look for it. The
+  // override exists for a fleet that keeps its own reports in one repo rather than scattered
+  // across every repo a task happened to touch.
+  const OWN = asTaskId("SMOKE-REPORT-5");
+  const OVERRIDDEN = asTaskId("SMOKE-REPORT-6");
+  await seedParkedWithReason(OWN, "the loader rejects a valid list");
+  await seedParkedWithReason(OVERRIDDEN, "the loader rejects a valid list");
+
+  const own = recordingTracker();
+  const ownInbox = new InMemoryChatQueue();
+  await applyOne(
+    chatOnlySupervisor({ inbox: ownInbox, trackers: FLEET_TRACKERS(own.tracker) }),
+    ownInbox,
+    { kind: "file-report", task: OWN, report: "bug", source: "parked", author: "ada" },
+  );
+  assert.equal(own.created[0]?.container, "acme/widget", JSON.stringify(own.created));
+
+  const overridden = recordingTracker();
+  const overrideInbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({
+      inbox: overrideInbox,
+      trackers: FLEET_TRACKERS(overridden.tracker),
+      config: {
+        ...config,
+        workspaces: new Map([
+          [
+            asWorkspaceName("test"),
+            {
+              name: asWorkspaceName("test"),
+              forge: {
+                kind: "github" as const,
+                host: "github.com",
+                owner: "acme",
+                apiBase: "https://api.github.com",
+              },
+              tracker: {
+                kind: "github-issues" as const,
+                apiBase: "https://api.github.com",
+                ingestLabel: "agent",
+                candidateContainer: "acme/fleet-reports",
+              },
+              secretRef: "test",
+            },
+          ],
+        ]),
+      },
+    }),
+    overrideInbox,
+    { kind: "file-report", task: OVERRIDDEN, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  assert.equal(overridden.created[0]?.container, "acme/fleet-reports");
+});
+
+test("a tracker that refuses the report says so instead of swallowing it", async () => {
+  // The text the human wanted captured is still only in Discord, so silence here loses it.
+  // Nothing may be recorded either: a remembered ref for an item that does not exist would
+  // make every later press report a phantom.
+  const REFUSED = asTaskId("SMOKE-REPORT-7");
+  await seedParkedWithReason(REFUSED, "the loader rejects a valid list");
+
+  const { tracker, created } = recordingTracker({ fail: "issues are disabled on acme/widget" });
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: REFUSED, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "not-filed", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-filed" ? outcome.reason : "",
+    /issues are disabled/,
+    "the tracker's own words are the only diagnosis the human gets",
+  );
+  assert.equal(created.length, 1);
+  assert.equal((await pushedState(REFUSED))?.reports, undefined, "nothing may be remembered");
+});
+
+test("a report filed from a question quotes the question, not the park reason", async () => {
+  // The three sources are three different files in the state repo, and the button says which
+  // one it sits under. Filing the wrong one would put an unrelated text in the tracker.
+  const ASKED = asTaskId("SMOKE-REPORT-8");
+  const store = new StateStore(statePath, stateGit);
+  await seedTask(ASKED, { status: "awaiting-human", sessions: 3 });
+  await store.pull("origin", config.stateRepo.branch);
+  await store.writeQuestion(ASKED, 1, "Should the loader accept a bare `repos:` string?");
+  await store.appendJournal(ASKED, 3, "**Parked:** unrelated earlier park");
+  await store.commitAndPush(`chore(${ASKED}): awaiting human`, "origin", "main");
+
+  const { tracker, created } = recordingTracker();
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(tracker) }),
+    inbox,
+    { kind: "file-report", task: ASKED, report: "feature", source: "question", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "filed", JSON.stringify(outcome));
+  assert.match(created[0]?.body ?? "", /Should the loader accept a bare `repos:` string\?/);
+  assert.doesNotMatch(created[0]?.body ?? "", /unrelated earlier park/);
+
+  await retire(ASKED);
+});
+
+test("a tracker whose containers are not repos will not have a repo slug guessed at", async () => {
+  // A Vikunja container is a project id. A repo slug passed as one is not a wrong destination,
+  // it is a nonexistent one — so this is refused before the create rather than by it, and the
+  // refusal names the setting that fixes it.
+  const PROJECTLESS = asTaskId("SMOKE-REPORT-10");
+  await seedParkedWithReason(PROJECTLESS, "the loader rejects a valid list");
+
+  const created: TrackerCreateRequest[] = [];
+  const vikunja: Tracker = {
+    kind: "vikunja",
+    listAgentItems: () => Promise.resolve([]),
+    comment: () => Promise.resolve(),
+    create: (request) => {
+      created.push(request);
+      return Promise.resolve({ kind: "vikunja" as const, id: "1" });
+    },
+    transition: () => Promise.resolve(),
+  };
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(
+    chatOnlySupervisor({ inbox, trackers: FLEET_TRACKERS(vikunja) }),
+    inbox,
+    { kind: "file-report", task: PROJECTLESS, report: "bug", source: "parked", author: "ada" },
+  );
+
+  assert.equal(outcome.kind, "not-filed", JSON.stringify(outcome));
+  assert.match(
+    outcome.kind === "not-filed" ? outcome.reason : "",
+    /candidateContainer/,
+    "the refusal has to name the setting that fixes it",
+  );
+  assert.deepEqual(created, [], "nothing may be filed against a guessed project id");
+});
+
+test("a workspace with no tracker cannot file, and says which workspace", async () => {
+  const NOWHERE = asTaskId("SMOKE-REPORT-9");
+  await seedParkedWithReason(NOWHERE, "the loader rejects a valid list");
+
+  const inbox = new InMemoryChatQueue();
+  const outcome = await applyOne(chatOnlySupervisor({ inbox }), inbox, {
+    kind: "file-report",
+    task: NOWHERE,
+    report: "bug",
+    source: "parked",
+    author: "ada",
+  });
+
+  assert.equal(outcome.kind, "not-filed", JSON.stringify(outcome));
+  assert.match(outcome.kind === "not-filed" ? outcome.reason : "", /test/, "name the workspace");
 });
 
 /**

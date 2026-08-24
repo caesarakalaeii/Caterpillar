@@ -296,12 +296,13 @@ const workspace = (name: string, value: unknown): WorkspaceProfile => {
     );
   }
 
-  const optionalLabel = (field: string): string | undefined => {
+  const optionalString = (field: string): string | undefined => {
     const value = t[field];
     return value === undefined ? undefined : str(value, `workspaces.${name}.tracker.${field}`);
   };
-  const wipLabel = optionalLabel("wipLabel");
-  const needsHumanLabel = optionalLabel("needsHumanLabel");
+  const wipLabel = optionalString("wipLabel");
+  const needsHumanLabel = optionalString("needsHumanLabel");
+  const candidateContainer = optionalString("candidateContainer");
 
   return {
     ...profile,
@@ -311,6 +312,7 @@ const workspace = (name: string, value: unknown): WorkspaceProfile => {
       ingestLabel: str(t["ingestLabel"], `workspaces.${name}.tracker.ingestLabel`),
       ...(wipLabel !== undefined ? { wipLabel } : {}),
       ...(needsHumanLabel !== undefined ? { needsHumanLabel } : {}),
+      ...(candidateContainer !== undefined ? { candidateContainer } : {}),
     },
   };
 };
