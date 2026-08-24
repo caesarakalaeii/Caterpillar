@@ -4190,6 +4190,34 @@ There is no route that edits the last amendment: append-only with the highest nu
 is already the correction path, and a second mechanism for it would be a second way for two
 writers to disagree about what the gate is.
 
+**Three surfaces have to SAY the gate moved**, or the overlay works and nobody is told:
+
+- **The session prompt** (`agent/prompt.ts`). `spec.acceptance` reaching the prompt is
+  already the effective list, so a session on an amended task runs the right commands and
+  cannot see that they were ever different. The section names the newest amendment's author
+  and time, its `why` verbatim, and the criteria it dropped and introduced. It is rendered
+  whenever an amendment exists and is deliberately **not** conditioned on recency: a
+  stale-but-visible note costs a paragraph, and a missing one costs a session — which is the
+  same cost, in the other direction, as the two tasks re-claimed twice each into the same
+  impossible line because nothing said the ground had not moved.
+- **The verification report** (`supervisor/verifier.ts`). Appended to whichever verdict is
+  returned, and the PASSING one is the case it is really for: a rejection is read straight
+  away by a session that also has the prompt's section, whereas a pass is read six months
+  later by somebody asking how a criterion nobody would have written got past the gate. The
+  answer has to be in the task's own record and not in a diff of the state repo.
+- **The task page** (`web/pages.ts`). Two labelled panels — in force, as filed — but only
+  when the lists actually differ, plus every amendment with its author, time and reason. A
+  re-amendment that restores the filed list leaves one list, and labelling it twice would
+  say something untrue about it.
+
+All three are handed the amendment records **alongside** the effective list rather than
+guessing from it. `readSpec` has already applied the newest amendment, so no consumer can
+tell an amended criterion from a filed one by looking, and a string comparison inside the
+verifier would put a guess in the audit trail. `listAmendments` returns `[]` for the
+overwhelming majority of tasks, and each of the three then renders byte-for-byte what it
+rendered before amendments existed — the prompt has a full-text regression test to that
+effect, because a stray blank line there changes every prompt in the fleet.
+
 ### 12.3 A merge queue is enqueued, and a conflict is said out loud early
 
 Two holes on the merge path, both of which turned an ordinary situation into a
