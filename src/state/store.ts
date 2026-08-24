@@ -47,6 +47,11 @@ import {
   type ToolchainSpec,
   type TrackerRef,
 } from "../domain/task.ts";
+// The amendment record is shared with the prompt, the verifier's report and the task page
+// (§12.3), so it lives in `domain/` rather than here. What this file owns is reading and
+// writing them.
+import type { AcceptanceAmendment } from "../domain/acceptance.ts";
+export type { AcceptanceAmendment };
 import {
   EMPTY_POLICY,
   isAlertFingerprint,
@@ -211,33 +216,6 @@ export class SpecParseError extends Error {
     super(`spec.md for ${task} is invalid: ${detail}`);
     this.name = "SpecParseError";
   }
-}
-
-/**
- * One append-only amendment to a task's acceptance criteria (DESIGN.md §12.3).
- *
- * `acceptance` is a WHOLE-LIST replacement rather than a positional patch. A positional
- * diff against an immutable file reads as noise six months later — "replace entry 2"
- * means nothing without the file open beside it — whereas the full list is the gate,
- * written out, in the record that changed it.
- *
- * Amendments are never merged and never applied in sequence: the highest-numbered one
- * wins entirely. Merging would resurrect a criterion an earlier amendment deliberately
- * removed, and there is no way for the writer of amendment 3 to know it was doing that.
- *
- * `why` is required. Without it the record is a hand-edited `spec.md` with extra steps.
- */
-export interface AcceptanceAmendment {
-  /** The `NNN` in the file name, as a number. Monotonically increasing from 1. */
-  readonly index: number;
-  /** The complete replacement acceptance list. */
-  readonly acceptance: readonly string[];
-  /** Why the criteria as filed could not stand. Human-facing, and load-bearing. */
-  readonly why: string;
-  /** Who decided — an operator handle, or the subsystem that filed it. */
-  readonly author: string;
-  /** ISO 8601, stamped by the writer. */
-  readonly at: string;
 }
 
 /**
