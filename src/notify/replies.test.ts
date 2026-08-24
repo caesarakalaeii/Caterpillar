@@ -350,6 +350,54 @@ test("a refused amendment says to cancel it first", () => {
   assert.match(reply, /cancel/i);
 });
 
+test("a filed report is reported back as a link, so the human can go straight there", () => {
+  // The point of the button is to stop somebody copying text between two windows. A reply
+  // that says "filed" and makes them go looking for it puts half the work back.
+  const reply = describeOutcome(TASK, {
+    kind: "filed",
+    report: "bug",
+    ref: { kind: "github-issues", id: "412", container: "acme/widget" },
+  });
+
+  assert.match(reply, /https:\/\/github\.com\/acme\/widget\/issues\/412/);
+  assert.match(reply, /bug/i);
+});
+
+test("a report whose ref has no web address still names the item", () => {
+  // Vikunja's web URL depends on the instance's frontend address, which a ref does not
+  // carry. Inventing one produces a link that 404s, which is worse than the id.
+  const reply = describeOutcome(TASK, {
+    kind: "filed",
+    report: "feature",
+    ref: { kind: "vikunja", id: "88" },
+  });
+
+  assert.match(reply, /88/);
+  assert.doesNotMatch(reply, /http/, "a guessed URL is worse than none");
+});
+
+test("a second press says the item already exists rather than implying a new one", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "filed",
+    report: "bug",
+    ref: { kind: "github-issues", id: "412", container: "acme/widget" },
+    note: "already filed from this task",
+  });
+
+  assert.match(reply, /already filed/i);
+  assert.match(reply, /412/);
+});
+
+test("a report that could not be filed says why, and never says it was filed", () => {
+  const reply = describeOutcome(TASK, {
+    kind: "not-filed",
+    reason: "issues are disabled on acme/widget",
+  });
+
+  assert.match(reply, /issues are disabled on acme\/widget/);
+  assert.doesNotMatch(reply, /\bfiled \*\*/i);
+});
+
 test("a running task's review lines say guidance needs no restart", () => {
   // The wording that was wrong: it told a human to say what to change "before the next
   // session starts", which is advice for a mechanism that did not exist and a session that

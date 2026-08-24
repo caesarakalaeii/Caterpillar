@@ -638,6 +638,80 @@ test("a stalled review keeps every button it had when the amend one is added", (
   }
 });
 
+test("every notification carrying the agent's own words offers to file it as a report", () => {
+  // The use case: a question, a park reason or a verdict is often already a good bug report
+  // or feature request, and the only way to capture it was to copy the text out by hand.
+  const carriers: readonly Notification[] = [
+    { kind: "question", task: TASK, phase: "implementing", question: "Which migration path?" },
+    { kind: "parked", task: TASK, reason: "the loader rejects a valid manifest" },
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+    },
+  ];
+
+  // The source travels in the arg, because the loop reads the text out of the state repo
+  // and a question, a park and a verdict are three different files there.
+  const source = { question: "q", parked: "p", verdict: "v" } as const;
+
+  for (const carrier of carriers) {
+    const attached = componentsFor(carrier);
+    assert.ok(labelsOf(attached).includes("Report a bug"), carrier.kind);
+    assert.ok(labelsOf(attached).includes("Request a feature"), carrier.kind);
+
+    const code = source[carrier.kind as "question" | "parked" | "verdict"];
+    assert.ok(idsOf(attached).includes(`c1:file:${TASK}:b${code}`), carrier.kind);
+    assert.ok(idsOf(attached).includes(`c1:file:${TASK}:f${code}`), carrier.kind);
+  }
+});
+
+test("the report buttons never push a row over Discord's five", () => {
+  // `row` THROWS above five, which costs the whole message — and these buttons go onto the
+  // busiest notifications in the system, two of which already carry three and four.
+  const carriers: readonly Notification[] = [
+    {
+      kind: "question",
+      task: TASK,
+      phase: "implementing",
+      question: "Which one?",
+      options: ["a", "b", "c", "d", "e"],
+    },
+    { kind: "parked", task: TASK, reason: "no progress for 3 sessions" },
+    {
+      kind: "verdict",
+      task: TASK,
+      summary: "blocked by criteria",
+      detail: "**Criteria** — the glob can never match.",
+      prUrl: "https://example.invalid/pr/1",
+    },
+  ];
+
+  for (const carrier of carriers) {
+    const attached = componentsFor(carrier);
+    assert.ok((attached ?? []).length <= 5, `${carrier.kind}: over five rows is a 400`);
+    for (const row of attached ?? []) {
+      assert.ok(row.components.length <= 5, `${carrier.kind}: over five buttons is a 400`);
+    }
+  }
+});
+
+test("a notification that is not the agent's own words offers no report button", () => {
+  // There is nothing to file: `done` is a URL, `failed` is the runner's own error, and a
+  // report whose body is the supervisor talking about itself is noise in the tracker.
+  for (const notification of [
+    { kind: "done", task: TASK, prUrl: "https://example.invalid/pr/1" },
+    { kind: "failed", task: TASK, error: "the dev environment could not be prepared" },
+  ] as const satisfies readonly Notification[]) {
+    assert.deepEqual(
+      labelsOf(componentsFor(notification)).filter((label) => label.includes("Report")),
+      [],
+      notification.kind,
+    );
+  }
+});
+
 test("a resume button refuses to encode rather than address the wrong task", () => {
   // `custom_id` is capped at 100 characters and a task id is tracker-derived. A clipped id is
   // still a valid-looking id, so the button is dropped instead — and the prose is what is

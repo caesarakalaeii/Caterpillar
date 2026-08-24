@@ -16,8 +16,10 @@ import {
   COMPONENT,
   CUSTOM_ID_LIMIT,
   decodeCustomId,
+  decodeReport,
   disableAll,
   encodeCustomId,
+  encodeReport,
   linkButton,
   row,
   rows,
@@ -131,11 +133,33 @@ test("every verb the type allows also decodes at runtime", () => {
     "plan-no",
     "done",
     "amd",
+    "file",
   ];
   for (const verb of verbs) {
     const encoded = encodeCustomId({ verb, task: TASK });
     assert.ok(encoded !== undefined, verb);
     assert.deepEqual(decodeCustomId(encoded), { verb, task: TASK }, verb);
+  }
+});
+
+test("every report a Report button can file round-trips through the two-character arg", () => {
+  // The arg is all a `custom_id` has left once the task id is in it, so it carries two
+  // facts in two characters: what to file, and which of the agent's texts to file. A code
+  // that decoded to the wrong pair would file a bug report out of an unrelated verdict.
+  for (const report of ["bug", "feature"] as const) {
+    for (const source of ["question", "parked", "verdict"] as const) {
+      const arg = encodeReport({ report, source });
+      assert.equal([...arg].length, 2, arg);
+      assert.deepEqual(decodeReport(arg), { report, source }, arg);
+    }
+  }
+});
+
+test("an arg that is not a report code decodes to nothing rather than to a default", () => {
+  // It arrives from whatever Discord was told to send, and a default would file a report
+  // nobody asked for out of a text nobody chose.
+  for (const arg of ["", "b", "xq", "bx", "bug", "qb"]) {
+    assert.equal(decodeReport(arg), undefined, JSON.stringify(arg));
   }
 });
 
