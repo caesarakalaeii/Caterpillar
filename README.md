@@ -158,7 +158,8 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/agent/exec.ts` | The agent's shell with a per-command time *and* output ceiling (§6.4). |
 | `src/agent/journal.ts` | Bounded journal view for prompts. Pure, no IO (§4.1). |
 | `src/agent/review-guidance.ts` | Unresolved pull request review comments → a prompt section. Pure, no IO (§7.3). |
-| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2). |
+| `src/agent/standards.ts` | Code health, test-first and how to write things down — the same words the council grades against, plus the per-repo `.caterpillar/standards.md` that joins them (§12.2), and what the cleanup pass deletes (§12.4). |
+| `src/agent/cleanup.ts` | The pass over a completed change: ponytail's ladder and `/simplify`'s four lenses, applied before the gates read it (§12.4). |
 | `src/agent/tools.ts` | Supervisor-mediated control-plane tools (§13). |
 | `src/agent/session.ts` | Runs one pi session. |
 | `src/agent/steering.ts` | The buffer between a human typing and a session reading (§7.3). |
@@ -378,6 +379,57 @@ awkward, the change is probably wrong.
     streak for the life of the pod: an alerting rule reading a sample nothing held. Both
     fixed at the meaning rather than the threshold — the exemption loses no information a
     thrash detector could use, whereas widening the limit would have (§11.1).
+
+## The cleanup pass
+
+Every session that claims completion gets one more pass over its own diff before anything
+grades it (§12.4). Not another reviewer — this one edits. It runs the ponytail ladder
+([DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail), MIT) and the four
+things `/simplify` looks for, and its job is to take out what the session wrote and stopped
+needing: the wrapper that only forwards, the abstraction with one caller, the option nobody
+sets, and the comment that restates the line beneath it.
+
+Three things about it are worth knowing before you read a journal entry from one.
+
+**It does not gate anything, and it cannot fail a task.** The change was complete before it
+started. A pass that cannot run says so in the journal, says the change is unaffected, and
+the task goes to the acceptance gate with exactly the code the session wrote.
+
+**It runs inside the session, not beside the council** — which looks like the wrong place
+until you notice that the task's credential is only open for the length of
+`AgentRunner.run`. A cleanup pass in the supervisor could edit the worktree and never push
+it, and the acceptance gate runs its commands *in the worktree* while CI grades *the pushed
+SHA*. Running it inside the lease means everything the gates bless is post-cleanup code.
+Whatever it leaves in the tree is committed as `refactor(<id>): cleanup pass` and pushed
+for it, in that order.
+
+**"Fewer comments" is not the rule, and getting that backwards would gut this repository.**
+This codebase records *why* in prose deliberately — the paragraph above every non-obvious
+decision is the point of it, and several of those paragraphs say so in their own text. The
+pass is told that those are load-bearing and stay. What it deletes is the comment carrying
+no information the code does not already carry: the restatement, the narration of the
+change (that is a commit message, and the commit already has it), the doc block that says
+the signature again in words, the banner over the obvious, commented-out code. The test is
+never length — it is *what does a reader lose if this is gone.* Nothing, and it goes; an
+afternoon, and it stays untouched.
+
+It will not delete a test, an assertion, validation at a trust boundary, error handling
+that prevents data loss, security or accessibility, whatever that would do to the line
+count. A suite that passes because it stopped looking is the most expensive thing a pass
+like this could leave behind.
+
+The journal entry reports what it did, and the numbers in it come from
+`git diff --shortstat` rather than from the model's account of its own work:
+
+```
+**Cleanup pass: -140/+6 lines (net -134).**
+
+Deleted the `RepoFormatter` wrapper — its two callers now use `repoSlug` directly.
+Cut the comment block over `parseRef`; it restated the signature.
+```
+
+A pass that found nothing says `**Cleanup pass: nothing to cut.** The diff was already
+lean.` — which is a good outcome, not a broken step.
 
 ## The web view
 

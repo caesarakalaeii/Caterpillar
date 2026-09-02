@@ -140,6 +140,90 @@ Throughout: plain language, no marketing, no hedging, no apologies, no exclamati
 Report what is true — including when what is true is that something does not work.`;
 
 /**
+ * What the cleanup pass takes out, and what it must leave alone. See DESIGN.md §12.4.
+ *
+ * Here rather than in `review/cleanup.ts` for the reason the whole module exists: this is
+ * a standard, and a standard the author is not told about is a standard that costs a round
+ * trip to discover. `CODE_HEALTH_STANDARD` above already says "comments record WHY" — this
+ * is the same sentence with an edge on it, written for an agent that is deleting rather
+ * than writing, because "record why" read by an author who wants to be helpful produces
+ * the paragraph, and only the deleting half says which paragraph goes.
+ *
+ * The ladder is ponytail's (https://github.com/DietrichGebert/ponytail, MIT), condensed to
+ * the seven rungs and the never-simplify list. It is quoted rather than paraphrased for the
+ * same reason Google's review standard is: a rung reworded is a rung that drifts from what
+ * everybody else means by it. The four lenses under it are the ones Claude Code's
+ * `/simplify` reviews for — reuse, simplification, efficiency, altitude — which is the
+ * other half of what an operator asking for "simplify and ponytail" is asking for.
+ */
+export const CLEANUP_STANDARD = `## The ladder
+
+Stop at the first rung that holds. It is a reflex, not a research project — but it runs
+AFTER you understand the code, never instead of reading it.
+
+1. **Does this need to exist at all?** Written for a need nobody has yet — delete it.
+2. **Already in this codebase?** A helper, type or pattern that already lives here —
+   reuse it. Re-implementing what sits a few files over is the most common waste.
+3. **Standard library does it?** Use it.
+4. **Native platform feature covers it?** Use it.
+5. **An already-installed dependency solves it?** Use it. Never add a new one for what a
+   few lines do.
+6. **Can it be one line?** One line.
+7. **Only then:** the minimum that works.
+
+## The four things you are looking for
+
+- **Reuse.** This repeats something the codebase already has. Call it instead.
+- **Simplification.** Same behaviour, less machinery: an abstraction with one caller, an
+  interface with one implementation, a config nobody sets, a wrapper that only forwards,
+  a branch that cannot be taken.
+- **Efficiency.** Work done that nobody reads — a second pass over what one pass had,
+  a value recomputed inside the loop that produced it.
+- **Altitude.** Written at the wrong level: twenty lines doing what one library call does,
+  or a general mechanism where the caller needed one case.
+
+## Comments
+
+**This is the one you will get wrong, so read it twice.** This codebase records WHY in
+prose and means it. A paragraph saying what was tried, what broke, and what a future
+reader would otherwise reconstruct from an incident is **load-bearing and stays** — some
+of them say so in their own text, and those are not a challenge.
+
+What goes is the comment that carries no information the code does not already carry:
+
+- restates the line under it — \`// increment the counter\` over \`counter++\`;
+- narrates the change instead of the code — "added this to handle X" is a commit message,
+  and the commit already has it;
+- a doc block that says the signature again in words, naming each parameter after its own
+  type and adding nothing;
+- a banner over code that is already obvious;
+- commented-out code, and a \`TODO\` with no reason and nothing concrete to do.
+
+The test is not length and never was. Ask what a reader loses if the comment is gone. If
+the answer is nothing, it goes; if the answer is an afternoon, it stays and you leave it
+exactly as it is. Where the code is not subtle and the explanation is longer than it, the
+explanation is the thing to cut — an argument defending a design is complexity smuggled
+back in as prose.
+
+## What you never take
+
+Deleting these is not laziness, it is damage, and no line count justifies it:
+
+- validation at a trust boundary, and error handling that prevents data loss;
+- security measures, and accessibility;
+- a test, or an assertion inside one. **Never weaken a test to make a diff smaller** —
+  a suite that passes because it stopped looking is the most expensive thing you can
+  leave behind;
+- anything the task explicitly asked for, however much you would not have asked for it.
+
+## Scope
+
+Only what this task changed. Reformatting code you are not otherwise touching buries the
+change in noise, and a cleanup that wanders into the rest of the repository is a second
+change nobody reviewed. The diff's best outcome is getting shorter; a diff that is already
+lean is a finished diff, and saying so is the right answer.`;
+
+/**
  * The reviewer's half, and deliberately NOT in `AUTHOR_STANDARDS`.
  *
  * It exists to stop a council being a bottleneck, and its central sentence — approve once

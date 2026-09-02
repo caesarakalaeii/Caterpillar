@@ -28,7 +28,7 @@ import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
 import type { AmendedAcceptance } from "../domain/acceptance.ts";
-import { repoSlug, taskPullRequests } from "../domain/task.ts";
+import { addUsage, repoSlug, taskPullRequests } from "../domain/task.ts";
 import type {
   RepoRef,
   SessionOutcome,
@@ -42,6 +42,7 @@ import type { LlmRuntime } from "../llm/models.ts";
 import type { AgentMetrics } from "../metrics/registry.ts";
 import type { Logger } from "../obs/log.ts";
 import type { LiveSession } from "../obs/live.ts";
+import { runCleanupPass, type CleanupOutcome } from "./cleanup.ts";
 import { BoundedExecutionEnv } from "./exec.ts";
 import type { StateStore } from "../state/store.ts";
 import type { Tracker } from "../tracker/types.ts";
@@ -271,7 +272,12 @@ export class AgentSessionRunner {
       // `write`, `edit` and the full control verbs — an alert-driven task that could not
       // edit a file or call `open_pr` would be a session with nowhere to put its fix.
       const brainstorm = spec.kind === "brainstorm";
-      const tools: AgentTool[] = [
+      // The file tools alone, held separately because the cleanup pass (§12.4) is given
+      // exactly these and none of the control verbs below: it may read, edit and run
+      // commands, and it may not open a pull request, claim completion, ask a human or
+      // hand off. Built once so the pass cannot end up in a different execution
+      // environment from the session whose work it is editing.
+      const fileTools: AgentTool[] = [
         bindTool(createReadTool<ExecContext>(), execContext) as AgentTool,
         ...(brainstorm
           ? []
@@ -280,6 +286,9 @@ export class AgentSessionRunner {
               bindTool(createEditTool<ExecContext>(), execContext) as AgentTool,
             ]),
         bindTool(createBashTool<ExecContext>(), execContext) as AgentTool,
+      ];
+      const tools: AgentTool[] = [
+        ...fileTools,
         // Which control verbs a kind gets is decided in `tools.ts`, so the binding can be
         // tested without running a session (§20).
         ...toolsForKind(spec.kind, toolContext),
@@ -373,6 +382,20 @@ export class AgentSessionRunner {
         metrics.contextOverruns.inc({ task: spec.id });
       }
 
+      // The cleanup pass (§12.4). Inside the credential lease, which is the whole reason it
+      // is here rather than beside the council: `lease.close()` in the `finally` below ends
+      // the only window in which this task's branch can be pushed, and a cleanup the remote
+      // never sees would leave the acceptance gate grading the cleaned tree while CI graded
+      // the commit before it.
+      //
+      // Only on a completion claim. Every other exit is a session that is coming back — a
+      // handoff, a question, a block — and tidying work that is still being written costs
+      // tokens to delete scaffolding the next session may still be standing on.
+      const cleanup =
+        result.outcome.reason === "done-claimed"
+          ? await this.cleanUp(spec, worktree, llm, fileTools, signal)
+          : undefined;
+
       // Only the pull requests are lifted off the sink here. A proposed plan is not, because
       // unlike a PR it is not consumed by a later gate — `buildOutcome` carries it directly.
       //
@@ -394,6 +417,16 @@ export class AgentSessionRunner {
         // a turn after reading this, and forgiving the round anyway leaves the objection in
         // front of the next session; the other way round loses it between two sessions.
         ...(review.newest === undefined ? {} : { reviewComment: review.newest }),
+        ...(cleanup === undefined
+          ? {}
+          : {
+              cleanup: cleanup.note,
+              // Folded in rather than left out. The pass runs on the task's own account and
+              // against the same weekly allowance every other session spends, so a cost the
+              // totals never see is a cost `/status` and the digest under-report — and the
+              // §6.3 cooldown reads those numbers.
+              usage: addUsage(result.outcome.usage, cleanup.usage),
+            }),
       };
     } finally {
       // Cleared on every exit, including a throw: the transcript is on disk by now, and a
@@ -549,6 +582,44 @@ export class AgentSessionRunner {
       "changes have been committed as `wip: recovered from interrupted session`. " +
       "Review that commit before continuing — it may be incomplete."
     );
+  }
+
+  /**
+   * The cleanup pass over a completed change (DESIGN.md §12.4). Never throws.
+   *
+   * Skipped for a `brainstorm`, which writes no code — it holds no `write` or `edit` tool
+   * and its output is a proposed plan the council reads, not a diff. Running a pass that
+   * deletes over-building on a session that produced none would spend a whole model
+   * session to report that it found nothing.
+   */
+  private async cleanUp(
+    spec: TaskSpec,
+    worktree: string,
+    llm: LlmRuntime,
+    tools: readonly AgentTool[],
+    signal?: AbortSignal,
+  ): Promise<CleanupOutcome | undefined> {
+    if (spec.kind === "brainstorm") return undefined;
+
+    const { worktrees, config, logger } = this.options;
+
+    return runCleanupPass({
+      spec,
+      worktree,
+      git: worktrees.gitAt(worktree),
+      // Resolved locally, against the mirror's default branch. The council resolves the
+      // range it reviews the same way, so the pass and the reviewers that grade its result
+      // are looking at the same change.
+      base: await worktrees.branchPoint(worktree),
+      llm,
+      tools,
+      // A session's ceiling, for the same reason the council's reviewers get one: this is a
+      // model session with a shell, and nothing else above it would stop one that hung.
+      timeoutSeconds: config.limits.maxSessionSeconds,
+      thresholdFraction: config.handoff.thresholdFraction,
+      logger,
+      ...(signal === undefined ? {} : { signal }),
+    });
   }
 
   private async stagedSection(

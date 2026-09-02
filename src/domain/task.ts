@@ -494,6 +494,19 @@ export interface SessionOutcome {
    * could not be reached — all three of which mean the same thing here: nothing new.
    */
   readonly reviewComment?: string;
+  /**
+   * What the cleanup pass did to this session's work, as a journal entry (DESIGN.md §12.4).
+   *
+   * Set only on a `done-claimed` exit, and only when the pass ran at all — it is the one
+   * step in a session that is allowed to fail without failing the session, so absent here
+   * means "no pass", never "the pass found nothing". A pass that ran and cut nothing says
+   * so in its own words.
+   *
+   * Carried on the outcome rather than journalled by the runner for the reason every other
+   * field here is: the runner has no state repo, and `recordSession` writes the session's
+   * journal, its handoff and its state as one unit that a second writer must not open.
+   */
+  readonly cleanup?: string;
   /** Free-text summary appended to the journal. */
   readonly summary: string;
 }

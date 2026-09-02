@@ -4294,6 +4294,114 @@ calls, no git calls, no clock, so every decision above is testable without a net
 
 ---
 
+### 12.4 The cleanup pass
+
+A session that has just claimed completion has written the change it was asked for. It has
+also, reliably, written a quantity of things it stopped needing three turns earlier: the
+wrapper that only forwards, the interface with one implementation, the option nobody sets —
+and, above all, a running commentary on its own reasoning, in comments that restate the line
+beneath them.
+
+**Nothing in §12 catches any of that, and that is not an oversight in the gates.** Gate 1
+measures exit codes and gate 2 measures exit codes; neither reads the change. The council
+does read it, and its `design` lens is exactly the right reader — but a lens that blocks
+over volume is a lens sending a correct change back for another full session, which is what
+most of §12.1 is spent telling it not to do. Volume is not a defect, and the council is a
+defect detector. Asking it to be both makes it worse at the job it has.
+
+So the answer is not another vote. It is a pass that does the deletion itself, before
+anybody grades the change, and whose worst outcome is that it finds nothing.
+
+**It runs inside `AgentRunner.run`, and the reason is the credential.** The obvious home
+for it is `supervisor/loop.ts`, beside the council, in the `done-claimed` case — and that
+home is wrong, for a reason that is a fact about §9.2 rather than a matter of taste:
+`credentials.activate` opens the task's credential at the top of `run` and the `finally`
+closes it. That window is the only time this task's branch can be pushed. A cleanup pass
+in the supervisor could edit the worktree and could never push the result, which is the
+worst of the three available outcomes — the acceptance gate runs its commands **in the
+worktree** while CI grades **the pushed SHA**, so an un-pushed cleanup has the two gates
+grading two different trees, and the council reviewing whichever one it happened to read.
+
+Running it inside the session's lease makes the ordering fall out for free: the pass
+finishes before the outcome leaves the runner, so the supervisor's *first* sight of the
+task is already the diff that will merge. Everything the §12 gates bless is post-cleanup
+code. Nothing is graded twice, and nothing merges ungraded.
+
+**It is never allowed to fail a session.** The change was complete and correct before the
+pass started, and trading a finished task for a tidier one is a bad trade at any exchange
+rate. Every path out of `runCleanupPass` therefore ends in a note for the journal —
+including the paths that end in an exception, which is the one place in the runner where
+swallowing an error is the right call rather than a shortcut. A pass that could not run
+says so, says the change is unaffected, and the task carries on to the gates with exactly
+the code the session wrote.
+
+**What it may do is deliberately narrow.** It is handed the session's own file tools —
+`read`, `write`, `edit`, `bash`, already bound to the same bounded shell and the same
+resolved toolchain, so it cannot end up in a different environment from the session whose
+work it is editing — and **none of the control verbs**. It cannot open a pull request,
+cannot claim completion, cannot ask a human and cannot hand off. Its whole output is edits
+and one call to `report_cleanup`.
+
+That tool reports; it does not decide. Nothing downstream branches on what it says, so
+there is no verdict here for a model to get wrong. It is also **not asked how many lines it
+cut** — the note is measured from `git diff --shortstat` between the head before and the
+head after. A number the model reports is a number nobody can check, and this system has
+already made that choice once, in §19: the digest is measured from git, not remembered.
+
+**The commit and the push are the supervisor's, not the model's.** Whatever the pass leaves
+in the working tree is committed as `refactor(<id>): cleanup pass` and pushed, in that
+order, with the measurement taken after both. Asking the model to commit would make "edited
+but did not commit" a state everything downstream has to know about; doing it here means
+that state cannot exist. The push is last, so a failure at that point leaves the work on the
+branch for the next session rather than losing it.
+
+Skipped entirely for a `brainstorm`, which writes no code — it holds no `write` or `edit`
+tool and its output is a proposed plan, so a pass that deletes over-building would spend a
+model session to report that it found none. Skipped for every exit other than a completion
+claim, too: a handoff, a question and a block are all sessions that are coming back, and
+tidying work still being written deletes scaffolding the next session is standing on.
+
+#### What it is told, and the one rule it must not get wrong
+
+`CLEANUP_STANDARD` lives in `agent/standards.ts` with the rest, for that module's founding
+reason: a standard the author is never told about is a standard that costs a round trip to
+discover.
+
+Its spine is **ponytail's ladder** ([DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail),
+MIT) — does this need to exist, is it already in the codebase, does the stdlib do it, does
+the platform, does an installed dependency, can it be one line, and only then the minimum
+that works. Quoted rather than paraphrased, for the reason Google's review standard is: a
+rung reworded is a rung that drifts from what everyone else means by it. Under it are the
+four things Claude Code's `/simplify` reviews for — reuse, simplification, efficiency and
+**altitude**, code written at the wrong level.
+
+The rule that needed the most care is the one this was built for, and it is not "fewer
+comments":
+
+> **This codebase records WHY in prose and means it.** A paragraph saying what was tried,
+> what broke, and what a reader would otherwise reconstruct from an incident is
+> load-bearing and stays.
+
+`README.md` says so in its own opening, and `remediation/receiver.ts` says it twice about
+its own escaping. A cleanup pass pointed at this repository with "delete comments" as its
+instruction would delete the most valuable thing in it. What goes is the comment that
+carries no information the code does not already carry: the one that restates the line
+under it, the one that narrates the change instead of the code — that is a commit message,
+and the commit already has it — the doc block that says the signature again in words, the
+banner over the obvious, commented-out code, and a `TODO` with nothing concrete to do.
+
+**The test is not length and never was: what does a reader lose if this is gone?** Nothing,
+and it goes; an afternoon, and it stays exactly as it is.
+
+Against that pull there is a standing list of things no line count justifies deleting —
+validation at a trust boundary, error handling that prevents data loss, security,
+accessibility, and **a test or an assertion inside one**. A suite that passes because it
+stopped looking is the most expensive thing a pass like this could leave behind, so
+"never weaken a test to make a diff smaller" is stated rather than implied, and
+`cleanup.test.ts` pins that the standard still says it.
+
+---
+
 ## 13. Agent tools
 
 | Tool | Provider | Notes |
