@@ -2245,6 +2245,15 @@ export class Supervisor {
         );
       }
 
+      // Its own shard, like the steering above and for the same reason: the exit summary is
+      // the agent's account of its own session, and the pass that went over its work
+      // afterwards is not something that session said. Written whether it cut anything or
+      // not — "already lean" is a fact about the change worth having in the record, and a
+      // pass that silently wrote nothing would be indistinguishable from one that never ran.
+      if (outcome.cleanup !== undefined) {
+        await store.appendJournal(spec.id, session, outcome.cleanup);
+      }
+
       if (outcome.reason === "handoff" || outcome.reason === "blocked") {
         await store.writeHandoff(spec.id, outcome.summary);
       }
