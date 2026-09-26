@@ -39,7 +39,38 @@ jobs:
       # scripts run, in CI or anywhere else.
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm test
+      # The failing test NAMES, as ANNOTATIONS. A job log on this repo needs admin
+      # rights, so an agent with no `actions:read` cannot read why its own suite went
+      # red — three of the fleet's fourteen parked questions on 2026-08-23 were a human
+      # pasting one, and one of them was a flake nobody could name for two days.
+      #
+      # Annotations and not `$GITHUB_STEP_SUMMARY`: verified anonymously against a
+      # deliberate failure (a1f53a9) that a completed Actions check-run answers with
+      # `output.summary: null`, so a job summary reaches nobody through the API. The
+      # annotations endpoint is public, and until now it only ever said "Process
+      # completed with exit code 1".
+      - id: test
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "${RUNNER_TEMP}/test.log"
+      # Ten is GitHub's cap on error annotations per step; the counts ride in one more so
+      # a lost-result rejection is never mistaken for a green run.
+      - if: failure() && steps.test.outcome == 'failure'
+        env:
+          NODE: ${{ matrix.node }}
+        run: |
+          awk -v node="$NODE" '
+            /^not ok [0-9]+ - / { name = substr($0, index($0, "- ") + 2); loc = ""; err = ""; block = 0; open = 1; next }
+            open && /^  location: / { loc = substr($0, 14, length($0) - 14); next }
+            open && /^  error: \|-/ { block = 1; next }
+            open && /^  error: / { err = substr($0, 11, length($0) - 11); next }
+            open && block && /^    ./ { if (err == "") { err = $0; sub(/^ +/, "", err) } next }
+            open && /^  [a-z]/ { block = 0 }
+            open && /^  \.\.\.$/ { print "::error::node " node ": " name " — " err " (" loc ")"; open = 0; n += 1 }
+            n == 10 { exit }
+          ' "${RUNNER_TEMP}/test.log"
+          grep -E '^# (tests|pass|fail|cancelled) |^npm test rejected this run' "${RUNNER_TEMP}/test.log" \
+            | tr '\n' ' ' | sed "s/^/::error::node $NODE: /"
 
   build:
     needs: check
