@@ -4411,6 +4411,7 @@ stopped looking is the most expensive thing a pass like this could leave behind,
 | web search / fetch | supervisor | fewer human round-trips on unfamiliar libs |
 | Grafana / Jira / Atlassian | MCP | verify impact, pull requirements |
 | `cluster_logs`, `cluster_events`, `cluster_describe` | supervisor | read-only cluster evidence — no writes of any kind |
+| `chat_post` | supervisor | peer coordination between plan siblings — the allowed set is enforced per post (§21) |
 
 The control-plane verbs being *tools* rather than parsed prose is load-bearing: every
 state transition is typed and auditable.
@@ -5744,6 +5745,7 @@ So Redis carries what has to cross a process boundary, and only that:
 | presence — which runners are alive, for display | ✔ | |
 | cancel signals — reaching a session already running | ✔ | |
 | steering — a human's guidance, reaching that same session (§7.3) | ✔ | |
+| agent chat rooms — peer coordination between plan siblings | ✔ | |
 | **leases** | | ✔ |
 | **task state** — `state.json`, phase, sessions, usage | | ✔ |
 | **journal, transcripts, artifacts, audit** | | ✔ |
@@ -5858,6 +5860,47 @@ makes it correct, because Redis pub/sub is fire-and-forget and a session that su
 millisecond late would otherwise run to completion with a human waiting on it. The session
 checks the key once on subscribing and at turn boundaries thereafter. The in-process path is
 untouched and still runs; the two abort the same controller.
+
+### Agent chat rooms, one per task, on the same crossing
+
+Sessions in a plan used to be sealed off from each other: wave 2 could not tell wave 1
+what it had learned, and the human was the only channel between two tasks. A chat room
+per task is the seventh structure on this plane, and it exists so a sibling can talk to a
+sibling without either of them being a human. It is `implement` and `remediation` kinds
+only — a `brainstorm` task has no peers to coordinate with, and giving it a voice in
+rooms it shares with nobody would be a tool with no purpose (§13).
+
+The room's shape is bounded by the rest of this section. A room is a LIST per task,
+`room:<task>`, trimmed to the last fifty messages, of which the opening prompt shows
+twenty (`ROOM_HISTORY_LIMIT`), and TTL-refreshed on every post: a room
+nobody posts to expires like every other ephemeral coordination, and a room that goes
+quiet mid-plan does not ambush whoever claims the task next month. `history` is
+non-consuming, so the opening prompt of every session shows the bounded tail of its own
+room without spending it, and live messages ride the same publish/subscribe wake-up the
+cancels use — only ever at a turn boundary, the path §7.3 proved for steering. There is
+no pull tool and no replay at subscribe time: a message that arrives while no session
+watches is in the room's history next session, and that gap is an accepted loss rather
+than a second delivery mechanism.
+
+**Who may post where is computed per post, from the plan graph.** A task may post to its
+own room, to the rooms of the tasks it declares `blockedBy`, and to the rooms of
+same-plan siblings that declare IT as a blocker — nothing else. The set is re-derived
+from `state.json` on every `chat_post` call rather than cached at claim time, because
+the graph moves while a slot lives; a task with no plan has no peers, and a state repo
+that cannot be read permits nothing. The session's `RoomChat` is the whole guard, which
+is why the boundary lives in the supervisor and not in the room structure: a runner that
+never got the plan right can still not talk to a room the graph does not connect it to.
+
+And the journal invariant is unchanged. A peer's message is never written to the journal
+shard — the journal is the operator's channel, `SlotSteering.arrived()` fills it, and a
+room message never enters it — so the durable record of an agent's own words remains the
+journal it writes itself. Three losses are accepted and declared: a message posted while
+no session is watching is invisible until the next session opens (the in-session gap),
+a message delivered live AND still in the bounded history is seen twice across two
+sessions, and two messages posted between two wake-ups deliver only the newest live —
+the older one waits in history. No dedup and no live queueing, because remembering what
+was delivered or holding what was not would be plane state, and plane state is what
+§21 forbids.
 
 ### What is deliberately absent
 

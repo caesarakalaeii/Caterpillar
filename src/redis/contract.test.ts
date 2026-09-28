@@ -240,6 +240,36 @@ const threadsContract = async (store: ThreadBindingStore): Promise<void> => {
   assert.deepEqual(await store.read(), []);
 };
 
+/**
+ * The one contract over the RAW client rather than a structure: `lrange` is a
+ * primitive the room's `history` reads through, so both implementers of
+ * `RedisClient` must agree on it directly.
+ */
+export const lrangeContract = async (redis: RedisClient): Promise<void> => {
+  const key = "lrange-contract";
+  await redis.rpush(key, "one");
+  await redis.rpush(key, "two");
+  await redis.rpush(key, "three");
+
+  // In order, stop inclusive.
+  assert.deepEqual(await redis.lrange(key, 0, -1), ["one", "two", "three"]);
+  assert.deepEqual(await redis.lrange(key, 0, 1), ["one", "two"]);
+
+  // Negative indices count from the end — the shape `history(limit)` reads with.
+  assert.deepEqual(await redis.lrange(key, -2, -1), ["two", "three"]);
+
+  // And clamp when the negative start reaches past the front: `history` always
+  // passes `-limit`, which routinely exceeds the list's length.
+  assert.deepEqual(await redis.lrange(key, -20, -1), ["one", "two", "three"]);
+
+  // A read is NOT a drain. The room keeps its history for the next session.
+  assert.deepEqual(await redis.lrange(key, 0, -1), ["one", "two", "three"]);
+
+  // Missing key: an empty answer, not an error.
+  await redis.del(key);
+  assert.deepEqual(await redis.lrange(key, 0, -1), []);
+};
+
 /* ─────────────────────────────── running them ─────────────────────────────── */
 
 interface Implementations {
@@ -338,6 +368,12 @@ runContracts({
     }),
 });
 
+describe("lrange: order, negative indices, clamp, non-consuming, empty key", () => {
+  test("memory client", async () => {
+    await lrangeContract(new MemoryRedisClient());
+  });
+});
+
 /**
  * And against a real server, when one is named.
  *
@@ -398,6 +434,11 @@ describe("a live redis server", { skip: liveUrl === undefined ? "REDIS_TEST_URL 
 
   test("steering round trips", async () => {
     await steeringContract(new RedisSteeringInbox({ redis: live(), logger: SILENT_LOGGER }));
+    await teardown();
+  });
+
+  test("lrange round trips", async () => {
+    await lrangeContract(live());
     await teardown();
   });
 

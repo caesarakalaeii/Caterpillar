@@ -330,7 +330,66 @@ test("controlTools is unchanged by any of this", () => {
     "done",
     "task_note",
     "publish_artifact",
+    "chat_post",
   ]);
+});
+
+test("chat_post posts in bound and says so, and the message reached the room", async () => {
+  const posted: { to: string; text: string }[] = [];
+  const ctx: ToolContext = {
+    ...harness().ctx,
+    chat: async (to, msg) => {
+      posted.push({ to, text: msg });
+      return true;
+    },
+  };
+
+  const reply = await call(controlTools(ctx), "chat_post", { to: "GH-1", text: "the fixture was the problem" });
+
+  assert.deepEqual(posted, [{ to: "GH-1", text: "the fixture was the problem" }]);
+  assert.match(reply, /posted/i);
+});
+
+test("chat_post refused out of bound is honest text, and the message did not reach the room", async () => {
+  const posted: { to: string; text: string }[] = [];
+  const ctx: ToolContext = {
+    ...harness().ctx,
+    chat: async (to, msg) => {
+      posted.push({ to, text: msg });
+      return false;
+    },
+  };
+
+  const reply = await call(controlTools(ctx), "chat_post", { to: "GH-unrelated", text: "hello" });
+
+  // The supervisor's callback returned false — the room never saw the message. The tool
+  // must say so: a session that believes a peer heard it will not repeat itself any
+  // other way.
+  assert.match(reply, /not|refused|outside/i);
+});
+
+test("chat_post with no callback configured is honest, not silent", async () => {
+  const { ctx } = harness();
+
+  const reply = await call(controlTools(ctx), "chat_post", { to: "GH-1", text: "hello" });
+
+  assert.match(reply, /no chat rooms|not configured/i);
+});
+
+test("a brainstorm never receives chat_post", () => {
+  // Pinned by assertion rather than by pattern-tautology: the deepEqual above cannot
+  // fail on a brainstorm tool gain, and §14.3's rule is that a brainstorm plans and
+  // never speaks for the fleet.
+  const { ctx } = harness();
+  const bound = names(toolsForKind("brainstorm", ctx));
+  assert.ok(!bound.includes("chat_post"), "brainstorm got chat_post");
+});
+
+test("implement and remediation both receive chat_post, with or without a cluster reader", () => {
+  for (const ctx of [harness().ctx, harness(new FakeReader("x")).ctx]) {
+    assert.ok(names(toolsForKind("implement", ctx)).includes("chat_post"), "implement lacks chat_post");
+    assert.ok(names(toolsForKind("remediation", ctx)).includes("chat_post"), "remediation lacks chat_post");
+  }
 });
 
 test("open_pr opens against a NAMED repo, not always the primary one", async () => {

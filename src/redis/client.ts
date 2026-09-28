@@ -78,13 +78,23 @@ export interface RedisClient {
   releaseIfHeld(key: string, value: string): Promise<boolean>;
   del(key: string): Promise<void>;
   /**
-   * Append to the right of a list, and bound it: older entries beyond `cap` are dropped.
+   * Elements of a list, in order, WITHOUT deleting it.
    *
-   * `ttlSeconds` refreshes the whole list's expiry on every push. A list nobody drains has
-   * to be able to go away by itself — see `STEER_TTL_SECONDS` for the case that needs it —
-   * and refreshing rather than setting-once means the clock measures silence rather than
-   * age, so an active conversation is never cut off mid-way.
+   * `drain` is for an inbox: one reader takes everything. A room's history is the
+   * opposite case — every session that starts later reads the same tail — so the
+   * read must leave the list standing. Redis LIST index semantics: 0-based,
+   * negative counts from the end, `stop` inclusive, a start past the front
+   * clamps to it, empty or missing key → `[]`.
    */
+  lrange(key: string, start: number, stop: number): Promise<readonly string[]>;
+  /**
+    * Append to the right of a list, and bound it: older entries beyond `cap` are dropped.
+    *
+    * `ttlSeconds` refreshes the whole list's expiry on every push. A list nobody drains has
+    * to be able to go away by itself — see `STEER_TTL_SECONDS` for the case that needs it —
+    * and refreshing rather than setting-once means the clock measures silence rather than
+    * age, so an active conversation is never cut off mid-way.
+    */
   rpush(key: string, value: string, cap?: number, ttlSeconds?: number): Promise<void>;
   /** Take every element of a list and delete it, atomically. */
   drain(key: string): Promise<readonly string[]>;
@@ -373,6 +383,10 @@ export class IoRedisClient implements RedisClient {
     const [error, value] = first;
     if (error !== null) throw error;
     return Array.isArray(value) ? (value as string[]) : [];
+  }
+
+  async lrange(key: string, start: number, stop: number): Promise<readonly string[]> {
+    return this.run("lrange", () => this.driver.lrange(this.key(key), start, stop));
   }
 
   async zrangeByScore(key: string, min: number): Promise<readonly RedisScored[]> {

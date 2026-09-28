@@ -90,12 +90,13 @@ import type { Tracker, TrackerTransition } from "../tracker/types.ts";
 import { ProviderCooldown } from "./cooldown.ts";
 import { AlertReverifier } from "./verifier.ts";
 import { isNewerComment } from "../agent/review-guidance.ts";
-import { SlotSteering, type SteeringFeed } from "../agent/steering.ts";
+import { SlotSteering, mergeFeeds, type SteeringFeed, type SteeringItem } from "../agent/steering.ts";
 import type { CancelSignals } from "../redis/cancel.ts";
 import type { ChatDrainer } from "../redis/inbox.ts";
 import type { PresenceRegistry } from "../redis/presence.ts";
 import type { SnapshotWriter } from "../redis/snapshot.ts";
 import type { SteeringInbox } from "../redis/steering.ts";
+import { ROOM_HISTORY_LIMIT, type ChatRooms, type RoomChat } from "../redis/rooms.ts";
 import type { ChatIntent, ChatOutcome, ChatRequest } from "./inbox.ts";
 import { checkLimits, committedLine, recordProgress, type ProgressEvidence } from "./progress.ts";
 import { summarise } from "./snapshot.ts";
@@ -166,6 +167,7 @@ export interface SessionRunner {
     state: TaskState,
     signal: AbortSignal,
     steering?: SteeringFeed,
+    chat?: RoomChat,
   ): Promise<SessionOutcome>;
 }
 
@@ -381,6 +383,13 @@ export interface SupervisorDeps {
    * before this, and the reason a rejected plan could only ever be re-run unchanged.
    */
   readonly steering?: SteeringInbox;
+  /**
+   * Per-task agent chat rooms on the ephemeral plane (DESIGN.md §21, "Agent chat rooms"). Optional:
+   * without it a session gets no `chat_post` callback and no room history, which
+   * is the same honest degradation as `publish` — exactly what every session
+   * did before rooms existed.
+   */
+  readonly rooms?: ChatRooms;
   /**
    * Advisory display of which runners are alive (DESIGN.md §21). Optional and, crucially,
    * never load-bearing: routing and claiming stay on leases in git (§5).
@@ -962,6 +971,7 @@ export class Supervisor {
     state: TaskState,
     signal: AbortSignal,
     steering: SteeringFeed,
+    chat?: RoomChat,
   ): Promise<SessionOutcome> {
     if (signal.aborted) {
       return {
@@ -971,7 +981,7 @@ export class Supervisor {
         summary: "the session was stopped before it started",
       };
     }
-    return this.deps.runner.run(spec, state, signal, steering);
+    return this.deps.runner.run(spec, state, signal, steering, chat);
   }
 
   /** Slots this runner could still fill. Never negative. */
@@ -1796,6 +1806,47 @@ export class Supervisor {
       slot.steering.push(text);
     });
 
+    // The task's chat room, if the plane has one (DESIGN.md §21, "Agent chat rooms"). Scoped to the
+    // whole slot like `steerWatch` above: a message posted between two sessions is
+    // not held here — it lands in the next session's opening history — so the watch
+    // exists only for the LIVE path, and the feed's `take()` is empty by design.
+    const rooms = this.deps.rooms;
+    let roomFeedListener: ((item: SteeringItem) => void) | undefined;
+    const roomFeed: SteeringFeed = {
+      take: (): readonly SteeringItem[] => [],
+      subscribe: (onItem: (item: SteeringItem) => void): (() => void) => {
+        roomFeedListener = onItem;
+        return (): void => {
+          roomFeedListener = undefined;
+        };
+      },
+    };
+    const roomWatch = rooms === undefined ? undefined : await rooms.watch(spec.id, (message) => {
+      logger.info("task.room-message", { task: spec.id, from: message.from });
+      roomFeedListener?.({ text: message.text, from: message.from });
+    });
+    const chat: RoomChat | undefined =
+      rooms === undefined
+        ? undefined
+        : {
+            // The allowed set is computed per POST, not per slot: `blockedBy` and the
+            // sibling states can change while the slot lives, and a stale set is a
+            // refusal of a peer the graph now allows (§21, "Agent chat rooms").
+            post: async (to, text) => {
+              if (!(await this.roomAllowed(spec, to))) return false;
+              return rooms.post(to, {
+                from: spec.id,
+                text,
+                at: new Date().toISOString(),
+              });
+            },
+            history: () => rooms.history(spec.id, ROOM_HISTORY_LIMIT),
+          };
+    // The merged feed the session actually sees: operator backlog first, the
+    // room's live messages alongside. The runner never constructs this — the
+    // supervisor owns both halves of the merge (§21, "Agent chat rooms").
+    const sessionSteering = mergeFeeds(slot.steering, roomFeed);
+
     // **One heartbeat per slot, renewing one lease.** The renewal is a CAS on
     // `refs/leases/<task>`, so the fencing `assertHeld` performs is per lease and stays so
     // however many slots are open: each slot's pushes are checked against its own ref and
@@ -1936,7 +1987,7 @@ export class Supervisor {
 
         let outcome: SessionOutcome;
         try {
-          outcome = await this.runSession(spec, state, interrupt.signal, slot.steering);
+          outcome = await this.runSession(spec, state, interrupt.signal, sessionSteering, chat);
         } finally {
           clearTimeout(deadline);
           stopTyping();
@@ -2070,6 +2121,7 @@ export class Supervisor {
       // already gone must not be the thing that fails a finished session.
       await cancelWatch?.close().catch(() => undefined);
       await steerWatch?.close().catch(() => undefined);
+      await roomWatch?.close().catch(() => undefined);
       signal.removeEventListener("abort", stopOnShutdown);
       await leases.release(await heartbeat.current()).catch(() => undefined);
     }
@@ -2240,7 +2292,7 @@ export class Supervisor {
           [
             `**Steered by the operator** during session ${session}:`,
             "",
-            ...steered.map((text) => `> ${text.replace(/\n/g, "\n> ")}`),
+            ...steered.map((item) => `> ${item.text.replace(/\n/g, "\n> ")}`),
           ].join("\n"),
         );
       }
@@ -2965,6 +3017,30 @@ export class Supervisor {
       records.push({ id, state });
     }
     return records;
+  }
+
+  /**
+   * Whether `spec` may post into `to`'s room: the task itself, its blockers, or a
+   * same-plan sibling that declares `spec` as a blocker (DESIGN.md §21, "Agent chat rooms").
+   *
+   * Dependents are scanned rather than stored, for the same reason `planRecords`
+   * scans: the reverse edge lives in OTHER tasks' state, and the loop already
+   * walks that set every pass. Read failures refuse — a graph that cannot be read
+   * is not a graph that permits everything.
+   */
+  private async roomAllowed(spec: TaskSpec, to: TaskId): Promise<boolean> {
+    if (to === spec.id) return true;
+    const state = await this.deps.store.readState(spec.id).catch(() => undefined);
+    const plan = state?.plan;
+    if (plan === undefined) return false;
+    if (plan.blockedBy.includes(to)) return true;
+    for (const id of await this.deps.store.listTasks()) {
+      if (id === spec.id) continue;
+      const sibling = await this.deps.store.readState(id).catch(() => undefined);
+      if (sibling?.plan?.parent !== plan.parent) continue;
+      if (id === to && (sibling.plan?.blockedBy ?? []).includes(spec.id)) return true;
+    }
+    return false;
   }
 
   /**

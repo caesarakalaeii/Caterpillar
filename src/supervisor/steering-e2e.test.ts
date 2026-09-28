@@ -301,7 +301,7 @@ test("a message in a running task's thread reaches the live session", async () =
         // Stand in for pi's turn boundary: subscribe, then hold the session open until
         // something arrives — which is the only window in which a steer can be delivered.
         feed = steering;
-        steering?.subscribe((text) => handed.push(text));
+        steering?.subscribe((item) => handed.push(item.text));
         // Bounded and silent: the test asserts on `handed`, and throwing here would park the
         // task and re-claim it forever instead of failing (see `settle`).
         await waitFor(() => handed.length > 0);

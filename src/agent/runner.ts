@@ -28,7 +28,7 @@ import { stateRepoRef, workspaceScopeOf } from "../config/scope.ts";
 import type { RunnerConfig } from "../config/types.ts";
 import type { CredentialService } from "../credential/service.ts";
 import type { AmendedAcceptance } from "../domain/acceptance.ts";
-import { addUsage, repoSlug, taskPullRequests } from "../domain/task.ts";
+import { addUsage, asTaskId, repoSlug, taskPullRequests } from "../domain/task.ts";
 import type {
   RepoRef,
   SessionOutcome,
@@ -55,6 +55,7 @@ import { newestHumanComment, renderReviewGuidance } from "./review-guidance.ts";
 import { readRepoStandards, repoCheckoutsOf } from "./standards.ts";
 import { runSession } from "./session.ts";
 import type { SteeringFeed } from "./steering.ts";
+import type { RoomChat } from "../redis/rooms.ts";
 import { toolsForKind, type ControlSink, type ToolContext } from "./tools.ts";
 
 void _gzipSync;
@@ -140,6 +141,7 @@ export class AgentSessionRunner {
     state: TaskState,
     signal?: AbortSignal,
     steering?: SteeringFeed,
+    chat?: RoomChat,
   ): Promise<SessionOutcome> {
     const { credentials, worktrees, store, llm, metrics, live } = this.options;
 
@@ -220,6 +222,14 @@ export class AgentSessionRunner {
                 metrics.clusterReads.inc(labels);
                 metrics.clusterReadSeconds.inc(labels, seconds);
               },
+            }),
+        ...(chat === undefined
+          ? {}
+          : {
+              // The allowed set is the supervisor's (§21, "Agent chat rooms") and is the whole guard: a
+              // `to` the supervisor does not know is refused there. This adapter only
+              // carries the brand the rooms' keys need.
+              chat: (to: string, text: string): Promise<boolean> => chat.post(asTaskId(to), text),
             }),
       };
 
@@ -309,6 +319,10 @@ export class AgentSessionRunner {
         ...(await this.conflictSection(spec, repo, worktree)),
         ...(await this.amendmentSection(spec)),
         ...(review.section === undefined ? {} : { reviewGuidance: review.section }),
+        // The room's history is fetched once here, not per turn: the live path is the
+        // steering feed the supervisor merges (§21, "Agent chat rooms"), and this section is the catch-up
+        // a session starting after a conversation needs.
+        ...(chat === undefined ? {} : { roomHistory: await chat.history() }),
       });
 
       // The last line is not decoration. `open_pr` defaults to the primary repo, so an agent

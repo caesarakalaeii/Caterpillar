@@ -45,6 +45,7 @@ import { DEFAULT_USAGE_CONFIG, type WorkspaceUsage } from "../workspace/usage.ts
 import { DEFAULT_REAP_CONFIG, type ReapResult } from "../workspace/worktree.ts";
 import { InMemoryCancelSignals } from "../redis/cancel.ts";
 import { type ChatDrainer, InMemoryChatQueue } from "../redis/inbox.ts";
+import { InMemoryChatRooms } from "../redis/rooms.ts";
 import { InMemorySnapshotStore } from "../redis/snapshot.ts";
 import { InMemoryThreadBindings } from "../redis/threads.ts";
 import { type ChatIntent, type ChatOutcome, type ChatRequest } from "./inbox.ts";
@@ -4974,7 +4975,7 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
         // session that errored, which the supervisor answers by parking and re-claiming, so a
         // broken expectation would come back as a loop that never settles rather than as a
         // failing assertion. The test asserts on `seen` instead.
-        steering?.subscribe((text) => seen.push(text));
+        steering?.subscribe((item) => seen.push(item.text));
         started?.();
         const held = Date.now() + 30_000;
         while (Date.now() < held && seen.length === 0) await sleep(50);
@@ -5021,6 +5022,213 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
   const journal = await store.readJournal(STEERED_TASK);
   assert.match(String(journal), /Steered by the operator/);
   assert.match(String(journal), /use the existing migration path/);
+});
+
+test("a room message posted live reaches the session framed as a peer, never the journal", async () => {
+  // Step 8 end to end: a sibling agent's message arrives over the room watch while
+  // the session runs, and what the session SEES is a SteeringItem with `from` — the
+  // peer frame in session.ts reads it. What the JOURNAL gets is nothing: the journal
+  // shard is written from `SlotSteering.arrived()`, which only the operator's
+  // `push(text)` ever fills, so a peer's note is in the room's own history next
+  // session instead of double-recorded (§21, "Agent chat rooms").
+  const ROOMED = asTaskId("SMOKE-ROOM-1");
+  const SIBLING = asTaskId("SMOKE-ROOM-2");
+  await seedTask(ROOMED, { plan: { parent: asTaskId("BS-ROOM"), wave: 0, blockedBy: [] } });
+  await seedTask(SIBLING, {
+    plan: { parent: asTaskId("BS-ROOM"), wave: 1, blockedBy: [ROOMED] },
+  });
+
+  const rooms = new InMemoryChatRooms();
+  // `from` carries the peer frame: `TaskId | undefined` rather than optional, because
+  // `exactOptionalPropertyTypes` refuses an explicit `undefined` in an optional slot.
+  const seenItems: { text: string; from: TaskId | undefined }[] = [];
+  let started: (() => void) | undefined;
+  const firstTurn = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: async (spec, _state, _signal, steering) => {
+        if (spec.id !== ROOMED) throw new Error("session not under test");
+        steering?.subscribe((item) => seenItems.push({ text: item.text, from: item.from }));
+        started?.();
+        const held = Date.now() + 30_000;
+        while (Date.now() < held && seenItems.length === 0) await sleep(50);
+        return {
+          reason: "handoff" as const,
+          usage: EMPTY_USAGE,
+          contextTokens: 10,
+          summary: "took the peer's note",
+        };
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    rooms,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await firstTurn;
+
+  // The sibling posts into ROOMED's room — as a sibling agent would, through its own
+  // `ChatRooms`, never through the RoomChat under test.
+  assert.equal(
+    await rooms.post(ROOMED, {
+      from: SIBLING,
+      text: "schema is in place, code against it freely",
+      at: "2026-08-13T00:00:00Z",
+    }),
+    true,
+    "the in-memory room must record the sibling's post",
+  );
+
+  const arrived = Date.now() + 30_000;
+  while (Date.now() < arrived && seenItems.length === 0) await sleep(50);
+  assert.deepEqual(
+    seenItems,
+    [
+      {
+        text: "schema is in place, code against it freely",
+        from: SIBLING,
+      },
+    ],
+    "the live session got the room message as a peer-framed item",
+  );
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  const store = new StateStore(statePath, stateGit);
+  await store.pull("origin", config.stateRepo.branch);
+  const journal = await store.readJournal(ROOMED);
+  assert.doesNotMatch(
+    String(journal),
+    /schema is in place/,
+    "a peer's room message must not land in the operator journal shard",
+  );
+});
+
+test("the chat callback enforces the plan's allowed set: own, blockers, dependents only", async () => {
+  // The RoomChat the supervisor builds is the WHOLE guard (runner.ts comments say
+  // so), so what it refuses is the contract: a task may post to its own room, to
+  // its blockers' rooms, and to the rooms of same-plan siblings that declare it
+  // as a blocker — and to nothing else, with no plan at all meaning no peers.
+  const ME = asTaskId("SMOKE-CHAT-1");
+  const BLOCKER = asTaskId("SMOKE-CHAT-2");
+  const DEPENDENT = asTaskId("SMOKE-CHAT-3");
+  const SIBLING = asTaskId("SMOKE-CHAT-6");
+  const STRANGER = asTaskId("SMOKE-CHAT-4");
+  const NO_PLAN = asTaskId("SMOKE-CHAT-5");
+  await seedTask(ME, {
+    plan: { parent: asTaskId("BS-CHAT"), wave: 1, blockedBy: [BLOCKER] },
+  });
+  // `done`, so `isClaimable` lets ME run: `blockedBy` is the authority (§6.x) and a
+  // blocker parked `failed` keeps its dependent unclaimable forever. STRANGER and
+  // DEPENDENT are parked, so the supervisor never spends a session on them — only ME
+  // and NO_PLAN are under test.
+  await seedTask(BLOCKER, {
+    status: "done",
+    plan: { parent: asTaskId("BS-CHAT"), wave: 0, blockedBy: [] },
+  });
+  await seedTask(DEPENDENT, {
+    status: "parked",
+    plan: { parent: asTaskId("BS-CHAT"), wave: 2, blockedBy: [ME] },
+  });
+  await seedTask(STRANGER, {
+    status: "parked",
+    plan: { parent: asTaskId("BS-OTHER"), wave: 0, blockedBy: [] },
+  });
+  // Same plan as ME but does NOT declare ME as a blocker: the sibling scan must walk
+  // PAST it, not stop, and a same-plan id alone must not be a pass.
+  await seedTask(SIBLING, {
+    status: "parked",
+    plan: { parent: asTaskId("BS-CHAT"), wave: 1, blockedBy: [] },
+  });
+  await seedTask(NO_PLAN);
+
+  const rooms = new InMemoryChatRooms();
+  let checked: (() => void) | undefined;
+  const ready = new Promise<void>((resolve) => {
+    checked = resolve;
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: {
+      run: async (spec, _state, _signal, _steering, chat) => {
+        if (spec.id !== ME && spec.id !== NO_PLAN) throw new Error("session not under test");
+        if (spec.id === NO_PLAN) {
+          assert.equal(
+            await chat?.post(BLOCKER, "hello"),
+            false,
+            "a task with no plan has no peers to post to",
+          );
+          return { reason: "handoff" as const, usage: EMPTY_USAGE, contextTokens: 0, summary: "no plan" };
+        }
+        assert.ok(chat !== undefined, "a supervisor with rooms must hand the session a RoomChat");
+        assert.equal(await chat.post(ME, "note to myself"), true, "own room is allowed");
+        assert.equal(await chat.post(BLOCKER, "checking in"), true, "blocker's room is allowed");
+        assert.equal(await chat.post(DEPENDENT, "unblocked you"), true, "dependent's room is allowed");
+        assert.equal(await chat.post(STRANGER, "should not land"), false, "unrelated room is refused");
+        assert.equal(
+          await chat.post(SIBLING, "same plan is not enough"),
+          false,
+          "a same-plan sibling that does not block ME is refused",
+        );
+        const history = await chat.history();
+        assert.equal(history[history.length - 1]?.text, "note to myself", "history reads the task's own room");
+        checked?.();
+        return { reason: "handoff" as const, usage: EMPTY_USAGE, contextTokens: 0, summary: "checked" };
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+    rooms,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  await ready;
+
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.equal(
+    (await rooms.history(STRANGER, 10)).length,
+    0,
+    "the refused post must never have reached the stranger's room",
+  );
 });
 
 test("a two-repo task merges both PRs, in the order its repos were named", async () => {

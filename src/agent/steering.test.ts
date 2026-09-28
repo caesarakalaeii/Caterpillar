@@ -15,21 +15,21 @@ test("a message that arrives with no session waiting is held for the next one", 
   const steering = new SlotSteering();
   steering.push("use the existing migration path");
 
-  assert.deepEqual(steering.take(), ["use the existing migration path"]);
+  assert.deepEqual(steering.take(), [{ text: "use the existing migration path" }]);
 });
 
 test("the backlog is taken exactly once", () => {
   const steering = new SlotSteering();
   steering.push("one");
 
-  assert.deepEqual(steering.take(), ["one"]);
+  assert.deepEqual(steering.take(), [{ text: "one" }]);
   assert.deepEqual(steering.take(), [], "a second session must not replay the first's steer");
 });
 
 test("a subscribed session gets messages as they arrive", () => {
   const steering = new SlotSteering();
   const seen: string[] = [];
-  steering.subscribe((text) => seen.push(text));
+  steering.subscribe((item) => seen.push(item.text));
 
   steering.push("drop the third task");
   steering.push("and the criteria are unmeasurable");
@@ -43,14 +43,14 @@ test("unsubscribing sends later messages back to the buffer", () => {
   // before the next one subscribes has to survive the gap.
   const steering = new SlotSteering();
   const seen: string[] = [];
-  const stop = steering.subscribe((text) => seen.push(text));
+  const stop = steering.subscribe((item) => seen.push(item.text));
 
   steering.push("during");
   stop();
   steering.push("between sessions");
 
   assert.deepEqual(seen, ["during"]);
-  assert.deepEqual(steering.take(), ["between sessions"]);
+  assert.deepEqual(steering.take(), [{ text: "between sessions" }]);
 });
 
 test("unsubscribing is scoped to the subscriber that did it", () => {
@@ -59,7 +59,7 @@ test("unsubscribing is scoped to the subscriber that did it", () => {
   const seen: string[] = [];
   const stale = steering.subscribe(() => assert.fail("the old session must not be called"));
   stale();
-  steering.subscribe((text) => seen.push(text));
+  steering.subscribe((item) => seen.push(item.text));
   stale();
 
   steering.push("still listening");
@@ -75,7 +75,7 @@ test("a listener that throws does not lose the message", () => {
   });
 
   steering.push("keep me");
-  assert.deepEqual(steering.take(), ["keep me"]);
+  assert.deepEqual(steering.take(), [{ text: "keep me" }]);
 });
 
 test("what arrived is recorded even when a session consumed it", () => {
@@ -87,7 +87,7 @@ test("what arrived is recorded even when a session consumed it", () => {
   steering.push("delivered");
   steering.push("also delivered");
 
-  assert.deepEqual(steering.arrived(), ["delivered", "also delivered"]);
+  assert.deepEqual(steering.arrived(), [{ text: "delivered" }, { text: "also delivered" }]);
 });
 
 test("recorded guidance is cleared once a session has journalled it", () => {
@@ -97,5 +97,5 @@ test("recorded guidance is cleared once a session has journalled it", () => {
   steering.clearArrived();
 
   assert.deepEqual(steering.arrived(), []);
-  assert.deepEqual(steering.take(), ["said once"], "clearing the record does not consume it");
+  assert.deepEqual(steering.take(), [{ text: "said once" }], "clearing the record does not consume it");
 });
