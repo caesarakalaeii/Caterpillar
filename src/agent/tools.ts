@@ -173,7 +173,7 @@ export interface ToolContext {
    */
   readonly recordClusterRead?: (tool: string, outcome: ClusterReadOutcome, seconds: number) => void;
   /**
-   * Posts one message to a peer task's chat room (§21.x).
+   * Posts one message to a peer task's chat room (§21, "Agent chat rooms").
    *
    * A callback for the same reason as `publish`: the tool must not be able to reach
    * any room but the ones the supervisor allows, and the allowed set is the
@@ -181,6 +181,7 @@ export interface ToolContext {
    */
   readonly chat?: (to: string, text: string) => Promise<boolean>;
 }
+
 /** `denied` is a refused namespace or kind; `error` is everything the cluster got wrong. */
 export type ClusterReadOutcome = "ok" | "denied" | "error";
 
@@ -422,9 +423,11 @@ const PublishArtifactParams = Type.Object({
       "File name to store it under, e.g. `sublevel-scan.json`. Letters, digits, dot, " +
       "dash and underscore only — no directories.",
   }),
-  path: Type.String({ description: "Path to the file, relative to the working directory." }),
+  path: Type.String({
+    description: "Path to the file, relative to your working directory.",
+  }),
   note: Type.String({
-    description: "One line on what it holds and how to read it.",
+    description: "One line on what it is and why the next task will want it.",
   }),
 });
 

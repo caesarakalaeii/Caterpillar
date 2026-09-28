@@ -226,7 +226,7 @@ export class AgentSessionRunner {
         ...(chat === undefined
           ? {}
           : {
-              // The allowed set is the supervisor's (§21.x) and is the whole guard: a
+              // The allowed set is the supervisor's (§21, "Agent chat rooms") and is the whole guard: a
               // `to` the supervisor does not know is refused there. This adapter only
               // carries the brand the rooms' keys need.
               chat: (to: string, text: string): Promise<boolean> => chat.post(asTaskId(to), text),
@@ -320,10 +320,11 @@ export class AgentSessionRunner {
         ...(await this.amendmentSection(spec)),
         ...(review.section === undefined ? {} : { reviewGuidance: review.section }),
         // The room's history is fetched once here, not per turn: the live path is the
-        // steering feed the supervisor merges (§21.x), and this section is the catch-up
+        // steering feed the supervisor merges (§21, "Agent chat rooms"), and this section is the catch-up
         // a session starting after a conversation needs.
         ...(chat === undefined ? {} : { roomHistory: await chat.history() }),
       });
+
       // The last line is not decoration. `open_pr` defaults to the primary repo, so an agent
       // that does not know a sibling PR is a thing it can ask for will finish the work, push the
       // branch, and then have nowhere to put it — which is what `GH-acme-all-chat-543`

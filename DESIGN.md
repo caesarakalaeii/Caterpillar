@@ -5871,7 +5871,8 @@ only — a `brainstorm` task has no peers to coordinate with, and giving it a vo
 rooms it shares with nobody would be a tool with no purpose (§13).
 
 The room's shape is bounded by the rest of this section. A room is a LIST per task,
-`room:<task>`, trimmed to the last twenty messages, TTL-refreshed on every post: a room
+`room:<task>`, trimmed to the last fifty messages, of which the opening prompt shows
+twenty (`ROOM_HISTORY_LIMIT`), and TTL-refreshed on every post: a room
 nobody posts to expires like every other ephemeral coordination, and a room that goes
 quiet mid-plan does not ambush whoever claims the task next month. `history` is
 non-consuming, so the opening prompt of every session shows the bounded tail of its own
@@ -5893,11 +5894,13 @@ never got the plan right can still not talk to a room the graph does not connect
 And the journal invariant is unchanged. A peer's message is never written to the journal
 shard — the journal is the operator's channel, `SlotSteering.arrived()` fills it, and a
 room message never enters it — so the durable record of an agent's own words remains the
-journal it writes itself. Two losses are accepted and declared: a message posted while
+journal it writes itself. Three losses are accepted and declared: a message posted while
 no session is watching is invisible until the next session opens (the in-session gap),
-and a message delivered live AND still in the bounded history is seen twice across two
-sessions. No dedup, because remembering what was delivered would be plane state, and
-plane state is what §21 forbids.
+a message delivered live AND still in the bounded history is seen twice across two
+sessions, and two messages posted between two wake-ups deliver only the newest live —
+the older one waits in history. No dedup and no live queueing, because remembering what
+was delivered or holding what was not would be plane state, and plane state is what
+§21 forbids.
 
 ### What is deliberately absent
 

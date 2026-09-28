@@ -92,7 +92,7 @@ export interface EphemeralPlane {
    */
   readonly threads: ThreadBindingStore;
   /**
-   * The per-task agent chat room (DESIGN.md §21.x).
+   * The per-task agent chat room (DESIGN.md §21, "Agent chat rooms").
    *
    * The seventh structure, and the first whose writers and readers are agents rather
    * than a human or the supervisor: a shorthand between peers working the same task,
@@ -155,8 +155,8 @@ export const inMemoryPlane = (): EphemeralPlane => {
 export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane => ({
   chat: new RedisChatQueue({ redis, logger }),
   snapshot: new RedisSnapshotStore({ redis, logger }),
-  cancels: new RedisCancelSignals({ redis, logger }),
   runners: new RedisPresenceRegistry({ redis, logger }),
+  cancels: new RedisCancelSignals({ redis, logger }),
   steering: new RedisSteeringInbox({ redis, logger }),
   threads: new RedisThreadBindings({ redis, logger }),
   rooms: new RedisChatRooms({ redis, logger }),

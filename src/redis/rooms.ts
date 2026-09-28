@@ -1,5 +1,5 @@
 /**
- * The agent chat room: per-task, nothing drains it. See DESIGN.md §21.x.
+ * The agent chat room: per-task, nothing drains it. See DESIGN.md §21, "Agent chat rooms".
  *
  * The same two halves every ephemeral-plane structure has (§21): a LIST for the
  * durable one and a pub/sub channel for the live one. The difference from
@@ -22,10 +22,8 @@ import { RedisGuard } from "./guarded.ts";
 /** One room message, as stored in the list and as delivered to a watcher. */
 export interface RoomMessage {
   readonly from: TaskId;
-  /** What the sender was doing — `implement` or `remediation` (DESIGN.md §13 row). */
-  readonly kind: "implement" | "remediation";
   readonly text: string;
-  /** ISO timestamp, stamped by the sender, for the opening prompt's rendering. */
+  /** ISO timestamp, stamped by the sender, for the durable record. */
   readonly at: string;
 }
 
@@ -45,7 +43,7 @@ export interface ChatRooms {
 }
 
 /**
- * The per-run carrier the supervisor hands the runner (§21.x). One task's view of
+ * The per-run carrier the supervisor hands the runner (§21, "Agent chat rooms"). One task's view of
  * the rooms: `post` is validated against the allowed set the supervisor computed,
  * `history` is this task's own room and nothing else. The runner is a pure
  * consumer and never sees the `ChatRooms` object itself.
@@ -66,7 +64,9 @@ export const ROOM_PREFIX = "room:";
 /**
  * Messages per room. A room nobody drains can grow without bound — the same
  * `maxmemory` argument every list here makes — and the oldest are the ones to drop:
- * the newest note is the one that reflects where the task actually is.
+ * the newest note is the one that reflects where the task actually is. Fifty kept,
+ * twenty shown (`ROOM_HISTORY_LIMIT`): the store keeps the depth a catch-up may
+ * need, the prompt pays only what its bound allows.
  */
 export const ROOM_CAP = 50;
 
@@ -165,7 +165,7 @@ export class RedisChatRooms implements ChatRooms {
     // is in the opening prompt, and replaying it here would hand a second watcher
     // the same old sentence as "new". The cost is the in-session gap: a message
     // posted between session start and subscribe lands on neither path, and waits
-    // for the next session's history read (§21.x, accepted loss).
+    // for the next session's history read (§21, accepted loss).
     const subscription = await this.guard.run<RedisSubscription | undefined>(
       "room.subscribe",
       () =>
@@ -204,12 +204,11 @@ const key = (task: TaskId): string => `${ROOM_PREFIX}${task}`;
 const parseMessage = (value: unknown): RoomMessage | undefined => {
   if (value === null || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
-  const { from, kind, text, at } = raw;
+  const { from, text, at } = raw;
   if (typeof from !== "string" || typeof text !== "string" || typeof at !== "string") {
     return undefined;
   }
-  if (kind !== "implement" && kind !== "remediation") return undefined;
-  return { from: from as TaskId, kind, text, at };
+  return { from: from as TaskId, text, at };
 };
 
 /** Per entry: one poison line between two good ones must not cost the whole room. */

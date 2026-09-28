@@ -384,7 +384,7 @@ export interface SupervisorDeps {
    */
   readonly steering?: SteeringInbox;
   /**
-   * Per-task agent chat rooms on the ephemeral plane (DESIGN.md §21.x). Optional:
+   * Per-task agent chat rooms on the ephemeral plane (DESIGN.md §21, "Agent chat rooms"). Optional:
    * without it a session gets no `chat_post` callback and no room history, which
    * is the same honest degradation as `publish` — exactly what every session
    * did before rooms existed.
@@ -1004,7 +1004,7 @@ export class Supervisor {
    * `try`/`catch`, so a task's failure was on the work loop's stack — which was fine while
    * there was one task, because unwinding the pass and unwinding the task were the same
    * act. With slots they are not: a throw reaching `workOnce` would abandon the pass that
-   * every OTHER in-flight task's reclaim depends on.
+   * every OTHER in-flight task's cleanup and reclaim depends on.
    *
    * So the promise here settles rather than rejects. Everything the old `catch` did is
    * still done, per task, in a place where doing it cannot reach a sibling:
@@ -1806,7 +1806,7 @@ export class Supervisor {
       slot.steering.push(text);
     });
 
-    // The task's chat room, if the plane has one (DESIGN.md §21.x). Scoped to the
+    // The task's chat room, if the plane has one (DESIGN.md §21, "Agent chat rooms"). Scoped to the
     // whole slot like `steerWatch` above: a message posted between two sessions is
     // not held here — it lands in the next session's opening history — so the watch
     // exists only for the LIVE path, and the feed's `take()` is empty by design.
@@ -1831,13 +1831,11 @@ export class Supervisor {
         : {
             // The allowed set is computed per POST, not per slot: `blockedBy` and the
             // sibling states can change while the slot lives, and a stale set is a
-            // refusal of a peer the graph now allows (§21.x).
+            // refusal of a peer the graph now allows (§21, "Agent chat rooms").
             post: async (to, text) => {
               if (!(await this.roomAllowed(spec, to))) return false;
-              const kind = spec.kind === "remediation" ? "remediation" : "implement";
               return rooms.post(to, {
                 from: spec.id,
-                kind,
                 text,
                 at: new Date().toISOString(),
               });
@@ -1846,7 +1844,7 @@ export class Supervisor {
           };
     // The merged feed the session actually sees: operator backlog first, the
     // room's live messages alongside. The runner never constructs this — the
-    // supervisor owns both halves of the merge (§21.x).
+    // supervisor owns both halves of the merge (§21, "Agent chat rooms").
     const sessionSteering = mergeFeeds(slot.steering, roomFeed);
 
     // **One heartbeat per slot, renewing one lease.** The renewal is a CAS on
@@ -3023,7 +3021,7 @@ export class Supervisor {
 
   /**
    * Whether `spec` may post into `to`'s room: the task itself, its blockers, or a
-   * same-plan sibling that declares `spec` as a blocker (DESIGN.md §21.x).
+   * same-plan sibling that declares `spec` as a blocker (DESIGN.md §21, "Agent chat rooms").
    *
    * Dependents are scanned rather than stored, for the same reason `planRecords`
    * scans: the reverse edge lives in OTHER tasks' state, and the loop already

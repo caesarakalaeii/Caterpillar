@@ -117,6 +117,7 @@ export class MemoryRedisClient implements RedisClient {
     const to = stop < 0 ? list.length + stop : Math.min(stop, list.length - 1);
     return Promise.resolve(to < from ? [] : list.slice(from, to + 1));
   }
+
   drain(key: string): Promise<readonly string[]> {
     this.expireList(key);
     const list = this.lists.get(key) ?? [];
@@ -124,7 +125,6 @@ export class MemoryRedisClient implements RedisClient {
     this.listExpiry.delete(key);
     return Promise.resolve(list);
   }
-
 
   /** Lazily, on touch — the same discipline the string keys use. See the file header. */
   private expireList(key: string): void {

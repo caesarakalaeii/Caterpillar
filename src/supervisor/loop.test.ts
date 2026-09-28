@@ -5030,7 +5030,7 @@ test("a room message posted live reaches the session framed as a peer, never the
   // peer frame in session.ts reads it. What the JOURNAL gets is nothing: the journal
   // shard is written from `SlotSteering.arrived()`, which only the operator's
   // `push(text)` ever fills, so a peer's note is in the room's own history next
-  // session instead of double-recorded (§21.x).
+  // session instead of double-recorded (§21, "Agent chat rooms").
   const ROOMED = asTaskId("SMOKE-ROOM-1");
   const SIBLING = asTaskId("SMOKE-ROOM-2");
   await seedTask(ROOMED, { plan: { parent: asTaskId("BS-ROOM"), wave: 0, blockedBy: [] } });
@@ -5092,7 +5092,6 @@ test("a room message posted live reaches the session framed as a peer, never the
   assert.equal(
     await rooms.post(ROOMED, {
       from: SIBLING,
-      kind: "implement",
       text: "schema is in place, code against it freely",
       at: "2026-08-13T00:00:00Z",
     }),
@@ -5134,6 +5133,7 @@ test("the chat callback enforces the plan's allowed set: own, blockers, dependen
   const ME = asTaskId("SMOKE-CHAT-1");
   const BLOCKER = asTaskId("SMOKE-CHAT-2");
   const DEPENDENT = asTaskId("SMOKE-CHAT-3");
+  const SIBLING = asTaskId("SMOKE-CHAT-6");
   const STRANGER = asTaskId("SMOKE-CHAT-4");
   const NO_PLAN = asTaskId("SMOKE-CHAT-5");
   await seedTask(ME, {
@@ -5154,6 +5154,12 @@ test("the chat callback enforces the plan's allowed set: own, blockers, dependen
   await seedTask(STRANGER, {
     status: "parked",
     plan: { parent: asTaskId("BS-OTHER"), wave: 0, blockedBy: [] },
+  });
+  // Same plan as ME but does NOT declare ME as a blocker: the sibling scan must walk
+  // PAST it, not stop, and a same-plan id alone must not be a pass.
+  await seedTask(SIBLING, {
+    status: "parked",
+    plan: { parent: asTaskId("BS-CHAT"), wave: 1, blockedBy: [] },
   });
   await seedTask(NO_PLAN);
 
@@ -5188,6 +5194,11 @@ test("the chat callback enforces the plan's allowed set: own, blockers, dependen
         assert.equal(await chat.post(BLOCKER, "checking in"), true, "blocker's room is allowed");
         assert.equal(await chat.post(DEPENDENT, "unblocked you"), true, "dependent's room is allowed");
         assert.equal(await chat.post(STRANGER, "should not land"), false, "unrelated room is refused");
+        assert.equal(
+          await chat.post(SIBLING, "same plan is not enough"),
+          false,
+          "a same-plan sibling that does not block ME is refused",
+        );
         const history = await chat.history();
         assert.equal(history[history.length - 1]?.text, "note to myself", "history reads the task's own room");
         checked?.();

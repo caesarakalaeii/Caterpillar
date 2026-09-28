@@ -921,7 +921,6 @@ test("a runner handed a RoomChat puts the room's history in the opening prompt",
     history: async () => [
       {
         from: asTaskId("TASK-9"),
-        kind: "implement",
         text: "the fixture needs its database up first",
         at: "2026-09-28T10:00:00.000Z",
       },

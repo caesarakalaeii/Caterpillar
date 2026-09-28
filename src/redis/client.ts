@@ -87,7 +87,7 @@ export interface RedisClient {
    * clamps to it, empty or missing key → `[]`.
    */
   lrange(key: string, start: number, stop: number): Promise<readonly string[]>;
-   /**
+  /**
     * Append to the right of a list, and bound it: older entries beyond `cap` are dropped.
     *
     * `ttlSeconds` refreshes the whole list's expiry on every push. A list nobody drains has

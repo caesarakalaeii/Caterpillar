@@ -65,7 +65,6 @@ test("unconfigured builds the in-process plane and touches no client", async () 
   assert.equal(
     await plane.rooms.post(asTaskId("GH-acme-widget-1"), {
       from: asTaskId("GH-acme-widget-2"),
-      kind: "implement",
       text: "the migration is slow, budget a minute",
       at: "2026-01-01T00:00:00.000Z",
     }),
@@ -97,7 +96,6 @@ test("configured with an injected client builds the redis plane", async () => {
   assert.equal(
     await plane.rooms.post(asTaskId("GH-acme-widget-1"), {
       from: asTaskId("GH-acme-widget-2"),
-      kind: "implement",
       text: "seen from the other pod",
       at: "2026-01-01T00:00:00.000Z",
     }),

@@ -28,7 +28,6 @@ const other = asTaskId("GH-acme-widget-2");
 
 const message = (over: Partial<RoomMessage> = {}): RoomMessage => ({
   from: asTaskId("GH-acme-widget-3"),
-  kind: "implement",
   text: "watch out for the migrations",
   at: "2026-01-01T00:00:00.000Z",
   ...over,

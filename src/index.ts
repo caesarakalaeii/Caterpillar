@@ -447,7 +447,7 @@ const main = async (): Promise<void> => {
     ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     steering: plane.steering,
-    // Per-task agent chat rooms, from the same plane (§21.x). Always passed, like the
+    // Per-task agent chat rooms, from the same plane (§21, "Agent chat rooms"). Always passed, like the
     // steering inbox beside it: with Redis off this is the in-memory rooms nobody else
     // sees, and the supervisor's own `roomAllowed` check — not this object — is what
     // decides which posts a session may make.

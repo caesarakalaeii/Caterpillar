@@ -273,14 +273,14 @@ test("only the newest amendment is described, because only it is the gate", () =
 });
 
 /**
- * The task chat room's history in the opening prompt (§21.x).
+ * The task chat room's history in the opening prompt (§21, "Agent chat rooms").
  *
  * The bounded half of the design: `watch` carries a message only to the session that is
  * live when it lands, so everything older has to arrive as prose or it is lost to every
  * later session. This section is that prose.
  */
 const message = (from: string, text: string, at: string): RoomMessage =>
-  ({ from: asTaskId(from), kind: "implement", text, at });
+  ({ from: asTaskId(from), text, at });
 
 test("room history renders, newest last, one line per message", () => {
   const prompt = buildPrompt({
@@ -321,8 +321,33 @@ test("a session with no room history gets the section it always got", () => {
 });
 
 test("the system prompt marks room messages as peer advice", () => {
-  // Provenance is load-bearing (§21.x): room text is model-authored, and a model that
+  // Provenance is load-bearing (§21, "Agent chat rooms"): room text is model-authored, and a model that
   // mistakes a peer's sentence for an instruction has no way to weigh it.
   assert.match(SYSTEM_PROMPT, /peer advice/i);
   assert.match(SYSTEM_PROMPT, /not\s+an\s+instruction/i);
+  assert.match(SYSTEM_PROMPT, /Weigh them against what you know/i);
+  assert.match(SYSTEM_PROMPT, /verify against the repository/i);
+});
+
+test("an answer from the operator is a section, not a line buried in the journal", () => {
+  // `store.ts` documents the section as the deliberate place for an answer: the journal
+  // is a budget, and an operator's reply to a parked question must not depend on
+  // surviving it. A `PromptParts.answer` that renders nowhere leaves the plumbing in
+  // `runner.ts` dead and the answer back to being journal luck — which is exactly what
+  // the suite stayed green through once before.
+  const prompt = buildPrompt({ spec: SPEC, state: STATE, answer: "use the existing migration path" });
+
+  assert.match(prompt, /## Answer from the operator/);
+  assert.ok(prompt.includes("use the existing migration path"));
+});
+
+test("the machine-handoff instruction survives whatever else is added to the prompt", () => {
+  // `requires` is the §8 path for a task that needs a machine this one is not, and the
+  // system prompt bullet is its only prompt-level instruction — the tool schema says
+  // "usually empty", which teaches nobody to declare a GPU. Guarded because this exact
+  // bullet was lost once to an unrelated edit and nothing failed.
+  assert.match(
+    SYSTEM_PROMPT,
+    /If work needs a machine you are not on.*call\s+`handoff` with `requires`/s,
+  );
 });

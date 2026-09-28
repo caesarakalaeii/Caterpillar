@@ -127,7 +127,7 @@ export class SlotSteering implements SteeringFeed {
 
 /**
  * The session's one feed when the slot's operator feed and the room's live
- * messages have to arrive on the same queue (§21.x). `take` drains the
+ * messages have to arrive on the same queue (§21, "Agent chat rooms"). `take` drains the
  * operator's backlog first — nothing the room has to say is ever queued, so
  * the room's `take` is empty by design and the order is the operator's.
  */
