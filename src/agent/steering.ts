@@ -30,23 +30,28 @@
  *   steered, which is a strictly worse outcome than the steer being late.
  */
 
+import type { TaskId } from "../domain/task.ts";
+
+/** One delivered steer: the text, and who it is from. */
+export interface SteeringItem {
+  readonly text: string;
+  /**
+   * Absent for a human's steer — the operator framing. Present for a room message
+   * from another agent, which gets the peer framing instead.
+   */
+  readonly from?: TaskId;
+}
+
 /** What `runSession` needs: the backlog, and a way to be told about the rest. */
 export interface SteeringFeed {
   /**
    * Messages queued before this session started, taken exactly once.
-   *
-   * Ordinarily empty. It is non-empty when a previous session was interrupted between a
-   * steer arriving and the turn boundary that would have read it — the message survived in
-   * the transport, and the session that replaces it is the one that should act on it.
    */
-  take(): readonly string[];
+  take(): readonly SteeringItem[];
   /**
    * Be told about each message that arrives while this session runs.
-   *
-   * The returned function unsubscribes and must be called when the session ends, or a
-   * long-lived runner accumulates one listener per session it has ever run.
    */
-  subscribe(onSteer: (text: string) => void): () => void;
+  subscribe(onSteer: (item: SteeringItem) => void): () => void;
 }
 
 /**
@@ -62,39 +67,42 @@ export interface SteeringFeed {
  * else, and splitting messages between two consumers would hide it.
  */
 export class SlotSteering implements SteeringFeed {
-  private buffered: string[] = [];
-  private listener: ((text: string) => void) | undefined;
-  private readonly seen: string[] = [];
+  private buffered: SteeringItem[] = [];
+  private listener: ((item: SteeringItem) => void) | undefined;
+  private readonly seen: SteeringItem[] = [];
 
   /**
    * A message from a human. Delivered to the live session, or held for the next one.
+   *
+   * A bare `text`, because a human's steer is the only thing the supervisor pushes
+   * here: the room's messages enter the feed already wrapped (step 8's `mergeFeeds`).
    *
    * Never throws: it is called from a Redis subscription callback, where nothing is
    * positioned to handle an exception (§21).
    */
   push(text: string): void {
-    this.seen.push(text);
+    this.seen.push({ text });
     const listener = this.listener;
     if (listener === undefined) {
-      this.buffered.push(text);
+      this.buffered.push({ text });
       return;
     }
     try {
-      listener(text);
+      listener({ text });
     } catch {
       // The session's own queue refused it. Hold it instead, so the next session's `take`
       // finds it rather than it vanishing between the two.
-      this.buffered.push(text);
+      this.buffered.push({ text });
     }
   }
 
-  take(): readonly string[] {
+  take(): readonly SteeringItem[] {
     const pending = this.buffered;
     this.buffered = [];
     return pending;
   }
 
-  subscribe(onSteer: (text: string) => void): () => void {
+  subscribe(onSteer: (item: SteeringItem) => void): () => void {
     this.listener = onSteer;
     return (): void => {
       if (this.listener === onSteer) this.listener = undefined;
@@ -108,7 +116,7 @@ export class SlotSteering implements SteeringFeed {
    * session has recorded them, so the same guidance is not appended again after every
    * subsequent session of a task that hands off five times.
    */
-  arrived(): readonly string[] {
+  arrived(): readonly SteeringItem[] {
     return [...this.seen];
   }
 
@@ -116,3 +124,21 @@ export class SlotSteering implements SteeringFeed {
     this.seen.length = 0;
   }
 }
+
+/**
+ * The session's one feed when the slot's operator feed and the room's live
+ * messages have to arrive on the same queue (§21.x). `take` drains the
+ * operator's backlog first — nothing the room has to say is ever queued, so
+ * the room's `take` is empty by design and the order is the operator's.
+ */
+export const mergeFeeds = (operator: SteeringFeed, room: SteeringFeed): SteeringFeed => ({
+  take: () => [...operator.take(), ...room.take()],
+  subscribe: (onSteer: (item: SteeringItem) => void): (() => void) => {
+    const stopOperator = operator.subscribe(onSteer);
+    const stopRoom = room.subscribe(onSteer);
+    return (): void => {
+      stopOperator();
+      stopRoom();
+    };
+  },
+});

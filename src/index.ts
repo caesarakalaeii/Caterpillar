@@ -305,12 +305,13 @@ const main = async (): Promise<void> => {
     staleAfterSeconds: config.lease.staleAfterSeconds,
   });
 
-  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels, steering
-  // (DESIGN.md §21). With `redis.enabled` false, which is the default, this is the four
-  // in-process objects the supervisor has always used and the behaviour is unchanged.
-  // With it on, the same four interfaces are served from Redis so a SEPARATE bot process
-  // can submit and read them. Leases and task state are not in it and never will be: they
-  // are what makes a task survive a pod restart, and they stay on git refs (§5).
+  // The ephemeral cross-process plane — chat inbox, task snapshot, presence, cancels,
+  // steering, thread bindings, agent chat rooms (DESIGN.md §21). With `redis.enabled`
+  // false, which is the default, these are the in-process objects the supervisor has
+  // always used and the behaviour is unchanged. With it on, the same interfaces are
+  // served from Redis so a SEPARATE bot process can submit and read them. Leases and
+  // task state are not in it and never will be: they are what makes a task survive a
+  // pod restart, and they stay on git refs (§5).
   const plane = await createEphemeralPlane({
     config: config.redis,
     secretsDir: config.secretsDir,
@@ -446,6 +447,11 @@ const main = async (): Promise<void> => {
     ...(activity === undefined ? {} : { activity }),
     cancels: plane.cancels,
     steering: plane.steering,
+    // Per-task agent chat rooms, from the same plane (§21.x). Always passed, like the
+    // steering inbox beside it: with Redis off this is the in-memory rooms nobody else
+    // sees, and the supervisor's own `roomAllowed` check — not this object — is what
+    // decides which posts a session may make.
+    rooms: plane.rooms,
     runners: plane.runners,
     // The supervisor→bot half of the thread index (§7.2). Always passed, never gated on
     // the mode: with Redis off this is the in-memory store nobody else reads and the

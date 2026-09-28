@@ -55,6 +55,7 @@ import {
 import { DEFAULT_TOOLCHAIN_CONFIG, ToolchainResolver } from "../workspace/toolchain.ts";
 import { SILENT_LOGGER } from "../obs/log.ts";
 import { AgentSessionRunner, type WorkspaceBindings } from "./runner.ts";
+import type { RoomChat } from "../redis/rooms.ts";
 import { TEST_FIRST_STANDARD } from "./standards.ts";
 import type { RunnerConfig } from "../config/types.ts";
 
@@ -904,4 +905,79 @@ test("an unamended task's session hears nothing about amendments", async () => {
   assert.equal(outcome.reason, "done-claimed");
   const transcript = await promptOf(TASK, 11);
   assert.doesNotMatch(transcript, /were amended/);
+});
+
+test("a runner handed a RoomChat puts the room's history in the opening prompt", async () => {
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("done", { summary: "read the room" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const chat: RoomChat = {
+    post: async () => true,
+    history: async () => [
+      {
+        from: asTaskId("TASK-9"),
+        kind: "implement",
+        text: "the fixture needs its database up first",
+        at: "2026-09-28T10:00:00.000Z",
+      },
+    ],
+  };
+
+  const outcome = await runner.run(spec, state({ sessions: 11 }), undefined, undefined, chat);
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(TASK, 12);
+  assert.match(transcript, /the fixture needs its database up first/);
+});
+
+test("a runner handed a RoomChat wires chat_post to it", async () => {
+  const { runner, faux } = buildRunner(200_000);
+  const posted: { to: string; text: string }[] = [];
+  const chat: RoomChat = {
+    post: async (to, text) => {
+      posted.push({ to, text });
+      return true;
+    },
+    history: async () => [],
+  };
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("chat_post", { to: "TASK-1", text: "started on the parser" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(fauxToolCall("done", { summary: "posted" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(spec, state({ sessions: 12 }), undefined, undefined, chat);
+
+  assert.equal(outcome.reason, "done-claimed");
+  assert.deepEqual(posted, [{ to: "TASK-1", text: "started on the parser" }]);
+});
+
+test("a runner with no RoomChat runs unchanged: no room section, no chat_post posting", async () => {
+  const { runner, faux } = buildRunner(200_000);
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("chat_post", { to: "TASK-1", text: "anyone there?" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(fauxToolCall("done", { summary: "no rooms here" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("finished"),
+  ]);
+
+  const outcome = await runner.run(spec, state({ sessions: 13 }));
+
+  assert.equal(outcome.reason, "done-claimed");
+  const transcript = await promptOf(TASK, 14);
+  assert.doesNotMatch(transcript, /task chat room/);
 });

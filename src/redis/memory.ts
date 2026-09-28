@@ -106,6 +106,17 @@ export class MemoryRedisClient implements RedisClient {
     return Promise.resolve();
   }
 
+  /** A read that leaves the list standing. See `RedisClient.lrange`. */
+  lrange(key: string, start: number, stop: number): Promise<readonly string[]> {
+    this.expireList(key);
+    const list = this.lists.get(key) ?? [];
+    // Same index semantics as Redis: negatives count from the end, a start past the
+    // front clamps to it. `history` always passes `-limit`, which routinely exceeds
+    // the list's length, so the clamp is the case that fires in production.
+    const from = start < 0 ? Math.max(0, list.length + start) : start;
+    const to = stop < 0 ? list.length + stop : Math.min(stop, list.length - 1);
+    return Promise.resolve(to < from ? [] : list.slice(from, to + 1));
+  }
   drain(key: string): Promise<readonly string[]> {
     this.expireList(key);
     const list = this.lists.get(key) ?? [];
@@ -113,6 +124,7 @@ export class MemoryRedisClient implements RedisClient {
     this.listExpiry.delete(key);
     return Promise.resolve(list);
   }
+
 
   /** Lazily, on touch — the same discipline the string keys use. See the file header. */
   private expireList(key: string): void {
@@ -216,6 +228,10 @@ export class FailingRedisClient implements RedisClient {
   }
 
   rpush(): Promise<void> {
+    return Promise.reject(this.error());
+  }
+
+  lrange(): Promise<readonly string[]> {
     return Promise.reject(this.error());
   }
 

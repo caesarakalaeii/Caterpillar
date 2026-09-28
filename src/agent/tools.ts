@@ -172,8 +172,15 @@ export interface ToolContext {
    * own calls and nothing else, and `AgentMetrics` is the whole metric set.
    */
   readonly recordClusterRead?: (tool: string, outcome: ClusterReadOutcome, seconds: number) => void;
+  /**
+   * Posts one message to a peer task's chat room (§21.x).
+   *
+   * A callback for the same reason as `publish`: the tool must not be able to reach
+   * any room but the ones the supervisor allows, and the allowed set is the
+   * supervisor's to compute. Returns false when `to` is out of that set.
+   */
+  readonly chat?: (to: string, text: string) => Promise<boolean>;
 }
-
 /** `denied` is a refused namespace or kind; `error` is everything the cluster got wrong. */
 export type ClusterReadOutcome = "ok" | "denied" | "error";
 
@@ -322,6 +329,38 @@ export const taskNoteTool = (ctx: ToolContext): AgentTool<typeof TaskNoteParams,
   },
 });
 
+const ChatPostParams = Type.Object({
+  to: Type.String({
+    description: "Task id of the room to post to: this task, a blocker, or a dependent.",
+  }),
+  text: Type.String({
+    description: "The message. One or two sentences a peer can act on.",
+  }),
+});
+
+export const chatPostTool = (ctx: ToolContext): AgentTool<typeof ChatPostParams, null> => ({
+  name: "chat_post",
+  label: "Peer message",
+  description:
+    "Post a short message to another task's chat room. Use sparingly: to warn a peer " +
+    "about a trap, or to answer a question their room history shows. Recent history is " +
+    "shown to sessions working the addressed task. Only this task, its blockers' and " +
+    "its dependents' rooms are reachable; anything else is refused.",
+  parameters: ChatPostParams,
+  execute: async (_id, params: Static<typeof ChatPostParams>) => {
+    if (ctx.chat === undefined) {
+      return text("No chat rooms are configured on this runner; message not posted.");
+    }
+    const posted = await ctx.chat(params.to, params.text);
+    return posted
+      ? text(`Posted to ${params.to}'s room.`)
+      : text(
+          `${params.to} is outside the rooms this task may post to (own, blockers', ` +
+            `dependents'); message not posted.`,
+        );
+  },
+});
+
 const SubmitPlanParams = Type.Object({
   title: Type.String({ description: "Short name for the whole plan." }),
   summary: Type.String({
@@ -383,11 +422,9 @@ const PublishArtifactParams = Type.Object({
       "File name to store it under, e.g. `sublevel-scan.json`. Letters, digits, dot, " +
       "dash and underscore only — no directories.",
   }),
-  path: Type.String({
-    description: "Path to the file, relative to your working directory.",
-  }),
+  path: Type.String({ description: "Path to the file, relative to the working directory." }),
   note: Type.String({
-    description: "One line on what it is and why the next task will want it.",
+    description: "One line on what it holds and how to read it.",
   }),
 });
 
@@ -429,6 +466,7 @@ export const controlTools = (ctx: ToolContext): readonly AgentTool[] => [
   doneTool(ctx) as AgentTool,
   taskNoteTool(ctx) as AgentTool,
   publishArtifactTool(ctx) as AgentTool,
+  chatPostTool(ctx) as AgentTool,
 ];
 
 const ClusterLogsParams = Type.Object({

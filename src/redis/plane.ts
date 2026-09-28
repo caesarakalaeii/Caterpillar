@@ -45,6 +45,11 @@ import {
   type SnapshotStore,
 } from "./snapshot.ts";
 import {
+  InMemoryChatRooms,
+  RedisChatRooms,
+  type ChatRooms,
+} from "./rooms.ts";
+import {
   InMemoryThreadBindings,
   RedisThreadBindings,
   type ThreadBindingStore,
@@ -86,6 +91,15 @@ export interface EphemeralPlane {
    * process with no state repo has nothing to rebuild it from.
    */
   readonly threads: ThreadBindingStore;
+  /**
+   * The per-task agent chat room (DESIGN.md §21.x).
+   *
+   * The seventh structure, and the first whose writers and readers are agents rather
+   * than a human or the supervisor: a shorthand between peers working the same task,
+   * carried here for the same line §21 draws — its loss is a repeated discovery, not
+   * a lost task. Nothing drains it; `history` is the read.
+   */
+  readonly rooms: ChatRooms;
   /** True when a Redis client is behind the structures above. For logs and the web view. */
   readonly backed: boolean;
   /**
@@ -129,6 +143,7 @@ export const inMemoryPlane = (): EphemeralPlane => {
     cancels: new InMemoryCancelSignals(),
     steering: new InMemorySteeringInbox(),
     threads: new InMemoryThreadBindings(),
+    rooms: new InMemoryChatRooms(),
     backed: false,
     inbox,
     tasks,
@@ -140,10 +155,11 @@ export const inMemoryPlane = (): EphemeralPlane => {
 export const redisPlane = (redis: RedisClient, logger: Logger): EphemeralPlane => ({
   chat: new RedisChatQueue({ redis, logger }),
   snapshot: new RedisSnapshotStore({ redis, logger }),
-  runners: new RedisPresenceRegistry({ redis, logger }),
   cancels: new RedisCancelSignals({ redis, logger }),
+  runners: new RedisPresenceRegistry({ redis, logger }),
   steering: new RedisSteeringInbox({ redis, logger }),
   threads: new RedisThreadBindings({ redis, logger }),
+  rooms: new RedisChatRooms({ redis, logger }),
   backed: true,
   client: redis,
   close: (): Promise<void> => redis.close(),

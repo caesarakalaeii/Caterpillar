@@ -228,6 +228,7 @@ and dependency bumps are reviewed code changes (`DESIGN.md` §15).
 | `src/redis/presence.ts` | Which runners are alive. Advisory, for display only (§21). |
 | `src/redis/cancel.ts` | `/cancel` reaching a session that is already running (§21). |
 | `src/redis/steering.ts` | A human's guidance reaching that same session (§7.3, §21). |
+| `src/redis/rooms.ts` | Per-task agent chat rooms — peer coordination between plan siblings (§21). |
 | `src/redis/plane.ts` | One decision at boot: Redis, or the objects that were already there (§21). |
 
 ## Invariants worth not breaking
@@ -719,10 +720,10 @@ upgraded.
 ## Turning on Redis
 
 Nothing needs it. `redis.enabled` defaults to false and every runner has run that way from
-the beginning — the chat inbox, the task snapshot, presence, cancels, steering and the thread
-bindings are six objects in the supervisor's heap. Turn it on when something else needs to see
-them, which for now means one thing: the Discord bot becoming its own process, in its own pod,
-unable to reach into a heap it is not in.
+the beginning — the chat inbox, the task snapshot, presence, cancels, steering, the thread
+bindings and the agent chat rooms are seven objects in the supervisor's heap. Turn it on when
+something else needs to see them, which for now means one thing: the Discord bot becoming its
+own process, in its own pod, unable to reach into a heap it is not in.
 
 ```json
 "redis": {
@@ -754,7 +755,7 @@ be fetched is *the last one this process saw*; a steer that cannot be pushed is 
 human is told did not land*, rather than one they are told did. The supervisor keeps claiming
 and working tasks throughout, because none of that is where the work lives.
 
-Steering is the one of the six that changes what a human is *told* when Redis is off, and it
+Steering is the one of the seven that changes what a human is *told* when Redis is off, and it
 says so deliberately: with no Redis the supervisor can steer a session in its own process and
 nothing else, so a message for a task running on another machine is answered "I could not reach
 the runner working it" rather than "sent to the session". Two machines sharing a state repo with

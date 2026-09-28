@@ -204,7 +204,7 @@ test("the feed is unsubscribed when the session ends", async () => {
   steering.push("after the session");
   assert.deepEqual(
     steering.take(),
-    ["after the session"],
+    [{ text: "after the session" }],
     "a message arriving after the session must be buffered for the next one",
   );
 });
