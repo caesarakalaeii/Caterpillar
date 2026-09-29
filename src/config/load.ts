@@ -360,6 +360,17 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
     );
   }
 
+  // Same refusal discipline as scheme: a field that selects a capability the other
+  // mode cannot honour is rejected rather than ignored, so a flip cannot leave a
+  // config claiming something nothing reads.
+  if (auth === "subscription" && llm["imageInput"] !== undefined) {
+    throw new ConfigError(
+      "llm.imageInput is set but llm.auth is 'subscription' — the provider's own model " +
+        "table decides image support there, and this field is not read",
+    );
+  }
+  const imageInput = bool(llm["imageInput"], "llm.imageInput", false);
+
   return {
     auth,
     scheme,
@@ -370,6 +381,7 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
     providerId: str(llm["providerId"], "llm.providerId"),
     contextWindow: num(llm["contextWindow"], "llm.contextWindow"),
     maxTokens: num(llm["maxTokens"], "llm.maxTokens"),
+    imageInput,
     // Defaulted, never required: this exists to survive an incident, and an incident
     // must not be the moment a runner discovers its ConfigMap is a field short.
     cooldown: {

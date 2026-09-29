@@ -80,7 +80,12 @@ const proxiedModel = (config: LlmConfig): Model<"anthropic-messages" | "openai-c
   // Thinking survives either scheme: pi maps `reasoning: true` to the provider's own
   // convention, and the openai-completions API reads vLLM's `reasoning_content`.
   reasoning: true,
-  input: ["text", "image"],
+  // Text by default, not the old hardcoded ["text", "image"]: whether a proxied
+  // endpoint takes images is a property of the MODEL behind it, and the coding
+  // gateway reports supports_vision: false for the alias. Advertising image input
+  // the endpoint refuses turns a task's screenshot into an unactionable provider
+  // error; a config that knows its endpoint takes images can say so.
+  input: config.imageInput ? ["text", "image"] : ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   contextWindow: config.contextWindow,
   maxTokens: config.maxTokens,

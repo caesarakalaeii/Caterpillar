@@ -619,3 +619,34 @@ test("a scheme on a subscription config is refused rather than ignored", async (
     (error: unknown) => error instanceof ConfigError && /llm\.scheme/.test(error.message),
   );
 });
+
+test("image input is off by default, because the endpoint's model may not take images", async () => {
+  // The coding gateway reports supports_vision: false for its aliases. A hardcoded
+  // true would turn a task's screenshot into a provider error nothing can act on.
+  const config = await load({});
+
+  assert.equal(config.llm.imageInput, false);
+});
+
+test("a proxy config can declare an endpoint that does take images", async () => {
+  const config = await load({ llm: { ...BASE.llm, imageInput: true } });
+
+  assert.equal(config.llm.imageInput, true);
+  await assert.rejects(() => load({ llm: { ...BASE.llm, imageInput: "yes" } }), ConfigError);
+});
+
+test("imageInput on a subscription config is refused rather than ignored", async () => {
+  // The provider's own model table decides image support in subscription mode; a
+  // config field nothing reads is a half-migrated config.
+  await assert.rejects(
+    () =>
+      load({
+        llm: {
+          auth: "subscription",
+          imageInput: true,
+          credentialsPath: "/work/credentials/anthropic.json",
+        },
+      }),
+    (error: unknown) => error instanceof ConfigError && /llm\.imageInput/.test(error.message),
+  );
+});
