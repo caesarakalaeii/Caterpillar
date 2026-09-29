@@ -10,9 +10,12 @@
  *     DIRECTLY — an OAuth bearer credential cannot be routed through a proxy that
  *     authenticates with `x-api-key`, so there is no proxy in this path.
  *
- *   "proxy" — the in-cluster proxy from §9.6, authenticated with a token that is
- *     not a provider credential. Keeps the spend cap and lets an off-cluster runner
- *     hold nothing.
+ *   "proxy" — the endpoint named by `llm.baseUrl` holds the provider credential,
+ *     authenticated with a token that is not a provider credential. `llm.scheme`
+ *     selects its wire API: `anthropic-messages` (the original, `x-api-key`) or
+ *     `openai-completions`, which is what vLLM serves — an OpenAI-compatible
+ *     `/v1/chat/completions` that authenticates with `Authorization: Bearer`.
+ *     Keeps the spend cap and lets an off-cluster runner hold nothing.
  *
  * The modes are not exclusive at runtime. pi resolves "a stored credential owns the
  * provider; ambient env is consulted only when nothing is stored", so a subscription
@@ -23,7 +26,7 @@
  * provider abstraction rather than a vendor SDK (DESIGN.md §2.1).
  */
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
-import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import {
   createModels,
   createProvider,
@@ -33,6 +36,7 @@ import {
   type Model,
   type MutableModels,
 } from "@earendil-works/pi-ai";
+import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { LlmConfig } from "../config/types.ts";
 
 /** Env var carrying the proxy's own token — not a provider credential. */
@@ -67,12 +71,14 @@ export class SubscriptionNotLoggedInError extends Error {
  * a stale local price table would make `usage.cost` quietly wrong. Token counts
  * remain exact, so the handoff trigger is unaffected.
  */
-const proxiedModel = (config: LlmConfig): Model<"anthropic-messages"> => ({
+const proxiedModel = (config: LlmConfig): Model<"anthropic-messages" | "openai-completions"> => ({
   id: config.modelId,
   name: config.modelId,
-  api: "anthropic-messages",
+  api: config.scheme ?? "anthropic-messages",
   provider: config.providerId,
   baseUrl: config.baseUrl,
+  // Thinking survives either scheme: pi maps `reasoning: true` to the provider's own
+  // convention, and the openai-completions API reads vLLM's `reasoning_content`.
   reasoning: true,
   input: ["text", "image"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -117,13 +123,19 @@ export const createLlmRuntime = (options: LlmRuntimeOptions): LlmRuntime => {
   }
 
   models.setProvider(
-    createProvider<"anthropic-messages">({
+    createProvider({
       id: config.providerId,
       name: "caterpillar llm proxy",
       baseUrl: config.baseUrl,
       auth: { apiKey: envApiKeyAuth("LLM proxy token", [PROXY_TOKEN_ENV]) },
       models: [proxiedModel(config)],
-      api: anthropicMessagesApi(),
+      // Bearer vs. x-api-key is the API's business, not the auth helper's: the
+      // anthropic-messages API stamps the key as `x-api-key`, the openai-completions
+      // API hands it to the OpenAI client, which sends `Authorization: Bearer`.
+      api: {
+        "anthropic-messages": anthropicMessagesApi(),
+        "openai-completions": openAICompletionsApi(),
+      },
     }),
   );
 

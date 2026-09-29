@@ -329,6 +329,23 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
     throw new ConfigError("llm.auth must be 'proxy' or 'subscription'");
   }
 
+  // Defaulted, not required: the original proxy spoke anthropic-messages and its
+  // config predates the field, so an omitted scheme keeps that meaning. Rejected
+  // on subscription rather than ignored, because "ignored" here would mean a
+  // runner with two model endpoints configured and only one of them real.
+  const scheme = llm["scheme"] ?? "anthropic-messages";
+  if (scheme !== "anthropic-messages" && scheme !== "openai-completions") {
+    throw new ConfigError(
+      "llm.scheme must be 'anthropic-messages' or 'openai-completions'",
+    );
+  }
+  if (auth === "subscription" && llm["scheme"] !== undefined) {
+    throw new ConfigError(
+      "llm.scheme is set but llm.auth is 'subscription' — the scheme selects the proxied " +
+        "endpoint's wire API and has no meaning when pi's own provider carries the traffic",
+    );
+  }
+
   const credentialsPath = llm["credentialsPath"];
   const credentialsUrl = llm["credentialsUrl"];
   // Either is a complete answer to "where does this runner get its credential", and a
@@ -345,6 +362,7 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
 
   return {
     auth,
+    scheme,
     // Unused by subscription mode, but still required: a config that silently
     // stops pointing anywhere when auth flips is worse than one that repeats itself.
     baseUrl: str(llm["baseUrl"], "llm.baseUrl"),

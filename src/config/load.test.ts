@@ -588,3 +588,34 @@ test("schedule.enabled is a boolean, not a truthy string", async () => {
   assert.equal((await load({ schedule: { enabled: true } })).schedule.enabled, true);
   await assert.rejects(() => load({ schedule: { enabled: "yes" } }), ConfigError);
 });
+
+test("a proxy config that says nothing about the scheme keeps speaking anthropic-messages", async () => {
+  // The original proxy predates the field, so an omitted scheme must keep its wire
+  // path. A default that flipped on upgrade would 404 every existing deployment.
+  const config = await load({});
+
+  assert.equal(config.llm.scheme, "anthropic-messages");
+});
+
+test("the proxy scheme can select the OpenAI wire API a vLLM endpoint serves", async () => {
+  const config = await load({ llm: { ...BASE.llm, scheme: "openai-completions" } });
+
+  assert.equal(config.llm.scheme, "openai-completions");
+  await assert.rejects(() => load({ llm: { ...BASE.llm, scheme: "openai" } }), ConfigError);
+});
+
+test("a scheme on a subscription config is refused rather than ignored", async () => {
+  // "Ignored" would mean a runner with two model endpoints configured and only one
+  // of them real. The loader names the collision rather than picking a winner.
+  await assert.rejects(
+    () =>
+      load({
+        llm: {
+          auth: "subscription",
+          scheme: "openai-completions",
+          credentialsPath: "/work/credentials/anthropic.json",
+        },
+      }),
+    (error: unknown) => error instanceof ConfigError && /llm\.scheme/.test(error.message),
+  );
+});

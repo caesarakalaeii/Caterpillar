@@ -2953,18 +2953,30 @@ line rather than a crash loop.
   an exception: the supervisor treats a refusal as a runner-wide pause, never as a fact
   about the task that happened to be running. See §6.3.
 
-**`proxy` (retained).** All runners point at an in-cluster proxy holding the provider
+**`proxy` (retained).** All runners point at one endpoint holding the provider
 credential. Its value is not "easy provider swap" (pi-ai already gives that) but:
 
 - The off-cluster machine runner never stores a Claude credential.
 - One choke point for the global spend cap and per-task cost metrics.
+
+`llm.scheme` selects the endpoint's wire API, and it exists because a proxy is not the
+only thing that can sit at `baseUrl`. `anthropic-messages` (the default, unchanged for
+configs that predate the field) speaks `x-api-key` and `/v1/messages`. `openai-completions`
+speaks `Authorization: Bearer` and `/v1/chat/completions` — the OpenAI-compatible API that
+vLLM serves, which is what a self-hosted model on the cluster looks like. The auth token
+still comes from `LLM_PROXY_TOKEN`; which header it lands in is the API implementation's
+decision, not the auth helper's. Costs stay zeroed in both schemes: the endpoint is the
+authority on spend, and a self-hosted model's spend is electricity.
 
 The modes are not exclusive at runtime: pi resolves *a stored credential owns the
 provider; ambient env is consulted only when nothing is stored*, so a subscription runner
 can keep an API key in its environment as an automatic fallback. The cluster deliberately
 does not — there is no Anthropic key anywhere in `deployment`.
 
-Swapping to a private provider later remains a config change.
+Swapping to a private provider later remains a config change: point `baseUrl` at the
+vLLM Service, set `scheme: "openai-completions"`, put its access key in
+`LLM_PROXY_TOKEN`, and set `modelId`/`contextWindow`/`maxTokens` to what the served model
+actually offers.
 
 ### 9.7 Who the fleet commits as
 
