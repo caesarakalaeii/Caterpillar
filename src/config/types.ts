@@ -298,13 +298,23 @@ export interface WorkspaceConfig {
 /**
  * How the runner authenticates to the model provider (DESIGN.md §9.6).
  *
- * `proxy` — the in-cluster proxy holds the provider credential.
+ * `proxy` — the endpoint named by `llm.baseUrl` holds the provider credential.
  * `subscription` — pi-ai's Anthropic OAuth mode against a Claude Pro/Max
  *   subscription, talking to api.anthropic.com directly. There is no proxy in this
  *   path: an OAuth bearer credential cannot be forwarded by a proxy that
  *   authenticates with `x-api-key`.
  */
 export type LlmAuthMode = "proxy" | "subscription";
+
+/**
+ * Which wire API the proxied endpoint speaks (DESIGN.md §9.6). Proxy mode only.
+ *
+ * `anthropic-messages` — `x-api-key` auth, `/v1/messages`.
+ * `openai-completions` — `Authorization: Bearer`, `/v1/chat/completions`. This is
+ *   what vLLM serves, and what makes a self-hosted model a pure config change:
+ *   point `baseUrl` at it and put its access key in `LLM_PROXY_TOKEN`.
+ */
+export type LlmApiScheme = "anthropic-messages" | "openai-completions";
 
 /**
  * How long the runner stops starting sessions after the provider refuses (§6.3).
@@ -322,6 +332,12 @@ export interface CooldownConfig {
 export interface LlmConfig {
   readonly auth: LlmAuthMode;
   readonly cooldown: CooldownConfig;
+  /**
+   * Wire API of the proxied endpoint. Defaults to `anthropic-messages` so an
+   * existing proxy config keeps working. Ignored for `subscription`, which uses
+   * pi's own provider.
+   */
+  readonly scheme?: LlmApiScheme;
   /** Proxy base URL. Ignored for `subscription`, which uses pi's own provider. */
   readonly baseUrl: string;
   readonly modelId: string;
