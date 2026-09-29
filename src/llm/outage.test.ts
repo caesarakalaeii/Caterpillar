@@ -111,6 +111,43 @@ test("an unknown model is a misconfiguration, not an outage", () => {
   );
 });
 
+/** pi's openai-completions path composes `"<status>: <body>"` — captured against a stub
+ * server driven through createLlmRuntime with scheme "openai-completions", not written
+ * from memory. */
+const GATEWAY_BUSY =
+  '429: {"message":"Model is at capacity, reserved for production load",' +
+  '"type":"rate_limit_error","code":429}';
+
+test("the coding gateway's capacity 429 is a rate limit, in the colon shape", () => {
+  // The gateway serves hobby traffic only when production load allows, so this is the
+  // intended steady state, not an incident: cooldown and retry, task untouched.
+  const outage = classifyProviderFailure(GATEWAY_BUSY);
+
+  assert.equal(outage?.kind, "rate-limited");
+  assert.equal(outage?.status, 429);
+  assert.match(outage?.detail ?? "", /reserved for production load/);
+});
+
+test("a rejected key from the gateway is unauthorised, in the colon shape too", () => {
+  const outage = classifyProviderFailure(
+    '401: {"message":"Invalid API key","type":"invalid_request_error"}',
+  );
+
+  assert.equal(outage?.kind, "unauthorised");
+  assert.equal(outage?.status, 401);
+  assert.equal(outage?.detail, "Invalid API key");
+});
+
+test("the flat openai body is read for detail without the nested error wrapper", () => {
+  const outage = classifyProviderFailure(GATEWAY_BUSY);
+
+  assert.equal(
+    outage?.detail,
+    "Model is at capacity, reserved for production load",
+    "flat message wins over the raw body",
+  );
+});
+
 test("anything that is not a provider error at all classifies as nothing", () => {
   assert.equal(classifyProviderFailure("Agent is already processing."), undefined);
   assert.equal(classifyProviderFailure(""), undefined);

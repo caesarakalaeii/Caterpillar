@@ -346,6 +346,14 @@ export interface LlmConfig {
   readonly contextWindow: number;
   readonly maxTokens: number;
   /**
+   * Whether the proxied model accepts image input. Defaults to FALSE: it is a
+   * property of the model behind the endpoint, and the coding gateway reports
+   * `supports_vision: false` for its aliases. Advertising an input the endpoint
+   * refuses turns a task's screenshot into an unactionable provider error.
+   * Ignored for `subscription`, whose provider table pi-ai maintains.
+   */
+  readonly imageInput?: boolean;
+  /**
    * Where the rotating OAuth credential lives. Required for `subscription`.
    *
    * Must be on WRITABLE, durable storage — the PVC, never a mounted Secret.

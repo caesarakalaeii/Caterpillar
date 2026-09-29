@@ -2,9 +2,11 @@
  * Telling a provider outage apart from a task failure. See DESIGN.md §6.3.
  *
  * pi does not throw when a provider request fails. The failure comes back as an
- * assistant message with `stopReason: "error"` and an `errorMessage` string, which for
- * the Anthropic SDK is `"<status> <json body>"`. That string is all we get — the
- * response headers are gone by the time it reaches us — so this reads it.
+ * assistant message with `stopReason: "error"` and an `errorMessage` string. Its
+ * shape depends on the API: the Anthropic SDK emits `"<status> <json body>"`,
+ * pi's openai-completions path composes `"<status>: <body>"` — which is what the
+ * coding gateway's refusals arrive as. The headers are gone by the time it
+ * reaches us, so the string is all we get — this reads it.
  *
  * The distinction it draws is the one the supervisor acts on:
  *
@@ -15,15 +17,26 @@
  *     and a human looks at it. Sweeping those into a cooldown would hide a real bug
  *     behind an hour of silence and then reproduce it exactly.
  *
- * Written after 2026-08-15, when the account's monthly spend limit was reached and the
- * supervisor read the resulting 429 as a clean handoff: five sessions in nine seconds,
- * three of them without a single token, and a task parked citing "no measurable
- * progress" — a verdict about the agent, for something the agent never saw.
+ * A "the provider is busy" refusal is the intended steady state against the coding
+ * gateway: it serves hobby traffic only when production load allows, so a 429 is a
+ * normal operating condition, not an incident — rate-limited, cooldown, retry at the
+ * capped interval, same as a burst limit on a paid API.
+ *
+ * Written after 2026-08-15, when the account's monthly spend limit was reached and
+ * the supervisor read the resulting 429 as a clean handoff: five sessions in nine
+ * seconds, three of them without a single token, and a task parked citing "no
+ * measurable progress" — a verdict about the agent, for something the agent never
+ * saw. The colon shape made the same failure reappear against the gateway in 2026-09.
  */
 import type { ProviderOutage } from "../domain/task.ts";
 
-/** `"429 {...}"` — the Anthropic SDK's `APIError.message`. */
-const STATUS = /^(\d{3})\s/;
+/**
+ * `"<status> <json body>"` — the Anthropic SDK's `APIError.message`. The openai API
+ * implementations in pi compose `"<status>: <body>"` instead (utils/error-body.ts's
+ * `formatProviderError`), which is what the coding gateway's 429 arrives as, so both
+ * separators match.
+ */
+const STATUS = /^(\d{3})\s?:?\s/;
 
 /**
  * pi's own refusal to sit out a long wait: it fails the request instead, naming the
@@ -97,15 +110,8 @@ const detailOf = (message: string): string => {
   if (start !== -1) {
     try {
       const body: unknown = JSON.parse(message.slice(start));
-      const inner =
-        typeof body === "object" && body !== null && "error" in body
-          ? (body as { readonly error: unknown }).error
-          : undefined;
-      const text =
-        typeof inner === "object" && inner !== null && "message" in inner
-          ? (inner as { readonly message: unknown }).message
-          : undefined;
-      if (typeof text === "string" && text.length > 0) return clip(text);
+      const inner = unwrapError(body);
+      if (typeof inner === "string" && inner.length > 0) return clip(inner);
     } catch {
       // Not JSON — an HTML error page from something in front of the provider, most
       // likely. The raw prefix is still the best description available.
@@ -113,6 +119,22 @@ const detailOf = (message: string): string => {
   }
 
   return clip(message);
+};
+
+/**
+ * The human-readable sentence inside an error body, wherever the provider's SDK put
+ * it. Anthropic nests it under `error.message`; the openai-completions path carries
+ * the openai body flat (`{"message": "...", "type": "..."}`), which is what the
+ * coding gateway sends.
+ */
+const unwrapError = (body: unknown): string | undefined => {
+  if (typeof body !== "object" || body === null) return undefined;
+  if ("message" in body && typeof body.message === "string") return body.message;
+  if ("error" in body && typeof body.error === "object" && body.error !== null) {
+    const nested = body.error;
+    if ("message" in nested && typeof nested.message === "string") return nested.message;
+  }
+  return undefined;
 };
 
 const clip = (text: string): string =>

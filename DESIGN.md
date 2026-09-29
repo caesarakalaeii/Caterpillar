@@ -736,10 +736,24 @@ is by reading the provider's message. The line it draws:
 |---|---|---|
 | outage | 429 spend/usage limit, 429 burst, 5xx, 529 overloaded, 401/403, no response at all | release the task, back the runner off |
 | the task's own error | 400 `prompt is too long`, 404 unknown model | unchanged — `failed`, and a human looks |
-
 Sweeping the second row into a cooldown would hide a real bug behind an hour of silence
 and then reproduce it exactly. That is why the classifier reads prose rather than
 treating every failure as transient.
+
+**Amended for the coding gateway (2026-09).** The classifier reads `errorMessage`
+strings whose shape depends on the API: the Anthropic SDK emits `"429 {json}"`, pi's
+openai-completions path composes `"429: {json}"`, and the gateway's flat openai error
+body has no `error` wrapper. The colon shape was missed first — every gateway 429
+classified as the task's own error, the retry-storm failure again through a different
+door. Both separators and both body shapes match now, pinned against strings captured
+from a stub rather than written from memory.
+
+A gateway capacity 429 is not an incident but the intended steady state: the gateway
+serves hobby traffic only while production load allows, so *"busy, try later"* arrives
+routinely and must read as `rate-limited` — cooldown, task untouched, success clears
+the incident. `llm.imageInput` (default false) belongs to the same fit: the gateway
+reports `supports_vision: false` for its aliases, so the proxied model advertises text
+only unless a config says otherwise.
 
 **3. The response belongs to the runner, not the task.** On an outage:
 
@@ -2974,9 +2988,11 @@ can keep an API key in its environment as an automatic fallback. The cluster del
 does not — there is no Anthropic key anywhere in `deployment`.
 
 Swapping to a private provider later remains a config change: point `baseUrl` at the
-vLLM Service, set `scheme: "openai-completions"`, put its access key in
-`LLM_PROXY_TOKEN`, and set `modelId`/`contextWindow`/`maxTokens` to what the served model
-actually offers.
+endpoint, set `scheme: "openai-completions"`, put its access key in
+`LLM_PROXY_TOKEN`, and set `modelId`/`contextWindow`/`maxTokens` to what the served
+model actually offers. `imageInput: true` only when the endpoint takes images — the
+default is text-only, because advertising an input the endpoint refuses turns a task's
+screenshot into a provider error nothing can act on.
 
 ### 9.7 Who the fleet commits as
 
