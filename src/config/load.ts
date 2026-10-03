@@ -371,13 +371,25 @@ const llmConfig = (llm: Record<string, unknown>): LlmConfig => {
   }
   const imageInput = bool(llm["imageInput"], "llm.imageInput", false);
 
+  // Subscription has no list endpoint to ask, so there a missing id is a
+  // misconfiguration; proxy treats it as a pin over what the gateway serves
+  // (llm/models.ts) and may omit it entirely.
+  if (auth === "subscription" && llm["modelId"] === undefined) {
+    throw new ConfigError(
+      "llm.modelId must be set when llm.auth is 'subscription' — pi's own provider " +
+        "has no list endpoint to discover the model from",
+    );
+  }
+
   return {
     auth,
     scheme,
     // Unused by subscription mode, but still required: a config that silently
     // stops pointing anywhere when auth flips is worse than one that repeats itself.
     baseUrl: str(llm["baseUrl"], "llm.baseUrl"),
-    modelId: str(llm["modelId"], "llm.modelId"),
+    ...(llm["modelId"] === undefined
+      ? {}
+      : { modelId: str(llm["modelId"], "llm.modelId") }),
     providerId: str(llm["providerId"], "llm.providerId"),
     contextWindow: num(llm["contextWindow"], "llm.contextWindow"),
     maxTokens: num(llm["maxTokens"], "llm.maxTokens"),
