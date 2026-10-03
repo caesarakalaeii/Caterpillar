@@ -1169,7 +1169,7 @@ export const runnerPage = (exported: RunnerExport, disk?: DiskView): Html => htm
   <section>
     <h2>Model</h2>
     <dl class="grid">
-      <div><dt>model</dt><dd>${exported.llm.modelId}</dd></div>
+      <div><dt>model</dt><dd>${exported.llm.modelId ?? "(discovered at boot)"}</dd></div>
       <div><dt>provider</dt><dd>${exported.llm.providerId}</dd></div>
       <div><dt>auth</dt><dd>${exported.llm.auth}</dd></div>
       <div><dt>context window</dt><dd>${exported.llm.contextWindow.toLocaleString("en-US")}</dd></div>

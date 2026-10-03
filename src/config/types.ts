@@ -340,7 +340,13 @@ export interface LlmConfig {
   readonly scheme?: LlmApiScheme;
   /** Proxy base URL. Ignored for `subscription`, which uses pi's own provider. */
   readonly baseUrl: string;
-  readonly modelId: string;
+  /**
+   * The proxied model id. OPTIONAL for `proxy`, where it is a pin over the
+   * gateway's `/v1/models` answer (see models.ts): an upstream model swap then
+   * needs no config edit and no rollout. Required for `subscription`, which has
+   * no list endpoint to ask — the loader refuses its absence there.
+   */
+  readonly modelId?: string;
   /** Provider id registered with pi-ai for the proxy. Ignored for `subscription`. */
   readonly providerId: string;
   readonly contextWindow: number;

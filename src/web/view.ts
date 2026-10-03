@@ -756,7 +756,12 @@ export interface RunnerExport {
   };
   readonly llm: {
     readonly auth: string;
-    readonly modelId: string;
+    /**
+     * OPTIONAL for the reason `concurrency` above is: a proxy-mode runner that
+     * discovers its model id at boot (llm/models.ts) carries no pin to export, and
+     * the aggregating viewer renders a replica mid-rollout with this same template.
+     */
+    readonly modelId?: string;
     readonly providerId: string;
     readonly contextWindow: number;
     readonly maxTokens: number;
@@ -836,7 +841,7 @@ export const runnerExport = (config: RunnerConfig): RunnerExport => ({
   },
   llm: {
     auth: config.llm.auth,
-    modelId: config.llm.modelId,
+    ...(config.llm.modelId === undefined ? {} : { modelId: config.llm.modelId }),
     providerId: config.llm.providerId,
     contextWindow: config.llm.contextWindow,
     maxTokens: config.llm.maxTokens,

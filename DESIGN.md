@@ -2989,10 +2989,17 @@ does not — there is no Anthropic key anywhere in `deployment`.
 
 Swapping to a private provider later remains a config change: point `baseUrl` at the
 endpoint, set `scheme: "openai-completions"`, put its access key in
-`LLM_PROXY_TOKEN`, and set `modelId`/`contextWindow`/`maxTokens` to what the served
-model actually offers. `imageInput: true` only when the endpoint takes images — the
+`LLM_PROXY_TOKEN`, and set `contextWindow`/`maxTokens` to what the served model
+actually offers. `imageInput: true` only when the endpoint takes images — the
 default is text-only, because advertising an input the endpoint refuses turns a task's
 screenshot into a provider error nothing can act on.
+
+The proxied model id is also no longer a required setting: at boot the runner reads
+`GET <baseUrl without its trailing /v1>/v1/models` and uses what the endpoint answers —
+one id as found, several lexicographically with a warning, none an error. A configured
+`modelId` acts as a pin: it wins while the endpoint still lists it, falls back with a
+warning once it does not, and is kept when the list endpoint cannot be reached at all.
+Only the id is discovered; the window and token ceilings stay pinned config values.
 
 ### 9.7 Who the fleet commits as
 

@@ -328,8 +328,9 @@ const main = async (): Promise<void> => {
 
   // Shared by the implementation sessions and the review council — one provider, one
   // credential store, one place the model id is decided.
-  const llm = createLlmRuntime({
+  const llm = await createLlmRuntime({
     config: config.llm,
+    logger,
     ...(credentialStore(config.llm, logger) ?? {}),
   });
 
