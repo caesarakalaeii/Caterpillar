@@ -27,6 +27,7 @@ import {
   recordedReason,
   repoSlug,
   taskPullRequests,
+  type AwaitingCi,
   type ProposedPlan,
   type RepoRef,
   type ProviderOutage,
@@ -207,11 +208,11 @@ export interface Verifier {
    * a task on evidence that could not be gathered wedges it on every poll with nothing
    * able to release it (`AlertReverifier.pending` states the same doctrine).
    *
-   * Optional so a `Supervisor` can be built without one, which the loop's older tests do.
-   * A verifier that cannot answer leaves the claim cycle exactly as it was — and the
-   * re-claim storm returns with it. `AcceptanceVerifier` implements it.
+   * Required, and that is the point — `reverifier`'s field comment states the argument
+   * word for word: an implementor that forgets it gets the old re-claim storm back, which
+   * is the one failure this exists to remove. A compile error is the right price.
    */
-  ciPending?(spec: TaskSpec, state: TaskState): Promise<boolean>;
+  ciPending(spec: TaskSpec, state: TaskState): Promise<boolean>;
 }
 
 export interface ProgressProbe {
@@ -550,6 +551,23 @@ const reverificationSkipped = (spec: TaskSpec, merge: MergeReport): string | und
 const RESUMABLE: readonly TaskStatus[] = ["parked", "failed"];
 
 /**
+ * How long a task may sit held for CI before the claim cycle takes it back anyway.
+ *
+ * BOUNDED, for the reason the gate's own settle wait is bounded (§11.1): "a check that
+ * never settles is a real problem an agent should be told about, not a reason to pin the
+ * runner forever". An unbounded hold would trade the re-claim storm for a task that
+ * silently never runs again.
+ *
+ * A day, which is the fleet's existing "you forgot" horizon — the `awaiting-human > 24h`
+ * alert's — and comfortably past every check a forge will still conclude on its own
+ * (GitHub gives a job six hours before it times out). Past it the hold lifts and a
+ * session runs with the wait in its journal, and the ordinary escalation — §11.1's
+ * streak, then the park — resumes with a human notified. The alternative, inventing a
+ * park reason for a task whose work is finished, would page somebody about a queue.
+ */
+const AWAITING_CI_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+/**
  * One task's session, as everything outside `workTask` needs to see it (DESIGN.md §6.4).
  *
  * **This type exists so that nothing task-scoped lives on the `Supervisor` instance any
@@ -684,6 +702,17 @@ export class Supervisor {
    * abandon a task mid-park.
    */
   private readonly running = new Map<TaskId, Promise<void>>();
+
+  /**
+   * When this process last asked about a held task's CI, and what it was told.
+   *
+   * A rate limit, not a claim rule: the durable "not before" is on the task
+   * (`AwaitingCi.notBefore`), and this stops a held task costing a forge round trip on
+   * every poll of a work loop that idles at seconds. Per process and in memory on
+   * purpose — the forge is shared by the whole fleet ("5000 requests an hour across every
+   * endpoint"), and losing this on a redeploy costs one extra call, not a decision.
+   */
+  private readonly ciAnswers = new Map<TaskId, { at: number; pending: boolean }>();
 
   /**
    * Post-merge re-verification of remediation tasks (DESIGN.md §20).
@@ -1586,6 +1615,12 @@ export class Supervisor {
 
       const spec = await store.readSpec(id).catch(() => undefined);
       if (spec === undefined) continue;
+      // A completion claim waiting on CI (§11.1). Like the settle above, this is a task
+      // nothing is wrong with and no session can do anything for: the gate could not
+      // decide, the release said "re-checked when CI reports", and the question is asked
+      // HERE — without a session — because asking it any later costs one. That is what
+      // manufactured GH-...-951's no-progress streak out of finished work.
+      if (await this.heldForCi(spec, state)) continue;
       candidates.push({ id, spec, state });
     }
 
@@ -1687,6 +1722,49 @@ export class Supervisor {
     }
 
     return won;
+  }
+
+  /**
+   * Is this task held out of claim, waiting for the CI its completion claim could not
+   * wait for? (DESIGN.md §11.1.)
+   *
+   * Three answers, in order of cost: no hold at all (every task but the handful between a
+   * `done` claim and its checks), a hold whose earliest-claim time has not arrived, and a
+   * hold whose time HAS arrived — which is the one that asks the forge, and only at most
+   * once per `limits.ciPollSeconds` (the gate's own poll cadence) per task per process.
+   *
+   * The hold ends four ways, and every one of them is deliberate:
+   *   - the checks conclude (the question is asked without a session, which is the point);
+   *   - the branch moves — the hold is about the head the undetermined claim was made on,
+   *     and a commit means there is work again;
+   *   - the wait passes `AWAITING_CI_HORIZON_MS` — a check that never settles is a real
+   *     problem an agent should be told about, and the ordinary escalation resumes;
+   *   - the forge cannot answer — FAIL OPEN, `AlertReverifier.pending`'s doctrine: a hold
+   *     kept on evidence that could not be gathered wedges the task with nothing able to
+   *     release it.
+   */
+  private async heldForCi(spec: TaskSpec, state: TaskState): Promise<boolean> {
+    const hold = state.awaitingCi;
+    if (hold === undefined) return false;
+
+    if (hold.headOid !== state.progress.lastHeadOid) {
+      this.ciAnswers.delete(spec.id);
+      return false;
+    }
+    const now = Date.now();
+    if (now - Date.parse(hold.since) >= AWAITING_CI_HORIZON_MS) {
+      this.ciAnswers.delete(spec.id);
+      return false;
+    }
+    if (now < Date.parse(hold.notBefore)) return true;
+
+    const cached = this.ciAnswers.get(spec.id);
+    if (cached !== undefined && now - cached.at < this.deps.config.limits.ciPollSeconds * 1000) {
+      return cached.pending;
+    }
+    const pending = await this.deps.verifier.ciPending(spec, state);
+    this.ciAnswers.set(spec.id, { at: now, pending });
+    return pending;
   }
 
   /**
@@ -2471,8 +2549,26 @@ export class Supervisor {
           // is what parked BS-...-07 — three sessions that could only wait, each
           // truthfully scored no-progress by §11.1, on work that was already finished.
           // Coming back through a later poll costs nothing and lets the runner do real
-          // work in between.
+          // work in between — and the hold below is what makes that true rather than
+          // aspirational: without it "a later poll" re-claimed the task seconds later and
+          // spent the very session this release exists to avoid (GH-...-951's streak).
           logger.info("task.awaiting-ci", { task: spec.id, session: state.sessions });
+          // The earliest-claim time (§11.1), keyed on the head the undetermined claim was
+          // about: a commit means there is work again and the hold must not strand it.
+          // `since` survives a later release of the SAME head, so the horizon in
+          // `heldForCi` measures the whole wait rather than the last lap around it.
+          const headOid = state.progress.lastHeadOid;
+          const previousHold = state.awaitingCi;
+          const hold: AwaitingCi = {
+            ...(headOid === undefined ? {} : { headOid }),
+            since:
+              previousHold !== undefined && previousHold.headOid === headOid
+                ? previousHold.since
+                : new Date().toISOString(),
+            notBefore: new Date(
+              Date.now() + this.deps.config.limits.ciPollSeconds * 1000,
+            ).toISOString(),
+          };
           // One unit, like every other write-then-push in this switch. Without the hold
           // this commit stages the whole writable tree, which at N slots means a sibling
           // session's deliberately-uncommitted `state.json` lands under this task's
@@ -2485,7 +2581,7 @@ export class Supervisor {
                 `commands passed. No action is needed: the task was released and will be ` +
                 `re-checked when CI reports.\n\n${result.detail}`,
             );
-            await this.transition(lease, state, "ready");
+            await this.transition(lease, { ...state, awaitingCi: hold }, "ready");
             await this.push(lease, `chore(${spec.id}): awaiting CI`);
           });
           return true;
