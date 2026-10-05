@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { LlmConfig } from "../config/types.ts";
 import { SILENT_LOGGER, type LogFields, type Logger } from "../obs/log.ts";
-import { createLlmRuntime } from "./models.ts";
+import { createLlmRuntime, PROXY_TOKEN_ENV } from "./models.ts";
 
 const config = (over: Partial<LlmConfig> = {}): LlmConfig => ({
   auth: "proxy",
@@ -114,24 +114,39 @@ test("an empty list is an error even though the endpoint answered", async () => 
 });
 
 test("the discovery request reaches the stripped /v1/models URL, with a bearer only when set", async () => {
-  const urls: string[] = [];
-  const authorizations: (string | undefined)[] = [];
-  const recording: typeof fetch = async (input, init) => {
-    urls.push(String(input));
-    const headers = new Headers(init?.headers);
-    authorizations.push(headers.get("authorization") ?? undefined);
-    return gateway(["m"])(input, init);
-  };
-
-  await createLlmRuntime({ config: config({ modelId: "m" }), fetch: recording });
-  assert.deepEqual(urls, ["https://gateway.invalid/v1/models"]);
-  assert.equal(authorizations[0], undefined, "no token env, no header");
-
-  process.env["LLM_PROXY_TOKEN"] = "tok";
+  // Runs against a CONTROLLED environment. The runner's own container carries
+  // `LLM_PROXY_TOKEN` by design — it is the supervisor's LLM credential (§9.6), which
+  // `workspace/toolchain.ts`'s RESERVED list deliberately keeps in every task's
+  // environment — so "no token set" is something this test must ARRANGE, not assume.
+  // Asserted as written it passed in GitHub's CI, where the variable is absent, and
+  // failed at the acceptance gate (`npm test` is an acceptance command), where it is
+  // always present: `no token env, no header` saw the ambient bearer and read as a defect
+  // in the code under test. The same hermetic principle as `probe.test.ts`'s git config —
+  // a test that borrows whatever the environment happens to hold fails for reasons
+  // unrelated to the code it is about.
+  const ambient = process.env[PROXY_TOKEN_ENV];
+  delete process.env[PROXY_TOKEN_ENV];
   try {
+    const urls: string[] = [];
+    const authorizations: (string | undefined)[] = [];
+    const recording: typeof fetch = async (input, init) => {
+      urls.push(String(input));
+      const headers = new Headers(init?.headers);
+      authorizations.push(headers.get("authorization") ?? undefined);
+      return gateway(["m"])(input, init);
+    };
+
+    await createLlmRuntime({ config: config({ modelId: "m" }), fetch: recording });
+    assert.deepEqual(urls, ["https://gateway.invalid/v1/models"]);
+    assert.equal(authorizations[0], undefined, "no token env, no header");
+
+    process.env[PROXY_TOKEN_ENV] = "tok";
     await createLlmRuntime({ config: config({ modelId: "m" }), fetch: recording });
     assert.equal(authorizations[1], "Bearer tok");
   } finally {
-    delete process.env["LLM_PROXY_TOKEN"];
+    // The ambient value, restored exactly. A suite that leaks env into its neighbours is
+    // the flake this test is the cure for, not another instance of it.
+    if (ambient === undefined) delete process.env[PROXY_TOKEN_ENV];
+    else process.env[PROXY_TOKEN_ENV] = ambient;
   }
 });
