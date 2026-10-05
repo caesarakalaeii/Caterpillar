@@ -273,21 +273,12 @@ export class AcceptanceVerifier {
   /**
    * The claim cycle's cheap question: is this task's branch still waiting on CI?
    *
-   * Asked WITHOUT a session, which is the whole point. A `done` claim the gate could not
-   * decide releases the task saying "will be re-checked when CI reports" (§11.1); before
-   * this existed nothing re-checked — `isClaimable` accepted `ready` seconds later and the
-   * session that ran could only re-claim `done`, commit nothing, and be scored a stall.
-   * Two of those manufactured `GH-caesarakalaeii-all-chat-951`'s no-progress streak on
-   * finished work.
-   *
    * One `checks()` call per PR repo and no settle wait: this is a poll, not a gate. True
    * only while some check is actually running — a green, a red and a repo with no CI all
    * settle the question alike, because the hold is about WAITING, not about passing.
    *
-   * Fails OPEN. No PR, no forge, a forge that cannot answer: all report false, so the
-   * task is claimed rather than held. Keeping a hold on evidence that could not be
-   * gathered would wedge the task on every poll with nothing able to release it — the
-   * same doctrine `AlertReverifier.pending` states for its own record.
+   * Fails OPEN: no PR, no forge, a forge that cannot answer — all report false, so the
+   * task is claimed rather than held.
    */
   async ciPending(spec: TaskSpec, state: TaskState): Promise<boolean> {
     const prs = taskPullRequests(spec.repos, state);
