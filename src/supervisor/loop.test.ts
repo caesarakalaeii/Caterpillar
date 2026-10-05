@@ -5968,6 +5968,80 @@ test("a check that never concludes is handed to a session, not held forever", as
   assert.ok(ran !== undefined, "a wait past the horizon must end in a session that is told");
 });
 
+test("a re-release of the same head does not restart the wait clock", async (t) => {
+  // The 24h horizon must measure the WHOLE wait, not the last lap around it (§11.1).
+  // A hold whose checks never conclude is handed to a session, that session re-claims
+  // `done`, and the pending gate releases the task again — for the same head. If that
+  // re-release stamped a fresh `since`, every lap would re-arm the 24h hold and the
+  // escalation to §11.1's park would take days of wall clock instead of a few poll
+  // cycles. That is what the `since` merge in the awaiting-CI release is for, and what
+  // carrying `awaitingCi` through the session is for: the record is what the merge
+  // reads. This pins the merge — the review's sabotage replaced it with
+  // `since: new Date().toISOString()` and the suite stayed green.
+  const RELAPSE = asTaskId("SMOKE-CI-RELAPSE");
+  const WAIT_STARTED = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  await seedTask(RELAPSE, {
+    sessions: 1,
+    pr: { number: 17, url: "https://example.invalid/pr/17" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      since: WAIT_STARTED,
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(RELAPSE);
+  });
+
+  // The seeded hold's horizon is already past, so the claim cycle hands the task to a
+  // session; the claim that session makes is then released pending CI — the SECOND wait
+  // on the same head, and the one under test.
+  const released = await waitForCommit(`chore(${RELAPSE}): awaiting CI`, 30_000);
+  assert.ok(released !== undefined, "the pending gate never re-released the task");
+
+  // Read AT that commit: what is under test is what the re-release pushed.
+  const reReleased = await stateAt(released, RELAPSE);
+  const hold = reReleased?.awaitingCi;
+  assert.ok(hold !== undefined, "the re-release must stamp a hold");
+  assert.equal(
+    Date.parse(hold.since),
+    Date.parse(WAIT_STARTED),
+    "the re-release restarted the 24h clock: the horizon must measure the whole wait, not the last lap",
+  );
+});
+
 test("a hold about a head that has moved does not stop the claim", async (t) => {
   // The hold is about the head the undetermined claim was made on. A commit — here, one
   // that landed while nothing held the task — means there is work again, and holding the
