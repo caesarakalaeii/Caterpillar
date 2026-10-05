@@ -365,6 +365,39 @@ export interface PlanMembership {
   readonly blockedBy: readonly TaskId[];
 }
 
+/**
+ * A completion claim the gate could not decide: acceptance passed and CI was still
+ * running, so the task was released to wait for the checks instead of spending sessions
+ * on a queue (DESIGN.md §11.1).
+ *
+ * The claim cycle reads this to answer "is there anything a session could do here" — the
+ * question whose absence manufactured `GH-caesarakalaeii-all-chat-951`'s no-progress
+ * streak. The release said "the task was released and will be re-checked when CI
+ * reports", but nothing re-checked: `isClaimable` accepted `ready` on the very next poll
+ * and the session that ran could only re-claim `done`, commit nothing, and be scored a
+ * stall by §11.1 — honestly, about a session that should never have existed. Two of
+ * those tripped `CaterpillarTaskThrashing` on finished work; a third would have parked
+ * it citing "no progress" with a green branch and an open PR.
+ */
+export interface AwaitingCi {
+  /**
+   * The branch head the undetermined claim was about. The hold applies only while this
+   * is still `progress.lastHeadOid`: a commit — by any hand — means there is work again,
+   * and holding the task for a claim that is no longer the question would strand it.
+   * Absent when the probe could read no head at all, and the hold then applies to the
+   * branch as it stands.
+   */
+  readonly headOid?: string;
+  /**
+   * When the wait BEGAN — the first pending release on this head, preserved across later
+   * ones so "how long has this been waiting" is a question the record can answer and the
+   * horizon below is measured from the wait, not from the last cycle around it.
+   */
+  readonly since: string;
+  /** Earliest time the claim cycle may take this task again. The earliest-claim time. */
+  readonly notBefore: string;
+}
+
 /** Mutable control record — `state.json`. */
 export interface TaskState {
   readonly id: TaskId;
@@ -396,6 +429,11 @@ export interface TaskState {
   readonly plan?: PlanMembership;
   /** The Discord thread this task talks in, when it has one. */
   readonly chat?: { readonly threadId: string };
+  /**
+   * Set while a completion claim waits on CI (see `AwaitingCi`). Absent on every task
+   * that is not between a `done` claim and its checks, which is almost all of them.
+   */
+  readonly awaitingCi?: AwaitingCi;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

@@ -5792,6 +5792,223 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
   await retire(RUNNING);
 });
 
+test("a task released to wait for CI is not re-claimed until the checks conclude", async (t) => {
+  // `GH-caesarakalaeii-all-chat-951`'s no-progress streak, and the residual DESIGN.md
+  // §11.1 left open. The pending path releases the task "and will be re-checked when CI
+  // reports" — but nothing re-checked. `isClaimable` accepted `ready` on the very next
+  // poll (13 seconds later, in the incident), and the session that ran could only
+  // re-claim `done`, commit nothing, and be scored a stall by §11.1. Two of those
+  // manufactured `CaterpillarTaskThrashing` on finished work; a third would have parked
+  // the task citing "no progress" with a green branch and an open PR.
+  //
+  // What must be true instead: the release carries an earliest-claim time, the claim
+  // cycle asks about CI WITHOUT a session, and the task is taken only once the checks
+  // have concluded. The streak stays honest throughout — §11.1 is right about every
+  // session it is shown; the fix is that there are none to show it.
+  const WAITING = asTaskId("SMOKE-CI-HOLD");
+  await seedTask(WAITING, { pr: { number: 14, url: "https://example.invalid/pr/14" } });
+
+  let sessions = 0;
+  let ciRunning = true;
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    // One second, so "the checks concluded" is seen on the next poll rather than after
+    // the production interval — and so a broken hold has several polls to betray itself.
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () => {
+        sessions += 1;
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(ciRunning),
+    },
+    // A probe that says what the incident's said: the branch did not move, and it knows
+    // what head it is at — which is what the hold is keyed on.
+    progress: {
+      probe: () =>
+        Promise.resolve({
+          committed: false,
+          acceptanceImproved: false,
+          stepCompleted: false,
+          headOid: "abc1234",
+          baselineOid: "abc1234",
+        }),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  // Cleanup runs even when an assertion fails mid-test: a supervisor left running claims
+  // the NEXT test's seeded task and keeps the shared state checkout busy, which is a hung
+  // suite rather than a failed test.
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(WAITING);
+  });
+
+  const released = await waitForCommit(`chore(${WAITING}): awaiting CI`, 30_000);
+  assert.ok(released !== undefined, "the pending gate never released the task");
+
+  // The release records the hold, keyed on the head the undetermined claim was about.
+  const releasedState = await stateAt(released, WAITING);
+  assert.equal(releasedState?.awaitingCi?.headOid, "abc1234");
+  assert.ok(
+    releasedState?.awaitingCi !== undefined &&
+      Date.parse(releasedState.awaitingCi.notBefore) >= Date.parse(releasedState.awaitingCi.since),
+    "the hold must carry both when the wait began and the earliest-claim time",
+  );
+
+  // And nothing takes it while the checks run. Long enough for several polls at
+  // `pollSeconds: 1` — without the hold this is a session per claim cycle, which is the
+  // incident. Asserted on the pushed state as well as the live counter: a session that
+  // ran records itself durably, so the two agree on what happened either way.
+  await sleep(5_000);
+  assert.equal(sessions, 1, "the claim cycle must not spend a session on a CI queue");
+  const stillWaiting = await pushedState(WAITING);
+  assert.equal(stillWaiting?.sessions, 1, "a second session would have recorded itself");
+  assert.equal(
+    stillWaiting?.progress.noProgressStreak,
+    1,
+    "the one session that DID run is still scored honestly — the fix is not to fudge the count",
+  );
+
+  // The checks conclude, and the claim cycle takes the task again. A session now has
+  // something real to decide (a red CI to fix, or a claim the gate can finally answer).
+  ciRunning = false;
+  const second = await waitForCommit(`chore(${WAITING}): session 2 — done-claimed`, 30_000);
+  assert.ok(second !== undefined, "a task whose checks concluded must be claimable again");
+});
+
+test("a check that never concludes is handed to a session, not held forever", async (t) => {
+  // The hold must be BOUNDED, for the reason the gate's own wait is bounded: "a check
+  // that never settles is a real problem an agent should be told about, not a reason to
+  // pin the runner forever" (§11.1). An unbounded hold would trade the re-claim storm
+  // for a task that silently never runs again — the wedge `AlertReverifier.pending`
+  // states its fail-open doctrine against.
+  const STUCK = asTaskId("SMOKE-CI-STUCK");
+  await seedTask(STUCK, {
+    sessions: 1,
+    pr: { number: 15, url: "https://example.invalid/pr/15" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      // A day and an hour: past the horizon this code must impose.
+      since: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      // Still running — forever. The horizon, not the checks, is what must let go.
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(STUCK);
+  });
+
+  const ran = await waitForCommit(`chore(${STUCK}): session 2 — done-claimed`, 30_000);
+  assert.ok(ran !== undefined, "a wait past the horizon must end in a session that is told");
+});
+
+test("a hold about a head that has moved does not stop the claim", async (t) => {
+  // The hold is about the head the undetermined claim was made on. A commit — here, one
+  // that landed while nothing held the task — means there is work again, and holding the
+  // task for a claim that is no longer the question would strand it behind its own
+  // history.
+  const MOVED = asTaskId("SMOKE-CI-MOVED");
+  await seedTask(MOVED, {
+    sessions: 1,
+    pr: { number: 16, url: "https://example.invalid/pr/16" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "new-head" },
+    awaitingCi: {
+      headOid: "old-head",
+      since: new Date().toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(MOVED);
+  });
+
+  const ran = await waitForCommit(`chore(${MOVED}): session 2 — done-claimed`, 30_000);
+  assert.ok(ran !== undefined, "work on the branch outranks a hold about an older head");
+});
+
 test("scheduled work is fired from the housekeeping loop, and a failing pass is not fatal", async () => {
   // The schedule runs on the housekeeping loop (§22) — no new listener, no new port, no
   // new Deployment. Two properties matter: it is reached on an ordinary pass, and it can

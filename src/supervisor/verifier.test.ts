@@ -319,6 +319,70 @@ test("a repo with no CI still passes, and says so once per repo", async () => {
   assert.match(result.detail, /acceptance criteria alone/);
 });
 
+/* ─────────── the claim cycle's CI question, asked without a session ─────────── */
+
+const bothPrs: TaskState = {
+  ...state,
+  prs: [
+    { number: 1, url: "https://example.invalid/r/1", repo: PRIMARY },
+    { number: 2, url: "https://example.invalid/r-extension/2", repo: SIBLING },
+  ],
+};
+
+test("one repo still running is enough for the claim cycle to hold the task", async () => {
+  // The hold is what makes the pending path's promise true — "the task was released and
+  // will be re-checked when CI reports" — and a two-repo task waits for BOTH (§9.4.1):
+  // half the change being green is not the change being ready.
+  const worktree = await scratch();
+  const { bindings } = ciForge({ "o/r": "success", "o/r-extension": "pending" });
+
+  assert.equal(await ciVerifier(worktree, bindings).ciPending(twoRepoSpec, bothPrs), true);
+});
+
+test("a task whose checks have all concluded is not waiting on CI", async () => {
+  const worktree = await scratch();
+  const { bindings, asked } = ciForge({ "o/r": "success", "o/r-extension": "failure" });
+
+  assert.equal(await ciVerifier(worktree, bindings).ciPending(twoRepoSpec, bothPrs), false);
+  assert.deepEqual(
+    asked,
+    ["o/r", "o/r-extension"],
+    "a red check settles the question just as a green one does — the hold is about waiting",
+  );
+});
+
+test("a forge that cannot answer releases the hold rather than wedging the task", async () => {
+  // Fail OPEN, the doctrine `AlertReverifier.pending` states: a hold kept on evidence
+  // that could not be gathered would wedge the task on every poll with nothing able to
+  // release it. A forge outage must cost a claimable task, not a lost one.
+  const worktree = await scratch();
+  const bindings: WorkspaceBindings = {
+    forges: new Map([
+      [
+        asWorkspaceName("test"),
+        {
+          forTask: () =>
+            Promise.resolve({
+              checks: () => Promise.reject(new Error("403 Forbidden")),
+              revoke: () => Promise.resolve(),
+            } as unknown as Forge),
+        },
+      ],
+    ]) as never,
+    trackers: new Map(),
+  };
+
+  assert.equal(await ciVerifier(worktree, bindings).ciPending(twoRepoSpec, bothPrs), false);
+});
+
+test("a task with no pull request is not waiting on CI", async () => {
+  const worktree = await scratch();
+  const { bindings, asked } = ciForge({});
+
+  assert.equal(await ciVerifier(worktree, bindings).ciPending(specWith(["true"]), state), false);
+  assert.deepEqual(asked, [], "nothing to ask about must not cost a forge round trip");
+});
+
 /* ────────────────── an amended criterion says so in the report (§12.3) ────────────────── */
 
 /**

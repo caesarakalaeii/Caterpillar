@@ -192,6 +192,26 @@ export interface Verifier {
     /** Set when CI has not finished, which is not the same as a failed gate. */
     readonly pending?: boolean;
   }>;
+
+  /**
+   * The claim cycle's cheap question: is this task's branch still waiting on CI?
+   *
+   * Asked WITHOUT a session, which is the whole point. A `done` claim the gate could not
+   * decide releases the task saying "will be re-checked when CI reports" (§11.1); before
+   * this existed nothing re-checked, `isClaimable` accepted `ready` seconds later, and the
+   * session that ran could only re-claim `done` — two of those manufactured
+   * `GH-caesarakalaeii-all-chat-951`'s no-progress streak out of finished work.
+   *
+   * True only while some check is actually running. Everything else — settled, no PR, a
+   * forge that cannot answer — must be false: the claim cycle fails OPEN, because holding
+   * a task on evidence that could not be gathered wedges it on every poll with nothing
+   * able to release it (`AlertReverifier.pending` states the same doctrine).
+   *
+   * Optional so a `Supervisor` can be built without one, which the loop's older tests do.
+   * A verifier that cannot answer leaves the claim cycle exactly as it was — and the
+   * re-claim storm returns with it. `AcceptanceVerifier` implements it.
+   */
+  ciPending?(spec: TaskSpec, state: TaskState): Promise<boolean>;
 }
 
 export interface ProgressProbe {
