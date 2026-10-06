@@ -101,7 +101,9 @@ test("a context-length refusal is the TASK's problem and must not read as an out
   );
 });
 
-test("an unknown model is a misconfiguration, not an outage", () => {
+test("an unknown model id is a misconfiguration, not an outage", () => {
+  // Anthropic's shape: a 404 with "model: <id>" in a not_found_error. The id is
+  // wrong in config, and a cooldown would hide the bug and reproduce it on retry.
   assert.equal(
     classifyProviderFailure(
       '404 {"type":"error","error":{"type":"not_found_error","message":"model: ' +
@@ -109,6 +111,20 @@ test("an unknown model is a misconfiguration, not an outage", () => {
     ),
     undefined,
   );
+});
+
+test("the coding gateway retiring an alias mid-run is an outage, not a misconfiguration", () => {
+  // The runner resolved the model id at boot; a later swap means every running
+  // task hits 404 "unknown alias". Backing off stops the stampede and a pod
+  // restart re-runs discovery. Distinguished from the Anthropic shape above by
+  // the gateway's own wording, which is all the classifier has to go on.
+  const outage = classifyProviderFailure(
+    '404: {"message":"unknown alias","type":"invalid_request_error"}',
+  );
+
+  assert.equal(outage?.kind, "model-retired");
+  assert.equal(outage?.status, 404);
+  assert.equal(outage?.detail, "unknown alias");
 });
 
 /** pi's openai-completions path composes `"<status>: <body>"` — captured against a stub
