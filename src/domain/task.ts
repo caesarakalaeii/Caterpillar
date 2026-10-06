@@ -442,7 +442,12 @@ export type OutageKind =
   /** The credential was rejected. Waiting does not fix this one; a human must. */
   | "unauthorised"
   /** No response arrived at all. */
-  | "network";
+  | "network"
+  /**
+   * The gateway retired the model alias the runner resolved at boot. A mid-run swap,
+   * not a misconfiguration: the runner backs off and a pod restart re-runs discovery.
+   */
+  | "model-retired";
 
 export interface ProviderOutage {
   readonly kind: OutageKind;

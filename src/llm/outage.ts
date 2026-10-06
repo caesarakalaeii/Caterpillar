@@ -49,6 +49,8 @@ const EXHAUSTED = /spend limit|usage limit|credit balance|out of credits|quota/i
 
 /** No HTTP status ever arrived, because no HTTP response did. */
 const NETWORK = /fetch failed|connection error|timed out|socket hang up|network|ECONN|ETIMEDOUT|EAI_AGAIN/i;
+/** The coding gateway's wording for a model alias it no longer serves. */
+const UNKNOWN_ALIAS = /unknown alias/i;
 
 /** Longest provider prose that is worth carrying into a log line or a Discord message. */
 const MAX_DETAIL = 200;
@@ -95,6 +97,12 @@ const classify = (message: string): ProviderOutage | undefined => {
   if (code === 408 || code >= 500) return { kind: "unavailable", ...base };
   // A 400 is normally the request's fault, but a spent balance is reported as one.
   if (EXHAUSTED.test(message)) return { kind: "exhausted", ...base };
+  // A 404 "unknown alias" is a gateway that retired the model the runner pinned at
+  // boot — a mid-run swap, not a misconfiguration. Distinguished from a genuinely
+  // wrong model id by the gateway's own wording: Anthropic says "model: <id>" in a
+  // not_found_error, the coding gateway says "unknown alias". Backing the runner off
+  // stops a stampede; restarting the pod re-runs discovery and picks up the new id.
+  if (code === 404 && UNKNOWN_ALIAS.test(message)) return { kind: "model-retired", ...base };
 
   return undefined;
 };

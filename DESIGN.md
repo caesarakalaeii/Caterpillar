@@ -735,7 +735,7 @@ is by reading the provider's message. The line it draws:
 | Reads as | Examples | Response |
 |---|---|---|
 | outage | 429 spend/usage limit, 429 burst, 5xx, 529 overloaded, 401/403, no response at all | release the task, back the runner off |
-| the task's own error | 400 `prompt is too long`, 404 unknown model | unchanged — `failed`, and a human looks |
+| the task's own error | 400 `prompt is too long`, 404 unknown model id | unchanged — `failed`, and a human looks |
 Sweeping the second row into a cooldown would hide a real bug behind an hour of silence
 and then reproduce it exactly. That is why the classifier reads prose rather than
 treating every failure as transient.
@@ -754,6 +754,18 @@ routinely and must read as `rate-limited` — cooldown, task untouched, success 
 the incident. `llm.imageInput` (default false) belongs to the same fit: the gateway
 reports `supports_vision: false` for its aliases, so the proxied model advertises text
 only unless a config says otherwise.
+
+**Amended for gateway model swaps (2026-10).** A 404 `unknown alias` from the
+coding gateway is now `model-retired`, not a task error. The runner resolved the
+model id at boot (§9.6); a mid-run gateway swap retires that alias and every
+running task hits the 404. Reading it as the task's own `error` let the runner
+claim the next task and fail it identically, because the id is frozen for the
+process lifetime. The classifier distinguishes a retired alias from a genuinely
+wrong model id by the gateway's own wording: the coding gateway says
+`unknown alias`, Anthropic says `model: <id>` in a `not_found_error`. The
+backoff is the same exponential cooldown, and a pod restart re-runs discovery
+and picks up the new alias, so the outage is bounded by how long it takes an
+operator to roll the pod.
 
 **3. The response belongs to the runner, not the task.** On an outage:
 
