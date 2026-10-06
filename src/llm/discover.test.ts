@@ -93,6 +93,7 @@ test("a failed list fetch keeps a set pin and warns", async () => {
     config: config({ modelId: "pinned" }),
     logger,
     fetch: unreachable,
+    sleep: noSleep,
   });
 
   assert.equal(runtime.model.id, "pinned");
@@ -104,7 +105,7 @@ test("a failed list fetch keeps a set pin and warns", async () => {
 
 test("a failed list fetch with no pin refuses to boot, naming the URL tried", async () => {
   await assert.rejects(
-    () => createLlmRuntime({ config: config(), fetch: unreachable }),
+    () => createLlmRuntime({ config: config(), fetch: unreachable, sleep: noSleep }),
     (error: unknown) => error instanceof Error && /https:\/\/gateway\.invalid\/v1\/models/.test(error.message),
   );
 });
@@ -134,4 +135,53 @@ test("the discovery request reaches the stripped /v1/models URL, with a bearer o
   } finally {
     delete process.env["LLM_PROXY_TOKEN"];
   }
+});
+
+/** A fetch that fails N times with a 503, then answers with the given model list. */
+const flaky = (failTimes: number, ids: readonly string[]): typeof fetch => {
+  let calls = 0;
+  return async () => {
+    if (calls++ < failTimes) {
+      return new Response("Service Unavailable", { status: 503, statusText: "Service Unavailable" });
+    }
+    return gateway(ids)();
+  };
+};
+
+/** No-op sleep so retry tests do not wait real seconds. */
+const noSleep = (): Promise<void> => Promise.resolve();
+
+test("a transient 503 is retried and discovery succeeds", async () => {
+  const { logger, warnings } = warningLogger();
+  const runtime = await createLlmRuntime({
+    config: config(),
+    logger,
+    fetch: flaky(2, ["recovered-model"]),
+    sleep: noSleep,
+  });
+
+  assert.equal(runtime.model.id, "recovered-model");
+  assert.equal(warnings.length, 0, "a recovered discovery is not a warning");
+});
+
+test("a persistent 503 exhausts retries and refuses to boot", async () => {
+  await assert.rejects(
+    () => createLlmRuntime({ config: config(), fetch: flaky(10, ["never"]), sleep: noSleep }),
+    (error: unknown) =>
+      error instanceof Error && /503 Service Unavailable/.test(error.message),
+  );
+});
+
+test("a 4xx is not retried — it fails on the first attempt", async () => {
+  let calls = 0;
+  const once: typeof fetch = async () => {
+    calls++;
+    return new Response("Bad Request", { status: 400, statusText: "Bad Request" });
+  };
+
+  await assert.rejects(
+    () => createLlmRuntime({ config: config(), fetch: once }),
+    /400 Bad Request/,
+  );
+  assert.equal(calls, 1, "a 4xx must not be retried");
 });

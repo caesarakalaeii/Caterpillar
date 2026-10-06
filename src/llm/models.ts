@@ -109,6 +109,8 @@ export interface LlmRuntimeOptions {
   readonly logger?: Logger;
   /** Injectable for tests. Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
+  /** Injectable for tests. Defaults to `setTimeout`-based sleep. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 /** Register the configured provider and resolve the model. */
@@ -139,7 +141,7 @@ export const createLlmRuntime = async (options: LlmRuntimeOptions): Promise<LlmR
     return { models, model };
   }
 
-  const modelId = await resolveProxiedModelId(config, logger, options.fetch);
+  const modelId = await resolveProxiedModelId(config, logger, options.fetch, options.sleep);
 
   models.setProvider(
     createProvider({
@@ -177,6 +179,7 @@ const resolveProxiedModelId = async (
   config: LlmConfig,
   logger: Logger,
   http?: typeof fetch,
+  sleep?: (ms: number) => Promise<void>,
 ): Promise<string> => {
   const pin = config.modelId;
   const token = process.env[PROXY_TOKEN_ENV];
@@ -187,6 +190,7 @@ const resolveProxiedModelId = async (
       baseUrl: config.baseUrl,
       ...(token === undefined ? {} : { token }),
       ...(http === undefined ? {} : { fetch: http }),
+      ...(sleep === undefined ? {} : { sleep }),
     });
   } catch (error) {
     if (pin === undefined) throw error;
