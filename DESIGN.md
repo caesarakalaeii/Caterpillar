@@ -3012,6 +3012,10 @@ one id as found, several lexicographically with a warning, none an error. A conf
 `modelId` acts as a pin: it wins while the endpoint still lists it, falls back with a
 warning once it does not, and is kept when the list endpoint cannot be reached at all.
 Only the id is discovered; the window and token ceilings stay pinned config values.
+The list request retries on 5xx and network errors (two attempts, exponential
+backoff), so a transient gateway outage at boot does not crash the pod when no
+pin is set: without a pin there is no fallback, and a single 503 would otherwise
+refuse to boot on every restart until the gateway recovers.
 
 ### 9.7 Who the fleet commits as
 
