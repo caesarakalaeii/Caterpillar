@@ -589,17 +589,17 @@ export class WorktreeManager {
    * runner B works the task and pushes, A claims it again — where the first `git push` is
    * refused as non-fast-forward and the agent has no way to tell it started behind.
    *
-   * Fast-forward, never force. `merge --ff-only` declines rather than moving a tree with
-   * local modifications, and declines on a divergence, so the failure modes it does not fix
-   * it reports: the throw below is the invariant's second half, and a session that refuses
-   * to start leaves both histories intact for a human, which is what GH-95 did by hand.
-   *
-   * The tolerant callers inherit that throw, which `mustReachRemote` does not shield them
-   * from: it governs an unreachable remote, not a decline. A probe on a worktree that is
-   * behind with local modifications does propagate the refusal. It needs the remote to move
-   * DURING the session to arise, which is what the lease is for, so this is left as is
-   * rather than softened into a silence — a probe reporting on a checkout it knows is behind
-   * would be a worse answer than no answer.
+   * Fast-forward first, rebase on divergence. `merge --ff-only` declines rather than
+   * moving a tree with local modifications, and declines on a divergence. A dirty tree
+   * is still refused — a probe reporting on a checkout it knows is behind with
+   * uncommitted changes is a worse answer than no answer. But a divergence — local
+   * commits the remote does not have, and remote commits the local does not — is now
+   * recovered by a `git rebase` onto the remote tip, rather than parking the task.
+   * This is the two-runner case where both pushed and committed concurrently, and the
+   * crash-between-commit-and-push case where the worktree holds unpushed local commits
+   * while the remote has moved. A conflicting rebase is aborted and refused, leaving
+   * both histories intact for a human — the same outcome as before, reached only when
+   * a mechanical replay genuinely cannot succeed.
    *
    * Only ever on `agent/<task>` itself, and that check is not a formality. An agent that ran
    * `git checkout` is documented elsewhere in this file (§`refspecs`), and merging the task
@@ -633,14 +633,41 @@ export class WorktreeManager {
     if (head === remote) return;
 
     const advance = await git.tryRun("merge", "--ff-only", remote);
-    if (advance.code !== 0) {
+    if (advance.code === 0) return;
+
+    // `--ff-only` declines on two shapes: a worktree with local modifications it
+    // refuses to move, and a divergence where the local HEAD has commits the remote
+    // does not. The first is unchanged — a dirty tree is left exactly as it is. The
+    // second is the case that parked tasks indefinitely: a worktree whose local
+    // commits and the remote's pushed commits share a common ancestor but neither
+    // contains the other. A crashed session between commit and push, combined with
+    // another runner pushing, leaves exactly this state.
+    //
+    // Rebase rather than merge: the task branch is one agent's work, so the histories
+    // commute, and a linear history is the one that reads as a sequence of sessions.
+    // This is the same pattern `StateStore.rebaseOnto` uses for its own divergence.
+    // On conflict, abort and refuse — a mechanical rebase of conflicting work would
+    // leave the worktree mid-rebase, which is worse than parking the task.
+    const hasLocal = await git.tryRun("rev-list", "--count", `${remote}..HEAD`);
+    const localCommits = hasLocal.code === 0 && hasLocal.stdout.trim() !== "0";
+    if (!localCommits) {
       throw new Error(
         `refusing to start ${task} on ${repo.owner}/${repo.name}: its worktree is at ` +
           `${head ?? "an unreadable HEAD"} and cannot fast-forward to origin/${branch} ` +
-          `(${remote}). Starting behind would lose the pushed work; reconcile ${path} by ` +
+          `(${remote}). The working tree has local modifications; reconcile ${path} by ` +
           `hand. git said: ${advance.stderr.trim()}`,
       );
     }
+
+    const rebased = await git.tryRun("rebase", remote);
+    if (rebased.code === 0) return;
+    await git.tryRun("rebase", "--abort");
+    throw new Error(
+      `refusing to start ${task} on ${repo.owner}/${repo.name}: its worktree is at ` +
+        `${head ?? "an unreadable HEAD"} and diverged from origin/${branch} ` +
+        `(${remote}). A rebase was attempted but conflicted; reconcile ${path} by ` +
+        `hand. git said: ${rebased.stderr.trim()}`,
+    );
   }
 
   /**

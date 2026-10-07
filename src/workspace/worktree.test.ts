@@ -1625,3 +1625,78 @@ test("conflictsWithBase says 'unknown' for a base it cannot resolve", async () =
 
   assert.equal(await manager(root).conflictsWithBase(repo, "no-such-branch"), "unknown");
 });
+
+test("a diverged worktree is rebased onto the remote instead of parking the task", async () => {
+  // The ALERT that parked indefinitely: a worktree whose local HEAD diverged from
+  // origin/agent/<task> — local commits the remote does not have, and remote commits
+  // the local does not. The old code threw on `merge --ff-only` decline, leaving the
+  // task parked until a human reconciled by hand. A rebase preserves both histories.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("DIVERGED-1");
+  const subject = manager(root);
+
+  // Start a worktree, then push from the seed to move the remote branch.
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const pushed = await pushAgentBranch(root, REPO, task, "remote work from another runner\n");
+
+  // Make a LOCAL commit in the worktree that the remote has not seen.
+  const git = new Git(worktree, HERMETIC);
+  await writeFile(join(worktree, "local-work"), "committed locally, not pushed\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "local work that diverges from the remote");
+  const local = (await git.run("rev-parse", "HEAD")).trim();
+  assert.notEqual(local, pushed, "fixture is wrong: the worktree must have diverged");
+
+  // The reuse path must rebase rather than refuse.
+  const reused = await subject.ensureWorktree(REPO, task);
+  const after = new Git(reused, HERMETIC);
+  const tip = (await after.run("rev-parse", "HEAD")).trim();
+
+  // The local commit's content survives — rebased on top of the remote tip.
+  assert.ok(existsSync(join(reused, "local-work")), "the local commit's file must survive the rebase");
+  assert.ok(existsSync(join(reused, "pushed")), "the remote commit's file must be present");
+  assert.notEqual(tip, local, "HEAD must have moved — the remote commits were replayed underneath");
+  assert.notEqual(tip, pushed, "HEAD must not be the bare remote tip — the local commit was replayed on top");
+});
+
+test("a diverged worktree with a conflicting rebase is refused, not left mid-rebase", async () => {
+  // A rebase that conflicts cannot be resolved mechanically. The worktree must be
+  // left usable (rebase aborted) and the task refused — the same outcome as before
+  // the rebase fallback, reached only when the replay genuinely cannot succeed.
+  const root = await scratch();
+  await seedMirror(root, REPO);
+
+  const task = asTaskId("DIVERGED-2");
+  const subject = manager(root);
+
+  // Create a worktree with a file the remote will also touch.
+  const worktree = await subject.ensureWorktree(REPO, task);
+  const git = new Git(worktree, HERMETIC);
+  await writeFile(join(worktree, "conflict.ts"), "local\n");
+  await git.run("add", "-A");
+  await git.run("commit", "-m", "local edit to conflict.ts");
+
+  // Push a conflicting change to the same file from the seed.
+  const seed = join(root, `${REPO.name}-seed`);
+  const seedGit = new Git(seed, HERMETIC);
+  const branch = `agent/${task}`;
+  await seedGit.run("checkout", "-B", branch, "main");
+  await writeFile(join(seed, "conflict.ts"), "remote\n");
+  await seedGit.run("add", "-A");
+  await seedGit.run("commit", "-m", "remote edit to conflict.ts");
+  await seedGit.run("push", "origin", `HEAD:refs/heads/${branch}`);
+
+  // The rebase must conflict, abort, and throw — not leave the worktree mid-rebase.
+  await assert.rejects(
+    () => subject.ensureWorktree(REPO, task),
+    (error: unknown) =>
+      error instanceof Error && /diverged.*conflicted/i.test(error.message),
+    "a conflicting rebase must refuse with a message that names the divergence",
+  );
+
+  // The worktree must not be left mid-rebase.
+  const rebaseState = await git.tryRun("rev-parse", "--verify", "--quiet", "REBASE_HEAD");
+  assert.equal(rebaseState.code, 1, "no REBASE_HEAD must remain — the rebase was aborted");
+});
