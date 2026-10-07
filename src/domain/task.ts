@@ -430,8 +430,11 @@ export interface TaskState {
   /** The Discord thread this task talks in, when it has one. */
   readonly chat?: { readonly threadId: string };
   /**
-   * Set while a completion claim waits on CI (see `AwaitingCi`). Absent on every task
-   * that is not between a `done` claim and its checks, which is almost all of them.
+   * Set while a completion claim waits on CI (see `AwaitingCi`). Stamped by the pending
+   * release, carried through the session that re-claims the task — the release's `since`
+   * merge reads it — and cleared the moment the gate decides the claim: a verdict, either
+   * way, is the checks answering. Absent on every task that is not between a `done` claim
+   * and its checks, which is almost all of them.
    */
   readonly awaitingCi?: AwaitingCi;
   readonly createdAt: string;

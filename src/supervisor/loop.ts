@@ -2586,16 +2586,25 @@ export class Supervisor {
           });
           return true;
         }
+        // The checks answered, so the wait is over — on either verdict. Up to here
+        // `awaitingCi` deliberately rides through the session, because the `since` merge
+        // above reads it; past the gate's decision it is a stale hold. A rejection is
+        // something a session CAN act on and a pass is on its way to `done`, and the
+        // record left in place re-holds the task behind a re-run of checks on the same
+        // head — up to `AWAITING_CI_HORIZON_MS` of `ready` that no claim cycle can touch.
+        // The cached answer goes with it: the question it answered is this very decision.
+        const { awaitingCi: _endedWait, ...decided } = state;
+        this.ciAnswers.delete(spec.id);
         if (!result.passed) {
           // Claim rejected. Back to ready with the failure in the journal, so the
           // next session sees why rather than re-claiming blindly.
           await this.unit(async () => {
             await store.appendJournal(
               spec.id,
-              state.sessions,
+              decided.sessions,
               `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
             );
-            await this.transition(lease, state, "ready");
+            await this.transition(lease, decided, "ready");
             await this.push(lease, `chore(${spec.id}): completion claim rejected`);
           });
           return false;
@@ -2603,7 +2612,7 @@ export class Supervisor {
 
         // The third gate. Runs only once the §12 pair has passed, so the council is
         // never asked to re-litigate whether the tests pass — it reads the change.
-        const reviewed = await this.convene(lease, spec, state);
+        const reviewed = await this.convene(lease, spec, decided);
         if (reviewed.decision === "changes") return false;
         // Both finish with this task for now. `stalled` waits for a human; `outage`
         // waits for the provider, with the task already released and the runner cooling.
