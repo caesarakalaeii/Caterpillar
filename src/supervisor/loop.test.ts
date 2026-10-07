@@ -6042,6 +6042,105 @@ test("a re-release of the same head does not restart the wait clock", async (t) 
   );
 });
 
+test("a completion claim the gate rejects stops waiting on CI", async (t) => {
+  // `AwaitingCi` means "between a done claim and its checks" — and a verdict of NO is
+  // the checks ANSWERING. The review's follow-up on GH-951's fix: `awaitingCi` is
+  // stamped on the pending release but never cleared, so it rides the
+  // "completion claim REJECTED → ready" transition and a re-run of checks on the same
+  // head answers `ciPending: true` — re-holding the task up to AWAITING_CI_HORIZON_MS
+  // behind real work, when after a rejection a session CAN act.
+  const REJECTED = asTaskId("SMOKE-CI-REJ");
+  await seedTask(REJECTED, {
+    sessions: 1,
+    pr: { number: 18, url: "https://example.invalid/pr/18" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      since: new Date().toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  // Per TASK, not one flag: `claimUpTo` takes whatever is `ready`, and this file seeds
+  // TASK at load, so a session run on any OTHER task must not flip this task's answer.
+  // Zero runs means "checks concluded" — the claim cycle takes the task — and one or
+  // more means "a re-run of checks on the same head", the exact world that re-holds a
+  // stale record. The second run of THIS task ends `blocked` so the task is released
+  // through the claim cycle, the only place `heldForCi` is consulted: a session the
+  // runner starts in-turn never asks the question, so releasing and re-claiming is the
+  // only way a test can see a stale hold bite. With `ciPollSeconds: 0` the rate-limit
+  // cache is out of the picture entirely: every poll asks, so no cached answer can mask
+  // the hold under test.
+  const runsPerTask = new Map<TaskId, number>();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 0 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: (spec) => {
+        const runs = (runsPerTask.get(spec.id) ?? 0) + 1;
+        runsPerTask.set(spec.id, runs);
+        // The first and third runs claim completion; the second releases the task so the
+        // claim cycle — not the in-turn loop — decides what happens to it next.
+        return Promise.resolve(
+          runs === 2
+            ? ({
+                reason: "blocked",
+                usage: EMPTY_USAGE,
+                contextTokens: 0,
+                summary: "releasing through the claim cycle",
+              } satisfies SessionOutcome)
+            : ({
+                reason: "done-claimed",
+                usage: EMPTY_USAGE,
+                contextTokens: 0,
+                summary: "claiming completion",
+              } satisfies SessionOutcome),
+        );
+      },
+    },
+    verifier: {
+      // The gate can finally say no — this is the decision that must end the wait.
+      verify: () => Promise.resolve({ passed: false, detail: "acceptance failed: 1 of 1" }),
+      ciPending: (spec) => Promise.resolve((runsPerTask.get(spec.id) ?? 0) > 0),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(REJECTED);
+  });
+
+  const rejected = await waitForCommit(`chore(${REJECTED}): completion claim rejected`, 30_000);
+  assert.ok(rejected !== undefined, "the gate never decided the claim");
+
+  // Read AT the rejection, which is the write under test.
+  const decided = await stateAt(rejected, REJECTED);
+  assert.equal(
+    decided?.awaitingCi,
+    undefined,
+    "a decided claim must not leave a wait behind — the record is what re-holds the task",
+  );
+
+  // And its consequence: the rejected claim was released (`blocked`), and a LATER claim
+  // cycle — one whose `ciPending` answer is now "checks are running again" — must still
+  // be able to take the task. A stale `awaitingCi` holds it there instead, and the
+  // session that could act on the rejection never runs.
+  const reClaimed = await waitForCommit(
+    `chore(${REJECTED}): session 4 — done-claimed`,
+    30_000,
+  );
+  assert.ok(
+    reClaimed !== undefined,
+    "a rejected claim was re-held behind its own stale wait — no session could act on it",
+  );
+});
+
 test("a hold about a head that has moved does not stop the claim", async (t) => {
   // The hold is about the head the undetermined claim was made on. A commit — here, one
   // that landed while nothing held the task — means there is work again, and holding the
