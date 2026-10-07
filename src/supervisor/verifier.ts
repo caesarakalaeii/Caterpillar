@@ -271,6 +271,36 @@ export class AcceptanceVerifier {
   }
 
   /**
+   * The claim cycle's cheap question: is this task's branch still waiting on CI?
+   *
+   * One `checks()` call per PR repo and no settle wait: this is a poll, not a gate. True
+   * only while some check is actually running — a green, a red and a repo with no CI all
+   * settle the question alike, because the hold is about WAITING, not about passing.
+   *
+   * Fails OPEN: no PR, no forge, a forge that cannot answer — all report false, so the
+   * task is claimed rather than held.
+   */
+  async ciPending(spec: TaskSpec, state: TaskState): Promise<boolean> {
+    const prs = taskPullRequests(spec.repos, state);
+    if (prs.length === 0) return false;
+
+    const forgeFactory = this.options.bindings.forges.get(spec.workspace);
+    if (forgeFactory === undefined) return false;
+    const forge = await forgeFactory.forTask(spec).catch(() => undefined);
+    if (forge === undefined) return false;
+
+    try {
+      for (const pr of prs) {
+        const status = await forge.checks(pr.repo, `agent/${spec.id}`).catch(() => undefined);
+        if (status?.conclusion === "pending") return true;
+      }
+      return false;
+    } finally {
+      await forge.revoke().catch(() => undefined);
+    }
+  }
+
+  /**
    * Gate 2's third question: does this branch still merge into its base? (§12.3.)
    *
    * Returns a REJECTION or `undefined`, so the caller keeps the CI detail when there is

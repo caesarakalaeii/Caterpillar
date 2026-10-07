@@ -313,7 +313,7 @@ test("a message in a running task's thread reaches the live session", async () =
         };
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -416,7 +416,7 @@ test("guidance in a parked task's thread lands in git, and the Resume button wor
         });
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),

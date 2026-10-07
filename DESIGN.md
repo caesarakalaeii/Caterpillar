@@ -3471,16 +3471,24 @@ both produced a session that could only fail:
   registry push, and the image build dominates the wall time. The budget has to cover the
   slowest check on the branch, not the length of the test suite.
 
-  **Known residual, deliberately left:** the release carries no not-before, and
-  `isClaimable` accepts `ready` immediately, so an idle runner re-claims the task on the
-  very next poll. CI that stays pending *longer than the whole settle budget* therefore
-  still spends a session per claim cycle, and three such cycles still park the task —
-  `BS-…-07`'s exact shape, roughly twenty minutes slower each time round. The observed
-  gaps were 3–7 minutes against a 20-minute budget, so this is not the case that fired;
-  fixing it properly means giving a released task an earliest-claim time, which is a
-  change to the claim/release cycle rather than to this gate, and it is not made here.
-  Anyone who sees a task park with green CI and an `awaiting CI` commit in its history
-  should start with that.
+  **The residual this left open is now closed, forced by the case it predicted.** On
+  2026-10-05 `GH-…-951` spent two sessions exactly this shape — its work finished, its PR
+  open, the image build still running — and the two do-nothing sessions tripped
+  `CaterpillarTaskThrashing` on it at streak 2; a third would have parked it citing "no
+  progress". The waits were the whole settle budget rather than 3–7 minutes (20 minutes,
+  twice), which is what turns the residual from a slowdown into a session factory. The
+  release now stamps `awaitingCi` — the head the undetermined claim was about, when the
+  wait began, and an earliest-claim time of one `ciPollSeconds` — and the claim filter
+  holds the task, asking `Verifier.ciPending` WITHOUT a session: one `checks()` call per
+  PR repo, rate-limited to the same cadence, so waiting costs a poll rather than a
+  session. The hold ends when the checks conclude, when the branch moves (a commit means
+  there is work again), when the wait passes 24h (a check that never settles is a problem
+  an agent should be told about, and the escalation above resumes), or when the forge
+  cannot answer — fail open, `AlertReverifier.pending`'s doctrine, so a task can never
+  wedge on evidence that could not be gathered. Anyone who sees a task park with green CI
+  and an `awaiting CI` commit in its history should now look at the hold's exits — the
+  horizon or the fail-open path — rather than at the release; the release is no longer
+  bare.
 - **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
   image sets it (correctly — that image installed with `--omit=dev`), but it is
   process-wide and every agent session and acceptance command is a child of the

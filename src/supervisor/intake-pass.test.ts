@@ -127,6 +127,7 @@ const configFor = (root: string, statePath: string, origin: string, runnerId: st
 const IDLE_RUNNER: SessionRunner = { run: () => Promise.reject(new Error("nothing to run")) };
 const IDLE_VERIFIER: Verifier = {
   verify: () => Promise.resolve({ passed: false, detail: "unused" }),
+  ciPending: () => Promise.resolve(false),
 };
 const IDLE_PROGRESS: ProgressProbe = {
   probe: () =>

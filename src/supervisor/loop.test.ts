@@ -457,6 +457,7 @@ test("a task whose session throws is parked on the REMOTE, not just locally", as
   };
   const verifier: Verifier = {
     verify: () => Promise.resolve({ passed: false, detail: "unused" }),
+    ciPending: () => Promise.resolve(false),
   };
   const progress: ProgressProbe = {
     probe: () =>
@@ -529,6 +530,7 @@ test("a notification that fails does not undo a task that finished", async () =>
         detail: "acceptance commands exited 0",
         prUrl: "https://example.invalid/pr/1",
       }),
+    ciPending: () => Promise.resolve(false),
   };
   const progress: ProgressProbe = {
     probe: () =>
@@ -627,7 +629,7 @@ test("an answer from the bridge unparks the task on the REMOTE", async () => {
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -677,7 +679,7 @@ test("a message for a task that is not waiting is RECORDED, not refused", async 
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -748,7 +750,7 @@ test("guidance resets the council's round count, and a bare resume does not", as
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -832,7 +834,7 @@ test("a blocking verdict sends the task back, and a stalemate parks it", async (
           summary: "claiming completion",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -950,7 +952,7 @@ test("a review comment on the pull request forgives a council round, once", asyn
           reviewComment: "2026-08-20T10:00:00.000Z",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -1063,6 +1065,7 @@ test("a passing verdict is approved and merged by the reviewer identity", async 
           detail: "acceptance passed",
           prUrl: "https://example.invalid/pr/11",
         }),
+      ciPending: () => Promise.resolve(false),
     },
     progress: {
       probe: () =>
@@ -1163,7 +1166,7 @@ test("a blocked task is not claimed until its blocker is done", async () => {
         } satisfies SessionOutcome);
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -1257,7 +1260,7 @@ test("a council slower than the heartbeat still lands its verdict on the remote"
           summary: "claiming completion",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -1345,7 +1348,7 @@ const resumeSupervisor = (
     }),
     // Claiming it is the proof; the session itself is not what these tests are about.
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -1460,6 +1463,7 @@ test("a provider outage releases the task and stops the runner claiming the next
   };
   const verifier: Verifier = {
     verify: () => Promise.resolve({ passed: false, detail: "unused" }),
+    ciPending: () => Promise.resolve(false),
   };
   const progress: ProgressProbe = {
     probe: () =>
@@ -1557,7 +1561,7 @@ test("a session interrupted mid-work keeps its tokens and its history", async ()
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: { probe: () => assert.fail("the probe must not run for an interrupted session") },
     notifier: new NullNotifier(),
     metrics: new AgentMetrics(),
@@ -1626,7 +1630,7 @@ test("a session that ended silently still has its branch tip named in the journa
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({
@@ -1716,7 +1720,7 @@ test("the runner says when the provider came back, once", async () => {
       staleAfterSeconds: quick.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -1822,7 +1826,7 @@ test("/resume clears the no-progress streak, or the task parks again without run
           summary: "needs a decision",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -1904,7 +1908,7 @@ test("a session that stops to ask a human does not report a no-progress streak",
           summary: "the acceptance list cannot be satisfied from inside this task's scope",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     // No commit: the session spent itself reading and reasoning, exactly as session 4 did.
     progress: {
       probe: () =>
@@ -1988,7 +1992,7 @@ test("a task that reaches a terminal status stops reporting a no-progress streak
           summary: "still going in circles",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2076,7 +2080,7 @@ test("a replica drops a streak for a task another replica finished", async () =>
     }),
     // Nothing may claim a `done` task, so no session should run at all.
     runner: { run: () => Promise.reject(new Error("a finished task must not be claimed")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2136,7 +2140,7 @@ test("a git failure in the poll loop is logged and retried, not fatal", async ()
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2226,7 +2230,7 @@ test("/cancel stops a session running on this runner instead of refusing it", as
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2317,7 +2321,7 @@ test("a cancel from another process reaches a session in flight, without the que
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2392,7 +2396,7 @@ test("the poll advertises this runner, and a presence failure never reaches the 
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2439,7 +2443,7 @@ test("a digest that is due is published from the poll loop, and a failing one is
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2533,7 +2537,7 @@ test("a queued brainstorm gets the runner at the next session boundary", async (
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: false, stepCompleted: false }),
@@ -2908,7 +2912,7 @@ test("the alert queue is drained on the poll loop, and a failure there is not fa
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -2994,7 +2998,7 @@ test("the usage measurement runs on the idle branch, and a failing one is not fa
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3050,7 +3054,7 @@ test("a measurement that comes back is published to the metrics the scrape reads
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3146,6 +3150,7 @@ test("a task that is done has its worktree reaped", async () => {
     },
     verifier: {
       verify: () => Promise.resolve({ passed: true, detail: "acceptance commands exited 0" }),
+      ciPending: () => Promise.resolve(false),
     },
     progress: {
       probe: () =>
@@ -3216,7 +3221,7 @@ test("a handoff keeps its worktree — the next session resumes in it", async ()
           summary: "context is filling; the next session continues",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3279,7 +3284,7 @@ test("a task awaiting a human keeps its worktree", async () => {
           summary: "asking",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3353,7 +3358,7 @@ test("losing the lease reaps this runner's copy, because another runner owns the
         } satisfies SessionOutcome;
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3409,7 +3414,7 @@ test("the idle sweep runs, and is told which tasks are live rather than guessing
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no task should be claimed here")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3471,7 +3476,7 @@ test("a survey that came back empty does not sweep the whole volume", async () =
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no task should be claimed here")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -3582,7 +3587,7 @@ const busySupervisor = (
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner,
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -4247,7 +4252,7 @@ test("the survey publishes thread bindings for a bot that is not in this process
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -4304,7 +4309,7 @@ const withSlots = (slots: number): RunnerConfig => ({ ...config, concurrency: sl
 
 /** The dependencies every test here supplies identically, so a case shows only its subject. */
 const inertDeps = (): Pick<SupervisorDeps, "verifier" | "progress" | "notifier" | "logger" | "toolchain"> => ({
-  verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+  verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
   progress: {
     probe: () =>
       Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -4914,7 +4919,7 @@ test("a park talks in the task's own thread, not in the channel", async () => {
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no session should run")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -4987,7 +4992,7 @@ test("a steer typed while a session runs reaches it, and lands in the journal", 
         };
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -5071,7 +5076,7 @@ test("a room message posted live reaches the session framed as a peer, never the
         };
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -5205,7 +5210,7 @@ test("the chat callback enforces the plan's allowed set: own, blockers, dependen
         return { reason: "handoff" as const, usage: EMPTY_USAGE, contextTokens: 0, summary: "checked" };
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -5292,7 +5297,7 @@ test("a two-repo task merges both PRs, in the order its repos were named", async
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -5382,7 +5387,7 @@ test("a merge that fails halfway names what DID land", async () => {
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -5464,7 +5469,7 @@ test("a base branch with a merge queue is enqueued, and the reply says queued no
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -5559,7 +5564,7 @@ test("a queued pull request stops the sequence, so the sibling repo is left alon
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("no session under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -5631,7 +5636,8 @@ test("CI that has not finished releases the task instead of spending a session o
         } satisfies SessionOutcome);
       },
     },
-    // Still running after the verifier's own bounded wait.
+    // Still running after the verifier's own bounded wait — and still running when the
+    // claim cycle later asks, which is the world this test describes throughout.
     verifier: {
       verify: () =>
         Promise.resolve({
@@ -5639,6 +5645,7 @@ test("CI that has not finished releases the task instead of spending a session o
           pending: true,
           detail: "CI has not finished: 1 check(s) still running",
         }),
+      ciPending: () => Promise.resolve(true),
     },
     // The honest probe for a session that only waited: nothing happened.
     progress: {
@@ -5674,21 +5681,24 @@ test("CI that has not finished releases the task instead of spending a session o
     "the pending gate never released the task: no `awaiting CI` commit was pushed",
   );
 
-  // Read AT that commit. By now the runner has re-claimed the task — it had nothing else
-  // to do — and `main` has moved on, which is the gate working as designed, not a
-  // failure. What is under test is the state the release itself pushed.
+  // Read AT that commit. What is under test is the state the RELEASE itself pushed, and
+  // an assertion about the release reads the release rather than whatever the tree has
+  // become by the time the test looks at it.
   const settled = await stateAt(released, WAITING);
-  assert.equal(settled?.status, "ready", "a task waiting on CI stays claimable");
+  assert.equal(
+    settled?.status,
+    "ready",
+    "the release leaves the task `ready` — the hold is a claim filter, not a status",
+  );
   assert.equal(
     settled?.progress.noProgressStreak,
     1,
     "the session that DID run is still scored honestly — the fix is not to fudge the count",
   );
   // The promise stated the way loop.ts states it: the release happens INSTEAD of a second
-  // session inside the same claim. Read at the release, not at the abort, because a LATER
-  // poll re-claiming is expected ("coming back through a later poll costs nothing") — the
-  // old `sessions === 1` on the live counter asserted a stopped clock, and failed 5 runs
-  // out of 5 the moment this test was run on its own.
+  // session inside the same claim. Read at the release rather than at the abort because
+  // this is about the release's own write — and what later polls do with the task it left
+  // behind is the next test's subject.
   assert.equal(
     settled?.sessions,
     1,
@@ -5757,6 +5767,7 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
           pending: true,
           detail: "CI has not finished: 1 check(s) still running",
         }),
+      ciPending: () => Promise.resolve(true),
     },
     progress: {
       probe: () =>
@@ -5792,6 +5803,403 @@ test("the pending-CI release commits its own files, not a sibling slot's", async
   await retire(RUNNING);
 });
 
+test("a task released to wait for CI is not re-claimed until the checks conclude", async (t) => {
+  // `GH-caesarakalaeii-all-chat-951`'s no-progress streak, and the residual DESIGN.md
+  // §11.1 left open. The pending path releases the task "and will be re-checked when CI
+  // reports" — but nothing re-checked. `isClaimable` accepted `ready` on the very next
+  // poll (13 seconds later, in the incident), and the session that ran could only
+  // re-claim `done`, commit nothing, and be scored a stall by §11.1. Two of those
+  // manufactured `CaterpillarTaskThrashing` on finished work; a third would have parked
+  // the task citing "no progress" with a green branch and an open PR.
+  //
+  // What must be true instead: the release carries an earliest-claim time, the claim
+  // cycle asks about CI WITHOUT a session, and the task is taken only once the checks
+  // have concluded. The streak stays honest throughout — §11.1 is right about every
+  // session it is shown; the fix is that there are none to show it.
+  const WAITING = asTaskId("SMOKE-CI-HOLD");
+  await seedTask(WAITING, { pr: { number: 14, url: "https://example.invalid/pr/14" } });
+
+  // Counted PER TASK: this file's shared seeded task is claimable whenever the tests
+  // before this one have left it so, and a supervisor claims whatever is ready. The
+  // question is how often THIS task's session ran, and nothing about a neighbour's.
+  const ran: TaskId[] = [];
+  let ciRunning = true;
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    // One second, so "the checks concluded" is seen on the next poll rather than after
+    // the production interval — and so a broken hold has several polls to betray itself.
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: (spec) => {
+        ran.push(spec.id);
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(ciRunning),
+    },
+    // A probe that says what the incident's said: the branch did not move, and it knows
+    // what head it is at — which is what the hold is keyed on.
+    progress: {
+      probe: () =>
+        Promise.resolve({
+          committed: false,
+          acceptanceImproved: false,
+          stepCompleted: false,
+          headOid: "abc1234",
+          baselineOid: "abc1234",
+        }),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  // Cleanup runs even when an assertion fails mid-test: a supervisor left running claims
+  // the NEXT test's seeded task and keeps the shared state checkout busy, which is a hung
+  // suite rather than a failed test.
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(WAITING);
+  });
+
+  const released = await waitForCommit(`chore(${WAITING}): awaiting CI`, 30_000);
+  assert.ok(released !== undefined, "the pending gate never released the task");
+
+  // The release records the hold, keyed on the head the undetermined claim was about.
+  const releasedState = await stateAt(released, WAITING);
+  assert.equal(releasedState?.awaitingCi?.headOid, "abc1234");
+  assert.ok(
+    releasedState?.awaitingCi !== undefined &&
+      Date.parse(releasedState.awaitingCi.notBefore) >= Date.parse(releasedState.awaitingCi.since),
+    "the hold must carry both when the wait began and the earliest-claim time",
+  );
+
+  // And nothing takes it while the checks run. Long enough for several polls at
+  // `pollSeconds: 1` — without the hold this is a session per claim cycle, which is the
+  // incident. Asserted on the pushed state as well as the live counter: a session that
+  // ran records itself durably, so the two agree on what happened either way.
+  await sleep(5_000);
+  assert.equal(
+    ran.filter((id) => id === WAITING).length,
+    1,
+    "the claim cycle must not spend a session on a CI queue",
+  );
+  const stillWaiting = await pushedState(WAITING);
+  assert.equal(stillWaiting?.sessions, 1, "a second session would have recorded itself");
+  assert.equal(
+    stillWaiting?.progress.noProgressStreak,
+    1,
+    "the one session that DID run is still scored honestly — the fix is not to fudge the count",
+  );
+
+  // The checks conclude, and the claim cycle takes the task again. A session now has
+  // something real to decide (a red CI to fix, or a claim the gate can finally answer).
+  ciRunning = false;
+  const second = await waitForCommit(`chore(${WAITING}): session 2 — done-claimed`, 30_000);
+  assert.ok(second !== undefined, "a task whose checks concluded must be claimable again");
+});
+
+test("a check that never concludes is handed to a session, not held forever", async (t) => {
+  // The hold must be BOUNDED, for the reason the gate's own wait is bounded: "a check
+  // that never settles is a real problem an agent should be told about, not a reason to
+  // pin the runner forever" (§11.1). An unbounded hold would trade the re-claim storm
+  // for a task that silently never runs again — the wedge `AlertReverifier.pending`
+  // states its fail-open doctrine against.
+  const STUCK = asTaskId("SMOKE-CI-STUCK");
+  await seedTask(STUCK, {
+    sessions: 1,
+    pr: { number: 15, url: "https://example.invalid/pr/15" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      // A day and an hour: past the horizon this code must impose.
+      since: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      // Still running — forever. The horizon, not the checks, is what must let go.
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(STUCK);
+  });
+
+  const ran = await waitForCommit(`chore(${STUCK}): session 2 — done-claimed`, 30_000);
+  assert.ok(ran !== undefined, "a wait past the horizon must end in a session that is told");
+});
+
+test("a re-release of the same head does not restart the wait clock", async (t) => {
+  // The 24h horizon must measure the WHOLE wait, not the last lap around it (§11.1).
+  // A hold whose checks never conclude is handed to a session, that session re-claims
+  // `done`, and the pending gate releases the task again — for the same head. If that
+  // re-release stamped a fresh `since`, every lap would re-arm the 24h hold and the
+  // escalation to §11.1's park would take days of wall clock instead of a few poll
+  // cycles. That is what the `since` merge in the awaiting-CI release is for, and what
+  // carrying `awaitingCi` through the session is for: the record is what the merge
+  // reads. This pins the merge — the review's sabotage replaced it with
+  // `since: new Date().toISOString()` and the suite stayed green.
+  const RELAPSE = asTaskId("SMOKE-CI-RELAPSE");
+  const WAIT_STARTED = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  await seedTask(RELAPSE, {
+    sessions: 1,
+    pr: { number: 17, url: "https://example.invalid/pr/17" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      since: WAIT_STARTED,
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(RELAPSE);
+  });
+
+  // The seeded hold's horizon is already past, so the claim cycle hands the task to a
+  // session; the claim that session makes is then released pending CI — the SECOND wait
+  // on the same head, and the one under test.
+  const released = await waitForCommit(`chore(${RELAPSE}): awaiting CI`, 30_000);
+  assert.ok(released !== undefined, "the pending gate never re-released the task");
+
+  // Read AT that commit: what is under test is what the re-release pushed.
+  const reReleased = await stateAt(released, RELAPSE);
+  const hold = reReleased?.awaitingCi;
+  assert.ok(hold !== undefined, "the re-release must stamp a hold");
+  assert.equal(
+    Date.parse(hold.since),
+    Date.parse(WAIT_STARTED),
+    "the re-release restarted the 24h clock: the horizon must measure the whole wait, not the last lap",
+  );
+});
+
+test("a completion claim the gate rejects stops waiting on CI", async (t) => {
+  // `AwaitingCi` means "between a done claim and its checks" — and a verdict of NO is
+  // the checks ANSWERING. The review's follow-up on GH-951's fix: `awaitingCi` is
+  // stamped on the pending release but never cleared, so it rides the
+  // "completion claim REJECTED → ready" transition and a re-run of checks on the same
+  // head answers `ciPending: true` — re-holding the task up to AWAITING_CI_HORIZON_MS
+  // behind real work, when after a rejection a session CAN act.
+  const REJECTED = asTaskId("SMOKE-CI-REJ");
+  await seedTask(REJECTED, {
+    sessions: 1,
+    pr: { number: 18, url: "https://example.invalid/pr/18" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "abc1234" },
+    awaitingCi: {
+      headOid: "abc1234",
+      since: new Date().toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  // Per TASK, not one flag: `claimUpTo` takes whatever is `ready`, and this file seeds
+  // TASK at load, so a session run on any OTHER task must not flip this task's answer.
+  // Zero runs means "checks concluded" — the claim cycle takes the task — and one or
+  // more means "a re-run of checks on the same head", the exact world that re-holds a
+  // stale record. The second run of THIS task ends `blocked` so the task is released
+  // through the claim cycle, the only place `heldForCi` is consulted: a session the
+  // runner starts in-turn never asks the question, so releasing and re-claiming is the
+  // only way a test can see a stale hold bite. With `ciPollSeconds: 0` the rate-limit
+  // cache is out of the picture entirely: every poll asks, so no cached answer can mask
+  // the hold under test.
+  const runsPerTask = new Map<TaskId, number>();
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 0 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: (spec) => {
+        const runs = (runsPerTask.get(spec.id) ?? 0) + 1;
+        runsPerTask.set(spec.id, runs);
+        // The first and third runs claim completion; the second releases the task so the
+        // claim cycle — not the in-turn loop — decides what happens to it next.
+        return Promise.resolve(
+          runs === 2
+            ? ({
+                reason: "blocked",
+                usage: EMPTY_USAGE,
+                contextTokens: 0,
+                summary: "releasing through the claim cycle",
+              } satisfies SessionOutcome)
+            : ({
+                reason: "done-claimed",
+                usage: EMPTY_USAGE,
+                contextTokens: 0,
+                summary: "claiming completion",
+              } satisfies SessionOutcome),
+        );
+      },
+    },
+    verifier: {
+      // The gate can finally say no — this is the decision that must end the wait.
+      verify: () => Promise.resolve({ passed: false, detail: "acceptance failed: 1 of 1" }),
+      ciPending: (spec) => Promise.resolve((runsPerTask.get(spec.id) ?? 0) > 0),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(REJECTED);
+  });
+
+  const rejected = await waitForCommit(`chore(${REJECTED}): completion claim rejected`, 30_000);
+  assert.ok(rejected !== undefined, "the gate never decided the claim");
+
+  // Read AT the rejection, which is the write under test.
+  const decided = await stateAt(rejected, REJECTED);
+  assert.equal(
+    decided?.awaitingCi,
+    undefined,
+    "a decided claim must not leave a wait behind — the record is what re-holds the task",
+  );
+
+  // And its consequence: the rejected claim was released (`blocked`), and a LATER claim
+  // cycle — one whose `ciPending` answer is now "checks are running again" — must still
+  // be able to take the task. A stale `awaitingCi` holds it there instead, and the
+  // session that could act on the rejection never runs.
+  const reClaimed = await waitForCommit(
+    `chore(${REJECTED}): session 4 — done-claimed`,
+    30_000,
+  );
+  assert.ok(
+    reClaimed !== undefined,
+    "a rejected claim was re-held behind its own stale wait — no session could act on it",
+  );
+});
+
+test("a hold about a head that has moved does not stop the claim", async (t) => {
+  // The hold is about the head the undetermined claim was made on. A commit — here, one
+  // that landed while nothing held the task — means there is work again, and holding the
+  // task for a claim that is no longer the question would strand it behind its own
+  // history.
+  const MOVED = asTaskId("SMOKE-CI-MOVED");
+  await seedTask(MOVED, {
+    sessions: 1,
+    pr: { number: 16, url: "https://example.invalid/pr/16" },
+    progress: { lastProgressSession: 1, noProgressStreak: 0, lastHeadOid: "new-head" },
+    awaitingCi: {
+      headOid: "old-head",
+      since: new Date().toISOString(),
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+    },
+  });
+
+  const supervisor = new Supervisor({
+    ...inertDeps(),
+    config: { ...config, limits: { ...config.limits, ciPollSeconds: 1 } },
+    store: new StateStore(statePath, stateGit),
+    leases: newLeases(),
+    runner: {
+      run: () =>
+        Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome),
+    },
+    verifier: {
+      verify: () =>
+        Promise.resolve({
+          passed: false,
+          pending: true,
+          detail: "CI has not finished: 1 check(s) still running",
+        }),
+      ciPending: () => Promise.resolve(true),
+    },
+    metrics: new AgentMetrics(),
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  t.after(async () => {
+    controller.abort();
+    await running.catch(() => undefined);
+    await retire(MOVED);
+  });
+
+  const ran = await waitForCommit(`chore(${MOVED}): session 2 — done-claimed`, 30_000);
+  assert.ok(ran !== undefined, "work on the branch outranks a hold about an older head");
+});
+
 test("scheduled work is fired from the housekeeping loop, and a failing pass is not fatal", async () => {
   // The schedule runs on the housekeeping loop (§22) — no new listener, no new port, no
   // new Deployment. Two properties matter: it is reached on an ordinary pass, and it can
@@ -5815,7 +6223,7 @@ test("scheduled work is fired from the housekeeping loop, and a failing pass is 
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("unused")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -5884,6 +6292,7 @@ test("a rejected claim still pushes the evidence its gate published", async () =
         await store.writeArtifact(EVIDENCE, "shot.png", Buffer.from("pretend png"));
         return { passed: false, detail: "the header still overlaps the nav" };
       },
+      ciPending: () => Promise.resolve(false),
     },
     progress: {
       probe: () =>
@@ -5948,7 +6357,7 @@ test("a question's options are pushed with it and offered in the notification", 
         });
       },
     },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -6015,7 +6424,7 @@ test("pressing an option lands exactly where the same text typed by hand lands",
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -6111,7 +6520,7 @@ test("an option index the stored question does not have is refused, and writes n
       staleAfterSeconds: config.lease.staleAfterSeconds,
     }),
     runner: { run: () => Promise.reject(new Error("session not under test")) },
-    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }) },
+    verifier: { verify: () => Promise.resolve({ passed: false, detail: "unused" }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
@@ -6176,6 +6585,7 @@ const chatOnlySupervisor = (options: {
     runner: { run: () => Promise.reject(new Error("no session under test")) },
     verifier: {
       verify: () => Promise.reject(new Error("no acceptance gate under test")),
+      ciPending: () => Promise.resolve(false),
     },
     progress: {
       probe: () =>
@@ -6615,7 +7025,7 @@ const reverifyingSupervisor = (
           summary: "claiming completion",
         } satisfies SessionOutcome),
     },
-    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed", prUrl }) },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed", prUrl }), ciPending: () => Promise.resolve(false) },
     progress: {
       probe: () =>
         Promise.resolve({ committed: true, acceptanceImproved: true, stepCompleted: true }),
@@ -6900,6 +7310,7 @@ test("the verifier is handed the task's amendments alongside the effective gate"
       // care about — the argument is what is under test.
       return Promise.resolve({ passed: false, detail: `ran ${spec.acceptance.join(", ")}` });
     },
+    ciPending: () => Promise.resolve(false),
   };
 
   const supervisor = new Supervisor({
