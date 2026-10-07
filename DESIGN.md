@@ -264,10 +264,12 @@ Both checkout paths enforce it:
   ref is the drift the rule exists to stop.
 - *Reusing* one runs `merge --ff-only` onto the remote tip, and only while HEAD is actually
   on `agent/<task>`. A worktree that is ahead is left alone — those commits exist nowhere
-  else — and a divergence or a dirty tree makes the merge decline, which becomes the same
-  refusal. A worktree an agent moved off its own branch is left alone too: merging the task
-  branch into `main` would fast-forward the default branch, which `remote.origin.push = HEAD`
-  would then make the agent's next push deliver.
+  else. A divergence that can be rebased is rebased: the local commits are replayed on top
+  of the remote tip, preserving both histories — the same recovery `StateStore` uses for its
+  own push races. A dirty tree, or a divergence that conflicts on replay, makes the merge or
+  rebase decline, which becomes a refusal. A worktree an agent moved off its own branch is
+  left alone too: merging the task branch into `main` would fast-forward the default branch,
+  which `remote.origin.push = HEAD` would then make the agent's next push deliver.
 
 The fetch names origin's **URL**, not the remote `origin`. A configured `+refs/*:refs/*` is
 applied opportunistically alongside an explicit refspec, so fetching by remote name also

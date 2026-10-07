@@ -1820,3 +1820,29 @@ test("commitAndPush stages occurrence records, and pull sweeps unpushed ones", a
     "the pushed one is tracked, so the sweep leaves it alone",
   );
 });
+
+test("Git.run recovers from a stale .lock file left by a crashed process", async () => {
+  // A git process killed mid-operation leaves `.git/HEAD.lock` behind. Every subsequent
+  // `reset --hard`, `commit`, or `fetch` then fails with "Unable to create ... File
+  // exists" — the supervisor logs the same error every poll and never recovers. This
+  // happened on the cluster: 37 pod restarts, every intake pass broken for hours.
+  const { store, git, root } = await sharedStateRepo();
+
+  // Simulate a crashed git process: create the lock file and leave it.
+  await writeFile(join(root, ".git", "HEAD.lock"), "", "utf8");
+
+  // The store's pullNow does `git reset --hard origin/main`, which needs HEAD.lock.
+  // Without the retry, this throws "Unable to create ... File exists".
+  const result = await store.pull("origin", "main");
+  assert.equal(result, "pulled", "a stale lock must not park the state repo");
+
+  // And the lock is gone after recovery, so the next poll is clean too.
+  assert.equal(
+    existsSync(join(root, ".git", "HEAD.lock")),
+    false,
+    "the stale lock must be removed, not left for the next invocation",
+  );
+
+  // A second pull succeeds normally — the retry path does not interfere.
+  await git.run("reset", "--hard", "origin/main");
+});

@@ -9,6 +9,7 @@
  * an external helper so tokens stay out of argv (DESIGN.md §9.2).
  */
 import { execFile } from "node:child_process";
+import { unlink } from "node:fs/promises";
 
 export interface GitResult {
   readonly stdout: string;
@@ -63,6 +64,24 @@ const run = (
  */
 export type GitEnvProvider = () => Promise<NodeJS.ProcessEnv>;
 
+/**
+ * Extract a stale lock path from git's stderr, if the failure was a lock contention.
+ *
+ * git's message looks like:
+ *   fatal: Unable to create '/work/state/.git/HEAD.lock': File exists.
+ *   fatal: Unable to create '/work/state/.git/index.lock': File exists.
+ *
+ * A lock left behind by a crashed or killed git process will never clear itself,
+ * and every subsequent invocation fails identically — the supervisor logs the same
+ * error every poll and never recovers. Removing the file and retrying is safe when
+ * no other git process is running against the same repo, which the StateStore mutex
+ * and the worktree's single-session invariant guarantee on the paths this wraps.
+ */
+const staleLockPath = (stderr: string): string | undefined => {
+  const match = stderr.match(/Unable to create '([^']+\.lock)': File exists/);
+  return match?.[1];
+};
+
 export class Git {
   private readonly cwd: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -109,11 +128,26 @@ export class Git {
     return new Git(this.cwd, { ...this.env, ...extra });
   }
 
-  /** Throws GitError on non-zero exit. */
+  /**
+   * Run git, throwing `GitError` on non-zero exit.
+   *
+   * A stale `.lock` file left behind by a crashed git process is detected and
+   * removed once before retrying. Without this, a single crashed git invocation
+   * parks the state repo permanently — every later `reset --hard` or `commit`
+   * hits the same lock, the same error, forever.
+   */
   async run(...args: readonly string[]): Promise<string> {
-    const result = await run(this.cwd, args, await this.resolveEnv());
-    if (result.code !== 0) throw new GitError(args, result);
-    return result.stdout.trim();
+    const env = await this.resolveEnv();
+    const result = await run(this.cwd, args, env);
+    if (result.code === 0) return result.stdout.trim();
+
+    const lockPath = staleLockPath(result.stderr);
+    if (lockPath === undefined) throw new GitError(args, result);
+
+    await unlink(lockPath).catch(() => {});
+    const retried = await run(this.cwd, args, env);
+    if (retried.code !== 0) throw new GitError(args, retried);
+    return retried.stdout.trim();
   }
 
   /** Never throws — for probes where failure is a legitimate answer. */

@@ -35,11 +35,12 @@ const warningLogger = (): { logger: Logger; warnings: Warning[] } => {
   };
 };
 
-const gateway = (ids: readonly string[]): typeof fetch => async () =>
-  new Response(JSON.stringify({ object: "list", data: ids.map((id) => ({ id })) }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+const gateway = (ids: readonly string[]): typeof fetch =>
+  async (_input, _init) =>
+    new Response(JSON.stringify({ object: "list", data: ids.map((id) => ({ id })) }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
 
 const unreachable: typeof fetch = async () => {
   throw new Error("ECONNREFUSED");
@@ -140,11 +141,11 @@ test("the discovery request reaches the stripped /v1/models URL, with a bearer o
 /** A fetch that fails N times with a 503, then answers with the given model list. */
 const flaky = (failTimes: number, ids: readonly string[]): typeof fetch => {
   let calls = 0;
-  return async () => {
+  return async (_input, _init) => {
     if (calls++ < failTimes) {
       return new Response("Service Unavailable", { status: 503, statusText: "Service Unavailable" });
     }
-    return gateway(ids)();
+    return gateway(ids)(_input, _init);
   };
 };
 
