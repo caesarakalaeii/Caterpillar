@@ -5685,7 +5685,11 @@ test("CI that has not finished releases the task instead of spending a session o
   // an assertion about the release reads the release rather than whatever the tree has
   // become by the time the test looks at it.
   const settled = await stateAt(released, WAITING);
-  assert.equal(settled?.status, "ready", "a task waiting on CI stays claimable");
+  assert.equal(
+    settled?.status,
+    "ready",
+    "the release leaves the task `ready` — the hold is a claim filter, not a status",
+  );
   assert.equal(
     settled?.progress.noProgressStreak,
     1,
