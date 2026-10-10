@@ -396,6 +396,13 @@ export interface TaskState {
   readonly plan?: PlanMembership;
   /** The Discord thread this task talks in, when it has one. */
   readonly chat?: { readonly threadId: string };
+  /**
+   * A completion claim that passed the §12 gate and is waiting on something no session can
+   * help with: CI still running (`ci`), or a council the provider would not answer
+   * (`review`). The next claim re-decides the claim instead of starting a session, and does
+   * so even at the session limit, because it spends no session. Absent otherwise.
+   */
+  readonly pendingClaim?: "ci" | "review";
   readonly createdAt: string;
   readonly updatedAt: string;
 }

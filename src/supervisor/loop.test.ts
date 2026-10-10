@@ -5772,6 +5772,148 @@ test("CI that has not finished releases the task instead of spending a session o
   assert.ok(sessions >= 1, "the session that made the claim must have run");
 });
 
+/** A council that passes, with one lens — the shape every passing review takes here. */
+const PASSING_REVIEW = {
+  usage: EMPTY_USAGE,
+  verdict: decide([
+    {
+      lens: "correctness",
+      title: "Correctness",
+      decision: "pass",
+      blocking: false,
+      summary: "Reads correctly.",
+      findings: [],
+    },
+  ]),
+};
+
+test("a council the provider will not answer is retried without spending another session", async () => {
+  // GH-caesarakalaeii-all-chat-951: the gate passed, every reviewer abstained on a 503, and
+  // the release sent the task back to an ordinary claim — which started a fresh session that
+  // could only claim done again. Ten of those used up its budget on an unchanged branch.
+  // Driven to `done` rather than stopped at the release, so the task leaves nothing
+  // claimable behind for the tests after it.
+  const STANDING = asTaskId("SMOKE-CLAIM-1");
+  await seedTask(STANDING, { pr: { number: 30, url: "https://example.invalid/pr/30" } });
+
+  let sessions = 0;
+  let reviews = 0;
+  const supervisor = new Supervisor({
+    // Waited out once, so it gets the short cooldown the other wait-it-out test uses.
+    config: { ...config, llm: { ...config.llm, cooldown: { initialSeconds: 1, maxSeconds: 2 } } },
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    // Counted for THIS task only: earlier tests leave claimable tasks on the shared remote,
+    // and this supervisor works them too.
+    runner: {
+      run: (spec) => {
+        if (spec.id === STANDING) sessions += 1;
+        return Promise.resolve({
+          reason: "done-claimed",
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          summary: "claiming completion",
+        } satisfies SessionOutcome);
+      },
+    },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    progress: {
+      probe: () =>
+        Promise.resolve({ committed: false, acceptanceImproved: false, stepCompleted: false }),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: (spec) => {
+        if (spec.id === STANDING) reviews += 1;
+        return Promise.resolve(
+          spec.id === STANDING && reviews === 1
+            ? {
+                ...PASSING_REVIEW,
+                outage: { kind: "unavailable", status: 503, detail: "No server is available" },
+              }
+            : PASSING_REVIEW,
+        );
+      },
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const released = await waitForCommit(
+    `chore(${STANDING}): released — the provider stopped answering`,
+    30_000,
+  );
+  const done = await waitForCommit(`chore(${STANDING}): done`, 30_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(released !== undefined, "the council outage never released the task");
+  assert.equal((await stateAt(released, STANDING))?.pendingClaim, "review");
+  assert.ok(done !== undefined, "the standing claim was never decided");
+  const state = await stateAt(done, STANDING);
+  assert.equal(state?.sessions, 1, "only the session that made the claim may be counted");
+  assert.equal(sessions, 1, "the retry must convene the council, not start a session");
+  assert.equal(state?.pendingClaim, undefined, "a decided claim no longer stands");
+});
+
+test("a standing claim is decided with no session, even at the session limit", async () => {
+  // The other half: the next claim re-runs the gate and the council and finishes, and it
+  // does so ahead of `checkLimits`, because a task parked at its limit for want of a
+  // council is exactly the one that was wedged.
+  const AT_LIMIT = asTaskId("SMOKE-CLAIM-2");
+  await seedTask(AT_LIMIT, {
+    sessions: 20,
+    limits: { maxSessions: 20 },
+    pendingClaim: "review",
+    pr: { number: 31, url: "https://example.invalid/pr/31" },
+  });
+
+  const supervisor = new Supervisor({
+    config,
+    store: new StateStore(statePath, stateGit),
+    leases: new LeaseManager({
+      git: stateGit,
+      remote: "origin",
+      runner: asRunnerId(config.runnerId),
+      staleAfterSeconds: config.lease.staleAfterSeconds,
+    }),
+    runner: { run: () => Promise.reject(new Error("a standing claim must not start a session")) },
+    verifier: { verify: () => Promise.resolve({ passed: true, detail: "acceptance passed" }) },
+    progress: {
+      probe: () => assert.fail("no session ran, so there is nothing to probe"),
+    },
+    council: {
+      reviewPlan: () => Promise.reject(new Error("not a brainstorm")),
+      review: () => Promise.resolve(PASSING_REVIEW),
+    },
+    notifier: new NullNotifier(),
+    metrics: new AgentMetrics(),
+    logger: SILENT_LOGGER,
+    toolchain: TEST_TOOLCHAIN,
+  });
+
+  const controller = new AbortController();
+  const running = supervisor.run(controller.signal);
+  const done = await waitForCommit(`chore(${AT_LIMIT}): done`, 30_000);
+  controller.abort();
+  await running.catch(() => undefined);
+
+  assert.ok(done !== undefined, "the standing claim was never decided");
+  const state = await stateAt(done, AT_LIMIT);
+  assert.equal(state?.status, "done");
+  assert.equal(state?.sessions, 20, "deciding a claim spends no session");
+  assert.equal(state?.pendingClaim, undefined, "a decided claim no longer stands");
+});
+
 test("the pending-CI release commits its own files, not a sibling slot's", async (t) => {
   // The release above writes a journal shard, transitions state and pushes. That trio is a
   // unit for the reason `Supervisor.unit` documents: `StateStore.stageCommitPush` stages the

@@ -807,6 +807,18 @@ as an empty one, and a council interrupted by an outage records no verdict at al
 verdict is a permanent document, and *"could not complete this review"* × 3 is not one
 worth keeping in the file the next session reads as its instructions.
 
+**And the retry must not be a session.** "Convened again later" used to mean the task went
+back to an ordinary claim, and an ordinary claim starts a session — which, on finished
+work, could only claim done again and walk back into the same council. On 2026-10-10
+`GH-caesarakalaeii-all-chat-951` spent ten sessions that way against a flapping gateway,
+each one passing all 96 checks and reaching a council that answered 503, until the session
+limit parked it. The release now records the claim as standing (`pendingClaim: "review"`
+in `state.json`), and the next claim re-runs the gate and the council directly, spending no
+session. It does so before `checkLimits`, because deciding a claim is not a session and a
+task wedged at its limit for want of a reviewer is exactly the one that needs it. Guidance
+from chat withdraws a standing claim — it is work for the agent, and a claim decided over
+it would merge without any session having read it.
+
 Visibility: `caterpillar_provider_outage_total{kind}`,
 `caterpillar_provider_cooldown_seconds`, a `provider.unavailable` log line, and exactly
 two Discord messages per incident — one when it breaks, one when it comes back.
@@ -3484,16 +3496,12 @@ both produced a session that could only fail:
   registry push, and the image build dominates the wall time. The budget has to cover the
   slowest check on the branch, not the length of the test suite.
 
-  **Known residual, deliberately left:** the release carries no not-before, and
-  `isClaimable` accepts `ready` immediately, so an idle runner re-claims the task on the
-  very next poll. CI that stays pending *longer than the whole settle budget* therefore
-  still spends a session per claim cycle, and three such cycles still park the task —
-  `BS-…-07`'s exact shape, roughly twenty minutes slower each time round. The observed
-  gaps were 3–7 minutes against a 20-minute budget, so this is not the case that fired;
-  fixing it properly means giving a released task an earliest-claim time, which is a
-  change to the claim/release cycle rather than to this gate, and it is not made here.
-  Anyone who sees a task park with green CI and an `awaiting CI` commit in its history
-  should start with that.
+  **Residual, closed on 2026-10-10:** the release carried no not-before and an idle
+  runner re-claimed the task on the very next poll, so CI pending *longer than the whole
+  settle budget* spent a session per claim cycle. The release now marks the claim as
+  standing (`pendingClaim: "ci"`, see §6.3's council paragraph for the same mechanism), and
+  the next claim re-runs the gate without a session. A claim still pending simply waits
+  another settle budget and releases again; it never reaches the no-progress detector.
 - **`NODE_ENV=production` leaked into the task's environment.** The supervisor's own
   image sets it (correctly — that image installed with `--omit=dev`), but it is
   process-wide and every agent session and acceptance command is a child of the
