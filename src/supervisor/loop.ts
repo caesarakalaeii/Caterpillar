@@ -1919,11 +1919,37 @@ export class Supervisor {
           return;
         }
 
+        // A claim that already passed its gate and was left waiting on CI or on the
+        // provider is decided again here, with no session — and BEFORE `checkLimits`,
+        // because deciding it spends no session, so a task waiting at its limit is the
+        // one that most needs this. When the claim is sent back (gate red, council asks
+        // for changes) the loop goes round and the agent gets a session as usual.
+        if (state.pendingClaim !== undefined) {
+          logger.info("claim.resettling", { task: spec.id, waitingOn: state.pendingClaim });
+          if (await this.settleClaim(heartbeat, spec, state)) return;
+          continue;
+        }
+
         const verdict = checkLimits(state, state.limits, {
           noProgressLimit: config.limits.noProgressLimit,
         });
         if (verdict.kind === "park") {
-          await this.park(heartbeat, spec, state, verdict.reason);
+          // Only the session limit offers the extension: a no-progress park is cleared by a
+          // plain `/resume`, and raising a budget nobody exhausted would be a button that lies.
+          await this.park(
+            heartbeat,
+            spec,
+            state,
+            verdict.reason,
+            verdict.limit === "sessions"
+              ? {
+                  kind: "parked",
+                  task: spec.id,
+                  reason: verdict.reason,
+                  extendBy: config.limits.sessionExtension,
+                }
+              : undefined,
+          );
           return;
         }
 
@@ -2427,133 +2453,8 @@ export class Supervisor {
         return true;
       }
 
-      case "done-claimed": {
-        // The records, not a derivation from `spec`: `readSpec` already applied the newest
-        // amendment, so the spec alone cannot say a criterion was amended. Never fails the
-        // claim — an unreadable amendment costs the provenance block in the report, and the
-        // gate itself is what decides the verdict.
-        const amendments = await this.amendedGate(spec);
-        const result = await this.deps.verifier.verify(spec, state, amendments);
-        logger.info("verification.result", {
-          task: spec.id,
-          session: state.sessions,
-          passed: result.passed,
-          pending: result.pending === true,
-          detail: result.detail,
-        });
-        if (result.pending === true) {
-          // NOT a rejection, and deliberately not journalled as one. The verifier already
-          // waited out `limits.ciSettleSeconds` and CI is still running, so there is
-          // still nothing an agent could usefully do: the acceptance commands pass and
-          // the branch will not change while nobody is working on it.
-          //
-          // Release the task WITHOUT starting another session on it. Spending one here
-          // is what parked BS-...-07 — three sessions that could only wait, each
-          // truthfully scored no-progress by §11.1, on work that was already finished.
-          // Coming back through a later poll costs nothing and lets the runner do real
-          // work in between.
-          logger.info("task.awaiting-ci", { task: spec.id, session: state.sessions });
-          // One unit, like every other write-then-push in this switch. Without the hold
-          // this commit stages the whole writable tree, which at N slots means a sibling
-          // session's deliberately-uncommitted `state.json` lands under this task's
-          // message and that sibling's own commit finds nothing to record.
-          await this.unit(async () => {
-            await store.appendJournal(
-              spec.id,
-              state.sessions,
-              `**Completion claim not yet decided — CI is still running.** Acceptance ` +
-                `commands passed. No action is needed: the task was released and will be ` +
-                `re-checked when CI reports.\n\n${result.detail}`,
-            );
-            await this.transition(lease, state, "ready");
-            await this.push(lease, `chore(${spec.id}): awaiting CI`);
-          });
-          return true;
-        }
-        if (!result.passed) {
-          // Claim rejected. Back to ready with the failure in the journal, so the
-          // next session sees why rather than re-claiming blindly.
-          await this.unit(async () => {
-            await store.appendJournal(
-              spec.id,
-              state.sessions,
-              `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
-            );
-            await this.transition(lease, state, "ready");
-            await this.push(lease, `chore(${spec.id}): completion claim rejected`);
-          });
-          return false;
-        }
-
-        // The third gate. Runs only once the §12 pair has passed, so the council is
-        // never asked to re-litigate whether the tests pass — it reads the change.
-        const reviewed = await this.convene(lease, spec, state);
-        if (reviewed.decision === "changes") return false;
-        // Both finish with this task for now. `stalled` waits for a human; `outage`
-        // waits for the provider, with the task already released and the runner cooling.
-        if (reviewed.decision === "stalled" || reviewed.decision === "outage") return true;
-
-        // BEFORE the merge, not after. `push` fences, but a merge is irreversible and
-        // crosses a system boundary, so fencing it afterwards fences nothing: `convene`
-        // takes minutes (§5.1 records 207s), and in that window a lease can go stale, an
-        // operator can `/cancel`, and another runner can park the task and push. The
-        // council would then return `pass` and this runner would merge a PR for a task
-        // the human had already cancelled — with `assertHeld` throwing afterwards, and
-        // the throw logged at warn and discarded. §5.1 says every push verifies lease
-        // ownership first; a merge deserves the same, first.
-        await this.deps.leases.assertHeld(await lease.current());
-
-        const merge = await this.mergeReviewed(spec, reviewed.state);
-
-        // §20's closing edge, and it goes BEFORE the transition to `done`. A remediation
-        // task exists because an alert fired, so the question the fleet still has is whether
-        // the alert stopped — and a task recorded as done is one nothing revisits. `held`
-        // being false is the ordinary case for every other kind of task, and for a
-        // remediation task whose record is gone; both finish exactly as they always did.
-        if (
-          merge.merged &&
-          (await this.holdForReverification(lease, spec, reviewed.state, merge.landed))
-        ) {
-          return true;
-        }
-
-        // In the SAME unit as the transition, so a task recorded as done and the reason
-        // nobody re-verified it are one commit. Nothing at all for every task that is not a
-        // remediation task with an unlanded fix.
-        const skipped = reverificationSkipped(spec, merge);
-        await this.unit(async () => {
-          if (skipped !== undefined) {
-            await store.appendJournal(spec.id, reviewed.state.sessions, skipped);
-          }
-          await this.transition(lease, reviewed.state, "done");
-          await this.push(lease, `chore(${spec.id}): done`);
-        });
-        // Mirrored only here, after every gate passed and git already says done.
-        const prUrl = result.prUrl ?? reviewed.state.pr?.url ?? "(no PR recorded)";
-        logger.info("task.done", {
-          task: spec.id,
-          sessions: reviewed.state.sessions,
-          prUrl,
-          merged: merge.merged,
-        });
-        await this.mirror(spec, { kind: "completed", prUrl });
-        await this.notifyTask(reviewed.state, {
-          kind: "done",
-          task: spec.id,
-          prUrl,
-          note: merge.note,
-        });
-        // After the task is recorded as done, never before: a maintenance pass that
-        // fails must not be able to unmake a completed task.
-        await this.maintainPlan(lease, spec, reviewed.state);
-        // And last of all, the disk. `done` is the one terminal status nothing comes back
-        // from — `/resume` explicitly refuses it, because the work passed every gate and
-        // merged — so the checkout has no further reader on this runner or any other.
-        // After the push and after the notification, so a reap that somehow fails cannot
-        // be what stops a completed task from being recorded as one.
-        await this.reapTask(spec, "done");
-        return true;
-      }
+      case "done-claimed":
+        return this.settleClaim(lease, spec, state);
 
       case "plan-proposed": {
         const plan = outcome.plan;
@@ -2615,6 +2516,159 @@ export class Supervisor {
         await this.reapTask(spec, "failed");
         return true;
     }
+  }
+
+  /**
+   * Decide a completion claim: the §12 gate, then the council, then merge and `done`.
+   * Returns true when the task is finished with this runner.
+   *
+   * Reached two ways. After a session that claimed done, and — without any session — on a
+   * claim of a task whose `pendingClaim` is set: one whose gate already passed and was left
+   * waiting on CI or on a council the provider would not answer. Those waits are nothing
+   * the agent can help with, and sending a fresh session at them is what burned
+   * GH-caesarakalaeii-all-chat-951's budget: ten sessions, each re-claiming done on an
+   * unchanged branch, each spent because the council's gateway answered 503. Re-deciding
+   * the claim directly costs a gate run and a council, and no session.
+   *
+   * The gate is re-run rather than trusted on that second path: the branch, the amended
+   * criteria or CI can all have moved while the task waited.
+   */
+  private async settleClaim(
+    lease: LeaseHandle,
+    spec: TaskSpec,
+    claimed: TaskState,
+  ): Promise<boolean> {
+    const { store, logger } = this.deps;
+    // Cleared up front, and set again by the two waits below. Every other way out — a
+    // rejection, a council asking for changes, a park, `done` — must leave no claim standing,
+    // or the next claim would skip the session that rejection was sending the agent back to.
+    const { pendingClaim: _settled, ...state } = claimed;
+
+    // The records, not a derivation from `spec`: `readSpec` already applied the newest
+    // amendment, so the spec alone cannot say a criterion was amended. Never fails the
+    // claim — an unreadable amendment costs the provenance block in the report, and the
+    // gate itself is what decides the verdict.
+    const amendments = await this.amendedGate(spec);
+    const result = await this.deps.verifier.verify(spec, state, amendments);
+    logger.info("verification.result", {
+      task: spec.id,
+      session: state.sessions,
+      passed: result.passed,
+      pending: result.pending === true,
+      detail: result.detail,
+    });
+    if (result.pending === true) {
+      // NOT a rejection, and deliberately not journalled as one. The verifier already
+      // waited out `limits.ciSettleSeconds` and CI is still running, so there is
+      // still nothing an agent could usefully do: the acceptance commands pass and
+      // the branch will not change while nobody is working on it.
+      //
+      // Release the task WITHOUT starting another session on it, now or on the next
+      // claim — `pendingClaim` is what makes the next claim re-check rather than work.
+      // Spending sessions here is what parked BS-...-07 — three sessions that could only
+      // wait, each truthfully scored no-progress by §11.1, on work that was already
+      // finished.
+      logger.info("task.awaiting-ci", { task: spec.id, session: state.sessions });
+      // One unit, like every other write-then-push in this class. Without the hold
+      // this commit stages the whole writable tree, which at N slots means a sibling
+      // session's deliberately-uncommitted `state.json` lands under this task's
+      // message and that sibling's own commit finds nothing to record.
+      await this.unit(async () => {
+        await store.appendJournal(
+          spec.id,
+          state.sessions,
+          `**Completion claim not yet decided — CI is still running.** Acceptance ` +
+            `commands passed. No action is needed: the task was released and will be ` +
+            `re-checked when CI reports.\n\n${result.detail}`,
+        );
+        await this.transition(lease, { ...state, pendingClaim: "ci" }, "ready");
+        await this.push(lease, `chore(${spec.id}): awaiting CI`);
+      });
+      return true;
+    }
+    if (!result.passed) {
+      // Claim rejected. Back to ready with the failure in the journal, so the
+      // next session sees why rather than re-claiming blindly.
+      await this.unit(async () => {
+        await store.appendJournal(
+          spec.id,
+          state.sessions,
+          `**Completion claim REJECTED by verification:**\n\n${result.detail}`,
+        );
+        await this.transition(lease, state, "ready");
+        await this.push(lease, `chore(${spec.id}): completion claim rejected`);
+      });
+      return false;
+    }
+
+    // The third gate. Runs only once the §12 pair has passed, so the council is
+    // never asked to re-litigate whether the tests pass — it reads the change.
+    const reviewed = await this.convene(lease, spec, state);
+    if (reviewed.decision === "changes") return false;
+    // Both finish with this task for now. `stalled` waits for a human; `outage`
+    // waits for the provider, with the task already released and the runner cooling.
+    if (reviewed.decision === "stalled" || reviewed.decision === "outage") return true;
+
+    // BEFORE the merge, not after. `push` fences, but a merge is irreversible and
+    // crosses a system boundary, so fencing it afterwards fences nothing: `convene`
+    // takes minutes (§5.1 records 207s), and in that window a lease can go stale, an
+    // operator can `/cancel`, and another runner can park the task and push. The
+    // council would then return `pass` and this runner would merge a PR for a task
+    // the human had already cancelled — with `assertHeld` throwing afterwards, and
+    // the throw logged at warn and discarded. §5.1 says every push verifies lease
+    // ownership first; a merge deserves the same, first.
+    await this.deps.leases.assertHeld(await lease.current());
+
+    const merge = await this.mergeReviewed(spec, reviewed.state);
+
+    // §20's closing edge, and it goes BEFORE the transition to `done`. A remediation
+    // task exists because an alert fired, so the question the fleet still has is whether
+    // the alert stopped — and a task recorded as done is one nothing revisits. `held`
+    // being false is the ordinary case for every other kind of task, and for a
+    // remediation task whose record is gone; both finish exactly as they always did.
+    if (
+      merge.merged &&
+      (await this.holdForReverification(lease, spec, reviewed.state, merge.landed))
+    ) {
+      return true;
+    }
+
+    // In the SAME unit as the transition, so a task recorded as done and the reason
+    // nobody re-verified it are one commit. Nothing at all for every task that is not a
+    // remediation task with an unlanded fix.
+    const skipped = reverificationSkipped(spec, merge);
+    await this.unit(async () => {
+      if (skipped !== undefined) {
+        await store.appendJournal(spec.id, reviewed.state.sessions, skipped);
+      }
+      await this.transition(lease, reviewed.state, "done");
+      await this.push(lease, `chore(${spec.id}): done`);
+    });
+    // Mirrored only here, after every gate passed and git already says done.
+    const prUrl = result.prUrl ?? reviewed.state.pr?.url ?? "(no PR recorded)";
+    logger.info("task.done", {
+      task: spec.id,
+      sessions: reviewed.state.sessions,
+      prUrl,
+      merged: merge.merged,
+    });
+    await this.mirror(spec, { kind: "completed", prUrl });
+    await this.notifyTask(reviewed.state, {
+      kind: "done",
+      task: spec.id,
+      prUrl,
+      note: merge.note,
+    });
+    // After the task is recorded as done, never before: a maintenance pass that
+    // fails must not be able to unmake a completed task.
+    await this.maintainPlan(lease, spec, reviewed.state);
+    // And last of all, the disk. `done` is the one terminal status nothing comes back
+    // from — `/resume` explicitly refuses it, because the work passed every gate and
+    // merged — so the checkout has no further reader on this runner or any other.
+    // After the push and after the notification, so a reap that somehow fails cannot
+    // be what stops a completed task from being recorded as one.
+    await this.reapTask(spec, "done");
+    return true;
   }
 
   /**
@@ -2840,9 +2894,17 @@ export class Supervisor {
     // Reviewers that could not reach the provider have not reviewed anything, and a
     // verdict is a permanent document. Written now it would say "could not complete
     // this review" three times over, in the file the next session reads as its
-    // instructions. So nothing is recorded and the council is convened again later.
+    // instructions. So nothing is recorded and the council is convened again later —
+    // by `settleClaim` on the next claim, not by a fresh session (`pendingClaim`).
     if (outage !== undefined) {
-      await this.releaseAfterOutage(lease, spec, state, outage, usage, "council");
+      await this.releaseAfterOutage(
+        lease,
+        spec,
+        { ...state, pendingClaim: "review" },
+        outage,
+        usage,
+        "council",
+      );
       return { state, decision: "outage" };
     }
 
@@ -3804,6 +3866,8 @@ export class Supervisor {
         return this.applyPark(request);
       case "resume":
         return this.applyResume(request);
+      case "extend":
+        return this.applyExtend(request);
       case "merge":
         return this.applyMerge(request);
       case "force-done":
@@ -4134,6 +4198,10 @@ export class Supervisor {
 
     const rounds = state.review?.rounds ?? 0;
     const roundsCleared = rounds > 0;
+    // Guidance is work for the agent, so a standing completion claim does not survive it:
+    // otherwise the next claim would re-decide the claim, and possibly merge, without any
+    // session ever reading what the human just wrote.
+    const { pendingClaim: _withdrawn, ...guided } = state;
 
     try {
       const handle = heldLease(lease);
@@ -4144,7 +4212,7 @@ export class Supervisor {
           `**Guidance from the operator:**\n\n${request.text}`,
         );
         await store.writeState({
-          ...state,
+          ...guided,
           progress: { ...state.progress, noProgressStreak: 0 },
           // `rounds` only. `last` and `reason` are the record of what the council actually
           // said and stay put — a human who resumes wants to see what they are answering,
@@ -4335,6 +4403,78 @@ export class Supervisor {
           : undefined;
 
       return { kind: "resumed", from, ...(exhausted === undefined ? {} : { exhausted }) };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Raise a task's session limit and resume it — the button on a session-limit park.
+   *
+   * `applyResume` deliberately leaves `sessions` alone (the budget is a human's call, not a
+   * command's), so a task parked at its limit could only come back by an operator editing
+   * `state.json` by hand — the out-of-band push `resume` exists to make unnecessary. This
+   * is that human's call, made through the loop instead.
+   *
+   * The new limit is counted from whichever is HIGHER, the old limit or the sessions used.
+   * A limit lowered by hand below the count would otherwise come back still exhausted,
+   * and a press must always buy exactly the sessions its label promised.
+   *
+   * Clears the no-progress streak for `applyResume`'s reason: `checkLimits` runs before
+   * the first session, so a streak at the threshold would park it again having run nothing.
+   */
+  private async applyExtend(
+    request: ChatRequest & { readonly kind: "extend" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    // The status check is also what makes a second press harmless: the first one put the
+    // task back to `ready`, and a stale button pressed again is refused rather than
+    // raising the limit a second time.
+    if (!RESUMABLE.includes(state.status)) {
+      return { kind: "not-resumable", status: state.status };
+    }
+    const from = state.status;
+    const before = state.limits.maxSessions;
+    const maxSessions = Math.max(before, state.sessions) + request.by;
+
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) return { kind: "not-resumable", status: "running" };
+
+    try {
+      const handle = heldLease(lease);
+      await this.unit(async () => {
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          `**Session limit raised** by ${request.author}: ${before} → ${maxSessions} ` +
+            `(${state.sessions} used). **Resumed** from chat.`,
+        );
+        await this.transition(
+          handle,
+          {
+            ...state,
+            limits: { ...state.limits, maxSessions },
+            progress: { ...state.progress, noProgressStreak: 0 },
+          },
+          "ready",
+        );
+        await this.push(
+          handle,
+          `chore(${request.task}): session limit raised to ${maxSessions} and resumed`,
+        );
+      });
+      this.publishNoProgress(request.task, 0);
+      logger.info("task.extended", {
+        task: request.task,
+        sessions: state.sessions,
+        from: before,
+        to: maxSessions,
+        author: request.author,
+      });
+      return { kind: "extended", from, maxSessions };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

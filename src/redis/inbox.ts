@@ -392,6 +392,15 @@ const parseIntent = (value: unknown): ChatIntent | undefined => {
       if (id === undefined) return undefined;
       return { kind: raw["kind"], task: id };
     }
+    case "extend": {
+      const id = task();
+      const { by, author } = raw;
+      if (id === undefined || typeof by !== "number" || !Number.isSafeInteger(by) || by < 1) {
+        return undefined;
+      }
+      if (typeof author !== "string" || author.trim().length === 0) return undefined;
+      return { kind: "extend", task: id, by, author };
+    }
     case "force-done": {
       // Not folded into the group above: `/done` carries a reason and an author, and both
       // are the whole audit trail for a `done` that skipped both §12 gates. A blank one

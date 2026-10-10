@@ -49,6 +49,7 @@ test("every intent in the union survives the round trip unchanged", async () => 
     { kind: "answer-option", task: TASK, option: 2 },
     { kind: "park", task: TASK },
     { kind: "resume", task: TASK },
+    { kind: "extend", task: TASK, by: 5, author: "ada" },
     { kind: "merge", task: TASK },
     { kind: "force-done", task: TASK, reason: "obsolete", author: "ada" },
     {

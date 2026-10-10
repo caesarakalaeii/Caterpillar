@@ -38,6 +38,12 @@ export type Command =
   | { readonly kind: "park"; readonly task: TaskId }
   /** Put a parked task back in the queue. The inverse of `park`. */
   | { readonly kind: "resume"; readonly task: TaskId }
+  /**
+   * Raise a task's own session limit by `by` and resume it — the button on a session-limit
+   * park. `/resume` alone cannot help there: it leaves the session count alone, so the task
+   * parks again on the next claim having run nothing.
+   */
+  | { readonly kind: "extend"; readonly task: TaskId; readonly by: number }
   /** Approve and merge a task's PR despite the council (DESIGN.md §12.1). */
   | { readonly kind: "merge"; readonly task: TaskId }
   /**

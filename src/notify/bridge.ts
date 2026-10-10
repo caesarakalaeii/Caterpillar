@@ -592,6 +592,8 @@ export class DiscordBridge {
           return `Merging ${command.task}`;
         case "resume":
           return `Resuming ${command.task}`;
+        case "extend":
+          return `Extending ${command.task} by ${command.by} sessions`;
         case "park":
           return `Cancelling ${command.task}`;
         case "force-done":
@@ -660,6 +662,12 @@ export class DiscordBridge {
         return describeOutcome(
           command.task,
           await inbox.submit({ kind: "resume", task: command.task }),
+        );
+      // Carries `author`: the journal records who spent more of the task's budget.
+      case "extend":
+        return describeOutcome(
+          command.task,
+          await inbox.submit({ kind: "extend", task: command.task, by: command.by, author }),
         );
       case "merge":
         return describeOutcome(

@@ -114,9 +114,14 @@ export const committedLine = (task: TaskId, evidence: ProgressEvidence): readonl
  */
 const neutralExit = (reason: SessionExitReason): boolean => reason === "ask-human";
 
+/**
+ * `limit` says WHICH budget ran out, because the two have different ways back: `/resume`
+ * clears the no-progress streak, but the session count only moves when a human raises the
+ * task's own limit — which is what the park notification offers a button for.
+ */
 export type LimitVerdict =
   | { readonly kind: "continue" }
-  | { readonly kind: "park"; readonly reason: string };
+  | { readonly kind: "park"; readonly limit: "sessions" | "no-progress"; readonly reason: string };
 
 export interface LimitOptions {
   readonly noProgressLimit: number;
@@ -162,6 +167,7 @@ export const checkLimits = (
   if (state.sessions >= limits.maxSessions) {
     return {
       kind: "park",
+      limit: "sessions",
       reason:
         `reached the session limit (${limits.maxSessions}). A task needing this many ` +
         `fresh contexts is usually mis-scoped rather than merely large.`,
@@ -171,6 +177,7 @@ export const checkLimits = (
   if (state.progress.noProgressStreak >= options.noProgressLimit) {
     return {
       kind: "park",
+      limit: "no-progress",
       reason:
         `${state.progress.noProgressStreak} consecutive sessions made no measurable ` +
         `progress (no commit, no newly passing acceptance command, no completed step). ` +

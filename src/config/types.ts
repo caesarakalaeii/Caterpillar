@@ -92,6 +92,12 @@ export interface HandoffConfig {
 
 export interface LimitsConfig {
   readonly maxSessionsPerTask: number;
+  /**
+   * Sessions the "Extend & resume" button on a session-limit park adds to that task's own
+   * limit. Per press and per task, never a change to `maxSessionsPerTask`: the limit is a
+   * budget a human raises deliberately for the one task in front of them.
+   */
+  readonly sessionExtension: number;
   /** Consecutive no-progress sessions before parking. */
   readonly noProgressLimit: number;
   /**

@@ -446,6 +446,18 @@ const idsOf = (attached: readonly ActionRow[] | undefined): readonly string[] =>
     r.components.flatMap((c) => ("custom_id" in c && c.custom_id !== undefined ? [c.custom_id] : [])),
   );
 
+test("a session-limit park offers Extend in place of a Resume that cannot help", () => {
+  const attached = componentsFor({
+    kind: "parked",
+    task: TASK,
+    reason: "reached the session limit (20)",
+    extendBy: 5,
+  });
+  assert.deepEqual(labelsOf(attached), ["Extend +5 & resume", "Mark done", "Amend criteria"]);
+  // The count travels in the button, so the press does what the label says.
+  assert.ok(idsOf(attached).includes(`c1:ext:${TASK}:5`));
+});
+
 test("a question with options offers one button per option AND the free-text one", () => {
   // The whole point: fourteen tasks waiting on a human one morning, most of them ending in
   // an enumerated list. Typing the choice back is the cost this removes — but never at the

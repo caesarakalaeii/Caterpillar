@@ -26,7 +26,9 @@ export const describeOutcome = (task: TaskId, outcome: ChatOutcome): string => {
         : // "on the next claim", NOT "after its next session": `checkLimits` runs before
           // the first session, so a task resumed at its session limit parks again having
           // run nothing. Saying otherwise sends the human away expecting work to happen.
-          `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again on the next claim, without running, unless the limit is raised.`;
+          `Resumed **${task}**, but ${outcome.exhausted} — resuming does not reset that, so it will park again on the next claim, without running. Use **Extend & resume** on that park message to raise its limit.`;
+    case "extended":
+      return `Raised **${task}**'s session limit to ${outcome.maxSessions} and resumed it from \`${outcome.from}\`. It is \`ready\` and will be claimed on the next poll.`;
     case "not-resumable":
       // Names both, because `failed` was added to `RESUMABLE` and this line was not: it told
       // a human that a `running` task was "not parked", which is true and answers a question

@@ -1235,6 +1235,9 @@ recovery.
 Resuming forgives the no-progress streak and — when guidance was given — the review council's
 round count. It never forgives `sessions`: if the task has used its session budget the reply
 says so rather than letting you find out when it parks itself again thirty seconds later.
+Raising that budget is the **Extend +N & resume** button, which a session-limit park carries
+in place of Resume: it adds `limits.sessionExtension` (default 5) to that one task's limit,
+counted from the sessions already used, and puts it back to `ready`.
 
 Waves describe what **may** run concurrently. Whether anything actually does is a separate
 setting: `concurrency` is how many tasks one replica works at once and defaults to 1, so out
