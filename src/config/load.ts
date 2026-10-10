@@ -61,6 +61,7 @@ interface RawConfig {
   readonly handoff?: { readonly thresholdFraction?: unknown };
   readonly limits?: {
     readonly maxSessionsPerTask?: unknown;
+    readonly sessionExtension?: unknown;
     readonly noProgressLimit?: unknown;
     readonly maxReviewRounds?: unknown;
     readonly maxSessionSeconds?: unknown;
@@ -642,6 +643,16 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     );
   }
 
+  // A whole number of at least one, because it travels in a button's custom_id and is
+  // parsed back strictly: a fractional or zero extension renders a button that the press
+  // then refuses, which is a dead end on the one message whose job is to offer a way out.
+  const sessionExtension = num(raw.limits?.sessionExtension, "limits.sessionExtension", 5);
+  if (!Number.isSafeInteger(sessionExtension) || sessionExtension < 1) {
+    throw new ConfigError(
+      `limits.sessionExtension (${sessionExtension}) must be a whole number of at least 1`,
+    );
+  }
+
   return {
     runnerId,
     capabilities: capabilities(raw.capabilities),
@@ -720,6 +731,7 @@ export const loadConfig = async (path: string): Promise<RunnerConfig> => {
     },
     limits: {
       maxSessionsPerTask: num(raw.limits?.maxSessionsPerTask, "limits.maxSessionsPerTask", 20),
+      sessionExtension,
       noProgressLimit: num(raw.limits?.noProgressLimit, "limits.noProgressLimit", 3),
       maxReviewRounds: num(raw.limits?.maxReviewRounds, "limits.maxReviewRounds", 3),
       // Four hours. Long enough that no honest session has ever come close — the longest

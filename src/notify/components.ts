@@ -107,6 +107,10 @@ export interface Modal {
  * `amd` is `/amend`: replace a task's acceptance criteria (§12.3). Abbreviated for the same
  * reason the rest are — the criteria themselves never travel in a `custom_id`, they are
  * pre-filled into the modal the press opens.
+ *
+ * `ext` raises a task's session limit and resumes it, and its `arg` is the number of
+ * sessions to add. Carried in the button rather than read from config at press time, so
+ * the press does exactly what its label said even if the config changed in between.
  */
 export type Verb =
   | "ans"
@@ -118,7 +122,8 @@ export type Verb =
   | "plan-ok"
   | "plan-no"
   | "done"
-  | "amd";
+  | "amd"
+  | "ext";
 
 export interface ButtonAction {
   readonly verb: Verb;
@@ -179,6 +184,7 @@ const VERBS: readonly string[] = [
   "plan-no",
   "done",
   "amd",
+  "ext",
 ];
 
 const isVerb = (value: string): value is Verb => VERBS.includes(value);

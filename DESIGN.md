@@ -1786,6 +1786,19 @@ measurements, so resuming does not forgive those — the reply names the one tha
 stands and says the task will park again on the next claim, without running, until a
 human raises it.
 
+**Raising the session budget is a button, not a hand edit.** Until it existed, "a human
+raises it" meant editing `state.json` in the state repo — the out-of-band push `/resume`
+was built to retire, and it raced the loop exactly as described there: a manual raise on
+2026-10-10 was followed within minutes by a park whose own state push was rejected. A
+session-limit park now carries **Extend +N & resume** in place of Resume, which cannot help
+there. The press sets `limits.maxSessions` to `max(limit, sessions) + N`, clears the streak
+for the reason above, journals who spent the budget, and resumes, all under a lease like
+every other chat write. `N` is `limits.sessionExtension` (default 5) and travels in the
+`custom_id`, so the press does what the label said even across a config change; the
+status check makes a stale second press a refusal rather than a second raise. Only the
+session limit offers it — a no-progress park is cleared by `/resume`, and a button raising a
+budget nobody exhausted would be one that lies.
+
 **The typing indicator is what says the agent is alive.** Handoffs are deliberately not
 notified (§11), so between a question and its answer the channel is silent and a task
 thinking for forty minutes looks exactly like one that has died. While a session runs for

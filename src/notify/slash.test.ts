@@ -113,6 +113,26 @@ test("an option button with no usable index is ignored, never answered as option
   );
 });
 
+test("an extend button becomes an extend command, and a count that is not whole is ignored", () => {
+  const customId = encodeCustomId({ verb: "ext", task: TASK, arg: "5" });
+  assert.ok(customId !== undefined);
+  assert.deepEqual(
+    parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: customId } })),
+    { kind: "run", command: { kind: "extend", task: TASK, by: 5 } },
+  );
+
+  // Coercing any of these would raise the limit by an amount nobody chose.
+  for (const arg of [undefined, "", "0", "-5", "2.5", "five"]) {
+    const bad = encodeCustomId({ verb: "ext", task: TASK, ...(arg === undefined ? {} : { arg }) });
+    assert.ok(bad !== undefined);
+    assert.equal(
+      parseInteraction(interaction({ type: INTERACTION.component, data: { custom_id: bad } })).kind,
+      "ignored",
+      `\`${String(arg)}\` was not refused`,
+    );
+  }
+});
+
 test("an autocompleted task id is still validated", () => {
   // Autocomplete is a SUGGESTION, not a constraint: Discord submits whatever was typed,
   // and the id becomes a directory name under `tasks/`.

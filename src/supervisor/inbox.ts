@@ -31,6 +31,8 @@ export type ChatOutcome =
    * discover it when the task parks itself thirty seconds later.
    */
   | { readonly kind: "resumed"; readonly from: string; readonly exhausted?: string }
+  /** A task's session limit was raised and it is back in the queue. */
+  | { readonly kind: "extended"; readonly from: string; readonly maxSessions: number }
   /**
    * Resuming a task that is not parked.
    *
@@ -154,6 +156,18 @@ export type ChatIntent =
    * Observed, not theorised: it cost a task a session and then failed its park too.
    */
   | { readonly kind: "resume"; readonly task: TaskId }
+  /**
+   * Raise a task's own `limits.maxSessions` by `by`, then resume it.
+   *
+   * A separate request rather than an option on `resume`, because it spends budget and so
+   * carries `author` for the journal; a plain resume does not.
+   */
+  | {
+      readonly kind: "extend";
+      readonly task: TaskId;
+      readonly by: number;
+      readonly author: string;
+    }
   | { readonly kind: "merge"; readonly task: TaskId }
   /**
    * Mark a task `done` by hand — `/done`.

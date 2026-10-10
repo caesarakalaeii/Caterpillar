@@ -1923,7 +1923,22 @@ export class Supervisor {
           noProgressLimit: config.limits.noProgressLimit,
         });
         if (verdict.kind === "park") {
-          await this.park(heartbeat, spec, state, verdict.reason);
+          // Only the session limit offers the extension: a no-progress park is cleared by a
+          // plain `/resume`, and raising a budget nobody exhausted would be a button that lies.
+          await this.park(
+            heartbeat,
+            spec,
+            state,
+            verdict.reason,
+            verdict.limit === "sessions"
+              ? {
+                  kind: "parked",
+                  task: spec.id,
+                  reason: verdict.reason,
+                  extendBy: config.limits.sessionExtension,
+                }
+              : undefined,
+          );
           return;
         }
 
@@ -3804,6 +3819,8 @@ export class Supervisor {
         return this.applyPark(request);
       case "resume":
         return this.applyResume(request);
+      case "extend":
+        return this.applyExtend(request);
       case "merge":
         return this.applyMerge(request);
       case "force-done":
@@ -4335,6 +4352,78 @@ export class Supervisor {
           : undefined;
 
       return { kind: "resumed", from, ...(exhausted === undefined ? {} : { exhausted }) };
+    } finally {
+      await leases.release(lease).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Raise a task's session limit and resume it — the button on a session-limit park.
+   *
+   * `applyResume` deliberately leaves `sessions` alone (the budget is a human's call, not a
+   * command's), so a task parked at its limit could only come back by an operator editing
+   * `state.json` by hand — the out-of-band push `resume` exists to make unnecessary. This
+   * is that human's call, made through the loop instead.
+   *
+   * The new limit is counted from whichever is HIGHER, the old limit or the sessions used.
+   * A limit lowered by hand below the count would otherwise come back still exhausted,
+   * and a press must always buy exactly the sessions its label promised.
+   *
+   * Clears the no-progress streak for `applyResume`'s reason: `checkLimits` runs before
+   * the first session, so a streak at the threshold would park it again having run nothing.
+   */
+  private async applyExtend(
+    request: ChatRequest & { readonly kind: "extend" },
+  ): Promise<ChatOutcome> {
+    const { store, leases, logger } = this.deps;
+
+    const state = await store.tryReadState(request.task);
+    if (state === undefined) return { kind: "unknown-task" };
+    // The status check is also what makes a second press harmless: the first one put the
+    // task back to `ready`, and a stale button pressed again is refused rather than
+    // raising the limit a second time.
+    if (!RESUMABLE.includes(state.status)) {
+      return { kind: "not-resumable", status: state.status };
+    }
+    const from = state.status;
+    const before = state.limits.maxSessions;
+    const maxSessions = Math.max(before, state.sessions) + request.by;
+
+    const lease = await leases.claim(request.task);
+    if (lease === undefined) return { kind: "not-resumable", status: "running" };
+
+    try {
+      const handle = heldLease(lease);
+      await this.unit(async () => {
+        await store.appendJournal(
+          request.task,
+          state.sessions,
+          `**Session limit raised** by ${request.author}: ${before} → ${maxSessions} ` +
+            `(${state.sessions} used). **Resumed** from chat.`,
+        );
+        await this.transition(
+          handle,
+          {
+            ...state,
+            limits: { ...state.limits, maxSessions },
+            progress: { ...state.progress, noProgressStreak: 0 },
+          },
+          "ready",
+        );
+        await this.push(
+          handle,
+          `chore(${request.task}): session limit raised to ${maxSessions} and resumed`,
+        );
+      });
+      this.publishNoProgress(request.task, 0);
+      logger.info("task.extended", {
+        task: request.task,
+        sessions: state.sessions,
+        from: before,
+        to: maxSessions,
+        author: request.author,
+      });
+      return { kind: "extended", from, maxSessions };
     } finally {
       await leases.release(lease).catch(() => undefined);
     }

@@ -475,6 +475,15 @@ const fromComponent = (interaction: Interaction): Intent => {
       return { kind: "open-done-modal", task: action.task };
     case "amd":
       return { kind: "open-amend-modal", task: action.task };
+    case "ext": {
+      // Strict for `opt`'s reason: a coerced count raises the limit by an amount nobody
+      // chose. A whole number of at least one, or the press is ignored.
+      const by = Number(action.arg);
+      if (action.arg === undefined || action.arg === "" || !Number.isSafeInteger(by) || by < 1) {
+        return { kind: "ignored", reason: "extend button without a usable count" };
+      }
+      return { kind: "run", command: { kind: "extend", task: action.task, by } };
+    }
     default:
       return { kind: "ignored", reason: `button ${action.verb} is not handled yet` };
   }

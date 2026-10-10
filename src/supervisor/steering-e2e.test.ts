@@ -151,6 +151,7 @@ const world = async (tasks: readonly TaskState[]): Promise<World> => {
       handoff: { thresholdFraction: 0.7 },
       limits: {
         maxSessionsPerTask: 20,
+        sessionExtension: 5,
         noProgressLimit: 3,
         maxReviewRounds: 3,
         maxSessionSeconds: 3600,

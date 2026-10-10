@@ -253,6 +253,7 @@ const config: RunnerConfig = {
   handoff: { thresholdFraction: 0.7 },
   limits: {
     maxSessionsPerTask: 20,
+    sessionExtension: 5,
     noProgressLimit: 3,
     maxReviewRounds: 3,
     maxSessionSeconds: 3600,
@@ -1429,6 +1430,64 @@ test("/resume warns when the task will meet the same limit again", async () => {
   if (outcome.kind !== "resumed") return;
   assert.match(outcome.exhausted ?? "", /20 of 20 sessions/);
   assert.equal((await pushedState(SPENT))?.status, "ready", "it is still resumed, just warned about");
+});
+
+/**
+ * Extend leaves its task `ready`, and this file shares one remote: every later test's
+ * supervisor would claim it ahead of the task that test seeded. A capability the test
+ * runner lacks keeps it out of every claim without changing what extend does to it.
+ */
+const UNCLAIMABLE: Partial<TaskState> = { requires: ["gpu"] };
+
+test("extend raises a spent task's limit on the remote and resumes it", async () => {
+  // The way out `/resume` points at. Counted from the sessions USED, so the press buys
+  // exactly what its label said, and the streak is cleared for `/resume`'s reason:
+  // `checkLimits` runs before the first session.
+  const SPENT = asTaskId("EXTEND-1");
+  await seedTask(SPENT, {
+    ...UNCLAIMABLE,
+    status: "parked",
+    sessions: 20,
+    limits: { maxSessions: 20 },
+    progress: { lastProgressSession: 17, noProgressStreak: 3 },
+  });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "extend", task: SPENT, by: 5, author: "ada" });
+
+  assert.deepEqual(outcome, { kind: "extended", from: "parked", maxSessions: 25 });
+  const pushed = await pushedState(SPENT);
+  assert.equal(pushed?.status, "ready");
+  assert.equal(pushed?.limits.maxSessions, 25);
+  assert.equal(pushed?.sessions, 20, "the count is history and stays put");
+  assert.equal(pushed?.progress.noProgressStreak, 0);
+  assert.match(await pushedJournal(SPENT), /Session limit raised.*ada.*20 → 25/);
+});
+
+test("extend counts from the sessions used when the limit sits below them", async () => {
+  const LOWERED = asTaskId("EXTEND-2");
+  await seedTask(LOWERED, {
+    ...UNCLAIMABLE,
+    status: "parked",
+    sessions: 22,
+    limits: { maxSessions: 20 },
+  });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "extend", task: LOWERED, by: 5, author: "ada" });
+
+  assert.deepEqual(outcome, { kind: "extended", from: "parked", maxSessions: 27 });
+});
+
+test("extend refuses a task that is not parked, so a second press raises nothing", async () => {
+  const LIVE = asTaskId("EXTEND-3");
+  await seedTask(LIVE, { ...UNCLAIMABLE, status: "ready", sessions: 20, limits: { maxSessions: 25 } });
+
+  const store = new StateStore(statePath, stateGit);
+  const outcome = await throughInbox(store, { kind: "extend", task: LIVE, by: 5, author: "ada" });
+
+  assert.deepEqual(outcome, { kind: "not-resumable", status: "ready" });
+  assert.equal((await pushedState(LIVE))?.limits.maxSessions, 25, "nothing should have been written");
 });
 
 test("a provider outage releases the task and stops the runner claiming the next one", async () => {
@@ -4896,9 +4955,11 @@ test("a park talks in the task's own thread, not in the channel", async () => {
 
   const targets: (string | undefined)[] = [];
   const kinds: string[] = [];
+  const extendBy: (number | undefined)[] = [];
   const notifier: Notifier = {
     notify: (notification, target) => {
       kinds.push(notification.kind);
+      if (notification.kind === "parked") extendBy.push(notification.extendBy);
       targets.push(target?.threadId);
       return Promise.resolve();
     },
@@ -4941,6 +5002,8 @@ test("a park talks in the task's own thread, not in the channel", async () => {
     [THREAD_ID],
     "every notification about a task with a thread belongs in that thread",
   );
+  // The session-limit park is the one that offers Extend; `config.limits.sessionExtension`.
+  assert.deepEqual(extendBy, [5]);
 });
 
 test("a steer typed while a session runs reaches it, and lands in the journal", async () => {

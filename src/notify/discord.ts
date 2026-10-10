@@ -56,7 +56,16 @@ export type Notification =
        */
       readonly options?: readonly string[];
     }
-  | { readonly kind: "parked"; readonly task: TaskId; readonly reason: string }
+  | {
+      readonly kind: "parked";
+      readonly task: TaskId;
+      readonly reason: string;
+      /**
+       * Set only when the park is the SESSION limit: the sessions the "Extend" button adds.
+       * Every other park keeps the buttons it had — `/resume` already covers them.
+       */
+      readonly extendBy?: number;
+    }
   | {
       readonly kind: "done";
       readonly task: TaskId;
@@ -709,11 +718,19 @@ export const componentsFor = (
     //
     // A park also offers to amend and a `failed` does NOT: `failed` is an environment that
     // would not build, which no acceptance list fixes, and a button offering a move that
-    // cannot help is worse than no button.
+    // cannot help is worse than no button. For the same reason a SESSION-limit park swaps
+    // Resume for Extend: resuming leaves the count alone, so the task would park again on
+    // the next claim having run nothing.
     case "parked":
       return rows(
         row(
-          resumeButton(notification.task),
+          notification.extendBy === undefined
+            ? resumeButton(notification.task)
+            : button({
+                action: { verb: "ext", task: notification.task, arg: String(notification.extendBy) },
+                label: `Extend +${notification.extendBy} & resume`,
+                style: BUTTON_STYLE.primary,
+              }),
           doneButton(notification.task),
           amendButton(notification.task),
         ),
